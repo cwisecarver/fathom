@@ -134,11 +134,8 @@ defmodule Fathom.ShardExecutor do
   # The handle may carry its previous stream's prepared statements (perf review 2026-10-14 #10);
   # they are adopted into THIS stream only after the reset succeeds, and released with the handle if
   # it does not.
-  #
-  # Both reuse clauses take a handle `close/1` rolled back at checkin, so the reset skips its own
-  # rollback probe (`:checked_in`, expert review 2026-10-17 #31).
   defp obtain_conn({:reuse, {conn, cache} = handle}, path, _scope, opts) do
-    case Connection.reset_for_reuse(conn, opts[:scope], :checked_in) do
+    case Connection.reset_for_reuse(conn, opts[:scope]) do
       :ok ->
         Connection.adopt_statements(conn, cache)
         {:ok, conn}
@@ -150,7 +147,7 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp obtain_conn({:reuse, conn}, path, _scope, opts) do
-    case Connection.reset_for_reuse(conn, opts[:scope], :checked_in) do
+    case Connection.reset_for_reuse(conn, opts[:scope]) do
       :ok ->
         {:ok, conn}
 

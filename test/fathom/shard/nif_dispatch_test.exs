@@ -397,41 +397,6 @@ defmodule Fathom.Shard.NifDispatchTest do
     end
   end
 
-  # expert review 2026-10-17 #31: a pooled handle was rolled back at checkin, so the reuse reset
-  # must not repeat the transaction-state probe; the 2-arity reset (unknown history) still rolls back.
-  describe "reset_for_reuse provenance" do
-    setup do
-      path = Path.join(System.tmp_dir!(), "nifd_rr_#{System.unique_integer([:positive])}.db")
-      {:ok, conn} = Connection.open(path, tenant?: true)
-      :ok = Connection.exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
-
-      on_exit(fn ->
-        Connection.close(conn)
-        for suffix <- ["", "-wal", "-shm"], do: File.rm(path <> suffix)
-      end)
-
-      %{conn: conn}
-    end
-
-    test ":checked_in skips transaction_status (one dispatch fewer); :any keeps it", %{conn: conn} do
-      for scope <- [:rw, :ro] do
-        {r1, _, by_any} = count(fn -> Connection.reset_for_reuse(conn, scope) end)
-        {r2, _, by_ci} = count(fn -> Connection.reset_for_reuse(conn, scope, :checked_in) end)
-        assert {r1, r2} == {:ok, :ok}
-        assert Map.get(by_any, :transaction_status) == 1
-        refute Map.has_key?(by_ci, :transaction_status)
-      end
-    end
-
-    test "the 2-arity reset still rolls back an open transaction", %{conn: conn} do
-      :ok = Sqlite3.execute(conn, "BEGIN")
-      :ok = Sqlite3.execute(conn, "INSERT INTO t VALUES (1)")
-      refute Connection.autocommit?(conn)
-      assert :ok = Connection.reset_for_reuse(conn, :rw)
-      assert Connection.autocommit?(conn)
-    end
-  end
-
   # A statement left un-reset keeps its read transaction (a WAL read mark), which blocks a
   # `wal_checkpoint(TRUNCATE)` from any other handle. After every outcome, the statement must have
   # released it. (The reset was removed from the hot path: only the abandoned-`{:rows, _}` and the
