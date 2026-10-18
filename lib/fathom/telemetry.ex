@@ -36,7 +36,6 @@ defmodule Fathom.Telemetry do
         {:telemetry_poller,
          measurements: [
            {__MODULE__, :measure_active_shards, []},
-           {Fathom.Admin.Measurements, :node_memory, []},
            {Fathom.Admin.Measurements, :connections, []},
            {Fathom.Admin.Measurements, :vm_limits, []},
            {Fathom.Admin.Measurements, :durability, []},
@@ -91,23 +90,28 @@ defmodule Fathom.Telemetry do
   """
   @spec reporter_children() :: [Supervisor.child_spec() | {module(), keyword()}]
   def reporter_children do
-    {fast, core} = Enum.split_with(metrics(), &Fathom.Telemetry.FastHistogram.handles?/1)
+    all = metrics()
+    fast_hist = Enum.filter(all, &Fathom.Telemetry.FastHistogram.handles?/1)
+    fast_count = Enum.filter(all, &Fathom.Telemetry.FastCounter.handles?/1)
+    core = all -- (fast_hist ++ fast_count)
 
     [
       {TelemetryMetricsPrometheus.Core, metrics: core, name: :fathom_metrics},
-      {Fathom.Telemetry.FastHistogram, metrics: fast}
+      {Fathom.Telemetry.FastHistogram, metrics: fast_hist},
+      {Fathom.Telemetry.FastCounter, metrics: fast_count}
     ]
   end
 
   @doc """
-  The full Prometheus exposition: Core's metrics plus the `FastHistogram` ones. Raises (like
+  The full Prometheus exposition: Core's metrics plus the `FastHistogram` and `FastCounter` ones. Raises (like
   `TelemetryMetricsPrometheus.Core.scrape/1`) when the reporters are not running.
   """
   @spec scrape() :: String.t()
   def scrape do
     IO.iodata_to_binary([
       TelemetryMetricsPrometheus.Core.scrape(:fathom_metrics),
-      Fathom.Telemetry.FastHistogram.render()
+      Fathom.Telemetry.FastHistogram.render(),
+      Fathom.Telemetry.FastCounter.render()
     ])
   end
 

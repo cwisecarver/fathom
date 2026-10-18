@@ -177,21 +177,38 @@ defmodule Fathom.Telemetry.FastHistogramTest do
   # The split must be a partition: a hot metric on BOTH reporters would double the series in
   # /metrics, and one on neither would vanish from it.
   test "reporter_children hands each metric to exactly one reporter" do
-    [{TelemetryMetricsPrometheus.Core, core_opts}, {FastHistogram, fast_opts}] =
-      Fathom.Telemetry.reporter_children()
+    [
+      {TelemetryMetricsPrometheus.Core, core_opts},
+      {FastHistogram, fast_opts},
+      {Fathom.Telemetry.FastCounter, counter_opts}
+    ] = Fathom.Telemetry.reporter_children()
 
     core = Enum.map(core_opts[:metrics], & &1.name)
     fast = Enum.map(fast_opts[:metrics], & &1.name)
+    counters = Enum.map(counter_opts[:metrics], & &1.name)
 
     assert Enum.sort(fast) ==
              Enum.sort([
                [:fathom, :shard, :query, :duration],
                [:fathom, :shards, :checkout, :stop, :duration],
-               [:fathom, :replication, :commit, :duration]
+               [:fathom, :replication, :commit, :duration],
+               [:fathom, :replication, :commit_total, :duration],
+               [:fathom, :replication, :commit_stage, :duration]
              ])
 
-    assert MapSet.disjoint?(MapSet.new(core), MapSet.new(fast))
-    assert length(core) + length(fast) == length(Fathom.Telemetry.metrics())
+    assert Enum.sort(counters) ==
+             Enum.sort([
+               [:fathom, :shard, :pool_take, :count],
+               [:fathom, :replication, :checkpoint, :count]
+             ])
+
+    all = [core, fast, counters]
+
+    assert Enum.all?(
+             for a <- all, b <- all, a != b, do: MapSet.disjoint?(MapSet.new(a), MapSet.new(b))
+           )
+
+    assert length(core) + length(fast) + length(counters) == length(Fathom.Telemetry.metrics())
   end
 
   test "Fathom.Telemetry.scrape/0 serves both reporters, each family once" do

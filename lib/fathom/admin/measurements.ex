@@ -13,12 +13,6 @@ defmodule Fathom.Admin.Measurements do
   alias Fathom.Admin.FlushWatermark
   alias Fathom.Shard.WriteCounter
 
-  @doc "BEAM memory gauge for this node."
-  @spec node_memory() :: :ok
-  def node_memory do
-    :telemetry.execute([:fathom, :node, :memory], %{total: :erlang.memory(:total)}, %{})
-  end
-
   @doc "Live SQLite connections on this node (perf review 2026-10-14 #16)."
   @spec connections() :: :ok
   def connections do
@@ -175,10 +169,15 @@ defmodule Fathom.Admin.Measurements do
   defp util_key(:cpu), do: :dirty_cpu
   defp util_key(:io), do: :dirty_io
 
-  @doc "The `:erlang.memory/0` breakdown as gauges (processes, binary, ets, code, atom, system)."
+  @doc """
+  The `:erlang.memory/0` breakdown as gauges (processes, binary, ets, code, atom, system), plus the
+  node total gauge (`[:fathom, :node, :memory]`) from the same call (expert review 2026-10-17 #33:
+  it used to be a second `:erlang.memory` call per poll).
+  """
   @spec memory_breakdown() :: :ok
   def memory_breakdown do
     mem = :erlang.memory()
+    :telemetry.execute([:fathom, :node, :memory], %{total: Keyword.fetch!(mem, :total)}, %{})
 
     :telemetry.execute(
       [:fathom, :node, :memory_breakdown],
@@ -387,8 +386,8 @@ defmodule Fathom.Admin.Measurements do
   def durability do
     # O(open shards) walk (a FlushWatermark snapshot copy + one counter read per shard):
     # skip it entirely when the observability layer is off — nothing consumes the event,
-    # and the walk scales linearly with density (review 2026-07-23 #30). node_memory/0
-    # stays ungated (a single :erlang.memory call, effectively free).
+    # and the walk scales linearly with density (review 2026-07-23 #30). memory_breakdown/0
+    # (node memory) stays ungated (a single :erlang.memory call, effectively free).
     if Fathom.Admin.enabled?(), do: do_durability()
     :ok
   end

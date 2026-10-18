@@ -33,7 +33,11 @@ defmodule Fathom.Telemetry.FastHistogram do
     [:fathom, :shards, :checkout, :stop, :duration],
     # One per replicated commit (expert review 2026-10-17 #25): a Core `duplicate_bag` insert per
     # commit otherwise. Same tag (`outcome`), unit and buckets as declared in telemetry.ex.
-    [:fathom, :replication, :commit, :duration]
+    [:fathom, :replication, :commit, :duration],
+    # Also one-per-commit (+ per round for commit_stage), added by round-1 #10 as Core distributions
+    # (expert review 2026-10-17 #4). Tags `outcome`/`stage` are bounded; buckets match telemetry.ex.
+    [:fathom, :replication, :commit_total, :duration],
+    [:fathom, :replication, :commit_stage, :duration]
   ]
   @sum_scale 1000
 
