@@ -5188,11 +5188,11 @@ defmodule Fathom.Shard do
   # coordinator writes its temps into, without duplicating the config/default.
   @doc false
   def data_dir do
-    Application.get_env(
-      :fathom,
-      :shard_data_dir,
+    # Lazy default: the 3-arg `get_env` evaluated `System.tmp_dir!()` (3 getenv + a `File.stat`,
+    # ~16 us) on EVERY call even when the dir is configured, and `db_path/1` runs on every
+    # replicated write (expert review 2026-10-17 #3). Configured: ~0.04 us.
+    Application.get_env(:fathom, :shard_data_dir) ||
       Path.join(System.tmp_dir!(), "fathom_shards")
-    )
   end
 
   # The three quarantine-file kinds the coordinator writes to preserve acked-but-unflushed / corrupt
