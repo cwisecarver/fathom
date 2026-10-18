@@ -277,6 +277,126 @@ defmodule Fathom.Shard.NifDispatchTest do
     end
   end
 
+  # expert review 2026-10-17 #6: with replication ON a DML statement needs changes, rowid AND the
+  # autocommit flag; the extension's `fathom_conn_state()` returns all three in one statement step.
+  describe "fathom_conn_state fast path (conn_state?: true)" do
+    setup do
+      path = Path.join(System.tmp_dir!(), "nifd_cs_#{System.unique_integer([:positive])}.db")
+      {:ok, conn} = Connection.open(path, tenant?: true)
+      :ok = Connection.exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+
+      on_exit(fn ->
+        Connection.close(conn)
+        for suffix <- ["", "-wal", "-shm"], do: File.rm(path <> suffix)
+      end)
+
+      %{conn: conn}
+    end
+
+    test "an INSERT is 2 dirty dispatches (was 4 with the executor's autocommit read)", %{
+      conn: conn
+    } do
+      sql = "INSERT INTO t (v) VALUES (?)"
+      {:ok, _} = Connection.query(conn, sql, ["warm"], conn_state?: true)
+
+      {res, total, by_fun} =
+        count(fn -> Connection.query(conn, sql, ["x"], conn_state?: true) end)
+
+      assert {:ok, %{num_changes: 1, last_insert_rowid: 2, autocommit?: true}} = res
+      assert {total, by_fun} == {2, %{multi_step: 2}}
+
+      # Without the option: unchanged 3 dispatches, autocommit not reported.
+      {res, total, by_fun} = count(fn -> Connection.query(conn, sql, ["y"], []) end)
+      assert {:ok, %{num_changes: 1, last_insert_rowid: 3, autocommit?: nil}} = res
+      assert {total, by_fun} == {3, %{multi_step: 1, changes: 1, last_insert_rowid: 1}}
+    end
+
+    test "autocommit? is SQLite's own answer inside a transaction and after it ends", %{
+      conn: conn
+    } do
+      {:ok, _} = Connection.query(conn, "BEGIN", [], conn_state?: true)
+
+      assert {:ok, %{autocommit?: false, num_changes: 1}} =
+               Connection.query(conn, "INSERT INTO t (v) VALUES ('a')", [], conn_state?: true)
+
+      assert {:ok, _} = Connection.query(conn, "COMMIT", [], conn_state?: true)
+
+      assert {:ok, %{autocommit?: true, num_changes: 1}} =
+               Connection.query(conn, "INSERT INTO t (v) VALUES ('b')", [], conn_state?: true)
+    end
+
+    test "INSERT ... RETURNING, a 0-row UPDATE, and a trigger's writes report the same counters",
+         %{conn: conn} do
+      :ok = Connection.exec(conn, "CREATE TABLE log (id INTEGER PRIMARY KEY)")
+
+      :ok =
+        Connection.exec(
+          conn,
+          "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NULL); END"
+        )
+
+      assert {:ok, %{rows: [[1]], num_changes: 1, last_insert_rowid: 1, autocommit?: true}} =
+               Connection.query(conn, "INSERT INTO t (v) VALUES ('r') RETURNING id", [],
+                 conn_state?: true
+               )
+
+      assert {:ok, %{num_changes: 0, last_insert_rowid: nil}} =
+               Connection.query(conn, "UPDATE t SET v = 'z' WHERE id = 999", [],
+                 conn_state?: true
+               )
+    end
+
+    test "without the extension (a bare exqlite handle) it falls back to the 3 NIF calls" do
+      {:ok, bare} = Sqlite3.open(":memory:")
+      :ok = Sqlite3.execute(bare, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+
+      assert {:ok, %{num_changes: 1, last_insert_rowid: 1, autocommit?: nil}} =
+               Connection.query(bare, "INSERT INTO t (v) VALUES ('a')", [], conn_state?: true)
+
+      Sqlite3.close(bare)
+    end
+
+    test "a replicated-mode INSERT inside a transaction through the executor is 2 dispatches" do
+      shard = "test_nifd_cs_#{System.unique_integer([:positive])}"
+      {:ok, conn} = ShardExecutor.open(shard)
+
+      on_exit(fn ->
+        ShardExecutor.close(conn)
+
+        for base <- [
+              Path.join(Fathom.Shard.data_dir(), "#{shard}.db"),
+              Path.join(Fathom.Shard.Storage.Local.dir(), "#{shard}.db")
+            ],
+            suffix <- ["", "-wal", "-shm"],
+            do: File.rm(base <> suffix)
+      end)
+
+      # Replication is on and the writes are in an open transaction, so nothing ships (autocommit is
+      # false); the dispatch count is the statement step plus the one state step.
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER PRIMARY KEY, v)"))
+
+      # Replication goes on only after the autocommit DDL (it would try to ship to a quorum).
+      prev = Application.get_env(:fathom, :replication_enabled)
+      Application.put_env(:fathom, :replication_enabled, true)
+
+      on_exit(fn ->
+        if prev == nil,
+          do: Application.delete_env(:fathom, :replication_enabled),
+          else: Application.put_env(:fathom, :replication_enabled, prev)
+      end)
+
+      {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (?, 'w')", [1]))
+
+      {res, total, by_fun} =
+        count(fn -> ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (?, 'w')", [2])) end)
+
+      assert {:ok, %StmtResult{affected_row_count: 1, last_insert_rowid: 2}} = res
+      assert {total, by_fun} == {2, %{multi_step: 2}}
+      {:ok, _} = ShardExecutor.execute(conn, stmt("ROLLBACK"))
+    end
+  end
+
   # A statement left un-reset keeps its read transaction (a WAL read mark), which blocks a
   # `wal_checkpoint(TRUNCATE)` from any other handle. After every outcome, the statement must have
   # released it. (The reset was removed from the hot path: only the abandoned-`{:rows, _}` and the

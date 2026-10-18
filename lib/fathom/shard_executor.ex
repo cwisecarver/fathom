@@ -365,8 +365,18 @@ defmodule Fathom.ShardExecutor do
     if ddl?, do: cap_temp(conn)
 
     read? = read_verb?(head)
+    # Read once per statement and shared with `maybe_replicate/6`: no extra `get_env`. With
+    # replication ON a DML statement also needs the autocommit flag right after the step, which
+    # `Connection.query` can return in the same dispatch as changes + rowid (expert review
+    # 2026-10-17 #6).
+    repl_on? = Session.enabled?()
 
-    case Connection.query(conn, sql, args, dml?: dml?, read?: read?, deadline: true) do
+    case Connection.query(conn, sql, args,
+           dml?: dml?,
+           read?: read?,
+           deadline: true,
+           conn_state?: repl_on?
+         ) do
       {:ok, result} ->
         # A write bumps the shard's write counter so the periodic durability flush knows local
         # holds un-flushed changes; a read-only shard stays clean and skips the upload (the
@@ -403,7 +413,7 @@ defmodule Fathom.ShardExecutor do
 
         # A2 quorum replication (off unless :replication_enabled). Computed BEFORE
         # track_txn_write/3, which clears the in-transaction flag this decision reads.
-        repl = maybe_replicate(shard_id, pid, conn, head, wrote?)
+        repl = maybe_replicate(shard_id, pid, conn, head, wrote?, repl_on?, result.autocommit?)
 
         track_txn_write(conn, head, wrote?)
 
@@ -765,8 +775,11 @@ defmodule Fathom.ShardExecutor do
   # Ship this shard's newly committed WAL frames and wait for a follower quorum. Entirely inert
   # unless `:replication_enabled` — the gate is checked before anything else, so a node with the
   # feature off pays one `Application.get_env` per write and nothing more.
-  defp maybe_replicate(shard_id, pid, conn, head, wrote?) do
-    if Session.enabled?() and ships_now?(conn, head, wrote?) do
+  #
+  # `repl_on?` is the caller's one read of the gate; `autocommit` is the flag the statement step
+  # already returned (`Connection.query` `conn_state?`), or nil to ask SQLite.
+  defp maybe_replicate(shard_id, pid, conn, head, wrote?, repl_on?, autocommit) do
+    if repl_on? and ships_now?(conn, head, wrote?, autocommit) do
       Session.commit(shard_id, Shard.db_path(shard_id) <> "-wal", pid)
     else
       :ok
@@ -787,11 +800,15 @@ defmodule Fathom.ShardExecutor do
   # skip the quorum ship and be ACKED undurable -- on a node where replication is on in prod.
   # The flag now answers only "did this transaction write", for the commit-boundary arm.
   @doc false
-  def ships_now?(conn, head, wrote?) do
+  def ships_now?(conn, head, wrote?, autocommit \\ nil) do
     # Cheap operands first: `autocommit?/1` is a dirty-IO NIF dispatch, and for a read `wrote?` is
     # false and no commit boundary, so evaluating it first paid a second dispatch per SELECT with
     # replication ON (expert review 2026-10-17 #3). Pure boolean reorder, same result.
-    (wrote? or (commit_boundary?(head) and txn_wrote?(conn))) and Connection.autocommit?(conn)
+    #
+    # `autocommit` (expert review 2026-10-17 #6) is SQLite's own flag as already read by the
+    # statement step, so the NIF dispatch is skipped; nil falls back to asking.
+    (wrote? or (commit_boundary?(head) and txn_wrote?(conn))) and
+      if(is_nil(autocommit), do: Connection.autocommit?(conn), else: autocommit)
   end
 
   # Distinct from a SQLite error, and a 503 rather than a 400: nothing is wrong with the statement,
@@ -1050,7 +1067,7 @@ defmodule Fathom.ShardExecutor do
         # `mark_txn_write` above recorded the write; a script that committed ships here. Same error
         # mapping as `execute/2`: the local commit already happened, the client asked for a
         # quorum-durable write and did not get one, so it gets the 503.
-        case maybe_replicate(shard_id, pid, conn, sql, true) do
+        case maybe_replicate(shard_id, pid, conn, sql, true, Session.enabled?(), nil) do
           :ok -> :ok
           {:error, reason} -> {:error, no_quorum_error(shard_id, reason)}
         end

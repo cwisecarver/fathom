@@ -426,6 +426,23 @@ fn register_misc(db: &Connection, det: FunctionFlags, nondet: FunctionFlags) -> 
         Ok(Some(rand::random::<f64>()))
     })?;
 
+    // `fathom_conn_state()` (expert review 2026-10-17 #6): this connection's `changes`,
+    // `last_insert_rowid` and autocommit flag in ONE statement step, so a write statement pays one
+    // dirty-NIF dispatch for them instead of three (Fathom.Shard.Connection). Not deterministic
+    // (it reads connection state). It only reports the CALLING connection's own counters, which
+    // the tenant can already read via `changes()` / `last_insert_rowid()`; the autocommit bit is
+    // the one extra fact, and is visible to the tenant through their own COMMIT/BEGIN anyway.
+    db.create_scalar_function("fathom_conn_state", 0, nondet, |ctx| {
+        // SAFETY: `get_connection` is unsafe only because the handle could be sent to another
+        // thread; it is used for three reads on this thread and dropped.
+        let conn = unsafe { ctx.get_connection() }?;
+        Ok(scalars::conn_state_blob(
+            conn.changes(),
+            conn.last_insert_rowid(),
+            conn.is_autocommit(),
+        ))
+    })?;
+
     Ok(())
 }
 

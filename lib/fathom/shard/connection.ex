@@ -817,11 +817,16 @@ defmodule Fathom.Shard.Connection do
   mutating the database (`ShardExecutor`'s `read_verb?/1` whitelist: select / values / explain).
   When the statement also returns columns, `sqlite3_changes()` is not fetched (a dirty-NIF
   dispatch) and `num_changes` is reported as 0; the caller must not need the inherited count.
+
+  `conn_state?: true` (DML only) fetches changes, last rowid and the autocommit flag in one
+  statement step via the extension's `fathom_conn_state()` and reports the flag as `autocommit?`
+  (expert review 2026-10-17 #6); `autocommit?` is nil when that path was not taken.
   """
   @spec query(reference(), String.t(), list(), keyword()) :: {:ok, map()} | {:error, term()}
   def query(conn, sql, args, opts \\ []) do
     dml? = Keyword.get(opts, :dml?, true)
     read? = Keyword.get(opts, :read?, false)
+    state? = Keyword.get(opts, :conn_state?, false)
 
     # Statement deadline (expert review 2026-07-14 #26): when `:query_timeout_ms` is set, a runaway
     # query (missing-index full scan) is interrupted so it can't pin memory and keep the shard busy
@@ -838,19 +843,19 @@ defmodule Fathom.Shard.Connection do
     # it opts in.
     case Keyword.get(opts, :deadline, false) && timeout_ms() do
       falsy when falsy in [nil, false] ->
-        do_query(conn, sql, args, dml?, read?)
+        do_query(conn, sql, args, dml?, read?, state?)
 
       ms when is_integer(ms) and ms > 0 ->
-        with_deadline(conn, ms, fn -> do_query(conn, sql, args, dml?, read?) end)
+        with_deadline(conn, ms, fn -> do_query(conn, sql, args, dml?, read?, state?) end)
 
       _ ->
-        do_query(conn, sql, args, dml?, read?)
+        do_query(conn, sql, args, dml?, read?, state?)
     end
   rescue
     e in ArgumentError -> {:error, Exception.message(e)}
   end
 
-  defp do_query(conn, sql, args, dml?, read?) do
+  defp do_query(conn, sql, args, dml?, read?, state?) do
     # A 4-tuple with a plain pattern, not a 3-tuple plus a guard. A `with` whose pattern carries a
     # guard lets the unmatched value fall through as the function's return, which dialyzer caught
     # as `{:ok, _, _} | {:refresh, reference(), [any()]}` escaping `query/4`'s spec.
@@ -886,7 +891,22 @@ defmodule Fathom.Shard.Connection do
           # read verb always is. So the caller says so with `read?` and the fetch is skipped. Never
           # set for a `WITH` statement, whose `INSERT … RETURNING` body is only detectable by
           # `changes > 0`.
-          changes = if read? and columns != [], do: 0, else: changes(conn)
+          #
+          # Expert review 2026-10-17 #6: for a DML statement whose caller asked (`conn_state?`, set
+          # when replication is ON, which also needs the autocommit flag right after), the
+          # extension's `fathom_conn_state()` returns `changes`, `last_insert_rowid` and autocommit
+          # in ONE statement step: 1 dirty dispatch instead of 3 (changes + rowid + the executor's
+          # separate `transaction_status`). Not used otherwise: without the autocommit read, the
+          # step costs about what `changes` + `last_insert_rowid` cost (measured 4.0 vs 3.9 us), so
+          # it would be no win, and BEGIN/COMMIT (not DML) keep the single `changes` fetch.
+          {changes, fast_rowid, autocommit} =
+            case if(state? and dml?, do: fetch_conn_state(conn)) do
+              {:ok, ch, rid, ac} ->
+                {ch, rid, ac}
+
+              _ ->
+                {if(read? and columns != [], do: 0, else: changes(conn)), :lazy, nil}
+            end
 
           {:ok,
            %{
@@ -894,6 +914,8 @@ defmodule Fathom.Shard.Connection do
              rows: rows,
              row_count: row_count,
              num_changes: changes,
+             # nil when the fast path was not taken (the caller then asks `autocommit?/1`).
+             autocommit?: autocommit,
              # Only fetch the rowid when the caller can actually use it (expert review
              # 2026-07-24 #18; tightened by perf review 2026-10-14 #7). Sqlite3.last_insert_rowid/1
              # is ERL_NIF_DIRTY_JOB_IO_BOUND — a full dirty-scheduler dispatch — and
@@ -901,7 +923,10 @@ defmodule Fathom.Shard.Connection do
              # (`read_only? = cols != [] and not dml?`), i.e. `(dml? or cols == []) and changes > 0`.
              # That is exactly this predicate, so what the caller sees is byte-identical; BEGIN,
              # COMMIT, SAVEPOINT and no-op statements (changes == 0) no longer pay the dispatch.
-             last_insert_rowid: if(changes > 0 and (dml? or columns == []), do: last_rowid(conn))
+             last_insert_rowid:
+               if(changes > 0 and (dml? or columns == []),
+                 do: if(fast_rowid == :lazy, do: last_rowid(conn), else: fast_rowid)
+               )
            }}
         end
       rescue
@@ -1810,6 +1835,25 @@ defmodule Fathom.Shard.Connection do
   end
 
   defp timeout_ms, do: Application.get_env(:fathom, :query_timeout_ms)
+
+  # One step of the extension's `fathom_conn_state()` (native/fathom_udf `scalars::conn_state_blob`):
+  # <<changes::u64-le, last_insert_rowid::i64-le, autocommit::u8>>. `:error` (extension not loaded,
+  # or any unexpected shape) sends the caller to the three separate NIF calls, so behaviour is
+  # identical wherever the extension is absent. Rides the ordinary statement cache.
+  defp fetch_conn_state(conn) do
+    with {:ok, stmt, _cols, _refresh} <- cached_stmt(conn, "SELECT fathom_conn_state()") do
+      case Sqlite3.multi_step(conn, stmt, @multi_step_chunk) do
+        {:done, [[<<changes::unsigned-little-64, rowid::signed-little-64, ac>>]]} ->
+          {:ok, changes, rowid, ac == 1}
+
+        _ ->
+          _ = Sqlite3.reset(stmt)
+          :error
+      end
+    else
+      _ -> :error
+    end
+  end
 
   defp changes(conn) do
     case Sqlite3.changes(conn) do

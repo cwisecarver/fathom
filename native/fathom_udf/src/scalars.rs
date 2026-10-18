@@ -141,6 +141,17 @@ pub fn cot(x: f64) -> f64 {
 }
 
 /// `_sqlite_bitxor(x, y)`.
+/// Wire form of `fathom_conn_state()` (expert review 2026-10-17 #6): `changes` (u64 LE),
+/// `last_insert_rowid` (i64 LE), then one byte, 1 when the connection is in autocommit mode.
+/// Fathom.Shard.Connection decodes exactly this 17-byte layout.
+pub fn conn_state_blob(changes: u64, last_insert_rowid: i64, autocommit: bool) -> Vec<u8> {
+    let mut b = Vec::with_capacity(17);
+    b.extend_from_slice(&changes.to_le_bytes());
+    b.extend_from_slice(&last_insert_rowid.to_le_bytes());
+    b.push(autocommit as u8);
+    b
+}
+
 pub fn bitxor(x: i64, y: i64) -> i64 {
     x ^ y
 }
@@ -317,6 +328,20 @@ mod tests {
         assert_eq!(sha256_hex("x").len(), 64);
         assert_eq!(sha384_hex("x").len(), 96);
         assert_eq!(sha512_hex("x").len(), 128);
+    }
+
+    #[test]
+    fn conn_state_blob_layout() {
+        let b = conn_state_blob(3, -2, true);
+        assert_eq!(b.len(), 17);
+        assert_eq!(&b[0..8], &3u64.to_le_bytes());
+        assert_eq!(&b[8..16], &(-2i64).to_le_bytes());
+        assert_eq!(b[16], 1);
+        assert_eq!(conn_state_blob(0, 0, false)[16], 0);
+        assert_eq!(
+            &conn_state_blob(u64::MAX, i64::MIN, false)[0..8],
+            &u64::MAX.to_le_bytes()
+        );
     }
 
     #[test]
