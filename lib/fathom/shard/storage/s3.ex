@@ -3054,8 +3054,11 @@ defmodule Fathom.Shard.Storage.S3 do
     # trigger this finding is about), `receive_timeout` how long we wait for the RESPONSE.
     timeouts =
       case Keyword.get(opts, :budget_ms) do
-        ms when is_integer(ms) and ms > 0 -> [receive_timeout: ms, finch: finch_opts(pool_timeout: ms)]
-        _ -> []
+        ms when is_integer(ms) and ms > 0 ->
+          [receive_timeout: ms, finch: finch_opts(pool_timeout: ms)]
+
+        _ ->
+          []
       end
 
     case Req.put(

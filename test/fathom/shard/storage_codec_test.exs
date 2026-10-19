@@ -208,6 +208,47 @@ defmodule Fathom.Shard.Storage.CodecTest do
     end
   end
 
+  # Expert review 2026-10-19 #8: the inline decode proof no longer hashes the decoded output; the
+  # zstd frame checksum is the only thing that catches a flip inside a RAW block (incompressible
+  # data is stored verbatim, so the decoder sees nothing structurally wrong). Without
+  # `checksumFlag` this body is accepted and PUT with a plaintext label it does not decode to.
+  test "zstd: a flipped byte inside an incompressible (raw-block) body is refused by the frame checksum" do
+    src = tmp("raw_block")
+    File.write!(src, :crypto.strong_rand_bytes(600_000))
+    on_exit(fn -> File.rm(src) end)
+
+    Application.put_env(:fathom, :codec_corrupt_hook, fn piece ->
+      bin = IO.iodata_to_binary(piece)
+
+      if byte_size(bin) < 1_000 do
+        bin
+      else
+        mid = div(byte_size(bin), 2)
+        <<head::binary-size(^mid), b, tail::binary>> = bin
+        <<head::binary, Bitwise.bxor(b, 0xFF), tail::binary>>
+      end
+    end)
+
+    on_exit(fn -> Application.delete_env(:fathom, :codec_corrupt_hook) end)
+
+    assert {:error, {:zstd, msg}} = Codec.compress_to_temp_hashed(src, :zstd)
+    assert msg =~ "checksum"
+  end
+
+  test "zstd: frames written before the checksum flag (and with it) both still decode" do
+    plain = String.duplicate("old frame ", 20_000)
+
+    for flag <- [false, true] do
+      {:ok, c} = :zstd.context(:compress, %{compressionLevel: 3, checksumFlag: flag})
+      {:done, frame} = :zstd.finish(c, plain)
+      :zstd.close(c)
+      path = tmp("oldframe")
+      File.write!(path, frame)
+      on_exit(fn -> File.rm(path) end)
+      assert stream_inflate(path, :zstd) == plain
+    end
+  end
+
   test "zstd is the default encoding" do
     prev = Application.get_env(:fathom, :shard_object_encoding)
     on_exit(fn -> restore(prev) end)
