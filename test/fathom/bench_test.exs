@@ -128,6 +128,24 @@ defmodule Fathom.BenchTest do
              "ETS-counter and LRU path, measured at ~1.04M/s when the floor was set"
   end
 
+  # Expert review 2026-10-19 #5: the hot-shard contention metrics. Floors ~10x under what the dev
+  # host measured BEFORE the fix (same_shard_stmt ~190-220k stmt/s, serial_checkout ~80-150k ops/s
+  # at 18 workers), so they catch an order-of-magnitude collapse and prove the metric ran at all.
+  test "the hot-shard contention metrics clear their absolute floors" do
+    lru_before = Process.whereis(Fathom.Shards.Lru)
+    stmt = Fathom.Bench.same_shard_stmt(concurrent_ms: 200, trials: 1)
+    assert is_float(stmt)
+    assert stmt > 10_000, "same-shard statements #{stmt}/s fell under the 10k/s floor"
+
+    serial = Fathom.Bench.serial_checkout(concurrent_ms: 200, trials: 1)
+    assert is_float(serial)
+    assert serial > 10_000, "pinned serial checkout #{serial}/s fell under the 10k/s floor"
+
+    # Scoped setup: a table owner they started is gone again (and one already running is left
+    # alone), so no later metric inherits them.
+    assert Process.whereis(Fathom.Shards.Lru) == lru_before
+  end
+
   test "the p99 metrics describe the same run as their p50, and bound it" do
     # One run, two reducers. If these ever came from separate runs the gate would compare two
     # samples of a noisy bench and call the difference a regression.

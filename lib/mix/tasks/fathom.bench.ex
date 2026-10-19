@@ -92,7 +92,9 @@ defmodule Mix.Tasks.Fathom.Bench do
     :flush,
     :served_repl,
     :hrana_write,
-    :hrana_open_auth
+    :hrana_open_auth,
+    :same_shard_stmt,
+    :serial_checkout
   ]
 
   @doc false
@@ -260,6 +262,10 @@ defmodule Mix.Tasks.Fathom.Bench do
        "\u00b5s   (INSERT RETURNING over Hrana, A2 replication ON, quorum ship asserted)"},
       {"hrana_open_auth_rt_us", metrics.hrana_open_auth_rt_us,
        "\u00b5s   (Hrana round trip INCLUDING stream open, auth REQUIRED)"},
+      {"same_shard_stmt_per_s", metrics.same_shard_stmt_per_s,
+       "stmt/s (point SELECT, schedulers streams on ONE shard, shard_load on; watch-only)"},
+      {"serial_checkout_per_s", metrics.serial_checkout_per_s,
+       "ops/s  (checkout+checkin, one worker per shard: every checkin a 1->0 edge; watch-only)"},
       {"wire_rows_per_s", metrics.wire_rows_per_s,
        "rows/s (result-set encode over the wire, keystone rows)"},
       {"wire_encode_rows_per_s", metrics.wire_encode_rows_per_s,

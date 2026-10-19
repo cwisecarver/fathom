@@ -110,7 +110,9 @@ defmodule Fathom.Bench do
     :flush,
     :served_repl,
     :hrana_write,
-    :hrana_open_auth
+    :hrana_open_auth,
+    :same_shard_stmt,
+    :serial_checkout
   ]
 
   @doc false
@@ -224,7 +226,13 @@ defmodule Fathom.Bench do
       # the open-per-request round trip with Hrana auth REQUIRED; before these the gate saw
       # neither a replicated write nor `HranaAuth.authorize/2`.
       hrana_write_rt_us: run_if(only, :hrana_write, fn -> hrana_write_rt(opts) end),
-      hrana_open_auth_rt_us: run_if(only, :hrana_open_auth, fn -> hrana_open_auth_rt(opts) end)
+      hrana_open_auth_rt_us: run_if(only, :hrana_open_auth, fn -> hrana_open_auth_rt(opts) end),
+      # HOT-SHARD CONTENTION, watch-only (expert review 2026-10-19 #5). Last for the same reason as
+      # the two above: each starts the ShardLoad/ShardLatency/Lru tables in its own scoped setup.
+      # Many streams on ONE shard through the executor (the per-statement counter keys), and one
+      # worker per shard so every checkin is a 1 -> 0 Lru edge.
+      same_shard_stmt_per_s: run_if(only, :same_shard_stmt, fn -> same_shard_stmt(opts) end),
+      serial_checkout_per_s: run_if(only, :serial_checkout, fn -> serial_checkout(opts) end)
     }
   end
 
@@ -2199,6 +2207,221 @@ defmodule Fathom.Bench do
 
     total * 1000 / ms
   end
+
+  @doc """
+  `same_shard_stmt_per_s` — point-SELECT throughput through `ShardExecutor.execute/2` with
+  `System.schedulers_online()` workers, each on its OWN tenant handle, all on ONE shard, with
+  `:shard_load` ON and its tables (and the Lru) started, as in prod (expert review 2026-10-19 #5).
+
+  Every other statement metric is serial, so a per-statement write that serialises one hot shard's
+  streams on a single ETS key (the load counters, the latency histogram) left all of them flat.
+  This is the one tenant with a connection pool: many streams, one shard.
+
+  Own scoped setup: it starts `Fathom.ShardLoad`, `Fathom.ShardLatency` and `Fathom.Shards.Lru`
+  and flips `:shard_load` only for its own window (restored after), so it changes no other series.
+  Watch-only until its band is measured.
+  """
+  @spec same_shard_stmt(keyword()) :: float()
+  def same_shard_stmt(opts \\ []) do
+    setup(opts)
+    owned = setup_load_tables()
+    ms = Keyword.get(opts, :concurrent_ms, @concurrent_ms)
+    workers = Keyword.get(opts, :stmt_workers, System.schedulers_online())
+    trials = Keyword.get(opts, :trials, @default_trials)
+    # `shard_load: false` is the A/B lever that proves the metric discriminates (and isolates the
+    # counters' share when it moves); the recorded series always runs it ON, as prod does.
+    load? = Keyword.get(opts, :shard_load, true)
+    prev = Application.get_env(:fathom, :shard_load)
+    Application.put_env(:fathom, :shard_load, load?)
+    id = uniq("bench_stmt_hot")
+
+    try do
+      {:ok, seed} = ShardExecutor.open(id, :trusted)
+      exec!(seed, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+      exec!(seed, "INSERT INTO t (id, v) VALUES (1, 'x')")
+      :ok = ShardExecutor.close(seed)
+
+      pids = Enum.map(1..workers, fn _ -> spawn_stmt_worker(id) end)
+
+      try do
+        before = Fathom.ShardLoad.get(id)[:queries] || 0
+        result = median(times(trials, fn _ -> stmt_trial(pids, ms) end))
+
+        # The precondition this metric exists for: the load counters were actually being bumped.
+        # Without it a table that failed to start (the rescued-ArgumentError path) reads as fast.
+        if load? and (Fathom.ShardLoad.get(id)[:queries] || 0) <= before,
+          do: raise("same_shard_stmt: ShardLoad recorded nothing — measuring the wrong path")
+
+        result
+      after
+        Enum.each(pids, &stop_stmt_worker/1)
+      end
+    after
+      restore_env(:shard_load, prev)
+      Shards.drain(id, 5_000)
+      teardown_load_tables(owned)
+    end
+  end
+
+  # One long-lived worker per stream: it OWNS its handle (a Connection's statement cache and flags
+  # live in the owning process, as with a real Filo stream), and runs one timed window per `:go`.
+  defp spawn_stmt_worker(id) do
+    parent = self()
+
+    pid =
+      spawn_link(fn ->
+        {:ok, handle} = ShardExecutor.open(id, :trusted)
+        send(parent, {:ready, self()})
+        stmt_worker_loop(handle)
+      end)
+
+    receive do
+      {:ready, ^pid} -> pid
+    after
+      10_000 -> raise "same_shard_stmt: worker never opened its handle"
+    end
+  end
+
+  defp stmt_worker_loop(handle) do
+    receive do
+      {:go, from, deadline} ->
+        send(from, {:done, self(), stmt_loop(handle, deadline, 0)})
+        stmt_worker_loop(handle)
+
+      {:stop, from} ->
+        :ok = ShardExecutor.close(handle)
+        send(from, {:stopped, self()})
+    end
+  end
+
+  @point_select %Filo.Stmt{sql: "SELECT v FROM t WHERE id = ?", args: [1]}
+
+  defp stmt_loop(handle, deadline, count) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      count
+    else
+      {:ok, _} = ShardExecutor.execute(handle, @point_select)
+      stmt_loop(handle, deadline, count + 1)
+    end
+  end
+
+  defp stmt_trial(pids, ms) do
+    deadline = System.monotonic_time(:millisecond) + ms
+    Enum.each(pids, &send(&1, {:go, self(), deadline}))
+
+    total =
+      Enum.reduce(pids, 0, fn pid, acc ->
+        receive do
+          {:done, ^pid, n} -> acc + n
+        after
+          ms * 10 + 5_000 -> raise "same_shard_stmt worker did not finish — wedged?"
+        end
+      end)
+
+    if total == 0, do: raise("same_shard_stmt completed 0 statements — measuring nothing")
+    total * 1000 / ms
+  end
+
+  defp stop_stmt_worker(pid) do
+    send(pid, {:stop, self()})
+
+    receive do
+      {:stopped, ^pid} -> :ok
+    after
+      5_000 -> :ok
+    end
+  end
+
+  defp exec!(handle, sql) do
+    {:ok, _} = ShardExecutor.execute(handle, %Filo.Stmt{sql: sql, args: []})
+  end
+
+  @doc """
+  `serial_checkout_per_s` — checkout+checkin throughput with `System.schedulers_online()` workers,
+  each PINNED to its own warm shard, so every checkin is a 1 -> 0 edge and every grant a 0 -> 1
+  edge (expert review 2026-10-19 #5). Those edges are where the coordinator writes the Lru busy
+  hint and re-keys the recency `:ordered_set` — always its right-most slot, from every coordinator
+  at once. `concurrent_checkout_per_s` cannot see that: with 4x schedulers workers over 64 shards
+  most checkins are not edges.
+
+  Own scoped setup (`:shard_load` ON, its tables and the Lru started); watch-only.
+  """
+  @spec serial_checkout(keyword()) :: float()
+  def serial_checkout(opts \\ []) do
+    setup(opts)
+    owned = setup_load_tables()
+    ms = Keyword.get(opts, :concurrent_ms, @concurrent_ms)
+    workers = Keyword.get(opts, :serial_workers, System.schedulers_online())
+    trials = Keyword.get(opts, :trials, @default_trials)
+    # A/B levers, as in `same_shard_stmt/1`: `shard_load: false` and `lru: false` switch off the
+    # load counters / the Lru edge writes for this window. The recorded series runs both ON.
+    load? = Keyword.get(opts, :shard_load, true)
+    lru? = Keyword.get(opts, :lru, true)
+    prev = Application.get_env(:fathom, :shard_load)
+    prev_evict = Application.get_env(:fathom, :evict_idle_at_capacity)
+    Application.put_env(:fathom, :shard_load, load?)
+    Application.put_env(:fathom, :evict_idle_at_capacity, lru?)
+
+    if lru? and not Fathom.Shards.Lru.enabled?(),
+      do: raise("serial_checkout: Lru is disabled — the edge writes this measures never run")
+
+    ids = Enum.map(1..workers, fn i -> "bench_serial_#{i}" end)
+    Enum.each(ids, &warm_checkout_shard/1)
+
+    try do
+      median(times(trials, fn _ -> pinned_churn(ids, ms) end))
+    after
+      restore_env(:shard_load, prev)
+      restore_env(:evict_idle_at_capacity, prev_evict)
+      Enum.each(ids, &Shards.drain(&1, 5_000))
+      teardown_load_tables(owned)
+    end
+  end
+
+  defp pinned_churn(ids, ms) do
+    deadline = System.monotonic_time(:millisecond) + ms
+    parent = self()
+
+    pids =
+      Enum.map(ids, fn id ->
+        spawn_link(fn -> send(parent, {:done, self(), churn_loop([id], 0, deadline, 0)}) end)
+      end)
+
+    total =
+      Enum.reduce(pids, 0, fn pid, acc ->
+        receive do
+          {:done, ^pid, count} -> acc + count
+        after
+          ms * 10 + 5_000 -> raise "serial checkout worker did not finish — wedged?"
+        end
+      end)
+
+    if total == 0, do: raise("serial checkout completed 0 operations — measuring nothing")
+    total * 1000 / ms
+  end
+
+  # The prod-shaped per-shard tables, started ONLY by the metrics that need them (not setup/1).
+  # Returns the owners THIS call started so `teardown_load_tables/1` stops exactly those: a table
+  # left up is residue that changes what a later metric in the same BEAM measures (with the Lru up,
+  # `concurrent_checkout_per_s` spread reads ~127k/s instead of ~1M/s on the dev host).
+  defp setup_load_tables do
+    for mod <- [Fathom.ShardLoad, Fathom.ShardLatency, Fathom.Shards.Lru],
+        pid = start_owned(mod),
+        do: pid
+  end
+
+  defp start_owned(mod) do
+    case mod.start_link([]) do
+      {:ok, pid} ->
+        Process.unlink(pid)
+        pid
+
+      {:error, {:already_started, _pid}} ->
+        nil
+    end
+  end
+
+  defp teardown_load_tables(pids), do: Enum.each(pids, &GenServer.stop/1)
 
   defp churn_loop(ids, w, deadline, count) do
     if System.monotonic_time(:millisecond) >= deadline do
