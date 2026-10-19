@@ -704,7 +704,12 @@ defmodule Fathom.Admin.MetricsCollector do
   # Returns `{hot_maps, next_prev}`. Maps are allocated for the survivors only —
   # `prev` is `%{shard_id => {queries, rows_read, rows_written}}`, a 3-tuple rather than the
   # 5-key map the old `load_map/0` retained for every resident shard.
-  defp hot_shards(prev, window_s) do
+  @doc false
+  # Public only so `Fathom.Bench.observability_tick_us/1` can time one pass at realistic row counts
+  # (expert review 2026-10-19 #25); the collector itself is the only production caller.
+  @spec hot_shards(%{optional(String.t()) => {integer(), integer(), integer()}}, number()) ::
+          {[map()], %{optional(String.t()) => {integer(), integer(), integer()}}}
+  def hot_shards(prev, window_s) do
     {heap, next_prev} =
       Enum.reduce(ShardLoad.snapshot_tuples(), {[], %{}}, fn
         {id, _checkouts, queries, rows_read, rows_written}, {heap, next} ->

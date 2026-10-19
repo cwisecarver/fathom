@@ -92,7 +92,9 @@ defmodule Mix.Tasks.Fathom.Bench do
     :flush,
     :served_repl,
     :hrana_write,
-    :hrana_open_auth
+    :hrana_open_auth,
+    :hrana_observed,
+    :observability_tick
   ]
 
   @doc false
@@ -260,6 +262,10 @@ defmodule Mix.Tasks.Fathom.Bench do
        "\u00b5s   (INSERT RETURNING over Hrana, A2 replication ON, quorum ship asserted)"},
       {"hrana_open_auth_rt_us", metrics.hrana_open_auth_rt_us,
        "\u00b5s   (Hrana round trip INCLUDING stream open, auth REQUIRED)"},
+      {"hrana_rt_observed_us", metrics.hrana_rt_observed_us,
+       "µs   (hrana_rt with the Prometheus reporters attached; watch-only)"},
+      {"observability_tick_us", metrics.observability_tick_us,
+       "µs   (one 10 s poller + hot_shards pass at 20k rows; watch-only)"},
       {"wire_rows_per_s", metrics.wire_rows_per_s,
        "rows/s (result-set encode over the wire, keystone rows)"},
       {"wire_encode_rows_per_s", metrics.wire_encode_rows_per_s,

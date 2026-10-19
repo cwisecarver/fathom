@@ -339,4 +339,44 @@ defmodule Fathom.BenchTest do
     assert is_float(us) and us > 20 and us < 1_000_000
     assert Application.get_env(:fathom, :hrana_auth) == prev, "the arm left hrana_auth changed"
   end
+
+  # expert review 2026-10-19 #4: the bench topology must have the ShardLoad/ShardLatency tables
+  # prod has (MIX_ENV=prod turns :shard_load on, and without the tables every query raises and
+  # rescues two ArgumentErrors). With the gate forced on, a wire run must leave rows in both.
+  @tag timeout: 120_000
+  test "setup starts the load tables and a wire run feeds them when :shard_load is on" do
+    prev = Application.get_env(:fathom, :shard_load)
+    Application.put_env(:fathom, :shard_load, true)
+
+    on_exit(fn ->
+      if prev == nil,
+        do: Application.delete_env(:fathom, :shard_load),
+        else: Application.put_env(:fathom, :shard_load, prev)
+    end)
+
+    # hrana_rt_stats/1 raises if the loop recorded nothing (assert_load_recorded!/2).
+    assert is_float(Fathom.Bench.hrana_rt(hrana_rt_samples: 20))
+    assert :ets.whereis(Fathom.ShardLoad) != :undefined
+    assert :ets.whereis(Fathom.ShardLatency) != :undefined
+  end
+
+  # expert review 2026-10-19 #26: reporters attached, scrape count asserted inside the metric (it
+  # raises if the query-duration count is below the sample count), handlers detached afterwards.
+  @tag timeout: 120_000
+  test "hrana_rt_observed_us runs with reporters attached and detaches them" do
+    before = length(:telemetry.list_handlers([]))
+    us = Fathom.Bench.hrana_rt_observed_us(hrana_rt_samples: 50)
+    assert is_float(us) and us > 5 and us < 1_000_000
+    assert length(:telemetry.list_handlers([])) == before, "the arm leaked telemetry handlers"
+  end
+
+  # expert review 2026-10-19 #25: preconditions (durability saw every seeded row, hot_shards
+  # baselined every row) are asserted inside the metric; the tables are emptied afterwards.
+  @tag timeout: 120_000
+  test "observability_tick_us walks the seeded tables and empties them afterwards" do
+    us = Fathom.Bench.observability_tick_us(tick_rows: 2_000, trials: 2)
+    assert is_float(us) and us > 0
+    assert Fathom.ShardLoad.snapshot_tuples() == []
+    assert Fathom.Admin.FlushWatermark.size() == 0
+  end
 end

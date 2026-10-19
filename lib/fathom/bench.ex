@@ -110,7 +110,9 @@ defmodule Fathom.Bench do
     :flush,
     :served_repl,
     :hrana_write,
-    :hrana_open_auth
+    :hrana_open_auth,
+    :hrana_observed,
+    :observability_tick
   ]
 
   @doc false
@@ -224,7 +226,13 @@ defmodule Fathom.Bench do
       # the open-per-request round trip with Hrana auth REQUIRED; before these the gate saw
       # neither a replicated write nor `HranaAuth.authorize/2`.
       hrana_write_rt_us: run_if(only, :hrana_write, fn -> hrana_write_rt(opts) end),
-      hrana_open_auth_rt_us: run_if(only, :hrana_open_auth, fn -> hrana_open_auth_rt(opts) end)
+      hrana_open_auth_rt_us: run_if(only, :hrana_open_auth, fn -> hrana_open_auth_rt(opts) end),
+      # WATCH-ONLY (expert review 2026-10-19 #26/#25), both with their OWN scoped setup and placed
+      # after every density metric: the first starts the Prometheus reporter children (telemetry
+      # handlers on the request path), the second seeds ~20k rows into the dirty-flag/load tables.
+      hrana_rt_observed_us: run_if(only, :hrana_observed, fn -> hrana_rt_observed_us(opts) end),
+      observability_tick_us:
+        run_if(only, :observability_tick, fn -> observability_tick_us(opts) end)
     }
   end
 
@@ -1999,6 +2007,192 @@ defmodule Fathom.Bench do
         :telemetry.detach(handler)
       end
     end)
+  end
+
+  # --- observed wire + poller tick (expert review 2026-10-19 #26, #25) --------
+
+  @doc """
+  `hrana_rt_observed_us` - `hrana_rt_us` with the Prometheus reporter children running, the shape
+  prod has and every other wire metric lacks (expert review 2026-10-19 #26): `Fathom.Telemetry`'s
+  `reporter_children/0` attach the `[:fathom, :shard, :query]` and checkout handlers
+  (`FastHistogram`, `FastCounter`, Core), so each statement pays the telemetry dispatch. The
+  ShardLoad/ShardLatency tables are present via `setup/1` (#4).
+
+  PRECONDITION asserted: after the timed loop the scrape reports a query-duration count of at least
+  the number of samples, otherwise the reporters were not attached and this would silently be
+  `hrana_rt_us` under another name. The reporters are stopped (handlers detached) afterwards.
+  Watch-only; the difference against `hrana_rt_us` is the telemetry cost.
+  """
+  @spec hrana_rt_observed_us(keyword()) :: float() | nil
+  def hrana_rt_observed_us(opts \\ []) do
+    samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
+    # `mix fathom.bench` only runs app.config, and the reporters register :telemetry handlers.
+    {:ok, _} = Application.ensure_all_started(:telemetry)
+
+    {:ok, sup} =
+      Supervisor.start_link(Fathom.Telemetry.reporter_children(), strategy: :one_for_one)
+
+    try do
+      with_wire(opts, "benchobs", fn client ->
+        {:ok, _, client} = Filo.Client.execute(client, "SELECT 1")
+
+        {_client, us} =
+          Enum.reduce(1..samples, {client, []}, fn _, {c, acc} ->
+            {t, result} = :timer.tc(fn -> Filo.Client.execute(c, "SELECT 1") end)
+            {:ok, _, c} = result
+            {c, [t | acc]}
+          end)
+
+        observed = query_duration_count(Fathom.Telemetry.scrape())
+
+        unless observed >= samples,
+          do:
+            raise(
+              "hrana_rt_observed_us: scrape counted #{observed} query durations for #{samples} " <>
+                "samples - the reporters are not attached, this would measure the unobserved path"
+            )
+
+        assert_load_recorded!("benchobs", "hrana_rt_observed_us")
+        p50(us)
+      end)
+    after
+      Supervisor.stop(sup)
+    end
+  end
+
+  # The `_count` sample of the per-query duration histogram in a Prometheus exposition (0 if absent).
+  defp query_duration_count(scrape) do
+    case Regex.run(~r/^fathom_shard_query_duration\w*_count(?:\{[^}]*\})? (\d+)/m, scrape) do
+      [_, n] -> String.to_integer(n)
+      nil -> 0
+    end
+  end
+
+  @tick_rows 20_000
+
+  @doc """
+  `observability_tick_us` - one pass of the 10 s observability tick at a realistic row count
+  (expert review 2026-10-19 #25): every `Fathom.Telemetry` poller measurement
+  (`Fathom.Admin.Measurements.*`, `LeaseHealth`, `LagGauge`, active shards) plus one
+  `MetricsCollector.hot_shards/2` pass, with #{@tick_rows} rows seeded into ShardLoad, WriteCounter
+  and FlushWatermark. Round 1 (#1, #14-#16) and round 2 (#27) removed several O(shards) walks and
+  none of those fixes was gated.
+
+  Like the real poller, a measurement that raises is skipped rather than fatal (some need the
+  supervision tree the bench does not boot); PRECONDITIONS asserted: `durability/0` ran and its
+  event saw every seeded watermark row (its walk is the O(rows) one), and the `hot_shards/2` pass
+  baselined every seeded ShardLoad row. Median of trials, own scoped setup, tables emptied after.
+  Watch-only.
+  """
+  @spec observability_tick_us(keyword()) :: float()
+  def observability_tick_us(opts \\ []) do
+    rows = Keyword.get(opts, :tick_rows, @tick_rows)
+    trials = Keyword.get(opts, :trials, @default_trials)
+    setup(opts)
+    setup_write_path()
+    # `disk/0` reads :disksup, which `mix fathom.bench` (app.config only) does not start.
+    {:ok, _} = Application.ensure_all_started(:os_mon)
+    # Prod shape: the collector/watermarks are on (off in the test env) and so is :shard_load.
+    restore_load = put_env_scoped(:shard_load, true)
+    restore_collector = put_env_scoped(:metrics_collector, true)
+    gen = Fathom.Shard.WriteCounter.generation()
+
+    for i <- 1..rows do
+      id = "benchtick_#{i}"
+      Fathom.ShardLoad.record_query(id, 1, 1)
+      Fathom.Shard.WriteCounter.bump(id)
+      Fathom.Admin.FlushWatermark.record(id, 0, gen)
+    end
+
+    # The measurement runs in this process, so the handler can just message it.
+    parent = self()
+    handler = "bench-tick-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :durability, :rpo],
+      fn _e, m, _meta, _ -> send(parent, {:bench_rpo, m}) end,
+      nil
+    )
+
+    try do
+      measurements = [
+        {Fathom.Telemetry, :measure_active_shards, []},
+        {Fathom.Admin.Measurements, :connections, []},
+        {Fathom.Admin.Measurements, :vm_limits, []},
+        {Fathom.Admin.Measurements, :durability, []},
+        {Fathom.Admin.Measurements, :disk, []},
+        {Fathom.Admin.Measurements, :replication, []},
+        {Fathom.Admin.Measurements, :flush_gate, []},
+        {Fathom.Admin.Measurements, :schedulers, []},
+        {Fathom.Admin.Measurements, :memory_breakdown, []},
+        {Fathom.Admin.Measurements, :recorder, []},
+        {Fathom.Admin.LeaseHealth, :measure, []},
+        {Fathom.Shard.Replication.LagGauge, :measure, []}
+      ]
+
+      tick = fn ->
+        Enum.each(measurements, fn {m, f, a} ->
+          try do
+            apply(m, f, a)
+          catch
+            _, _ -> :skipped
+          end
+        end)
+
+        {hot, next} = Fathom.Admin.MetricsCollector.hot_shards(%{}, 10)
+        {length(hot), map_size(next)}
+      end
+
+      tick.()
+
+      m =
+        receive do
+          {:bench_rpo, m} -> m
+        after
+          0 -> nil
+        end
+
+      unless is_map(m) and m.watermark_rows == rows and m.dirty_shards == rows,
+        do:
+          raise(
+            "observability_tick_us: durability saw #{inspect(m)}, expected #{rows} dirty " <>
+              "watermark rows - the tick is not walking the seeded tables"
+          )
+
+      samples =
+        times(trials, fn _ ->
+          {us, {_hot, baselined}} = :timer.tc(tick)
+
+          unless baselined == rows,
+            do: raise("observability_tick_us: hot_shards baselined #{baselined} of #{rows} rows")
+
+          us
+        end)
+
+      median(samples)
+    after
+      :telemetry.detach(handler)
+      Fathom.ShardLoad.reset()
+      Fathom.Shard.WriteCounter.reset()
+      Fathom.Admin.FlushWatermark.reset()
+
+      restore_load.()
+      restore_collector.()
+    end
+  end
+
+  # Sets a :fathom env key and returns a function that puts the previous state back.
+  defp put_env_scoped(key, value) do
+    prev = Application.fetch_env(:fathom, key)
+    Application.put_env(:fathom, key, value)
+
+    fn ->
+      case prev do
+        {:ok, v} -> Application.put_env(:fathom, key, v)
+        :error -> Application.delete_env(:fathom, key)
+      end
+    end
   end
 
   defp write_with_retry(client, sql, deadline \\ nil) do
