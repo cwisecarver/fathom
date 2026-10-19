@@ -270,6 +270,186 @@ defmodule Tpc do
     |> Map.merge(for {k, v} <- p, into: %{}, do: {"tpcb_#{k}", v})
   end
 
+  # --- oneshot-fleet: K concurrent one-shot streams PER tenant shard ---------------------------
+  # Every other mode holds ONE long-lived stream per tenant, so a stream opens once and the
+  # coordinator's connection pool (`Fathom.Shard.HandlePool`) is never exercised. This mode is the
+  # shape the pool exists for: each op is a baton-less `[execute, execute, close]` pipeline (a fresh
+  # stream per request, the way a serverless / per-request libSQL client talks), and `--streams K`
+  # workers per tenant run those ops at the same time on the SAME shard, so opens overlap and a
+  # closing stream's handle can serve the next open. `max_per_scope` (expert review 2026-10-17 #19)
+  # only matters when K >= 2 opens overlap; read the server's pool_take hit ratio beside the txn/s
+  # (`chaos.sh pool-fleet` prints both).
+  def mode_oneshot_fleet(args) do
+    k = max(1, args.streams)
+    ops = max(1, div(args.txns, args.clients * k))
+    a = Map.merge(args, %{streams: k, ops: ops})
+
+    raw =
+      Task.async_stream(0..(a.clients - 1), fn tid -> oneshot_tenant(tid, a) end,
+        max_concurrency: a.clients,
+        timeout: a.worker_timeout + 30_000,
+        on_timeout: :kill_task,
+        ordered: false
+      )
+      |> Enum.to_list()
+
+    results = for {:ok, r} <- raw, do: r
+    crashed = length(raw) - length(results)
+    lat = Enum.flat_map(results, & &1.lat)
+    errs = Enum.sum(Enum.map(results, & &1.errors)) + crashed * k * ops
+    spans = Enum.flat_map(results, & &1.spans)
+
+    window_us =
+      case spans do
+        [] -> 0
+        _ -> Enum.max(Enum.map(spans, &elem(&1, 1))) - Enum.min(Enum.map(spans, &elem(&1, 0)))
+      end
+
+    tps = if window_us > 0, do: Float.round(length(lat) / (window_us / 1_000_000), 1), else: 0.0
+    p = pctls(lat)
+
+    IO.puts(
+      :stderr,
+      "  oneshot-fleet: #{length(lat)} one-shot ops, #{a.clients} tenants x #{k} concurrent " <>
+        "streams, #{tps} ops/s (#{errs} errs) p50=#{p["p50_us"]}us p99=#{p["p99_us"]}us"
+    )
+
+    %{
+      "mode" => "oneshot_fleet",
+      "tenant_shards" => a.clients,
+      "streams_per_shard" => k,
+      "ops" => length(lat),
+      "errors" => errs,
+      "shed_tenants" => crashed,
+      "oneshot_tps" => tps
+    }
+    |> Map.merge(for {key, v} <- p, into: %{}, do: {"oneshot_#{key}", v})
+  end
+
+  # One tenant: seed its shard on a held stream, then run K workers against it concurrently.
+  defp oneshot_tenant(tid, a) do
+    :rand.seed(:exsss, {(tid + 1) * 7919, 104_729, 15_485_863})
+    Process.sleep(:rand.uniform(max(1, a.clients)))
+    auth = "#{a.shard}_#{tid}.#{a.domain}"
+
+    case oneshot_seed(a, auth, 8) do
+      :ok ->
+        rs =
+          1..a.streams
+          |> Enum.map(fn w -> Task.async(fn -> oneshot_worker(a, auth, tid * 1000 + w) end) end)
+          |> Task.await_many(a.worker_timeout + 15_000)
+
+        %{
+          lat: Enum.flat_map(rs, & &1.lat),
+          errors: Enum.sum(Enum.map(rs, & &1.errors)),
+          spans: Enum.map(rs, & &1.span)
+        }
+
+      :error ->
+        %{lat: [], errors: a.streams * a.ops, spans: []}
+    end
+  end
+
+  defp oneshot_seed(a, auth, attempts) do
+    with {:ok, c} <- Client.connect(a.lb, authority: auth) do
+      try do
+        c = exec!(c, "CREATE TABLE IF NOT EXISTS acct (id INTEGER PRIMARY KEY, bal INTEGER)")
+
+        c =
+          exec!(
+            c,
+            "WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM seq WHERE i < #{a.accounts}) " <>
+              "INSERT OR IGNORE INTO acct (id, bal) SELECT i, 0 FROM seq"
+          )
+
+        Client.close(c)
+        :ok
+      rescue
+        e ->
+          ErrTally.note(e)
+          Client.close(c)
+          oneshot_retry(a, auth, attempts)
+      end
+    else
+      other ->
+        ErrTally.note(other)
+        oneshot_retry(a, auth, attempts)
+    end
+  end
+
+  defp oneshot_retry(_a, _auth, attempts) when attempts <= 1, do: :error
+
+  defp oneshot_retry(a, auth, attempts) do
+    Process.sleep(50 + :rand.uniform(200))
+    oneshot_seed(a, auth, attempts - 1)
+  end
+
+  # One worker: its own HTTP connection, `ops` one-shot pipelines back to back. Each pipeline
+  # carries a null baton and ends in `close`, so every op is a stream open + close on the shard.
+  defp oneshot_worker(a, auth, seed) do
+    :rand.seed(:exsss, {seed, 7, 13})
+    t0 = System.monotonic_time(:microsecond)
+    deadline = t0 + a.worker_timeout * 1000
+
+    case Client.connect(a.lb, authority: auth) do
+      {:ok, c} ->
+        {lat, e, c} =
+          Enum.reduce(1..a.ops, {[], 0, c}, fn _, {lat, e, c} ->
+            start = System.monotonic_time(:microsecond)
+
+            if start > deadline do
+              {lat, e + 1, c}
+            else
+              case oneshot_op(c, a.accounts) do
+                {:ok, c} ->
+                  {[System.monotonic_time(:microsecond) - start | lat], e, c}
+
+                {:error, reason, c} ->
+                  ErrTally.note(reason)
+                  {lat, e + 1, reconnect(c)}
+              end
+            end
+          end)
+
+        _ = c.transport.close(c.transport_state)
+        %{lat: lat, errors: e, span: {t0, System.monotonic_time(:microsecond)}}
+
+      other ->
+        ErrTally.note(other)
+        t = System.monotonic_time(:microsecond)
+        %{lat: [], errors: a.ops, span: {t, t}}
+    end
+  end
+
+  defp oneshot_op(c, accounts) do
+    id = :rand.uniform(accounts)
+    delta = :rand.uniform(201) - 101
+
+    stmt = fn sql, args ->
+      %{
+        "type" => "execute",
+        "stmt" => %{"sql" => sql, "args" => Enum.map(args, &Filo.Value.encode/1)}
+      }
+    end
+
+    reqs = [
+      stmt.("UPDATE acct SET bal = bal + ? WHERE id = ?", [delta, id]),
+      stmt.("SELECT bal FROM acct WHERE id = ?", [id]),
+      %{"type" => "close"}
+    ]
+
+    case Client.pipeline(%{c | baton: nil}, reqs) do
+      {:ok, results, c} ->
+        case Enum.find(results, &(&1["type"] == "error")) do
+          nil -> {:ok, c}
+          err -> {:error, get_in(err, ["error", "code"]) || "stmt_error", c}
+        end
+
+      {:error, reason, c} ->
+        {:error, reason, c}
+    end
+  end
+
   # One client = one tenant shard = one BEAM process holding one Filo.Client stream.
   # Crash-proof: a tenant that can't establish its stream returns an errored result, never an
   # exception (an uncaught worker exit would take down the whole run's aggregate).
@@ -453,6 +633,8 @@ defmodule Tpc do
       worker_timeout: 300_000,
       accounts: 100_000,
       max_w: 5,
+      # oneshot-fleet: concurrent one-shot workers per tenant shard.
+      streams: 2,
       threads: 8,
       scale: 0.02
     }
@@ -466,14 +648,15 @@ defmodule Tpc do
         "tpcb" -> mode_tpcb(a)
         "tpcc" -> Tpcc.run(a)
         "tpcc-fleet" -> Tpcc.fleet(a)
-        other -> raise "unknown mode #{other} (rtt|tpcb|tpcc|tpcc-fleet)"
+        "oneshot-fleet" -> mode_oneshot_fleet(a)
+        other -> raise "unknown mode #{other} (rtt|tpcb|tpcc|tpcc-fleet|oneshot-fleet)"
       end
 
     out = Map.put(out, "err_reasons", ErrTally.report())
     IO.puts(Jason.encode!(out))
   end
 
-  @ints [:samples, :txns, :clients, :accounts, :threads, :max_w, :worker_timeout]
+  @ints [:samples, :txns, :clients, :accounts, :threads, :max_w, :worker_timeout, :streams]
   @floats [:scale]
 
   defp parse_opts([], acc), do: acc

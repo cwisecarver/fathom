@@ -56,6 +56,9 @@
 #   TPC_NET=container ./chaos.sh tpcc-fleet [tenants_csv per_client scale]  the TPC-C analog: sweep the
 #                                 tenant count with a 1-warehouse TPC-C per tenant; aggregate tpmC +
 #                                 per-node split (elixir driver only)
+#   TPC_DRIVER=elixir ./chaos.sh pool-fleet [tenants streams ops caps_csv]  CONNECTION-POOL A/B:
+#                                 `streams` concurrent one-shot (open+exec+close) workers per tenant
+#                                 shard, alternating max_per_scope over caps_csv; ops/s + pool hit%
 #   TPC_DRIVER=elixir ./chaos.sh tpcb|tpc-fleet  drive with the Filo.Client BEAM driver
 #                                 (tpc_driver.exs): one process per client instead of python's
 #                                 thread-per-client, so one box models far more concurrent clients.
@@ -2208,6 +2211,70 @@ cmd_tpc_fleet() {
   done
 }
 
+# -- pool-fleet: the connection pool under K concurrent one-shot streams per shard -------------------
+# tpc-fleet holds ONE long-lived stream per tenant, so a stream opens once per run and the per-shard
+# connection pool (Fathom.Shard.HandlePool) is never on the measured path. This arm runs `streams`
+# workers per tenant shard, each sending baton-less [execute, execute, close] pipelines — a stream
+# open + close per op, overlapping on the same shard — and alternates the pool's max_per_scope over
+# `caps_csv` (default 1,2,1,2: ABAB on one VM so drift hits both arms). Each round gets its own shard
+# namespace (`pf<round>_*`) so every coordinator starts under that round's cap. Per round it prints
+# ops/s, latency, errors and the fleet-wide pool_take hit ratio (the proof the pool was exercised).
+# Written for expert review 2026-10-17 #19 (max_per_scope 1 -> 2), which no other arm could measure.
+cmd_pool_fleet() {
+  local tenants=${1:-128} streams=${2:-2} ops=${3:-300} caps_csv=${4:-"1,2,1,2"}
+  local n
+  echo "pool-fleet: $tenants tenants x $streams concurrent one-shot streams x $ops ops each, caps $caps_csv ($TPC_DRIVER driver)" >&2
+  [ "$TPC_DRIVER" = elixir ] || { echo "pool-fleet needs TPC_DRIVER=elixir (the python driver has no oneshot mode)" >&2; return 1; }
+
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, false); Application.put_env(:fathom, :shard_idle_ms, 900_000)' >/dev/null
+  done
+  echo "  connection_pool on fathom1: $(rpc "${NODES[0]}" 'IO.puts(inspect(Application.get_env(:fathom, :connection_pool)))')" >&2
+
+  tpc_prewarm
+
+  # Fleet-wide pool_take counters (hit miss), summed over nodes, from each node's Prometheus scrape.
+  pool_takes() {
+    local h=0 m=0 nh nm
+    for n in "${NODES[@]}"; do
+      read -r nh nm <<< "$(rpc "$n" 's = Fathom.Telemetry.scrape(); f = fn r -> case Regex.run(~r/fathom_shard_pool_take_count\{result="#{r}"\} (\d+)/, s) do [_, v] -> v; _ -> "0" end end; IO.puts("#{f.("hit")} #{f.("miss")}")')"
+      h=$(( h + ${nh:-0} )); m=$(( m + ${nm:-0} ))
+    done
+    echo "$h $m"
+  }
+
+  printf "  %-6s %4s %8s %10s %8s %8s %6s %7s\n" round cap ops "ops/s" "p50 ms" "p99 ms" errs "hit%"
+  local IFS=,
+  set -f; set -- $caps_csv; set +f
+  unset IFS
+  local round=0 cap h0 m0 h1 m1 json tps p50 p99 errs nops hits
+  for cap in "$@"; do
+    round=$(( round + 1 ))
+    for n in "${NODES[@]}"; do
+      rpc "$n" "Application.put_env(:fathom, :connection_pool_opts, Keyword.put(Application.get_env(:fathom, :connection_pool_opts, []), :max_per_scope, $cap))" >/dev/null
+    done
+    read -r h0 m0 <<< "$(pool_takes)"
+    json=$(tpc_run oneshot-fleet --domain "$DOMAIN" --shard "pf$round" \
+      --worker-timeout "${TPC_WORKER_TIMEOUT:-300000}" --accounts 1000 \
+      --clients "$tenants" --streams "$streams" --txns $(( tenants * streams * ops )) 2>/dev/null)
+    read -r h1 m1 <<< "$(pool_takes)"
+    tps=$(printf '%s' "$json" | jq -r '.oneshot_tps // 0')
+    p50=$(printf '%s' "$json" | jq -r '.oneshot_p50_us // 0')
+    p99=$(printf '%s' "$json" | jq -r '.oneshot_p99_us // 0')
+    errs=$(printf '%s' "$json" | jq -r '.errors // 0')
+    nops=$(printf '%s' "$json" | jq -r '.ops // 0')
+    hits=$(awk -v h=$(( h1 - h0 )) -v m=$(( m1 - m0 )) 'BEGIN{printf "%.1f", (h+m>0)?100*h/(h+m):0}')
+    printf "  %-6s %4s %8s %10s %8s %8s %6s %7s\n" "$round" "$cap" "$nops" "$tps" \
+      "$(awk -v x="$p50" 'BEGIN{printf "%.2f", x/1000}')" \
+      "$(awk -v x="$p99" 'BEGIN{printf "%.2f", x/1000}')" "$errs" "$hits"
+    printf "  err reasons: %s\n" "$(printf '%s' "$json" | jq -c '.err_reasons // {}')"
+  done
+
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, true); Application.put_env(:fathom, :shard_idle_ms, 20_000)' >/dev/null
+  done
+}
+
 # tpcc-fleet: the TPC-C analog of tpc-fleet — N concurrent TENANTS, each its own shard running a
 # 1-warehouse TPC-C mix (heavier: value-fed, multi-statement, held streams), swept by tenant count.
 # Reads aggregate tpmC + txn/s and the per-node split, like tpc-fleet. This is the multi-tenant path
@@ -2681,6 +2748,7 @@ case "${1:-}" in
   latency-cost) shift; cmd_latency_cost "$@" ;;
   tpc-fleet)   shift; cmd_tpc_fleet "$@" ;;
   tpcc-fleet)  shift; cmd_tpcc_fleet "$@" ;;
+  pool-fleet)  shift; cmd_pool_fleet "$@" ;;
   rebalance)   shift; cmd_rebalance "$@" ;;
   hotspots)    shift; cmd_hotspots "$@" ;;
   replication) shift; cmd_replication "$@" ;;
