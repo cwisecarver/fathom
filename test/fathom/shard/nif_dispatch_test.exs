@@ -253,14 +253,15 @@ defmodule Fathom.Shard.NifDispatchTest do
       %{path: path}
     end
 
-    test "a tenant :rw open is 19 dirty dispatches (was 23)", %{path: path} do
+    test "a tenant :rw open is 18 dirty dispatches (was 23)", %{path: path} do
       {res, total, by_fun} = count(fn -> Connection.open(path, tenant?: true) end)
       assert {:ok, conn} = res
       Connection.close(conn)
 
-      # The five fixed PRAGMAs are ONE execute; journal_mode, page_size and the extension's own
-      # setup are untouched.
-      assert total == 19, "open dispatches: #{inspect(by_fun)}"
+      # The five fixed PRAGMAs are ONE execute, and since expert review 2026-10-19 #23 the two
+      # engine-hardening PRAGMAs (trusted_schema, cell_size_check) are one more. Was 19 before that;
+      # journal_mode, page_size and the extension's own setup are untouched.
+      assert total == 18, "open dispatches: #{inspect(by_fun)}"
     end
 
     test "the batched PRAGMAs all took effect", %{path: path} do

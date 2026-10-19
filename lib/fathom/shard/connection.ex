@@ -453,11 +453,12 @@ defmodule Fathom.Shard.Connection do
   # (like the extension re-disable), because the alternative is a tenant handle without the floor.
   defp maybe_harden(_conn, false), do: :ok
 
-  defp maybe_harden(conn, true) do
-    with :ok <- Sqlite3.execute(conn, "PRAGMA trusted_schema=OFF") do
-      Sqlite3.execute(conn, "PRAGMA cell_size_check=ON")
-    end
-  end
+  # ONE batch (expert review 2026-10-19 #23): both are plain PRAGMAs, and `sqlite3_exec` stops at
+  # the first error, which is what the two-step `with` did. Probe: two executes 11-17 us mean per
+  # open, one batch 5-9 us. The engine-level tests (`connection_test.exs`, "engine hardening") read
+  # both values back after open, so a batch that silently dropped one would fail there.
+  defp maybe_harden(conn, true),
+    do: Sqlite3.execute(conn, "PRAGMA trusted_schema=OFF;PRAGMA cell_size_check=ON")
 
   # This file's actual page size. Falls back to SQLite's default rather than raising: an
   # unreadable pragma must not stop a shard opening, and 4096 is the value that reproduces the
@@ -470,6 +471,11 @@ defmodule Fathom.Shard.Connection do
   #
   # Not `query/3` either: this runs inside `configure/1` during `open/2`, before the statement
   # cache and deadline machinery that path expects are meaningful.
+  #
+  # NOT cached per coordinator (expert review 2026-10-19 #23): a `{path => page_size}` cache is
+  # only safe while the file at that path is the one it was read from, and the pull, fork and
+  # promote paths replace files in place. A stale value would size the cap wrongly (up to 16x
+  # off), and the cost it saves is one prepare/fetch/release, about 18 us per open.
   # RELEASES the statement. Leaving it open kept a schema snapshot alive on the connection for the
   # rest of its life, and the failure showed up nowhere near here: `Copy.migrate/4` came back
   # `{:error, "no such table: app_thing"}` because the destination connection could not see a
