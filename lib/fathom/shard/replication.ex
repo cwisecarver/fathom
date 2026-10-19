@@ -184,10 +184,24 @@ defmodule Fathom.Shard.Replication do
   # Routine per-event, alarming in aggregate: exactly the shape that belongs at the decision point
   # rather than at the event.
   defp settle({:impossible, _}, shard, _deadline, {_acked, rejects}, _expected) do
-    Logger.warning(
-      "replication quorum IMPOSSIBLE for #{shard}: " <>
-        inspect(Enum.map(rejects, fn {_from, reason, at} -> {reason, at} end))
-    )
+    # Rate-limited per node: this fires once per failed write (expert review 2026-10-19 #14; ~800-1000
+    # `unknown_shard` lines per rig run). The no_quorum telemetry counter keeps the per-write signal.
+    case Fathom.LogLimiter.check(:quorum_impossible) do
+      :suppress ->
+        :ok
+
+      verdict ->
+        extra =
+          case verdict do
+            {:log, n} -> " (#{n} similar warnings suppressed in the previous second)"
+            :log -> ""
+          end
+
+        Logger.warning(
+          "replication quorum IMPOSSIBLE for #{shard}: " <>
+            inspect(Enum.map(rejects, fn {_from, reason, at} -> {reason, at} end)) <> extra
+        )
+    end
 
     {:error, {:no_quorum, :impossible, rejects}}
   end

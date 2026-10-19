@@ -2184,7 +2184,7 @@ defmodule Fathom.Shard.Replication.Session do
 
     case result do
       {:ok, at} ->
-        Logger.info("replication seeded a follower for #{state.shard_id} at #{inspect(at)}")
+        Logger.debug("replication seeded a follower for #{state.shard_id} at #{inspect(at)}")
         key = shipper
 
         %{
@@ -2398,7 +2398,7 @@ defmodule Fathom.Shard.Replication.Session do
       %{shard_id: shard_id, result: seed_outcome(result)}
     )
 
-    Logger.info(
+    Logger.debug(
       "replication seed #{seed_outcome(result)} for #{shard_id} to #{inspect(shipper)}: " <>
         "bytes=#{bytes} ms=#{ms}"
     )

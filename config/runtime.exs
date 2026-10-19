@@ -44,6 +44,26 @@ if otlp_endpoint = System.get_env("OTEL_EXPORTER_OTLP_ENDPOINT") do
   config :opentelemetry, traces_exporter: {:opentelemetry_exporter, %{}}
   config :opentelemetry_exporter, otlp_endpoint: otlp_endpoint
   config :fathom, otel_spans: true
+
+  # Trace sampling ratio for ROOT spans (expert review 2026-10-19 #20). Unset keeps the SDK default
+  # (parent_based over always_on: every checkout span is recorded and exported, and the batch queue
+  # of 2048 silently drops spans at ~7k spans/s anyway). A value in [0, 1] switches to
+  # parent_based + trace_id_ratio_based, so an incoming sampled trace is still honoured.
+  # Anything else raises at boot rather than silently tracing everything.
+  case System.get_env("OTEL_TRACES_SAMPLER_RATIO") do
+    nil ->
+      :ok
+
+    raw ->
+      case Float.parse(raw) do
+        {ratio, ""} when ratio >= 0.0 and ratio <= 1.0 ->
+          config :opentelemetry,
+            sampler: {:parent_based, %{root: {:trace_id_ratio_based, ratio}}}
+
+        _ ->
+          raise "OTEL_TRACES_SAMPLER_RATIO must be a number in [0, 1], got: #{inspect(raw)}"
+      end
+  end
 end
 
 # ---- Shard-plane deploy knobs (env-gated, any config_env) --------------------------------

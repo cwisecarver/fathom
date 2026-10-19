@@ -120,6 +120,7 @@ config; diff from it.
 | Var | Default | What it does | Safety consequence |
 |---|---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (no-op) | Enables OpenTelemetry OTLP trace export (also honors the standard `OTEL_EXPORTER_OTLP_*` vars). | Off by default; traces contain shard ids — send to a trusted collector. |
+| `OTEL_TRACES_SAMPLER_RATIO` | unset (sample every root span) | Only read with `OTEL_EXPORTER_OTLP_ENDPOINT`. A number in `[0, 1]` switches to `parent_based` + `trace_id_ratio_based` (e.g. `0.01`). Anything else fails boot. | The checkout span is the highest-volume span; the exporter's 2048-span batch queue drops silently at ~7k spans/s anyway (expert review 2026-10-19 #20). |
 | `SHARD_LOAD` | on in prod, off elsewhere | Per-shard load counters (`Fathom.ShardLoad`) — the rebalancer / hot-spot input and the admin dashboard's load view. | Prod defaults on (2026-10-15). `false`/`0` turns it off on a node that doesn't want the counters; `true`/`1` turns it on anywhere. Dev/test stay off so the hot path doesn't pay for an unread counter. |
 
 ## Cluster / node
