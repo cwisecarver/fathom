@@ -149,6 +149,11 @@ defmodule Fathom.Bench.Gate do
     # asserted) and the auth-required open-per-request round trip — the gate could see neither.
     {:hrana_write_rt_us, :higher_worse},
     {:hrana_open_auth_rt_us, :higher_worse},
+    # WATCH-ONLY, first numbers (expert review 2026-10-19 #26/#25): the wire round trip with the
+    # Prometheus reporters attached, and one 10 s poller + hot_shards tick at 20k rows. No band
+    # measured yet; the orchestrator promotes them.
+    {:hrana_rt_observed_us, :higher_worse, :watch},
+    {:observability_tick_us, :higher_worse, :watch},
     # WATCH-ONLY until its band is measured (expert review 2026-10-01 perf #19), the same rule
     # hrana_open_rt_us and flush_p50_us followed above: variance first, then a threshold. It is
     # the first metric that runs the executor's close and the connection pool at all.
