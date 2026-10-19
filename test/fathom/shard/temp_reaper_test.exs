@@ -191,6 +191,63 @@ defmodule Fathom.Shard.TempReaperTest do
     assert Shard.quarantine_files(dir) != []
   end
 
+  # expert review 2026-10-19 #28: the orphan and quarantine predicates now run on a pattern compiled
+  # once (stored in :persistent_term / built once per sweep), not recompiled per name. Pin the match
+  # table so a marker typo or a dropped marker cannot pass silently. Each row was checked against the
+  # previous `String.contains?/2` implementation.
+  test "the compiled temp-orphan and quarantine patterns match exactly the previous predicate" do
+    orphan_table = [
+      {"s.db.snap.7", true},
+      {"s.db.pull.dl.9", true},
+      {"s.db.tmp.3", true},
+      {"s.db.z.5", true},
+      {"s.db.promote.2", true},
+      {"s.db.prepromote", true},
+      {"s.db.prepromote-wal", true},
+      {"s.db.dl", true},
+      {"s.db.snap", true},
+      # the marker may sit anywhere after the first character
+      {"x.snap.db", true},
+      {"zz.z", true},
+      # near misses: no marker substring
+      {"s.db", false},
+      {"s.db-wal", false},
+      {"s.db.etag", false},
+      {"s.db.fenced.1", false},
+      {"s.db.forked.2", false},
+      {"s.db.corrupt.9", false},
+      {"plain.db", false},
+      {"", false},
+      # dotfiles are never orphans, whatever they contain
+      {".hidden.snap.1", false},
+      {".hidden.dl", false}
+    ]
+
+    for {name, expected} <- orphan_table do
+      assert Fathom.Shard.Storage.temp_orphan?(name) == expected,
+             "temp_orphan?(#{inspect(name)})"
+    end
+
+    quarantine_table = [
+      {"s.db.fenced.1", true},
+      {"s.db.forked.2-3", true},
+      {"s.db.corrupt.9-wal", true},
+      {"x.db.fenced.", true},
+      {"s.db.snap.7", false},
+      {"s.db.fenced", false},
+      {"s.fenced.1", false},
+      {"s.db.etag", false},
+      {".hidden.db.fenced.1", false}
+    ]
+
+    dir = "/q"
+
+    for {name, expected} <- quarantine_table do
+      matched = Shard.quarantine_files_in([name], dir) == [Path.join(dir, name)]
+      assert matched == expected, "quarantine_files_in(#{inspect(name)})"
+    end
+  end
+
   # expert review 2026-10-13 #37: the scratch volume was the system temp dir, unconfigurable and never
   # checked for free space before a shard-sized pull. Two pins: the location is configurable (so it can
   # sit on the data volume), and a scratch pull is refused below the free-space floor.

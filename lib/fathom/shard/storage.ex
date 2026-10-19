@@ -1832,7 +1832,25 @@ defmodule Fathom.Shard.Storage do
   # character (expert review 2026-10-10 #P6).
   @spec temp_orphan?(String.t()) :: boolean()
   def temp_orphan?("." <> _), do: false
-  def temp_orphan?(name), do: String.contains?(name, @temp_orphan_markers)
+  def temp_orphan?(name), do: :binary.match(name, temp_orphan_pattern()) != :nomatch
+
+  # The compiled form of `@temp_orphan_markers`, built once and kept in `:persistent_term`
+  # (a compiled pattern cannot be a module attribute). `String.contains?/2` with a list compiles
+  # the pattern on every call: the TempReaper sweep paid ~4 µs per name, 361 ms per 90k names,
+  # against ~0.03 µs per name with the stored pattern (expert review 2026-10-19 #28).
+  @temp_orphan_pattern_key {__MODULE__, :temp_orphan_pattern}
+  @spec temp_orphan_pattern() :: :binary.cp()
+  defp temp_orphan_pattern do
+    case :persistent_term.get(@temp_orphan_pattern_key, nil) do
+      nil ->
+        pattern = :binary.compile_pattern(@temp_orphan_markers)
+        :persistent_term.put(@temp_orphan_pattern_key, pattern)
+        pattern
+
+      pattern ->
+        pattern
+    end
+  end
 
   @doc """
   Reap a KNOWN, fixed set of sibling temp `paths` older than `older_than_ms` by a
