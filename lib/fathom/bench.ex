@@ -2497,10 +2497,21 @@ defmodule Fathom.Bench do
     id = uniq("bench_stmt_hot")
 
     try do
-      {:ok, seed} = ShardExecutor.open(id, :trusted)
-      exec!(seed, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-      exec!(seed, "INSERT INTO t (id, v) VALUES (1, 'x')")
-      :ok = ShardExecutor.close(seed)
+      # Seed through the shard's own file, as hrana_pooled_pipeline does: the prod-compiled bench
+      # has replication configured on but none of its processes started, so a write through the
+      # executor raises ("unknown registry: ...SessionRegistry", first full run 2026-10-19).
+      path = Fathom.Shard.db_path(id)
+      drop_db(path)
+      {:ok, db} = Exqlite.Sqlite3.open(path)
+
+      :ok =
+        Exqlite.Sqlite3.execute(
+          db,
+          "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t (id, v) VALUES (1, 'x')"
+        )
+
+      :ok = Exqlite.Sqlite3.close(db)
+      :ok = Fathom.Shard.stamp_local_provenance(id)
 
       pids = Enum.map(1..workers, fn _ -> spawn_stmt_worker(id) end)
 
@@ -2591,10 +2602,6 @@ defmodule Fathom.Bench do
     after
       5_000 -> :ok
     end
-  end
-
-  defp exec!(handle, sql) do
-    {:ok, _} = ShardExecutor.execute(handle, %Filo.Stmt{sql: sql, args: []})
   end
 
   @doc """
