@@ -991,13 +991,13 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       [body, _] = String.split(body, "\n  defp ", parts: 2)
 
       # The call names changed with expert review 2026-08-26 #32 — both reads now go through a
-      # HELD, inode-revalidated fd (`read_delta_held/4`, `read_held/2`) instead of opening the file
+      # HELD, inode-revalidated fd (`read_delta_held/4`, `recheck_held/2`) instead of opening the file
       # each time. The invariant this test pins is the ORDER of the two reads and the check, which
       # is unchanged; only the names moved. A `:nomatch` here means the names moved again, not that
       # the ordering broke — fix the strings, then re-read the assertions below to confirm the
       # ordering still holds.
       payload_at = :binary.match(body, "Wal.read_delta_held(fd, wal_path, off, len)") |> elem(0)
-      reread_at = :binary.match(body, "Wal.read_held(fd, wal_path)") |> elem(0)
+      reread_at = :binary.match(body, "Wal.recheck_held(fd, wal_path)") |> elem(0)
 
       check_at =
         :binary.match(body, "stable?(header, after_, :checkpoint_during_push)") |> elem(0)

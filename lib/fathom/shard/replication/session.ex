@@ -1149,11 +1149,13 @@ defmodule Fathom.Shard.Replication.Session do
     # reason. Failing here re-plans on the next round, which is correct and cheap; shipping
     # mis-stamped bytes is neither.
     # The re-check reads through the SAME held fd, so it is one stat + one pread rather than a
-    # third open/close pair — and the inode revalidation inside `read_held/2` makes it a STRICTLY
+    # third open/close pair — and the inode revalidation inside `recheck_held/2` makes it a STRICTLY
     # STRONGER recreate detector than before, when an unlink+recreate between the two reads was
-    # caught only if the salt happened to differ.
+    # caught only if the salt happened to differ. It reads the header only (`stable?/3` compares
+    # nothing else), skipping the commit-extent pread `read_held/2` would add (expert review
+    # 2026-10-19 #17).
     {recheck, fd} =
-      case Wal.read_held(fd, wal_path) do
+      case Wal.recheck_held(fd, wal_path) do
         {:ok, after_, fd} -> {{:ok, after_}, fd}
         {:error, reason, fd} -> {{:error, reason}, fd}
       end
