@@ -75,7 +75,14 @@ defmodule Fathom.Shard.RefusedOpenProvenanceTest do
 
   # `fail_pull` is an Agent flag: while true, the pull task's GET of the shard's data object answers 403
   # (not retried by Req), which fails the open's cold pull AFTER the acquire has already touched.
+  #
+  # The refused GET also parks until the test has monitored the coordinator: an un-held 403 can fail
+  # the open and stop the coordinator before `refused_open!/1` monitors it, so the DOWN reason read
+  # `:noproc` instead of `{:shutdown, {:pull_failed, _}}` (seen once under full-suite load, seed
+  # 294196, 2026-10-19).
   defp use_s3!(store, fail_pull) do
+    test_pid = self()
+
     Application.put_env(:fathom, S3,
       bucket: "b",
       region: "us-east-1",
@@ -88,6 +95,14 @@ defmodule Fathom.Shard.RefusedOpenProvenanceTest do
         # (the one registered under the shard id) and must succeed.
         if conn.method == "GET" and String.ends_with?(conn.request_path, ".db") and
              Agent.get(fail_pull, & &1) and Registry.keys(Fathom.ShardRegistry, self()) == [] do
+          send(test_pid, {:pull_refusing, self()})
+
+          receive do
+            :refuse -> :ok
+          after
+            10_000 -> :ok
+          end
+
           Plug.Conn.send_resp(conn, 403, "denied")
         else
           S3EtagStore.serve(conn, store)
@@ -118,6 +133,8 @@ defmodule Fathom.Shard.RefusedOpenProvenanceTest do
   defp refused_open!(shard) do
     {:ok, pid} = Shards.ensure(shard)
     ref = Process.monitor(pid)
+    assert_receive {:pull_refusing, puller}, 10_000
+    send(puller, :refuse)
     assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 10_000
     assert {:shutdown, {:pull_failed, _}} = reason
     reason
