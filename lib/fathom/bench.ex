@@ -112,7 +112,8 @@ defmodule Fathom.Bench do
     :hrana_write,
     :hrana_open_auth,
     :flush_codec,
-    :pull_decode
+    :pull_decode,
+    :s3_loopback
   ]
 
   @doc false
@@ -147,6 +148,9 @@ defmodule Fathom.Bench do
     # VM holding the followers, a Fleet started and stopped here), so it cannot change what any other
     # metric measures. See `served_repl/1`.
     repl = run_if(only, :served_repl, fn -> served_repl(opts) end)
+
+    # One run, two metrics (HEAD and conditional PUT through the real S3 Finch pool, loopback stub).
+    s3io = run_if(only, :s3_loopback, fn -> Fathom.Bench.StorageIO.s3_loopback(opts) end)
 
     %{
       cold_open_p50_us: cold && cold.p50_us,
@@ -233,7 +237,11 @@ defmodule Fathom.Bench do
         run_if(only, :flush_codec, fn -> Fathom.Bench.StorageIO.flush_codec_ms_per_mb(opts) end),
       # S3 download decode + verify through a loopback stub and the real Finch pool.
       pull_decode_ms_per_mb:
-        run_if(only, :pull_decode, fn -> Fathom.Bench.StorageIO.pull_decode_ms_per_mb(opts) end)
+        run_if(only, :pull_decode, fn -> Fathom.Bench.StorageIO.pull_decode_ms_per_mb(opts) end),
+      # The S3 client itself (expert review 2026-10-19 #3): no other gated metric goes through the
+      # Req/Finch adapter, so the per-request Req deprecation IO.warn was invisible.
+      s3_loopback_op_us: s3io && s3io.op_us,
+      s3_loopback_put_us: s3io && s3io.put_us
     }
   end
 

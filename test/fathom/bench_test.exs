@@ -363,4 +363,16 @@ defmodule Fathom.BenchTest do
     assert ms > 0.2, "#{ms} ms/MB is too fast to have run GET + decode + MD5"
     assert ms < 100, "#{ms} ms/MB: the S3 pull regressed by an order of magnitude"
   end
+
+  # expert review 2026-10-19 #3. HEAD and a conditional PUT through the real S3 Finch pool against a
+  # loopback stub. The metric raises if the requests did not cross the pool. Prod ~220 us / ~500 us
+  # (of which ~118 us each is the Req `finch:` deprecation warn until it is fixed).
+  test "s3_loopback measures the S3 client through the Finch pool to an order of magnitude" do
+    %{op_us: op, put_us: put} =
+      Fathom.Bench.StorageIO.s3_loopback(s3_head_samples: 50, s3_put_samples: 20)
+
+    IO.puts("s3_loopback: op_us=#{op} put_us=#{put}")
+    assert op > 20 and op < 20_000, "object_head #{op}us outside the order-of-magnitude band"
+    assert put > 20 and put < 50_000, "conditional PUT #{put}us outside the band"
+  end
 end
