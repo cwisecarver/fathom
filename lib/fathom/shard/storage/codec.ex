@@ -50,7 +50,11 @@ defmodule Fathom.Shard.Storage.Codec do
   # zstd level 3 (zstd's own default): ratio 1.92 vs 1.82 at level 1 for +50% CPU, still ~9x
   # cheaper than zlib-6 (perf review 2026-10-01 #31).
   @zstd_level 3
-  @chunk 1024 * 1024
+  # 256 KiB, not 1 MiB (expert review 2026-10-19 #29). The zstd/md5 NIF calls run on normal
+  # schedulers; probe (37 MB, zstd-3 + frame checksum, 3 rounds): 1 MiB 2.42-2.45 ms/MB with a
+  # 2.6 ms max call, 256 KiB 2.47-2.54 ms/MB (within ~2%) with a 0.7-1.0 ms max call, 128 KiB
+  # 2.46-2.51 ms/MB with 0.35-0.4 ms. 256 KiB keeps the call count 4x lower than 128 KiB.
+  @chunk 256 * 1024
 
   @doc "The metadata header carrying an object's encoding marker."
   def meta_header, do: @enc_meta
@@ -120,33 +124,32 @@ defmodule Fathom.Shard.Storage.Codec do
     try do
       File.open!(tmp, [:write, :raw, :binary], fn out ->
         # Every compressed piece does three things in one pass: it goes to disk, into the body
-        # digest (`content-md5`), and into a decoder whose output is hashed. At the end the decoded
-        # digest must equal the plaintext digest, so a body that would not decode to the database
-        # it is labelled as is refused HERE, before anything is PUT (expert review 2026-10-08 #15,
-        # moved inline by 2026-10-17 #20). This decodes the same bytes that are written, so it needs
-        # no second read of the file, and the output is hashed as it arrives, never collected.
-        write = fn piece, {size, md5, dec} ->
+        # digest (`content-md5`), and into a decoder whose output is DISCARDED. The codec's own
+        # integrity check does the proving: the zstd frame checksum (xxh64 of the plaintext,
+        # verified when the frame ends) and zlib's adler32, so a body that would not decode to the
+        # database it is labelled as is refused HERE, before anything is PUT (expert review
+        # 2026-10-08 #15, moved inline by 2026-10-17 #20). The decode-side MD5 over the output was
+        # a third plaintext-sized hash pass (~1 ms/MB of ~4.5) made redundant by the frame checksum
+        # (expert review 2026-10-19 #8). This decodes the same bytes that are written, so it needs
+        # no second read of the file, and the output is never collected.
+        write = fn piece, {size, md5} ->
           piece = corrupt_piece(corrupt, piece)
           :ok = IO.binwrite(out, piece)
-
-          {size + IO.iodata_length(piece), :crypto.hash_update(md5, piece),
-           decode_piece(dctx, piece, dec)}
+          decode_piece(dctx, piece)
+          {size + IO.iodata_length(piece), :crypto.hash_update(md5, piece)}
         end
 
         {plain, body} =
           Enum.reduce(
             File.stream!(path, @chunk),
-            {:crypto.hash_init(:md5), {0, :crypto.hash_init(:md5), :crypto.hash_init(:md5)}},
+            {:crypto.hash_init(:md5), {0, :crypto.hash_init(:md5)}},
             fn chunk, {plain, body} ->
               {:crypto.hash_update(plain, chunk), write.(compress_chunk(ctx, chunk), body)}
             end
           )
 
-        {size, body_md5, dec} = write.(compress_finish(ctx), body)
+        {size, body_md5} = write.(compress_finish(ctx), body)
         plain_hex = Base.encode16(:crypto.hash_final(plain), case: :lower)
-        decoded_hex = Base.encode16(:crypto.hash_final(dec), case: :lower)
-
-        if decoded_hex != plain_hex, do: throw({:compressed_body_mismatch, decoded_hex})
 
         {size, :crypto.hash_final(body_md5), plain_hex}
       end)
@@ -159,10 +162,6 @@ defmodule Fathom.Shard.Storage.Codec do
       {:decode_failed, reason} ->
         File.rm(tmp)
         {:error, reason}
-
-      {:compressed_body_mismatch, actual} ->
-        File.rm(tmp)
-        {:error, {:compressed_body_mismatch, actual}}
     after
       release(dctx)
       compress_close(ctx)
@@ -175,11 +174,12 @@ defmodule Fathom.Shard.Storage.Codec do
   defp corrupt_piece(nil, piece), do: piece
   defp corrupt_piece(hook, piece), do: hook.(piece)
 
-  # One compressed piece through the decoder, its output folded into `dec`. A body that does not decode
-  # is thrown out of the file write, which removes the temp, so nothing is PUT.
-  defp decode_piece(dctx, piece, dec) do
-    case inflate_into(dctx, piece, &:crypto.hash_update(&2, &1), dec) do
-      {:ok, dec} -> dec
+  # One compressed piece through the decoder, its output dropped. A body that does not decode (or
+  # whose frame checksum fails, raised by the NIF at the end of the frame) is thrown out of the file
+  # write, which removes the temp, so nothing is PUT.
+  defp decode_piece(dctx, piece) do
+    case inflate_into(dctx, piece, fn _out, acc -> acc end, :ok) do
+      {:ok, :ok} -> :ok
       {:error, reason} -> throw({:decode_failed, reason})
     end
   end
@@ -313,7 +313,13 @@ defmodule Fathom.Shard.Storage.Codec do
   end
 
   defp compressor(:zstd) do
-    {:ok, c} = :zstd.context(:compress, %{compressionLevel: @zstd_level})
+    # `checksumFlag`: the frame carries a 32-bit xxh64 of the plaintext, which the decoder verifies
+    # at the frame's end. That is what lets `compress_to_temp_hashed/2` prove the body decodes
+    # without a third MD5 pass (expert review 2026-10-19 #8; probe: +4 bytes, same compress time,
+    # a flipped byte fails with "Restored data doesn't match checksum"). Frames written without it
+    # (every object before this change) still decode; the flag is a property of the frame, not of
+    # the decoder.
+    {:ok, c} = :zstd.context(:compress, %{compressionLevel: @zstd_level, checksumFlag: true})
     {:zstd, c}
   end
 
