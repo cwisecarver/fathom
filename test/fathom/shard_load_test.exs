@@ -50,6 +50,50 @@ defmodule Fathom.ShardLoadTest do
              ShardLoad.get("a")
   end
 
+  # Expert review 2026-10-19 #5: every sample was an `:ets.update_counter` — a WRITE under the key's
+  # lock — so the streams of ONE hot shard serialised on it (0.63 us/op alone, 159 us/op at 18
+  # workers). A sample now only READS the row and bumps the shard's `:counters` block. Pinned two
+  # ways: the stored row is never rewritten by a sample, and racing FIRST touches of a fresh shard
+  # converge on one block (a plain `insert` there would drop every loser's counts).
+  test "a sample reads the shard's row and never rewrites it (2026-10-19 #5)" do
+    ShardLoad.record_query("r", 1, 0)
+    [row] = :ets.lookup(ShardLoad, "r")
+
+    for _ <- 1..1_000, do: ShardLoad.record_query("r", 2, 1)
+    ShardLoad.record_checkout("r")
+
+    assert :ets.lookup(ShardLoad, "r") == [row], "a sample rewrote the stored row"
+
+    assert %{checkouts: 1, queries: 1_001, rows_read: 2_001, rows_written: 1_000} =
+             ShardLoad.get("r")
+  end
+
+  # 2,000 fresh shards, every one first-touched by all workers at once, so the create race fires
+  # many times per run. Verified to discriminate: with `insert` in place of `insert_new` in
+  # `create_block/1` this loses counts (each loser's block replaces the winner's).
+  test "racing first touches of fresh shards lose no counts (2026-10-19 #5)" do
+    prefix = uniq("race")
+    ids = for i <- 1..2_000, do: "#{prefix}_#{i}"
+    workers = System.schedulers_online() * 2
+    rounds = 3
+    parent = self()
+
+    pids =
+      for _ <- 1..workers do
+        spawn_link(fn ->
+          receive do: (:go -> :ok)
+          for _ <- 1..rounds, id <- ids, do: ShardLoad.record_query(id, 1, 0)
+          send(parent, {:done, self()})
+        end)
+      end
+
+    Enum.each(pids, &send(&1, :go))
+    for pid <- pids, do: assert_receive({:done, ^pid}, 30_000)
+
+    short = Enum.reject(ids, &(ShardLoad.get(&1).queries == workers * rounds))
+    assert short == [], "#{length(short)} shard(s) lost counts to the first-touch race"
+  end
+
   test "get is nil for an unrecorded shard" do
     assert ShardLoad.get("never") == nil
   end
