@@ -436,6 +436,15 @@ defmodule Fathom.BenchTest do
 
   # expert review 2026-10-19 #12. A warm-stream SELECT 1 over the WebSocket path; the metric
   # asserts each reply is [[1]]. Prod ~100-200 us.
+  # The full `mix fathom.bench` run crashed in await_upgrade/2 with a CaseClauseError on :unknown
+  # (2026-10-19): the WS client's receive took any message, and an earlier metric had left one in
+  # the bench process's mailbox. The client must skip messages that are not its socket's.
+  test "hrana_ws_rt_us survives a stray message in the caller's mailbox" do
+    send(self(), {:stray, :from_an_earlier_metric})
+    us = Fathom.Bench.hrana_ws_rt_us(hrana_rt_samples: 5)
+    assert is_float(us)
+  end
+
   test "hrana_ws_rt_us measures the WebSocket round trip to an order of magnitude" do
     us = Fathom.Bench.hrana_ws_rt_us(hrana_rt_samples: 30)
     IO.puts("hrana_ws_rt_us: #{inspect(us)}")

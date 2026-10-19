@@ -184,6 +184,11 @@ defmodule Fathom.Bench.HranaClient do
 
           {:error, _conn, reason, _} ->
             {:error, reason}
+
+          # Not this socket's message: a stray from an earlier metric in the same bench process
+          # (the full `mix fathom.bench` run crashed here on 2026-10-19 with a CaseClauseError).
+          :unknown ->
+            recv_frame(client)
         end
     after
       @recv_timeout -> {:error, :timeout}
@@ -240,6 +245,10 @@ defmodule Fathom.Bench.HranaClient do
 
           {:error, _conn, reason, _} ->
             {:error, reason}
+
+          # Not this socket's message (see recv_frame/1).
+          :unknown ->
+            await_upgrade(conn, ref)
         end
     after
       @recv_timeout -> {:error, :upgrade_timeout}
