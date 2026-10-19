@@ -86,6 +86,27 @@
   # reachable (then dialyzer stops flagging it and this filter goes unused).
   {"lib/fathom/shard/promote_on_open.ex", :pattern_match, 1},
 
+  # THE mint_web_socket OPAQUE-TYPE CASCADE, now in lib/ (expert review 2026-10-19 #12). The bench
+  # WebSocket client (`Fathom.Bench.HranaClient`) moved from test/support to lib/ when
+  # `mint_web_socket` became a prod-compiled dep so the prod bench can run `hrana_ws_rt_us`; the
+  # dev-scoped dialyzer gate then analyzes it, and the cascade the `dialyzer/0` comment in mix.exs
+  # describes comes with it. `Mint.WebSocket.t()` is `@opaque`, so dialyzer cannot see the
+  # `{:ok, conn, t()}` branch of `Mint.WebSocket.new/4` and concludes the upgrade can never
+  # succeed: `HranaClient.connect/3` "never returns {:ok, _}" (its spec then reads too wide and too
+  # narrow at once) and its sole bench caller's `{:ok, client} = connect(...)` "can never match".
+  # Re-measured 2026-10-19 on this tree: exactly these 5 findings, no others. The @spec on
+  # `await_upgrade/2` is already the documented partial mitigation and does not reach `connect/3`.
+  # DIALYZER IS WRONG here (the handshake works; `hrana_ws_rt_us` runs it every bench). Scoped to
+  # the one client file, plus bench.ex's `:pattern_match` and `:invalid_contract` (the sole
+  # instance of each is `hrana_ws_rt_us/1`; a message-regex filter did not match, so these are the
+  # coarse file forms — re-tighten if a second instance ever needs distinguishing). Removable if Mint stops marking
+  # `Mint.WebSocket.t()` opaque or dialyzer learns to see through it.
+  {"lib/fathom/bench/hrana_client.ex", :extra_range},
+  {"lib/fathom/bench/hrana_client.ex", :missing_range},
+  {"lib/fathom/bench/hrana_client.ex", :pattern_match},
+  {"lib/fathom/bench.ex", :pattern_match},
+  {"lib/fathom/bench.ex", :invalid_contract},
+
   # --- (2) deliberate, and unreachable only for reasons that are not guaranteed -----------------
 
   # Two deliberate fallbacks in one file, so one filter each covers both:

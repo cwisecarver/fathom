@@ -379,4 +379,49 @@ defmodule Fathom.BenchTest do
     assert Fathom.ShardLoad.snapshot_tuples() == []
     assert Fathom.Admin.FlushWatermark.size() == 0
   end
+
+  # expert review 2026-10-19 #7. The flush codec on a ~20 MB realistic snapshot; the metric raises
+  # itself on a non-compressible or undersized fixture. Baseline ~6-7 ms/MB prod; the dev-build
+  # ceiling is an order of magnitude loose, and the floor catches a measurement that ran no codec.
+  @tag timeout: 300_000
+  test "flush_codec_ms_per_mb measures the zstd flush codec to an order of magnitude" do
+    ms = Fathom.Bench.StorageIO.flush_codec_ms_per_mb(codec_trials: 1)
+    IO.puts("flush_codec_ms_per_mb: #{inspect(ms)}")
+    assert is_float(ms)
+    assert ms > 0.5, "#{ms} ms/MB is too fast to have run compress + 2 MD5s + decode"
+    assert ms < 100, "#{ms} ms/MB: the flush codec regressed by an order of magnitude"
+  end
+
+  # expert review 2026-10-19 #7. A whole S3 pull of the ~20 MB fixture through the loopback stub and
+  # the real Finch pool; the metric itself asserts the Finch path was used and the pulled file is
+  # byte-identical. Prod ~2 ms/MB.
+  @tag timeout: 300_000
+  test "pull_decode_ms_per_mb measures an S3 pull to an order of magnitude" do
+    ms = Fathom.Bench.StorageIO.pull_decode_ms_per_mb(pull_trials: 1)
+    IO.puts("pull_decode_ms_per_mb: #{inspect(ms)}")
+    assert is_float(ms)
+    assert ms > 0.2, "#{ms} ms/MB is too fast to have run GET + decode + MD5"
+    assert ms < 100, "#{ms} ms/MB: the S3 pull regressed by an order of magnitude"
+  end
+
+  # expert review 2026-10-19 #3. HEAD and a conditional PUT through the real S3 Finch pool against a
+  # loopback stub. The metric raises if the requests did not cross the pool. Prod ~220 us / ~500 us
+  # (of which ~118 us each is the Req `finch:` deprecation warn until it is fixed).
+  test "s3_loopback measures the S3 client through the Finch pool to an order of magnitude" do
+    %{op_us: op, put_us: put} =
+      Fathom.Bench.StorageIO.s3_loopback(s3_head_samples: 50, s3_put_samples: 20)
+
+    IO.puts("s3_loopback: op_us=#{op} put_us=#{put}")
+    assert op > 20 and op < 20_000, "object_head #{op}us outside the order-of-magnitude band"
+    assert put > 20 and put < 50_000, "conditional PUT #{put}us outside the band"
+  end
+
+  # expert review 2026-10-19 #12. A warm-stream SELECT 1 over the WebSocket path; the metric
+  # asserts each reply is [[1]]. Prod ~100-200 us.
+  test "hrana_ws_rt_us measures the WebSocket round trip to an order of magnitude" do
+    us = Fathom.Bench.hrana_ws_rt_us(hrana_rt_samples: 30)
+    IO.puts("hrana_ws_rt_us: #{inspect(us)}")
+    assert is_float(us), "the WS listener/client did not come up - this measured nothing"
+    assert us > 10 and us < 20_000, "WS round trip #{us}us outside the order-of-magnitude band"
+  end
 end

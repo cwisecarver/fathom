@@ -6,8 +6,9 @@ defmodule Fathom.Bench.HranaClient do
   `Mint.WebSocket` to drive the *full* `Filo.Socket` path (WS framing, `hello`, request/
   response, client-allocated `stream_id`) exactly as `django-libsql` does.
 
-  Lives in `test/support` (dev/test only, like `mint_web_socket`), so it never ships in a
-  prod release. It's a bench/test tool, not production code.
+  Moved from `test/support` to `lib/` on 2026-10-19 (expert review #12) so the prod-compiled bench
+  can run `Fathom.Bench.hrana_ws_rt_us/1`; `mint_web_socket` is no longer dev/test-only. It is a
+  bench/test tool, not called by the serving path.
 
   ## Protocol (JSON, `hrana3`)
 
