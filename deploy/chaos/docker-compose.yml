@@ -150,6 +150,9 @@ x-fathom-env: &fathom-env
   REPLICATION_SEED_MAX_CONCURRENCY: "${REPLICATION_SEED_MAX_CONCURRENCY:-}"
   # Follower workers per primary connection (expert review 2026-10-01 #7). Empty = 8; 1 = serial.
   REPLICATION_FOLLOWER_WORKERS: "${REPLICATION_FOLLOWER_WORKERS:-}"
+  # Held replica WAL fds per follower worker (expert review 2026-10-19 #16). Empty = the default 64;
+  # the tpc-fleet 2048 A/B compares 64 with 256 through this switch.
+  REPLICATION_HELD_WAL_FDS: "${REPLICATION_HELD_WAL_FDS:-}"
   # Deferred retry for a push OUR OWN shipper refused (:already_in_flight / :overloaded), which never
   # reached the follower. Empty ⇒ the shipped 1000 ms default; 0 disables, which is the A/B control.
   REPLICATION_CATCHUP_MS: "${REPLICATION_CATCHUP_MS:-}"
