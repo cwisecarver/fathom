@@ -825,9 +825,24 @@ defmodule Fathom.ShardExecutor do
 
     query_error(:no_quorum)
 
-    Logger.warning(
-      "shard #{shard_id} write not replicated to a follower quorum: #{inspect(reason)}"
-    )
+    # Rate-limited per node (expert review 2026-10-19 #14): one line per failed write cost 62 µs/call
+    # at 16 concurrent writers exactly while the node is degraded. The telemetry counter above keeps
+    # the per-write signal; the log names the incident and one summary carries the suppressed count.
+    case Fathom.LogLimiter.check(:no_quorum) do
+      :log ->
+        Logger.warning(
+          "shard #{shard_id} write not replicated to a follower quorum: #{inspect(reason)}"
+        )
+
+      {:log, suppressed} ->
+        Logger.warning(
+          "shard #{shard_id} write not replicated to a follower quorum: #{inspect(reason)} " <>
+            "(#{suppressed} similar warnings suppressed in the previous second)"
+        )
+
+      :suppress ->
+        :ok
+    end
 
     %Error{
       message: "write not replicated to a follower quorum",

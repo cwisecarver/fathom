@@ -2053,7 +2053,7 @@ defmodule Fathom.Shard.Replication.Follower do
       if state.wal_size == 0 and state.wal_offset > 0,
         do: record_db_position(name, shard_id, installed, installed.wal_ordinal, state.wal_offset)
 
-      Logger.info(
+      Logger.debug(
         "replication seeded #{shard_id}: #{state.db_size}B db + #{state.wal_size}B wal " <>
           "at gen #{state.wal_gen} offset #{state.wal_offset}"
       )
