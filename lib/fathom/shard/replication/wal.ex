@@ -246,6 +246,48 @@ defmodule Fathom.Shard.Replication.Wal do
     end
   end
 
+  @typedoc "What a stability recheck needs: the generation identity, not the commit extent."
+  @type identity :: %{ckpt_seq: non_neg_integer(), salt1: non_neg_integer()}
+
+  @doc """
+  The cheap trailing recheck of a commit (expert review 2026-10-19 #17): is this still the same WAL
+  generation the commit planned against?
+
+  `Session.stable?/3` compares only `ckpt_seq` and `salt1`, but the recheck used to call
+  `read_held/2` again, which also walked for the commit extent (one more pread, on a dirty-IO
+  scheduler, on the ack path) and then threw it away. This is a path stat plus ONE header pread.
+
+  Everything that makes `read_held/2` safe is kept: the path is stat'd and its inode compared with
+  the handle's, so an unlink+recreate reopens the fd and reports the NEW file's identity (never the
+  deleted inode's), and an absent or too-short file is `:empty` and releases the fd. The cursor is
+  left alone: the next commit's `read_held/2` refreshes it, and a stale cursor only lengthens its
+  forward walk, never misreports the extent.
+
+  (The finding also proposed fstat on the held fd for the FIRST read. Measured by counting, that is
+  job-neutral — an fstat is one dirty-IO job exactly like the path stat — and it would lose the
+  first read's recreate detection, turning every normal WAL recreate into a refused round.)
+  """
+  @spec recheck_held(handle(), Path.t()) ::
+          {:ok, identity(), handle()} | {:ok, :empty, handle()} | {:error, term(), handle()}
+  def recheck_held(handle, path) do
+    case stat(path) do
+      {:ok, %{size: size, inode: inode}} when size >= @header_bytes ->
+        case ensure_fd(handle, path, inode) do
+          {:ok, h} -> identity_from(h)
+          {:error, reason} -> {:error, reason, close_held(handle)}
+        end
+
+      {:ok, _} ->
+        {:ok, :empty, close_held(handle)}
+
+      {:error, :enoent} ->
+        {:ok, :empty, close_held(handle)}
+
+      {:error, reason} ->
+        {:error, reason, close_held(handle)}
+    end
+  end
+
   @doc """
   `read_delta/3` through `handle`. Same `{:ok, bin, handle}` / `{:error, reason, handle}` shape,
   and the same short-read guard: a shrunken file means a checkpoint raced us, so refuse.
@@ -399,6 +441,22 @@ defmodule Fathom.Shard.Replication.Wal do
 
       _ ->
         extent
+    end
+  end
+
+  defp identity_from(handle) do
+    case :file.pread(handle.fd, 0, 20) do
+      {:ok, <<magic::32, _fmt::32, _page::32, seq::32, salt1::32>>} when magic in @magics ->
+        {:ok, %{ckpt_seq: seq, salt1: salt1}, handle}
+
+      {:ok, _} ->
+        {:error, :not_a_wal, close_held(handle)}
+
+      :eof ->
+        {:ok, :empty, close_held(handle)}
+
+      {:error, reason} ->
+        {:error, reason, close_held(handle)}
     end
   end
 

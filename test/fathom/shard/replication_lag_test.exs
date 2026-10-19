@@ -144,6 +144,40 @@ defmodule Fathom.Shard.ReplicationLagTest do
     assert report.answered == report.sessions
   end
 
+  # Expert review 2026-10-19 #9 (measure only): the commit_stage events carry a bounded
+  # `reset: true | false` tag, so the first commit after a checkpoint (a planned `:reset`, which waits
+  # on the follower's absorb) can be separated from a plain append commit in the rig's histogram.
+  test "commit_stage events are tagged reset: true for a reset round and false for an append",
+       ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    configure!(followers, 2)
+    {coordinator, path} = open_shard!(id)
+    {:ok, conn} = Connection.open(path)
+    on_exit(fn -> Connection.close(conn) end)
+
+    drain = fn drain, acc ->
+      receive do
+        {:tel, [:fathom, :replication, :commit_stage], _, %{stage: st, reset: r}} ->
+          drain.(drain, [{st, r} | acc])
+      after
+        100 -> acc
+      end
+    end
+
+    # Never shipped before: Primary.plan(nil, ...) is {:reset, 0, _}.
+    assert :ok = Session.commit(id, path <> "-wal", coordinator)
+    first = drain.(drain, [])
+    assert {:collect, true} in first and {:build, true} in first
+
+    # Followers are now at the WAL's extent in the same generation: the next commit is an append.
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    assert :ok = Session.commit(id, path <> "-wal", coordinator)
+    second = drain.(drain, [])
+    assert {:collect, false} in second and {:build, false} in second
+    refute Enum.any?(second, fn {_, r} -> r end)
+  end
+
   test "a failed quorum emits outcome no_quorum", ctx do
     %{id: id, root: root} = ctx
     [{name, port}] = start_followers!(root, 1)

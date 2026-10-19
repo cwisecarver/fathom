@@ -119,6 +119,36 @@ defmodule Fathom.Shard.Replication.FollowerAppendMissingWalTest do
     assert held == %{}, "the worker still holds #{map_size(held)} WAL fd(s) with the cache off"
   end
 
+  # Expert review 2026-10-19 #16: the held-fd cache reports hit/miss (bounded `result` tag) so the
+  # rig can show whether the per-worker cap is being exceeded at density.
+  test "the held-fd cache emits a miss when it opens the fd and a hit when it reuses it", ctx do
+    %{name: name, id: id} = ctx
+    :ok = Follower.seed(name, id, 1, 0, 0, 0)
+
+    hid = "held-fd-#{System.unique_integer([:positive])}"
+    me = self()
+
+    :telemetry.attach(
+      hid,
+      [:fathom, :replication, :held_fd],
+      fn _, %{count: 1}, meta, _ -> send(me, {:held_fd, meta, self()}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(hid) end)
+
+    # An offset-0 push runs in a short-lived per-shard task (expert review 2026-10-17 #5), whose own
+    # held-fd map is empty: a miss that is not the worker's. The worker's first append then misses
+    # (opens + holds the fd) and every later one hits.
+    assert {:ack, ^id, 6} = send_push(ctx, push(id, 0))
+    assert_receive {:held_fd, %{result: :miss}, _}
+    assert {:ack, ^id, 12} = send_push(ctx, %{push(id, 6) | payload: "more!!"})
+    assert_receive {:held_fd, %{result: :miss}, _}
+    assert {:ack, ^id, 18} = send_push(ctx, %{push(id, 12) | payload: "again!"})
+    assert_receive {:held_fd, %{result: :hit}, _}
+    refute_received {:held_fd, _, _}
+  end
+
   test "an append at offset 0 still starts a WAL (it carries the header)", ctx do
     %{name: name, id: id} = ctx
     :ok = Follower.seed(name, id, 1, 0, 0, 0)

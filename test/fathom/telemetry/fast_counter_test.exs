@@ -39,6 +39,7 @@ defmodule Fathom.Telemetry.FastCounterTest do
   test "the two hot counters are exactly the ones FastCounter claims" do
     assert hot_metrics() |> Enum.map(& &1.name) |> Enum.sort() == [
              [:fathom, :replication, :checkpoint, :count],
+             [:fathom, :replication, :held_fd, :count],
              [:fathom, :shard, :pool_take, :count]
            ]
   end
@@ -113,11 +114,14 @@ defmodule Fathom.Telemetry.FastCounterTest do
     })
 
     :telemetry.execute([:fathom, :replication, :commit_stage], %{duration: ms.(7)}, %{
-      stage: :build
+      stage: :build,
+      reset: false
     })
 
     text = FastHistogram.render(fast)
     assert text =~ ~s(fathom_replication_commit_total_duration_count{outcome="ok"} 1)
-    assert text =~ ~s(fathom_replication_commit_stage_duration_count{stage="build"} 1)
+
+    assert text =~
+             ~s(fathom_replication_commit_stage_duration_count{reset="false",stage="build"} 1)
   end
 end

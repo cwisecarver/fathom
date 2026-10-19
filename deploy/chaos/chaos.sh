@@ -32,6 +32,14 @@
 #                                 from its peers (the half that was never started outside tests).
 #                                 Add REPLICATION_ENABLED=true — to `up` AND to this — to also
 #                                 ship a write and check followers hold a replica.
+#   TPC_NET=container TPC_DRIVER=elixir ./chaos.sh repl-cpu [tenants]  CPU ATTRIBUTION for replication
+#                                 (expert review 2026-10-19 #15): runs a tpc-fleet at `tenants` (default
+#                                 1024) and, once load is flowing, samples every node in parallel every
+#                                 REPL_CPU_TICK_S (5) s for REPL_CPU_TICKS (12) ticks: :reductions delta per
+#                                 replication role, run-queue length, msacc busy% for scheduler / dirty-IO /
+#                                 poll. Prints reductions per committed replication txn per role. Run it
+#                                 with replication ON, then again on a fleet brought up with
+#                                 REPLICATION_ENABLED=false for the baseline. Never part of a gate.
 #   ./chaos.sh seed-rate [kib...] Phase-2 A2: what one seed costs by shard size (default 64 1024
 #                                 8192 32768 KiB) — per-seed ms and the first-write latency a
 #                                 seed-on-ownership-change rule would add. Needs REPLICATION_ENABLED;
@@ -2734,6 +2742,166 @@ PY
   revive "$node"
 }
 
+# -- repl-cpu: CPU attribution for A2 replication on the saturated rig (expert review 2026-10-19 #15) ---
+# The rig is CPU-saturated (~20 runnable on 12 schedulers), so p99 is queueing and an idle-box per-call
+# microsecond cannot show the hop or run-queue cost. This attributes the CPU instead: while a tpc-fleet
+# load runs, every node is sampled IN PARALLEL for TICKS windows of TICK_S seconds; each window takes, on
+# the node, a :reductions delta per ROLE (module.function of the process's initial call: Session, Shipper,
+# the follower reader / per-connection workers / per-shard tasks, ...), the summed run-queue length, an
+# :msacc busy% per scheduler type (scheduler, dirty_io_scheduler, dirty_cpu_scheduler, poll), and the
+# delta of replicated commits (fathom_replication_commit_duration_count{outcome="ok"}). Reductions are
+# summed only over processes alive at BOTH ends of a window, so short-lived tasks that start and die
+# inside one window are UNDERCOUNTED (a lower bound for those roles; the long-lived Session / Shipper /
+# follower workers are exact). The driver (tpc-fleet) is launched in the background; sampling starts once
+# fathom1's ShardLoad query counter moves >= REPL_CPU_MIN_QPS per second (the prewarm phase is skipped).
+#   env: REPL_CPU_TICKS=12  REPL_CPU_TICK_S=5  REPL_CPU_MIN_QPS=2000  REPL_CPU_WAIT_S=900
+# Run twice for the A/B the finding asks for: fleet up with REPLICATION_ENABLED=true, then false.
+repl_cpu_node_script() { # args: tick_ms
+  cat <<EOS
+tick = $1
+role = fn p ->
+  ic =
+    case Process.info(p, :dictionary) do
+      {:dictionary, d} -> Keyword.get(d, :"\$initial_call")
+      _ -> nil
+    end
+
+  ic =
+    ic ||
+      case Process.info(p, :initial_call) do
+        {:initial_call, mfa} -> mfa
+        _ -> nil
+      end
+
+  case ic do
+    {m, f, _} ->
+      ms = inspect(m)
+      if String.contains?(ms, "Replication"), do: ms <> "." <> to_string(f), else: nil
+
+    _ ->
+      nil
+  end
+end
+
+snap = fn ->
+  for p <- Process.list(), r = role.(p), r != nil, {:reductions, red} <- [Process.info(p, :reductions)], into: %{}, do: {p, {r, red}}
+end
+
+commits = fn ->
+  Fathom.Telemetry.scrape()
+  |> IO.iodata_to_binary()
+  |> String.split("\n")
+  |> Enum.filter(&(String.starts_with?(&1, "fathom_replication_commit_duration_count") and String.contains?(&1, ~s(outcome="ok"))))
+  |> Enum.map(fn l -> l |> String.split(" ") |> List.last() |> String.trim() |> String.to_integer() end)
+  |> Enum.sum()
+end
+
+queries = fn -> Fathom.ShardLoad.snapshot() |> Enum.reduce(0, fn m, a -> a + m.queries end) end
+a = snap.()
+c0 = commits.()
+q0 = queries.()
+:msacc.start(tick)
+d = :msacc.stats()
+b = snap.()
+c1 = commits.()
+q1 = queries.()
+
+roles =
+  for {p, {r, red1}} <- b, {^r, red0} <- [Map.get(a, p)], reduce: %{} do
+    acc -> Map.update(acc, r, {1, red1 - red0}, fn {n, s} -> {n + 1, s + (red1 - red0)} end)
+  end
+
+Enum.each(roles, fn {r, {n, s}} -> IO.puts("ROLE\t#{r}\t#{n}\t#{s}") end)
+IO.puts("RQ\t#{:erlang.statistics(:run_queue_lengths_all) |> Enum.sum()}")
+IO.puts("COMMITS\t#{c1 - c0}")
+IO.puts("QUERIES\t#{q1 - q0}")
+
+for {t, l} <- Enum.group_by(d, & &1.type), t in [:scheduler, :dirty_io_scheduler, :dirty_cpu_scheduler, :poll] do
+  tot = l |> Enum.map(fn x -> x.counters |> Map.values() |> Enum.sum() end) |> Enum.sum()
+  sl = l |> Enum.map(fn x -> Map.get(x.counters, :sleep, 0) end) |> Enum.sum()
+  IO.puts("MSACC\t#{t}\t#{if tot > 0, do: Float.round((tot - sl) / tot * 100, 1), else: 0.0}")
+end
+EOS
+}
+
+cmd_repl_cpu() {
+  local tenants=${1:-1024}
+  local ticks=${REPL_CPU_TICKS:-12} tick_s=${REPL_CPU_TICK_S:-5} min_qps=${REPL_CPU_MIN_QPS:-2000}
+  local wait_s=${REPL_CPU_WAIT_S:-900}
+  local out; out=$(mktemp -d)
+  local script; script=$(repl_cpu_node_script $(( tick_s * 1000 )))
+  local qsum='IO.puts(Fathom.ShardLoad.snapshot() |> Enum.reduce(0, fn m, a -> a + m.queries end))'
+  echo "repl-cpu: tpc-fleet $tenants tenants, ${ticks}x${tick_s}s windows on ${#NODES[@]} nodes (parallel)" >&2
+
+  cmd_tpc_fleet "$tenants" >"$out/fleet.txt" 2>&1 &
+  local fleet_pid=$!
+
+  # Wait for load: fathom1's ShardLoad query counter must advance >= min_qps per second.
+  local waited=0 q0 q1 rate=0
+  while [ "$waited" -lt "$wait_s" ] && kill -0 "$fleet_pid" 2>/dev/null; do
+    q0=$(rpc fathom1 "$qsum" | tail -1)
+    sleep 2; waited=$(( waited + 2 ))
+    q1=$(rpc fathom1 "$qsum" | tail -1)
+    rate=$(( (${q1:-0} - ${q0:-0}) / 2 ))
+    [ "$rate" -ge "$min_qps" ] && break
+  done
+  if [ "$rate" -lt "$min_qps" ]; then
+    echo "repl-cpu: load never reached $min_qps q/s on fathom1 (last $rate/s) — nothing sampled" >&2
+    wait "$fleet_pid" 2>/dev/null; cat "$out/fleet.txt"; rm -rf "$out"; return 1
+  fi
+  echo "  load flowing on fathom1 (~$rate q/s) — sampling" >&2
+
+  local t n sp
+  for t in $(seq 1 "$ticks"); do
+    sp=()
+    for n in "${NODES[@]}"; do
+      rpc "$n" "$script" >"$out/$n.$t.txt" &
+      sp+=($!)
+    done
+    wait "${sp[@]}" 2>/dev/null
+  done
+  wait "$fleet_pid" 2>/dev/null
+
+  echo ""
+  echo "  --- tpc-fleet result (the load the samples were taken under) ---"
+  cat "$out/fleet.txt"
+  echo ""
+  echo "  --- replication CPU attribution (${ticks}x${tick_s}s windows, all nodes) ---"
+  /usr/bin/python3 - "$out" "$tick_s" <<'PY'
+import sys, glob, collections
+d, tick_s = sys.argv[1], float(sys.argv[2])
+red = collections.Counter(); nproc = collections.defaultdict(list)
+commits = queries = rq = 0; nsamp = 0
+msacc = collections.defaultdict(list)
+for f in glob.glob(d + "/fathom*.txt"):
+    nsamp += 1
+    for line in open(f):
+        p = line.rstrip("\n").split("\t")
+        if p[0] == "ROLE" and len(p) == 4:
+            red[p[1]] += int(p[3]); nproc[p[1]].append(int(p[2]))
+        elif p[0] == "COMMITS": commits += int(p[1])
+        elif p[0] == "QUERIES": queries += int(p[1])
+        elif p[0] == "RQ": rq += int(p[1])
+        elif p[0] == "MSACC" and len(p) == 3: msacc[p[1]].append(float(p[2]))
+if nsamp == 0:
+    print("  no samples collected"); sys.exit(0)
+secs = nsamp * tick_s  # node-seconds
+print(f"  node-windows sampled: {nsamp}  ({secs:.0f} node-seconds)   replicated commits: {commits}   queries: {queries}")
+print(f"  mean summed run-queue length per sample: {rq / nsamp:.1f}")
+for t in sorted(msacc):
+    v = msacc[t]; print(f"  msacc busy% {t:20s} mean {sum(v)/len(v):5.1f}  max {max(v):5.1f}")
+tot = sum(red.values())
+print(f"  {'role':58s} {'procs/win':>9s} {'Mred/s':>9s} {'red/commit':>11s} {'share':>6s}")
+for r, s in sorted(red.items(), key=lambda kv: -kv[1]):
+    pn = sum(nproc[r]) / max(len(nproc[r]), 1)
+    per = (s / commits) if commits else float("nan")
+    print(f"  {r[:58]:58s} {pn:9.0f} {s / secs / 1e6:9.2f} {per:11.0f} {100 * s / tot if tot else 0:5.1f}%")
+if commits == 0:
+    print("  (0 replicated commits: replication is OFF on this fleet — this is the baseline; compare Mred/s and msacc)")
+PY
+  rm -rf "$out"
+}
+
 case "${1:-}" in
   build)       cmd_build ;;
   build-driver) cmd_build_driver ;;
@@ -2754,6 +2922,7 @@ case "${1:-}" in
   replication) shift; cmd_replication "$@" ;;
   seed-rate)   shift; cmd_seed_rate "$@" ;;
   rpo)         shift; cmd_rpo "$@" ;;
+  repl-cpu)    shift; cmd_repl_cpu "$@" ;;
   quorum-loss) shift; cmd_quorum_loss "$@" ;;
   up)          cmd_up ;;
   down)        cmd_down ;;

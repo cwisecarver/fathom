@@ -2967,9 +2967,11 @@ defmodule Fathom.Shard.Replication.Follower do
   defp held_fd(held, path, offset, stat) do
     case {Map.get(held, path), stat} do
       {{fd, inode, _used}, {:ok, info}} when elem(info, 11) == inode ->
+        held_fd_result(:hit)
         {:ok, fd, Map.put(held, path, {fd, inode, System.monotonic_time()})}
 
       {_stale_or_none, stat} ->
+        held_fd_result(:miss)
         held = drop_held(held, path)
 
         # Creates a missing file ONLY for an append at offset 0, which begins with the WAL header
@@ -2993,6 +2995,12 @@ defmodule Fathom.Shard.Replication.Follower do
         end
     end
   end
+
+  # Held-WAL-fd hit/miss counter (expert review 2026-10-19 #16). The cache has a cliff: past the cap
+  # per worker, cyclic access over more active shards than fds drops to ~0% hits (45 vs 18 us per
+  # push on a miss). This surfaces the rate before anyone changes the cap. Bounded `result` tag.
+  defp held_fd_result(result),
+    do: :telemetry.execute([:fathom, :replication, :held_fd], %{count: 1}, %{result: result})
 
   defp same_inode(_fd, :created, _got), do: :ok
   defp same_inode(_fd, inode, inode), do: :ok

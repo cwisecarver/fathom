@@ -161,6 +161,98 @@ defmodule Fathom.Shard.Replication.WalHeldFdTest do
                     "the warm delta read stat'd the WAL again"
   end
 
+  describe "recheck_held/2 (expert review 2026-10-19 #17)" do
+    test "reports the same identity as read_held/2, reusing the fd", %{path: path} do
+      File.write!(path, wal_bytes(7, 111, :binary.copy(<<1>>, 512)))
+      assert {:ok, _header, h1} = Wal.read_held(nil, path)
+      assert {:ok, %{ckpt_seq: 7, salt1: 111}, h2} = Wal.recheck_held(h1, path)
+      assert h2.fd == h1.fd
+      Wal.close_held(h2)
+    end
+
+    test "an unlink+recreate reopens and reports the NEW file, never the deleted inode",
+         %{path: path} do
+      # The inode comparison is why the recheck still stats the path. Skipping it would read the
+      # old generation off the held fd and let `stable?/3` compare old against old.
+      File.write!(path, wal_bytes(7, 111, :binary.copy(<<1>>, 512)))
+      assert {:ok, _header, h1} = Wal.read_held(nil, path)
+
+      File.rm!(path)
+      File.write!(path, wal_bytes(0, 222, :binary.copy(<<2>>, 512)))
+      assert File.stat!(path).inode != h1.inode, "fixture: the OS recycled the inode"
+
+      assert {:ok, %{ckpt_seq: 0, salt1: 222}, h2} = Wal.recheck_held(h1, path)
+      refute h2.fd == h1.fd
+      Wal.close_held(h2)
+    end
+
+    test "absent, too-short and non-WAL files", %{path: path} do
+      File.write!(path, wal_bytes(1, 2, <<>>))
+      assert {:ok, _header, h} = Wal.read_held(nil, path)
+      File.rm!(path)
+      assert {:ok, :empty, nil} = Wal.recheck_held(h, path)
+
+      File.write!(path, <<0, 1, 2>>)
+      assert {:ok, :empty, nil} = Wal.recheck_held(nil, path)
+
+      File.write!(path, :binary.copy(<<0>>, 64))
+      assert {:error, :not_a_wal, nil} = Wal.recheck_held(nil, path)
+    end
+
+    # A replicated commit's reads on the primary: header read, payload read, trailing recheck. Was
+    # 7 dirty-IO file jobs (stat, header pread, EOF-frame pread, payload pread, stat, header pread,
+    # EOF-frame pread); the recheck no longer repeats the commit-extent pread. This pins the count
+    # for the warm (fd already held, EOF frame is a commit) case.
+    test "a warm commit's read shape issues 6 raw file calls, not 7", %{path: path} do
+      # One real commit frame (nTruncate != 0, this generation's salts) so the EOF-frame pread runs.
+      frame = <<1::32, 1::32, 111::32, 0::32, 0::64>> <> :binary.copy(<<1>>, 4096)
+      File.write!(path, wal_bytes(7, 111, frame))
+      test = self()
+
+      reader =
+        spawn_link(fn ->
+          {:ok, _header, h1} = Wal.read_held(nil, path)
+          send(test, :ready)
+
+          receive do
+            :go ->
+              {:ok, _hdr, h} = Wal.read_held(h1, path)
+              {:ok, _bin, h} = Wal.read_delta_held(h, path, 32, 64)
+              {:ok, _after, h} = Wal.recheck_held(h, path)
+              send(test, {:done, h})
+          end
+
+          receive do
+            :exit -> :ok
+          end
+        end)
+
+      assert_receive :ready
+      :erlang.trace_pattern({:file, :pread, 3}, true, [:local])
+      :erlang.trace_pattern({:file, :read_file_info, 2}, true, [:local])
+      :erlang.trace_pattern({:file, :open, 2}, true, [:local])
+      :erlang.trace(reader, true, [:call, {:tracer, self()}])
+      send(reader, :go)
+      assert_receive {:done, _h}
+      :erlang.trace(reader, false, [:call])
+      ref = :erlang.trace_delivered(reader)
+      assert_receive {:trace_delivered, _, ^ref}
+      send(reader, :exit)
+
+      calls = collect_calls([])
+      assert Enum.count(calls, &(&1 == :open)) == 0, "a warm commit reopened the WAL"
+      assert length(calls) == 6, "expected 6 raw file calls per commit, saw #{inspect(calls)}"
+    end
+
+    defp collect_calls(acc) do
+      receive do
+        {:trace, _, :call, {:file, f, _}} -> collect_calls([f | acc])
+      after
+        0 -> Enum.reverse(acc)
+      end
+    end
+  end
+
   test "read shapes still match the un-held versions", %{path: path} do
     # The held path must not become a second, subtly different implementation.
     File.write!(path, wal_bytes(3, 55, :binary.copy(<<9>>, 1024)))
