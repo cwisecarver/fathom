@@ -3054,7 +3054,7 @@ defmodule Fathom.Shard.Storage.S3 do
     # trigger this finding is about), `receive_timeout` how long we wait for the RESPONSE.
     timeouts =
       case Keyword.get(opts, :budget_ms) do
-        ms when is_integer(ms) and ms > 0 -> [receive_timeout: ms, pool_timeout: ms]
+        ms when is_integer(ms) and ms > 0 -> [receive_timeout: ms, finch: finch_opts(pool_timeout: ms)]
         _ -> []
       end
 
@@ -3495,7 +3495,18 @@ defmodule Fathom.Shard.Storage.S3 do
   # Finch if it isn't started, so Storage.S3 still works standalone (iex,
   # one-off scripts) without a hard dependency on the supervision tree.
   defp finch_opt do
-    if finch_running?(), do: [finch: @finch], else: []
+    case finch_opts([]) do
+      [] -> []
+      opts -> [finch: opts]
+    end
+  end
+
+  # The non-deprecated keyword form (expert review 2026-10-19 #3). Req 0.7.4 `IO.warn`s with a
+  # stacktrace (~118 us CPU) on EVERY request for `finch: atom`, and again for a top-level
+  # `pool_timeout:`. `Req.merge` replaces the `:finch` option wholesale, so a per-call override
+  # (the heartbeat renew's `pool_timeout`) must re-state the pool name.
+  defp finch_opts(extra) do
+    if finch_running?(), do: [name: @finch] ++ extra, else: extra
   end
 
   # Deliberately still checked per call (as part of req/0's cache key): it is a ~100ns
