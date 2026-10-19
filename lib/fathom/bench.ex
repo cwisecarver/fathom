@@ -111,7 +111,8 @@ defmodule Fathom.Bench do
     :served_repl,
     :hrana_write,
     :hrana_open_auth,
-    :flush_codec
+    :flush_codec,
+    :pull_decode
   ]
 
   @doc false
@@ -229,7 +230,10 @@ defmodule Fathom.Bench do
       # WATCH-ONLY storage-IO metrics (expert review 2026-10-19 #7), each with its own scoped
       # setup in `Fathom.Bench.StorageIO`: a ~20 MB realistic snapshot through the flush codec.
       flush_codec_ms_per_mb:
-        run_if(only, :flush_codec, fn -> Fathom.Bench.StorageIO.flush_codec_ms_per_mb(opts) end)
+        run_if(only, :flush_codec, fn -> Fathom.Bench.StorageIO.flush_codec_ms_per_mb(opts) end),
+      # S3 download decode + verify through a loopback stub and the real Finch pool.
+      pull_decode_ms_per_mb:
+        run_if(only, :pull_decode, fn -> Fathom.Bench.StorageIO.pull_decode_ms_per_mb(opts) end)
     }
   end
 

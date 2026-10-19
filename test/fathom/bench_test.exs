@@ -351,4 +351,16 @@ defmodule Fathom.BenchTest do
     assert ms > 0.5, "#{ms} ms/MB is too fast to have run compress + 2 MD5s + decode"
     assert ms < 100, "#{ms} ms/MB: the flush codec regressed by an order of magnitude"
   end
+
+  # expert review 2026-10-19 #7. A whole S3 pull of the ~20 MB fixture through the loopback stub and
+  # the real Finch pool; the metric itself asserts the Finch path was used and the pulled file is
+  # byte-identical. Prod ~2 ms/MB.
+  @tag timeout: 300_000
+  test "pull_decode_ms_per_mb measures an S3 pull to an order of magnitude" do
+    ms = Fathom.Bench.StorageIO.pull_decode_ms_per_mb(pull_trials: 1)
+    IO.puts("pull_decode_ms_per_mb: #{inspect(ms)}")
+    assert is_float(ms)
+    assert ms > 0.2, "#{ms} ms/MB is too fast to have run GET + decode + MD5"
+    assert ms < 100, "#{ms} ms/MB: the S3 pull regressed by an order of magnitude"
+  end
 end

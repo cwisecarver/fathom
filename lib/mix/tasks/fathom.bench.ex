@@ -93,7 +93,8 @@ defmodule Mix.Tasks.Fathom.Bench do
     :served_repl,
     :hrana_write,
     :hrana_open_auth,
-    :flush_codec
+    :flush_codec,
+    :pull_decode
   ]
 
   @doc false
@@ -263,6 +264,8 @@ defmodule Mix.Tasks.Fathom.Bench do
        "\u00b5s   (Hrana round trip INCLUDING stream open, auth REQUIRED)"},
       {"flush_codec_ms_per_mb", metrics.flush_codec_ms_per_mb,
        "ms/MB  (zstd flush codec: compress + 2 MD5s + decode proof, ~20 MB realistic; watch-only)"},
+      {"pull_decode_ms_per_mb", metrics.pull_decode_ms_per_mb,
+       "ms/MB  (S3 pull: GET + zstd decode + MD5 verify + fsync, loopback stub; watch-only)"},
       {"wire_rows_per_s", metrics.wire_rows_per_s,
        "rows/s (result-set encode over the wire, keystone rows)"},
       {"wire_encode_rows_per_s", metrics.wire_encode_rows_per_s,

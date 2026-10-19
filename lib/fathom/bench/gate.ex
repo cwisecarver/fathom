@@ -162,6 +162,7 @@ defmodule Fathom.Bench.Gate do
     # WATCH-ONLY storage-IO metrics (expert review 2026-10-19 #7), new series: the flush codec on a
     # ~20 MB realistic snapshot (`Fathom.Bench.StorageIO`). Watch-only until a band is measured.
     {:flush_codec_ms_per_mb, :higher_worse, :watch},
+    {:pull_decode_ms_per_mb, :higher_worse, :watch},
     # THE TAIL, gated from 2026-08-03 (expert review #41.5). Every metric above is a p50, and
     # `delta/4` is a pure ratio — which AGENTS.md forbids in as many words ("Assert an absolute
     # floor, not only a ratio… The ratio holds while throughput collapses"). A change that leaves
