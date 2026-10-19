@@ -375,4 +375,13 @@ defmodule Fathom.BenchTest do
     assert op > 20 and op < 20_000, "object_head #{op}us outside the order-of-magnitude band"
     assert put > 20 and put < 50_000, "conditional PUT #{put}us outside the band"
   end
+
+  # expert review 2026-10-19 #12. A warm-stream SELECT 1 over the WebSocket path; the metric
+  # asserts each reply is [[1]]. Prod ~100-200 us.
+  test "hrana_ws_rt_us measures the WebSocket round trip to an order of magnitude" do
+    us = Fathom.Bench.hrana_ws_rt_us(hrana_rt_samples: 30)
+    IO.puts("hrana_ws_rt_us: #{inspect(us)}")
+    assert is_float(us), "the WS listener/client did not come up - this measured nothing"
+    assert us > 10 and us < 20_000, "WS round trip #{us}us outside the order-of-magnitude band"
+  end
 end

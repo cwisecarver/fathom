@@ -170,7 +170,9 @@ defmodule Fathom.Bench.StorageIO do
       File.rm(tmp)
       expect = :crypto.hash(:md5, File.read!(path))
 
-      with_s3(fn stub ->
+      stub = start_s3()
+
+      try do
         shard = "pulldecode"
 
         S3Stub.put_object(stub.table, object_path(shard), body, [
@@ -196,7 +198,9 @@ defmodule Fathom.Bench.StorageIO do
         samples = Enum.map(1..trials, fn _ -> pull.() end)
         assert_finch_used!(stub, trials + 1)
         median(samples)
-      end)
+      after
+        stop_s3(stub)
+      end
     end)
   end
 
@@ -220,35 +224,36 @@ defmodule Fathom.Bench.StorageIO do
     small = Path.join(dir, "small.db")
     File.write!(small, String.duplicate("fathom s3 loopback payload ", 600))
 
+    stub = start_s3()
+
     try do
-      with_s3(fn stub ->
-        shard = "s3loop"
+      shard = "s3loop"
 
-        S3Stub.put_object(stub.table, object_path(shard), "x", [
-          {"etag", ~s("seed")},
-          {"x-amz-meta-fathom-md5", "00"}
-        ])
+      S3Stub.put_object(stub.table, object_path(shard), "x", [
+        {"etag", ~s("seed")},
+        {"x-amz-meta-fathom-md5", "00"}
+      ])
 
-        head_us =
-          timed(heads, fn ->
-            {:ok, %{etag: ~s("seed")}} = S3.object_head(shard)
-          end)
+      head_us =
+        timed(heads, fn ->
+          {:ok, %{etag: ~s("seed")}} = S3.object_head(shard)
+        end)
 
-        Process.put(:s3io_etag, ~s("seed"))
+      Process.put(:s3io_etag, ~s("seed"))
 
-        put_us =
-          timed(puts, fn ->
-            {:ok, new, _carried} =
-              S3.flush(shard, small, Process.get(:s3io_etag), nil, {:carried, :none})
+      put_us =
+        timed(puts, fn ->
+          {:ok, new, _carried} =
+            S3.flush(shard, small, Process.get(:s3io_etag), nil, {:carried, :none})
 
-            Process.put(:s3io_etag, new)
-          end)
+          Process.put(:s3io_etag, new)
+        end)
 
-        # `timed/2` runs its function once untimed first, hence the + 2.
-        assert_finch_used!(stub, heads + puts + 2)
-        %{op_us: median(head_us), put_us: median(put_us)}
-      end)
+      # `timed/2` runs its function once untimed first, hence the + 2.
+      assert_finch_used!(stub, heads + puts + 2)
+      %{op_us: median(head_us), put_us: median(put_us)}
     after
+      stop_s3(stub)
       File.rm_rf(dir)
     end
   end
@@ -260,7 +265,7 @@ defmodule Fathom.Bench.StorageIO do
 
   # Points `Storage.S3` at a loopback stub, starts the real S3 Finch pool, counts requests that go
   # through it, and restores everything afterwards.
-  defp with_s3(fun) do
+  defp start_s3 do
     {:ok, _} = Application.ensure_all_started(:req)
     {:ok, _} = Application.ensure_all_started(:bandit)
     prev = Application.fetch_env(:fathom, S3)
@@ -297,17 +302,25 @@ defmodule Fathom.Bench.StorageIO do
         {counter, S3.finch_name()}
       )
 
-    try do
-      fun.(%{table: table, port: port, counter: counter})
-    after
-      :telemetry.detach(handler)
-      if finch, do: Supervisor.stop(finch)
-      Supervisor.stop(sup)
+    %{
+      table: table,
+      port: port,
+      counter: counter,
+      sup: sup,
+      finch: finch,
+      handler: handler,
+      prev: prev
+    }
+  end
 
-      case prev do
-        {:ok, v} -> Application.put_env(:fathom, S3, v)
-        :error -> Application.delete_env(:fathom, S3)
-      end
+  defp stop_s3(stub) do
+    :telemetry.detach(stub.handler)
+    if stub.finch, do: Supervisor.stop(stub.finch)
+    Supervisor.stop(stub.sup)
+
+    case stub.prev do
+      {:ok, v} -> Application.put_env(:fathom, S3, v)
+      :error -> Application.delete_env(:fathom, S3)
     end
   end
 

@@ -35,9 +35,10 @@ defmodule Fathom.Bench do
 
   Both are **loopback software cost**, not a network RTT: a µs link, no bandwidth-delay, no
   TLS, no LB hop. The chaos rig measures real network cost (`docs/deploy-cluster.md`). They
-  run over HTTP (`Filo.Client`, on the transitive `:mint`) rather than WebSocket, because
-  `mint_web_socket` is a dev/test-only dependency and the gate compiles `MIX_ENV=prod`. Row
-  encoding is shared by both JSON transports, so the HTTP path covers it.
+  run over HTTP (`Filo.Client`, on the transitive `:mint`); row encoding is shared by both JSON
+  transports, so the HTTP path covers it. The WebSocket path (django-libsql's) has its own
+  watch-only metric, `hrana_ws_rt_us/1`, since `mint_web_socket` became a prod-compiled dep
+  (expert review 2026-10-19 #12).
 
   Each returns a number (or `nil` when a bench can't run, e.g. no Postgres for the
   directory bench). `all/1` runs the requested set and returns the perf-history
@@ -113,7 +114,8 @@ defmodule Fathom.Bench do
     :hrana_open_auth,
     :flush_codec,
     :pull_decode,
-    :s3_loopback
+    :s3_loopback,
+    :hrana_ws
   ]
 
   @doc false
@@ -241,7 +243,10 @@ defmodule Fathom.Bench do
       # The S3 client itself (expert review 2026-10-19 #3): no other gated metric goes through the
       # Req/Finch adapter, so the per-request Req deprecation IO.warn was invisible.
       s3_loopback_op_us: s3io && s3io.op_us,
-      s3_loopback_put_us: s3io && s3io.put_us
+      s3_loopback_put_us: s3io && s3io.put_us,
+      # WATCH-ONLY (expert review 2026-10-19 #12): the WebSocket round trip, the path django-libsql
+      # uses. Every other wire metric is HTTP.
+      hrana_ws_rt_us: run_if(only, :hrana_ws, fn -> hrana_ws_rt_us(opts) end)
     }
   end
 
@@ -1052,6 +1057,50 @@ defmodule Fathom.Bench do
 
       p50(us)
     end)
+  end
+
+  @doc """
+  `hrana_ws_rt_us` — median µs of a warm-stream `SELECT 1` round trip over the Hrana WEBSOCKET
+  path (expert review 2026-10-19 #12): `Fathom.Bench.HranaClient` (Mint.WebSocket) → `Filo.Socket`
+  → `ShardExecutor` → the shard → back. This is the path django-libsql, the primary prod client,
+  uses; every other wire metric here is HTTP, so WS framing, `Filo.Socket` routing and the
+  `validate_text_frames` check were gated by nothing. Watch-only.
+
+  Precondition: every reply must be the single row `[[1]]`, so a client that silently stopped
+  executing (and just echoed) cannot produce a number.
+  """
+  @spec hrana_ws_rt_us(keyword()) :: float() | nil
+  def hrana_ws_rt_us(opts \\ []) do
+    samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
+    shard = "benchwsrt"
+
+    setup(opts)
+    Application.put_env(:fathom, :shard_base_domain, nil)
+    Application.put_env(:fathom, :default_shard, nil)
+    {:ok, _} = Application.ensure_all_started(:bandit)
+    {:ok, _} = Application.ensure_all_started(:mint)
+
+    {:ok, sup, port} = Fathom.Bench.HranaClient.start_listener()
+
+    try do
+      {:ok, client} = Fathom.Bench.HranaClient.connect(port, shard)
+      # Warm the shard and the stream; not timed.
+      {:ok, client, _} = Fathom.Bench.HranaClient.execute(client, "SELECT 1")
+
+      {client, us} =
+        Enum.reduce(1..samples, {client, []}, fn _, {c, acc} ->
+          {t, {:ok, c, %{rows: [[1]]}}} =
+            :timer.tc(fn -> Fathom.Bench.HranaClient.execute(c, "SELECT 1") end)
+
+          {c, [t | acc]}
+        end)
+
+      Fathom.Bench.HranaClient.close(client)
+      p50(us)
+    after
+      Fathom.Bench.HranaClient.stop_listener(sup)
+      Fathom.Shards.drain(shard, 5_000)
+    end
   end
 
   @doc """

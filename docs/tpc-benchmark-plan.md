@@ -10,7 +10,7 @@
 >
 > **Rev. 4 — Phase 0 + Phase 1 shipped.** Phase 0: `Connection.collect` is O(R). Phase 1:
 > the wire loopback harness + the three gated wire metrics are built and proven —
-> `Fathom.Bench.HranaClient` (a Mint.WebSocket client in `test/support`, dev/test only) +
+> `Fathom.Bench.HranaClient` (a Mint.WebSocket client in `lib/fathom/bench/`; moved from `test/support` 2026-10-19 so the prod bench can run `hrana_ws_rt_us`) +
 > `Fathom.Bench.Wire` + the **`MIX_ENV=test mix fathom.wire_bench`** task. Metrics (measured
 > here, loopback, relative): `hrana_rt_us` ≈ 100–175 µs, `cold_open_wire_p50_us` ≈ 2.5–4 ms
 > (vs the in-process `cold_open_p50_us` ≈ 1.6 ms — the delta is the WS software tax),

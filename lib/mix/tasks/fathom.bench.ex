@@ -95,7 +95,8 @@ defmodule Mix.Tasks.Fathom.Bench do
     :hrana_open_auth,
     :flush_codec,
     :pull_decode,
-    :s3_loopback
+    :s3_loopback,
+    :hrana_ws
   ]
 
   @doc false
@@ -271,6 +272,8 @@ defmodule Mix.Tasks.Fathom.Bench do
        "\u00b5s   (S3 object_head via the real Finch pool, loopback stub; watch-only)"},
       {"s3_loopback_put_us", metrics.s3_loopback_put_us,
        "\u00b5s   (S3 conditional flush PUT via the real Finch pool, loopback stub; watch-only)"},
+      {"hrana_ws_rt_us", metrics.hrana_ws_rt_us,
+       "\u00b5s   (Hrana round trip over the WEBSOCKET path, warm stream; watch-only)"},
       {"wire_rows_per_s", metrics.wire_rows_per_s,
        "rows/s (result-set encode over the wire, keystone rows)"},
       {"wire_encode_rows_per_s", metrics.wire_encode_rows_per_s,

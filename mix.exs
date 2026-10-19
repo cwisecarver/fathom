@@ -171,11 +171,12 @@ defmodule Fathom.MixProject do
       # so the path dep can never be committed by accident:
       #     FILO_PATH=../filo mix test
       {:filo, filo_dep()},
-      # In-process Hrana WebSocket *client*, dev/test only — the loopback client the
-      # wire benches use to exercise the full Filo.Socket path (Phase 1,
-      # docs/tpc-benchmark-plan.md). `mint` + `castore` are already transitive (Finch/Req),
-      # so this adds only the thin WS layer, and never ships in a prod release.
-      {:mint_web_socket, "~> 1.0", only: [:dev, :test]},
+      # In-process Hrana WebSocket *client* — the loopback client the wire benches use to exercise
+      # the full Filo.Socket path (Phase 1, docs/tpc-benchmark-plan.md). `mint` + `castore` are
+      # already transitive (Finch/Req), so this adds only the thin WS layer. NOT dev/test-only any
+      # more (expert review 2026-10-19 #12, user-approved): the prod-compiled bench gate runs
+      # `hrana_ws_rt_us` through `Fathom.Bench.HranaClient`, the path django-libsql uses.
+      {:mint_web_socket, "~> 1.0"},
       # Dialyzer. `:test` is required as well as `:dev`, not optional: `precommit` runs in :test
       # (see `cli/0`), so a :dev-only dep would leave `mix dialyzer` unavailable in the exact env
       # the gate will run in. `runtime: false` keeps it out of every release — the prod images

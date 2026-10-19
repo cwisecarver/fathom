@@ -167,6 +167,9 @@ defmodule Fathom.Bench.Gate do
     # If-Match PUT against a loopback stub. Exposes the per-request Req `finch:` deprecation warn.
     {:s3_loopback_op_us, :higher_worse, :watch},
     {:s3_loopback_put_us, :higher_worse, :watch},
+    # The WebSocket round trip, django-libsql's path (expert review 2026-10-19 #12); every other
+    # wire metric is HTTP. Needs mint_web_socket, now a prod-compiled dep. Watch-only.
+    {:hrana_ws_rt_us, :higher_worse, :watch},
     # THE TAIL, gated from 2026-08-03 (expert review #41.5). Every metric above is a p50, and
     # `delta/4` is a pure ratio — which AGENTS.md forbids in as many words ("Assert an absolute
     # floor, not only a ratio… The ratio holds while throughput collapses"). A change that leaves
