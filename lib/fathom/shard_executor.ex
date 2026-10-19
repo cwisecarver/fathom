@@ -111,11 +111,15 @@ defmodule Fathom.ShardExecutor do
         # `reuse` is `:open` unless connection pooling handed back a warm handle for this scope
         # (docs/pooling-spike-plan.md); `obtain_conn/3` resets a reused one and falls back to a fresh
         # open if it will not reset cleanly, so a request never serves on a half-reset handle.
-        case obtain_conn(reuse, path, scope, open_opts(shard_id, scope)) do
+        # The template check casts the configured template id; resolve it ONCE for both the open
+        # options and the stream options (expert review 2026-10-19 #22).
+        template? = template?(shard_id)
+
+        case obtain_conn(reuse, path, scope, open_opts(scope, template?)) do
           {:ok, conn} ->
             # The scope rides the handle so execute/2 can enforce read-only across baton-resumes
             # and every stream on the connection.
-            {:ok, {pid, ref, conn, shard_id, scope, token_version, stream_opts(shard_id)}}
+            {:ok, {pid, ref, conn, shard_id, scope, token_version, stream_opts(template?)}}
 
           {:error, reason} ->
             Shard.checkin(pid, ref)
@@ -164,11 +168,11 @@ defmodule Fathom.ShardExecutor do
   # `user_version` assignment — the text gate (`user_version_write?/1`) only fires when the
   # statement starts with "pragma". Resolved once at open, like `stream_opts/1`; a pooled handle
   # keeps its open-time value (the guard is set-once per connection).
-  defp open_opts(shard_id, scope) do
+  defp open_opts(scope, template?) do
     [
       tenant?: true,
       scope: scope,
-      block_user_version?: block_tenant_ddl?() and not template?(shard_id)
+      block_user_version?: block_tenant_ddl?() and not template?
     ]
   end
 
@@ -1438,8 +1442,8 @@ defmodule Fathom.ShardExecutor do
   # operator config — a stream seeing a consistent value for its lifetime is the correct
   # semantic (the DDL guard / template identity never flip mid-stream), and every existing
   # test configures them before opening.
-  defp stream_opts(shard_id) do
-    %{template?: template?(shard_id), block_ddl?: block_tenant_ddl?()}
+  defp stream_opts(template?) do
+    %{template?: template?, block_ddl?: block_tenant_ddl?()}
   end
 
   # `shard_id` here is already canonical (normalized in open/1), so normalize the configured
@@ -1715,7 +1719,11 @@ defmodule Fathom.ShardExecutor do
     end
   end
 
-  defp ip?(host), do: host =~ ~r/^\d+\.\d+\.\d+\.\d+$/
+  # A dotted-quad must start with a digit, so a name host never reaches the regex (expert review
+  # 2026-10-19 #22): probe, 426 ns -> 6 ns per call on "acme.fathom.example"; an IP host still pays
+  # the regex (477 ns), as before. Same verdict for every input.
+  defp ip?(<<c, _::binary>> = host) when c in ?0..?9, do: host =~ ~r/^\d+\.\d+\.\d+\.\d+$/
+  defp ip?(_host), do: false
 
   # A read-only statement (SELECT / read PRAGMA) returns columns but mutates nothing → report no
   # affected rows / rowid (SQLite otherwise leaks the previous write's counters). But an

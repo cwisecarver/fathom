@@ -122,6 +122,14 @@ defmodule Fathom.ShardExecutorHostRoutingTest do
     "10.0.0.1.",
     "a.10.0.0.1",
     "999.1.1.1",
+    # Digit-leading hosts that are NOT dotted quads: `ip?/1` now skips its regex for any host not
+    # starting with a digit (expert review 2026-10-19 #22), so the digit-leading side must still
+    # agree with the previous implementation.
+    "42acme.fathom.example",
+    "1.2.3.example",
+    "1.2.3",
+    "1.2.3.4.5",
+    "1.2.3.4x",
     ".fathom.example",
     "..fathom.example",
     "acme..fathom.example",

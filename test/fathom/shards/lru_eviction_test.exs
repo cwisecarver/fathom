@@ -43,6 +43,15 @@ defmodule Fathom.Shards.LruEvictionTest do
   # bound — while the ghost behaviour itself gets its own test below, against the real registry.
   defp all_live, do: fn _id -> true end
 
+  # Ages a BUSY shard's current stamp past the Lru's 1 s granularity window — the state a stream
+  # held longer than the window produces — without sleeping. Busy shards have no order key, so only
+  # the authority row moves.
+  defp backdate(id) do
+    [{^id, stamp}] = :ets.lookup(Fathom.Shards.Lru, id)
+    old = stamp - System.convert_time_unit(2, :second, :native)
+    true = :ets.insert(Fathom.Shards.Lru, {id, old})
+  end
+
   defp uniq, do: "lru_#{System.unique_integer([:positive])}"
 
   # The Lru is keyed by shard id, and `open_idle/1` hands back a pid. Read the id back out of the
@@ -289,6 +298,54 @@ defmodule Fathom.Shards.LruEvictionTest do
       assert Lru.lru_order(10, all_live()) == ["warm", "later"]
     end
 
+    # Expert review 2026-10-19 #5. Every release edge used to delete the shard's order key and insert
+    # a FRESH `System.monotonic_time` key — by construction the right-most slot of the ordered_set,
+    # so every coordinator on the node wrote the same CA-tree slot (218 us/op at 18 writers against
+    # 0.16 us alone; pinned checkout+checkin at ~150k/s with the Lru on vs ~850k/s off). Inside the
+    # granularity window the release now re-inserts the key at the shard's EXISTING stamp. Pre-fix,
+    # the stamp assertion fails: the release re-stamped.
+    test "a release inside the granularity window re-inserts at the existing stamp (2026-10-19 #5)" do
+      Application.put_env(:fathom, :max_open_shards, 100)
+      Lru.reset()
+
+      Lru.record_conns("a", 1)
+      Lru.record_conns("a", 0)
+      [{"a", stamp}] = :ets.lookup(Fathom.Shards.Lru, "a")
+
+      for _ <- 1..50 do
+        Lru.record_conns("a", 1)
+        refute "a" in Lru.lru_order(10, all_live()), "a busy shard must be out of the walk (#29)"
+        Lru.record_conns("a", 0)
+      end
+
+      assert [{"a", ^stamp}] = :ets.lookup(Fathom.Shards.Lru, "a"),
+             "a release inside the window re-stamped — the right-most-slot write being avoided"
+
+      assert :ets.lookup(Fathom.Shards.Lru.Order, {stamp, "a"}) == [{{stamp, "a"}}],
+             "the idle shard must be back in the order table at its existing stamp"
+
+      assert Lru.lru_order(10, all_live()) == ["a"]
+      assert :ets.info(Fathom.Shards.Lru.Order, :size) == 1
+    end
+
+    # The other side of the window: a stream held longer than it re-stamps at release, so a shard
+    # released after a younger one sorts AFTER it (LRU recency is by release, not by checkout).
+    test "a release past the granularity window re-stamps at the release time (2026-10-19 #5)" do
+      Application.put_env(:fathom, :max_open_shards, 100)
+      Lru.reset()
+
+      Lru.record_conns("long", 1)
+      Lru.record_conns("long", 0)
+      Lru.record_conns("long", 1)
+      Lru.record_conns("short", 1)
+      Lru.record_conns("short", 0)
+      backdate("long")
+      Lru.record_conns("long", 0)
+
+      assert Lru.lru_order(10, all_live()) == ["short", "long"]
+      assert :ets.info(Fathom.Shards.Lru.Order, :size) == 2
+    end
+
     test "touch is a no-op when eviction is unreachable (no finite cap)" do
       Application.put_env(:fathom, :max_open_shards, :infinity)
       Lru.reset()
@@ -354,6 +411,12 @@ defmodule Fathom.Shards.LruEvictionTest do
       assert :ets.info(Fathom.Shards.Lru.Order, :size) == 16
 
       # Release re-inserts the shard at the RELEASE stamp: it is now the warmest candidate.
+      #
+      # Back-dated past the granularity window first (expert review 2026-10-19 #5). This used to run
+      # inside the window — the whole test takes well under a second — and a release that young now
+      # re-inserts at its EXISTING stamp instead of writing the ordered_set's right-most slot. A
+      # stream held longer than the window, which is what this asserts about, still re-stamps.
+      backdate("busy1")
       Lru.record_conns("busy1", 0)
       assert List.last(Lru.lru_order(100, all_live())) == "busy1"
 

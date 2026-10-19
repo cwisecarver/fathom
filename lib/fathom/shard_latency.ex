@@ -19,11 +19,12 @@ defmodule Fathom.ShardLatency do
 
   ## Representation
 
-  Each row is `{shard_id, b0, b1, …}` — a fixed **µs log-scale histogram** whose edges mirror
-  the node-wide `fathom_shard_query_duration` buckets (×1000 for µs, plus a `0` floor), so a
-  per-shard p99 lines up with the hero chart's node-wide p99. `record/2` bumps one bucket with
-  a single lock-free `:ets.update_counter` (per-shard key — no cross-shard contention, no process
-  hop), the same hot-path class as `ShardLoad.record_query`.
+  Each shard has a fixed **µs log-scale histogram** whose edges mirror the node-wide
+  `fathom_shard_query_duration` buckets (×1000 for µs, plus a `0` floor), so a per-shard p99 lines
+  up with the hero chart's node-wide p99. The row is `{shard_id, counters_ref}`, one `:counters`
+  slot per bucket, and `record/2` bumps one slot after an ETS READ of the ref — no ETS write per
+  sample, so the streams of one hot shard do not serialise on its key lock (expert review
+  2026-10-19 #5; the measurement is in `Fathom.ShardLoad`'s moduledoc, the same hot-path class).
   Percentiles are computed **on read** by `Fathom.Rebalancer.Stats.percentile_from_histogram/3`
   (shared with the fleet q/s histogram, given these µs `edges/0`).
 
@@ -64,8 +65,7 @@ defmodule Fathom.ShardLatency do
   ]
 
   @bucket_count length(@edges_us)
-  # ETS position of bucket i is 2 + i (position 1 is the shard_id key). An all-zero seed row.
-  @empty_row List.to_tuple([nil | List.duplicate(0, @bucket_count)])
+  # `:counters` index of bucket i is 1 + i.
   @zero_hist List.duplicate(0, @bucket_count)
 
   @doc false
@@ -77,24 +77,49 @@ defmodule Fathom.ShardLatency do
 
   @doc """
   Records one query's latency (a `System.monotonic_time/0` diff, native units) against
-  `shard_id`. Converts to µs, picks the log-bucket, and bumps it with a single lock-free
-  `:ets.update_counter`. A no-op when disabled or before the table is up.
+  `shard_id`. Converts to µs, picks the log-bucket, and bumps its slot in the shard's `:counters`
+  block. A no-op when disabled or before the table is up.
   """
   @spec record(String.t(), integer()) :: :ok
   def record(shard_id, dt_native) do
     if enabled?() do
-      us = System.convert_time_unit(dt_native, :native, :microsecond)
-      pos = 2 + bucket_index(us)
-      :ets.update_counter(@table, shard_id, {pos, 1}, default_row(shard_id))
+      case block(shard_id) do
+        nil ->
+          :ok
+
+        ref ->
+          us = System.convert_time_unit(dt_native, :native, :microsecond)
+          :counters.add(ref, 1 + bucket_index(us), 1)
+      end
     end
 
     :ok
-  rescue
-    # Table not up yet (boot/teardown) — a dropped sample is harmless.
-    ArgumentError -> :ok
   end
 
-  defp default_row(shard_id), do: put_elem(@empty_row, 0, shard_id)
+  # The shard's histogram block — an ETS READ once it exists; created on first touch with
+  # `insert_new` so racing first samples agree on one block (the `Fathom.ShardLoad` pattern).
+  # `nil` when the table is not up (boot/teardown) — a dropped sample is harmless.
+  defp block(shard_id) do
+    case :ets.lookup(@table, shard_id) do
+      [{_, ref}] -> ref
+      [] -> create_block(shard_id)
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp create_block(shard_id) do
+    ref = :counters.new(@bucket_count, [])
+
+    if :ets.insert_new(@table, {shard_id, ref}) do
+      ref
+    else
+      case :ets.lookup(@table, shard_id) do
+        [{_, winner}] -> winner
+        [] -> ref
+      end
+    end
+  end
 
   # The largest bucket index whose lower edge is ≤ us (µs ≥ last edge land in the overflow
   # bucket). Mirrors Fathom.Rebalancer.Stats.bucket_index/1 exactly.
@@ -117,7 +142,7 @@ defmodule Fathom.ShardLatency do
   @spec histogram(String.t()) :: [non_neg_integer()]
   def histogram(shard_id) do
     case :ets.lookup(@table, shard_id) do
-      [row] -> row |> Tuple.to_list() |> tl()
+      [{_, ref}] -> for i <- 1..@bucket_count, do: :counters.get(ref, i)
       [] -> @zero_hist
     end
   rescue
@@ -163,8 +188,8 @@ defmodule Fathom.ShardLatency do
 
   @impl true
   def init(_opts) do
-    # Same shape as Fathom.ShardLoad: many executing processes bump concurrently, each on its
-    # own shard key; readers (the collector) are off the hot path.
+    # Same shape as Fathom.ShardLoad: the hot path only READS a shard's row (its counter block);
+    # the one write per shard is its first touch. Readers (the collector) are off the hot path.
     #
     # NO `decentralized_counters` — see the measurement recorded in `Fathom.Shard.WriteCounter`
     # (expert review 2026-08-26 #41). It decentralises the TABLE'S internal counters, not user

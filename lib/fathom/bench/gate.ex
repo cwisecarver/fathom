@@ -114,6 +114,11 @@ defmodule Fathom.Bench.Gate do
     # throughput, which a spread measurement averages away.
     {:concurrent_checkout_per_s, :lower_worse},
     {:same_shard_checkout_per_s, :lower_worse},
+    # HOT-SHARD CONTENTION, WATCH-ONLY until a band is measured (expert review 2026-10-19 #5): many
+    # streams' statements on ONE shard (the per-statement counter keys) and one worker per shard so
+    # every checkin is a 1 -> 0 Lru edge (the recency ordered_set's right-most slot).
+    {:same_shard_stmt_per_s, :lower_worse, :watch},
+    {:serial_checkout_per_s, :lower_worse, :watch},
     # The wire, gated from 2026-07-31. Before this the gate ran no Filo code at all, which is
     # how a 200x regression in row encoding stayed invisible: every other metric is SQLite,
     # storage, Postgres or BEAM memory. `hrana_rt_us` covers per-REQUEST overhead;

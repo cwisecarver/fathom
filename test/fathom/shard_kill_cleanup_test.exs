@@ -205,8 +205,9 @@ defmodule Fathom.ShardKillCleanupTest do
   # stop of the same shard clears it. That is accepted rather than fixed, and the reasoning is
   # recorded here so it stays a decision instead of drifting back into an oversight:
   #
-  #   * The blast radius is genuinely small. A stale row is a 5-tuple in `ShardLoad` and a
-  #     15-bucket histogram row in `ShardLatency`, bounded by the shards this node has ever opened.
+  #   * The blast radius is genuinely small. A stale row is a 4-slot `:counters` block in
+  #     `ShardLoad` and a 14-bucket one in `ShardLatency` (rows hold refs since expert review
+  #     2026-10-19 #5), bounded by the shards this node has ever opened.
   #   * The consumer that matters is unaffected. `Rebalancer.Reporter` DIFFS two snapshots, so a
   #     frozen row contributes a rate of zero. What degrades is `snapshot/0` / `top/2` — the admin
   #     "which shards are hot" page listing a dead shard — and cumulative counters resuming from a

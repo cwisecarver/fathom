@@ -2880,8 +2880,12 @@ defmodule Fathom.Shard do
     # Update the busy count and re-stamp recency (#14): a just-released shard was recently used, so it
     # should not read as the LRU-coldest, and its lowered count lets the eviction probe consider it.
     # The count only on the 1 -> 0 EDGE, the one change `Lru.busy?/1` can observe (perf #34).
+    #
+    # No `Lru.touch/1` after it any more (expert review 2026-10-19 #5): on the edge,
+    # `record_conns(_, 0)` has just stamped the shard, so the touch was a redundant lookup; on a
+    # release that leaves the shard BUSY it could only no-op (busy) or, on a shard never yet stamped,
+    # insert an order key for a busy shard that the eviction walk then had to delete.
     if map_size(conns) == 0, do: Fathom.Shards.Lru.record_conns(state.id, 0)
-    Fathom.Shards.Lru.touch(state.id)
 
     cond do
       map_size(conns) > 0 ->

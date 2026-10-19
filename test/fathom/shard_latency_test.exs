@@ -103,6 +103,19 @@ defmodule Fathom.ShardLatencyTest do
     assert ShardLatency.percentiles_from_histogram(windowed).p99_ms < 5.0
   end
 
+  # Expert review 2026-10-19 #5 — the ShardLoad pattern: a sample reads the row and bumps the
+  # shard's `:counters` block, never an ETS write under the hot shard's key lock.
+  test "a sample never rewrites the shard's row (2026-10-19 #5)" do
+    ShardLatency.record("r", native_us(50))
+    [row] = :ets.lookup(ShardLatency, "r")
+
+    for _ <- 1..1_000, do: ShardLatency.record("r", native_us(1500))
+
+    assert :ets.lookup(ShardLatency, "r") == [row], "a sample rewrote the stored row"
+    hist = ShardLatency.histogram("r")
+    assert Enum.at(hist, 0) == 1 and Enum.at(hist, 3) == 1_000 and Enum.sum(hist) == 1_001
+  end
+
   test "forget drops a shard's histogram" do
     ShardLatency.record("gone", native_us(1000))
     assert Enum.sum(ShardLatency.histogram("gone")) == 1

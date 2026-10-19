@@ -151,7 +151,7 @@ defmodule Fathom.Shards do
     with :ok <- maybe_lazy_migrate(shard_id),
          {:ok, pid} <- do_ensure(shard_id, true, attempts < 3),
          {:ok, ref, path, reuse} <- pid |> grant(scope) |> note_held(shard_id) do
-      record_use(shard_id)
+      record_use(shard_id, pid)
       # Per-shard load: the checkout (traffic) signal for the rebalancer. Lock-free
       # ETS bump, gated + off by default (see Fathom.ShardLoad).
       Fathom.ShardLoad.record_checkout(shard_id)
@@ -642,9 +642,13 @@ defmodule Fathom.Shards do
   # path: a lock-free ETS buffer write that `Fathom.Directory.Recorder` coalesces
   # and batch-flushes. Gated by config; the data path never blocks on or fails
   # because of the directory, so a Postgres outage just means a missed touch.
-  defp record_use(shard_id) do
+  #
+  # The coordinator pid is the Recorder's coalescing key (expert review 2026-10-19 #5): a hot
+  # shard's checkouts from one coordinator incarnation collapse to ~one buffer write per second,
+  # while the first touch from a NEW incarnation (e.g. after a cutover) always lands.
+  defp record_use(shard_id, coordinator) do
     if Application.get_env(:fathom, :directory_touch, true) do
-      Fathom.Directory.Recorder.record(shard_id)
+      Fathom.Directory.Recorder.record(shard_id, coordinator)
     end
 
     :ok

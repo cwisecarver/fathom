@@ -98,7 +98,9 @@ defmodule Mix.Tasks.Fathom.Bench do
     :flush_codec,
     :pull_decode,
     :s3_loopback,
-    :hrana_ws
+    :hrana_ws,
+    :same_shard_stmt,
+    :serial_checkout
   ]
 
   @doc false
@@ -280,6 +282,10 @@ defmodule Mix.Tasks.Fathom.Bench do
        "\u00b5s   (S3 conditional flush PUT via the real Finch pool, loopback stub; watch-only)"},
       {"hrana_ws_rt_us", metrics.hrana_ws_rt_us,
        "\u00b5s   (Hrana round trip over the WEBSOCKET path, warm stream; watch-only)"},
+      {"same_shard_stmt_per_s", metrics.same_shard_stmt_per_s,
+       "stmt/s (point SELECT, schedulers streams on ONE shard, shard_load on; watch-only)"},
+      {"serial_checkout_per_s", metrics.serial_checkout_per_s,
+       "ops/s  (checkout+checkin, one worker per shard: every checkin a 1->0 edge; watch-only)"},
       {"wire_rows_per_s", metrics.wire_rows_per_s,
        "rows/s (result-set encode over the wire, keystone rows)"},
       {"wire_encode_rows_per_s", metrics.wire_encode_rows_per_s,

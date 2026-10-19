@@ -12,15 +12,30 @@ defmodule Fathom.ShardLoad do
   A hot shard serves thousands of queries a second. Recording load by sending the
   `Fathom.Shard` coordinator a message per query would turn it into a mailbox
   bottleneck — the same trap `Fathom.Directory.Recorder` avoids for directory
-  writes. So load is a **public ETS table** bumped **lock-free from the executing
-  process** (`:ets.update_counter` with `write_concurrency`): different shards hit
-  different key locks, so there's no contention across shards, and no process hop.
+  writes. So load lives in **public ETS** and is bumped **lock-free from the executing
+  process** (a per-shard `:counters` block, below): no contention across shards, none between
+  the streams of one shard, and no process hop.
 
-  Each row is `{shard_id, checkouts, queries, rows_read, rows_written}`, cumulative
+  Each shard's counters are `{checkouts, queries, rows_read, rows_written}`, cumulative
   since the shard's coordinator opened (`Fathom.Shard.terminate` calls `forget/1` so a
   stopped shard's row doesn't leak). `rows_read`/`rows_written` are the query **cost**
   dimension — a shard doing a few big scans is hotter than one doing many trivial
   point reads.
+
+  ## One `:counters` block per shard, not an `update_counter` per sample
+
+  The row is `{shard_id, counters_ref}` (expert review 2026-10-19 #5). The executing process looks
+  the ref up — an ETS READ on a `read_concurrency` table — and bumps a plain `:counters` array.
+  The old row held the integers themselves and every sample was an `:ets.update_counter`, a WRITE
+  under the key's lock: fine across shards, but every stream of ONE hot shard took the same lock.
+  Probe, record_query + ShardLatency.record on one key with ~50 reductions of work between:
+  0.63 us/op alone, 7.5 at 4 workers, 32 at 8, 159 at 18. The `:counters` form: 0.31 / 0.66 /
+  0.8 / 1.4. `:write_concurrency` counters were flatter still but cost 3.7 KB per shard (one
+  cache-line-padded array per scheduler) against 184 B — a density cost at 30k resident shards.
+
+  The first sample for a shard creates its block with `:ets.insert_new`, so racing first-touches
+  converge on one block; a sample racing `forget/1` can land in a block that is already gone, which
+  drops it (the same "a dropped sample is harmless" contract as before).
 
   ## Reading it
 
@@ -42,13 +57,12 @@ defmodule Fathom.ShardLoad do
 
   @table __MODULE__
 
-  # Row layout: {shard_id, checkouts, queries, rows_read, rows_written}. Positions
-  # for :ets.update_counter (1 is the key).
-  @pos_checkouts 2
-  @pos_queries 3
-  @pos_rows_read 4
-  @pos_rows_written 5
-  @empty {nil, 0, 0, 0, 0}
+  # Row layout: {shard_id, counters_ref}. Counter indices within the block.
+  @ix_checkouts 1
+  @ix_queries 2
+  @ix_rows_read 3
+  @ix_rows_written 4
+  @slots 4
 
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -63,7 +77,13 @@ defmodule Fathom.ShardLoad do
   """
   @spec record_checkout(String.t()) :: :ok
   def record_checkout(shard_id) do
-    if enabled?(), do: bump(shard_id, {@pos_checkouts, 1})
+    if enabled?() do
+      case block(shard_id) do
+        nil -> :ok
+        ref -> :counters.add(ref, @ix_checkouts, 1)
+      end
+    end
+
     :ok
   end
 
@@ -74,27 +94,55 @@ defmodule Fathom.ShardLoad do
   @spec record_query(String.t(), non_neg_integer(), non_neg_integer()) :: :ok
   def record_query(shard_id, rows_read, rows_written) do
     if enabled?() do
-      bump(shard_id, [
-        {@pos_queries, 1},
-        {@pos_rows_read, rows_read},
-        {@pos_rows_written, rows_written}
-      ])
+      case block(shard_id) do
+        nil ->
+          :ok
+
+        ref ->
+          :counters.add(ref, @ix_queries, 1)
+          :counters.add(ref, @ix_rows_read, rows_read)
+          :counters.add(ref, @ix_rows_written, rows_written)
+      end
     end
 
     :ok
   end
 
-  # The single ETS write. `default_row/1` is inserted first if the shard has no row
-  # yet, then the op is applied — so first-touch and increment are one atomic call.
-  defp bump(shard_id, op) do
-    :ets.update_counter(@table, shard_id, op, default_row(shard_id))
-    :ok
+  # The shard's counter block: an ETS READ on the hot path, never a write once the block exists.
+  # `nil` when the table is not up (boot/teardown) — a dropped sample is harmless.
+  defp block(shard_id) do
+    case :ets.lookup(@table, shard_id) do
+      [{_, ref}] -> ref
+      [] -> create_block(shard_id)
+    end
   rescue
-    # Table not up yet (boot/teardown) — a dropped sample is harmless.
-    ArgumentError -> :ok
+    ArgumentError -> nil
   end
 
-  defp default_row(shard_id), do: put_elem(@empty, 0, shard_id)
+  # First touch. `insert_new` makes racing first-touches agree on ONE block: the loser re-reads the
+  # winner's. A `forget/1` between the two leaves the loser's re-read empty; it then counts into its
+  # own block, which is not in the table — a dropped sample, the documented contract.
+  defp create_block(shard_id) do
+    ref = :counters.new(@slots, [])
+
+    if :ets.insert_new(@table, {shard_id, ref}) do
+      ref
+    else
+      case :ets.lookup(@table, shard_id) do
+        [{_, winner}] -> winner
+        [] -> ref
+      end
+    end
+  end
+
+  # A stored row in the read API's tuple shape, `{shard_id, checkouts, queries, rows_read,
+  # rows_written}` — what `snapshot_tuples/0`'s callers (the Rebalancer.Reporter, the
+  # MetricsCollector) destructure. Each counter is read separately, so a row read concurrently with
+  # a sample is not one atomic snapshot; for rates diffed over a window that is immaterial.
+  defp to_tuple({shard_id, ref}) do
+    {shard_id, :counters.get(ref, @ix_checkouts), :counters.get(ref, @ix_queries),
+     :counters.get(ref, @ix_rows_read), :counters.get(ref, @ix_rows_written)}
+  end
 
   @doc "Drops `shard_id`'s row — called from `Fathom.Shard.terminate` so stopped shards don't leak."
   @spec forget(String.t()) :: :ok
@@ -109,7 +157,7 @@ defmodule Fathom.ShardLoad do
   @spec get(String.t()) :: map() | nil
   def get(shard_id) do
     case :ets.lookup(@table, shard_id) do
-      [row] -> to_map(row)
+      [row] -> row |> to_tuple() |> to_map()
       [] -> nil
     end
   rescue
@@ -119,7 +167,7 @@ defmodule Fathom.ShardLoad do
   @doc "Every shard's load counters on this node (unordered)."
   @spec snapshot() :: [map()]
   def snapshot do
-    @table |> :ets.tab2list() |> Enum.map(&to_map/1)
+    @table |> :ets.tab2list() |> Enum.map(&(&1 |> to_tuple() |> to_map()))
   rescue
     ArgumentError -> []
   end
@@ -132,7 +180,7 @@ defmodule Fathom.ShardLoad do
   @doc false
   @spec snapshot_tuples() :: [tuple()]
   def snapshot_tuples do
-    :ets.tab2list(@table)
+    @table |> :ets.tab2list() |> Enum.map(&to_tuple/1)
   rescue
     ArgumentError -> []
   end
@@ -154,7 +202,10 @@ defmodule Fathom.ShardLoad do
 
     @table
     |> :ets.tab2list()
-    |> Enum.reduce([], fn row, heap -> keep_top(heap, n, elem(row, idx), row) end)
+    |> Enum.reduce([], fn stored, heap ->
+      row = to_tuple(stored)
+      keep_top(heap, n, elem(row, idx), row)
+    end)
     |> Enum.sort_by(fn {v, _row} -> v end, :desc)
     |> Enum.map(fn {_v, row} -> to_map(row) end)
   rescue
@@ -198,8 +249,9 @@ defmodule Fathom.ShardLoad do
 
   @impl true
   def init(_opts) do
-    # public + write_concurrency: many executing/checkout processes bump concurrently,
-    # each on its own shard key; readers (the control plane) are off the hot path.
+    # public + read_concurrency: the hot path only READS a shard's row (its counter block, expert
+    # review 2026-10-19 #5); the one write per shard is the first touch. write_concurrency stays
+    # for that insert and for forget/1. Readers (the control plane) are off the hot path.
     # NO `decentralized_counters` — it does not do what a reader (and this comment, until expert
     # review 2026-08-26 #41) assumed. The option decentralises the TABLE'S OWN internal counters
     # (what `:ets.info(tab, :size)` and `:memory` read), NOT user counter values, and its
