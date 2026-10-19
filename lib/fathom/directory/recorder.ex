@@ -9,8 +9,10 @@ defmodule Fathom.Directory.Recorder do
 
   This GenServer replaces that with a coalescing, batched, fire-and-forget buffer:
 
-    * `record/1` is a single lock-free `:ets.insert` (microseconds, no Postgres,
-      no GenServer mailbox). A shard hit 1000×/s collapses to one buffered row.
+    * `record/2` is a lock-free ETS write (microseconds, no Postgres, no GenServer
+      mailbox) — and, for a touch from the coordinator that wrote the buffered row less
+      than a second ago, only a read (expert review 2026-10-19 #5). A shard hit 1000×/s
+      collapses to one buffered row.
     * a periodic flush (default 1s) drains the buffer and batch-upserts every
       touched shard in one chunked `Repo.insert_all` (see
       `Fathom.Directory.record_batch/1`).
@@ -30,6 +32,12 @@ defmodule Fathom.Directory.Recorder do
   # write). Read lock-free by `stats/0` for the admin Node-health strip (expert review 2026-10-15
   # #17).
   @meta_table Module.concat(__MODULE__, Meta)
+  # `{shard_id, coordinator_pid}` of the buffered touch — the coalescing key of `record/2` (expert
+  # review 2026-10-19 #5). Deleted when the touch is drained; a missing or stale row only costs a
+  # touch its coalescing, never its stamp.
+  @owner_table Module.concat(__MODULE__, Owners)
+  # A touch within this window of a buffered one from the same coordinator only reads (`record/2`).
+  @coalesce_us 1_000_000
   @default_flush_ms 1_000
 
   @doc false
@@ -42,9 +50,62 @@ defmodule Fathom.Directory.Recorder do
   Buffers a shard access for the next flush. Lock-free ETS write; returns `:ok`
   without ever touching Postgres. Safe to call before the recorder is up (a
   missed touch never breaks serving) — the access is simply dropped.
+
+  `coordinator` is the pid of the shard coordinator that granted the checkout; with it, a touch
+  inside the coalescing window of a buffered one from the same coordinator is a read, not a write
+  (see the body). `nil` always buffers.
   """
-  @spec record(String.t()) :: :ok
-  def record(shard_id) do
+  @spec record(String.t(), pid() | nil) :: :ok
+  def record(shard_id, coordinator \\ nil) do
+    now = System.os_time(:microsecond)
+
+    # COALESCED for a known coordinator (expert review 2026-10-19 #5). Every checkout of a shard
+    # inserted the SAME key, so one hot shard's streams convoyed on its lock: a probe measured
+    # 143 us per insert at 18 concurrent callers (1.0 alone), and same-shard checkout+checkin at 72
+    # workers swung between 124k and 603k/s with this on against a steady ~608k/s off. A touch now
+    # only READS when the buffer already holds one from the last `@coalesce_us`.
+    #
+    # NOT a plain "skip if fresh": `last_active_at` must stay exact at two edges (see
+    # `Fathom.Directory.record_batch/1`), and a skip that keeps an OLDER buffered stamp can lose
+    # the first touch past either of them:
+    #
+    #   * a CUTOVER — the revert write-age guard refuses on `last_active_at > cutover_at`, so a
+    #     dropped post-cutover touch lets a revert discard post-cutover writes. A migration holds
+    #     the S3 lease, so the shard's coordinator must stop first: every touch after a cutover
+    #     comes from a NEW coordinator pid. The skip requires the buffered touch to be from the
+    #     SAME coordinator (`@owner_table`), so the first touch of a new incarnation always lands.
+    #   * a FLUSH — the loss report calls a shard dirty on `last_active_at > last_flushed_at`. The
+    #     skip also requires NO buffered flush row for the shard, and the joint drain takes a
+    #     shard's touch BEFORE its flush row (`take_joint/1`), so from the moment `record_flush/1`
+    #     buffers a stamp until both are written, every touch inserts its own stamp.
+    #
+    # Inside one incarnation, between flushes, `last_active_at` may trail by up to `@coalesce_us`,
+    # far finer than the 30 s write granularity downstream. `coordinator: nil` never coalesces.
+    if coalesced?(shard_id, coordinator, now) do
+      :ok
+    else
+      buffer_touch(shard_id, coordinator, now)
+    end
+  rescue
+    # Table not up yet (boot/teardown). Best-effort: a dropped touch is harmless,
+    # the next checkout re-records.
+    ArgumentError -> :ok
+  end
+
+  defp coalesced?(_shard_id, nil, _now), do: false
+
+  defp coalesced?(shard_id, coordinator, now) do
+    case :ets.lookup(@table, shard_id) do
+      [{_, at}] when now - at < @coalesce_us and now >= at ->
+        :ets.lookup(@owner_table, shard_id) == [{shard_id, coordinator}] and
+          not :ets.member(@flush_table, shard_id)
+
+      _ ->
+        false
+    end
+  end
+
+  defp buffer_touch(shard_id, coordinator, now) do
     # A bare integer (µs — the schema's :utc_datetime_usec precision), not DateTime.utc_now():
     # the buffer only needs an ordering timestamp, and the calendar conversion + 9-field
     # struct allocation ran on EVERY checkout (review 2026-07-23 #24). The flush converts once
@@ -68,12 +129,9 @@ defmodule Fathom.Directory.Recorder do
     # Since expert review 2026-10-12 #8 `cutover_at` is on the POSTGRES clock and the flush rebases
     # these stamps onto it by an offset sampled with `System.os_time` (`do_flush/2`). This stamp and
     # that sample must still be the same clock, or the offset carries the slew above.
-    :ets.insert(@table, {shard_id, System.os_time(:microsecond)})
+    :ets.insert(@table, {shard_id, now})
+    if coordinator, do: :ets.insert(@owner_table, {shard_id, coordinator})
     :ok
-  rescue
-    # Table not up yet (boot/teardown). Best-effort: a dropped touch is harmless,
-    # the next checkout re-records.
-    ArgumentError -> :ok
   end
 
   @doc """
@@ -125,9 +183,34 @@ defmodule Fathom.Directory.Recorder do
 
     # public + write_concurrency: many checkout processes insert concurrently;
     # the recorder is the only reader (during flush).
-    :ets.new(@table, [:set, :public, :named_table, write_concurrency: true])
+    #
+    # read_concurrency since expert review 2026-10-19 #5: a coalesced `record/2` only READS these,
+    # and the writes drop to about one per shard per second.
+    :ets.new(@table, [
+      :set,
+      :public,
+      :named_table,
+      write_concurrency: true,
+      read_concurrency: true
+    ])
+
     # Parallel buffer for durable-flush times (#28), same coalesce/batch shape.
-    :ets.new(@flush_table, [:set, :public, :named_table, write_concurrency: true])
+    :ets.new(@flush_table, [
+      :set,
+      :public,
+      :named_table,
+      write_concurrency: true,
+      read_concurrency: true
+    ])
+
+    :ets.new(@owner_table, [
+      :set,
+      :public,
+      :named_table,
+      write_concurrency: true,
+      read_concurrency: true
+    ])
+
     :ets.new(@meta_table, [:set, :public, :named_table])
     note_flush_ok()
 
@@ -361,13 +444,11 @@ defmodule Fathom.Directory.Recorder do
     if past?(deadline) do
       acc
     else
-      case drain_chunk(@flush_table) do
-        [] ->
+      case take_joint(@drain_chunk) do
+        {[], []} ->
           acc
 
-        rows ->
-          {both, only} = take_touches(rows)
-
+        {both, only} ->
           case write_joint(both, offset) do
             {:ok, n} ->
               case write_flush_only(only, offset) do
@@ -385,13 +466,44 @@ defmodule Fathom.Directory.Recorder do
     end
   end
 
-  defp take_touches(rows) do
-    Enum.reduce(rows, {[], []}, fn {id, flushed_us} = row, {both, only} ->
-      case :ets.take(@table, id) do
-        [{^id, touched_us}] -> {[{id, flushed_us, touched_us} | both], only}
-        [] -> {both, [row | only]}
-      end
-    end)
+  # For each buffered flush, take the shard's touch FIRST and its flush row second (expert review
+  # 2026-10-19 #5). `record/2` coalesces only while no flush row is buffered, so taking the flush row
+  # first opened a gap — flush row gone, touch still buffered — in which a post-flush touch was
+  # coalesced into the PRE-flush stamp and the loss report then called the shard clean. Touch-first,
+  # a touch in that gap finds no touch row and buffers its own.
+  defp take_joint(limit) do
+    case :ets.select(@flush_table, [{{:"$1", :_}, [], [:"$1"]}], limit) do
+      {ids, _cont} -> Enum.reduce(ids, {[], []}, &take_pair/2)
+      :"$end_of_table" -> {[], []}
+    end
+  rescue
+    ArgumentError -> {[], []}
+  end
+
+  defp take_pair(id, {both, only}) do
+    touch = take_touch(id)
+
+    case {:ets.take(@flush_table, id), touch} do
+      {[{^id, flushed_us}], [{^id, touched_us}]} ->
+        {[{id, flushed_us, touched_us} | both], only}
+
+      {[{^id, _} = row], []} ->
+        {both, [row | only]}
+
+      # The flush row went between the select and the take (only a drain takes it, so this is a
+      # concurrent shutdown drain): hand the touch back for the touch-only pass.
+      {[], taken} ->
+        Enum.each(taken, &:ets.insert_new(@table, &1))
+        {both, only}
+    end
+  end
+
+  # Takes a buffered touch and its coalescing owner. Deleting the owner AFTER the take can only
+  # cost a racing touch its coalescing (it then inserts), never lose a stamp.
+  defp take_touch(id) do
+    taken = :ets.take(@table, id)
+    if taken != [], do: :ets.delete(@owner_table, id)
+    taken
   end
 
   defp write_joint([], _offset), do: {:ok, 0}
@@ -508,11 +620,14 @@ defmodule Fathom.Directory.Recorder do
   # thing that makes each row's removal atomic.
   defp drain_chunk(table) do
     case :ets.select(table, [{{:"$1", :_}, [], [:"$1"]}], @drain_chunk) do
-      {ids, _cont} -> Enum.flat_map(ids, &:ets.take(table, &1))
+      {ids, _cont} -> Enum.flat_map(ids, &take_row(table, &1))
       :"$end_of_table" -> []
     end
   rescue
     # Table gone (teardown).
     ArgumentError -> []
   end
+
+  defp take_row(@table, id), do: take_touch(id)
+  defp take_row(table, id), do: :ets.take(table, id)
 end

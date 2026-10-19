@@ -261,6 +261,81 @@ defmodule Fathom.Directory.RecorderTest do
     end
   end
 
+  # Expert review 2026-10-19 #5: every checkout inserted the shard's key, so one hot shard's
+  # streams convoyed on its lock (143 us/insert at 18 callers; same-shard checkout swung 124k-603k/s
+  # with the Recorder on). A touch from the SAME coordinator inside the window now only reads. The
+  # two edges `last_active_at` must stay exact at are pinned beside it: a new coordinator (every
+  # touch after a cutover comes from one, because the migration's lease forces a stand-down) and a
+  # buffered flush. A plain "skip if fresh" fails both edge tests.
+  describe "2026-10-19 #5 — coalescing a hot shard's touches" do
+    defp buffered(id) do
+      [{^id, at}] = :ets.lookup(Recorder, id)
+      at
+    end
+
+    defp coordinator, do: spawn(fn -> :ok end)
+
+    test "a touch from the same coordinator inside the window does not rewrite the buffer" do
+      a = uniq()
+      p = coordinator()
+
+      :ok = Recorder.record(a, p)
+      first = buffered(a)
+      for _ <- 1..100, do: :ok = Recorder.record(a, p)
+
+      assert buffered(a) == first, "a same-coordinator touch inside the window rewrote the row"
+      assert Recorder.flush() == 1
+    end
+
+    test "the first touch from a NEW coordinator always buffers its own stamp (the cutover edge)" do
+      a = uniq()
+      :ok = Recorder.record(a, coordinator())
+      first = buffered(a)
+
+      # Make the next stamp distinguishable without sleeping: back-date the buffered one by 1 ms,
+      # still well inside the window.
+      :ets.insert(Recorder, {a, first - 1_000})
+      :ok = Recorder.record(a, coordinator())
+
+      assert buffered(a) > first - 1_000,
+             "a new incarnation's touch was coalesced into the previous one's stamp — after a " <>
+               "cutover that is a dropped post-cutover touch, and the revert guard passes"
+    end
+
+    test "a touch while a flush is buffered always buffers its own stamp (the flush edge)" do
+      a = uniq()
+      p = coordinator()
+      :ok = Recorder.record(a, p)
+      :ets.insert(Recorder, {a, buffered(a) - 1_000})
+      stale = buffered(a)
+
+      :ok = Recorder.record_flush(a)
+      :ok = Recorder.record(a, p)
+
+      assert buffered(a) > stale,
+             "a post-flush touch was coalesced into the pre-flush stamp — the loss report then " <>
+               "calls a shard with post-flush checkouts clean"
+    end
+
+    test "a drained touch takes its coalescing owner with it, so nothing accumulates" do
+      a = uniq()
+      :ok = Recorder.record(a, coordinator())
+      assert [{^a, _}] = :ets.lookup(Module.concat(Recorder, Owners), a)
+
+      Recorder.flush()
+      assert :ets.lookup(Module.concat(Recorder, Owners), a) == []
+    end
+
+    test "record/1 (no coordinator) never coalesces" do
+      a = uniq()
+      :ok = Recorder.record(a)
+      :ets.insert(Recorder, {a, buffered(a) - 1_000})
+      stale = buffered(a)
+      :ok = Recorder.record(a)
+      assert buffered(a) > stale
+    end
+  end
+
   describe "#38 — the shutdown flush is budgeted and says so when it gives up" do
     # This buffer holds a `last_flushed_at` row for every shard the node just flushed, and
     # terminate/2 is the only chance to persist them. Shutdown order is
