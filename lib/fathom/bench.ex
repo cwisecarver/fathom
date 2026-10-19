@@ -110,7 +110,8 @@ defmodule Fathom.Bench do
     :flush,
     :served_repl,
     :hrana_write,
-    :hrana_open_auth
+    :hrana_open_auth,
+    :flush_codec
   ]
 
   @doc false
@@ -224,7 +225,11 @@ defmodule Fathom.Bench do
       # the open-per-request round trip with Hrana auth REQUIRED; before these the gate saw
       # neither a replicated write nor `HranaAuth.authorize/2`.
       hrana_write_rt_us: run_if(only, :hrana_write, fn -> hrana_write_rt(opts) end),
-      hrana_open_auth_rt_us: run_if(only, :hrana_open_auth, fn -> hrana_open_auth_rt(opts) end)
+      hrana_open_auth_rt_us: run_if(only, :hrana_open_auth, fn -> hrana_open_auth_rt(opts) end),
+      # WATCH-ONLY storage-IO metrics (expert review 2026-10-19 #7), each with its own scoped
+      # setup in `Fathom.Bench.StorageIO`: a ~20 MB realistic snapshot through the flush codec.
+      flush_codec_ms_per_mb:
+        run_if(only, :flush_codec, fn -> Fathom.Bench.StorageIO.flush_codec_ms_per_mb(opts) end)
     }
   end
 

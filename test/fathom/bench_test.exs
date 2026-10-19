@@ -339,4 +339,16 @@ defmodule Fathom.BenchTest do
     assert is_float(us) and us > 20 and us < 1_000_000
     assert Application.get_env(:fathom, :hrana_auth) == prev, "the arm left hrana_auth changed"
   end
+
+  # expert review 2026-10-19 #7. The flush codec on a ~20 MB realistic snapshot; the metric raises
+  # itself on a non-compressible or undersized fixture. Baseline ~6-7 ms/MB prod; the dev-build
+  # ceiling is an order of magnitude loose, and the floor catches a measurement that ran no codec.
+  @tag timeout: 300_000
+  test "flush_codec_ms_per_mb measures the zstd flush codec to an order of magnitude" do
+    ms = Fathom.Bench.StorageIO.flush_codec_ms_per_mb(codec_trials: 1)
+    IO.puts("flush_codec_ms_per_mb: #{inspect(ms)}")
+    assert is_float(ms)
+    assert ms > 0.5, "#{ms} ms/MB is too fast to have run compress + 2 MD5s + decode"
+    assert ms < 100, "#{ms} ms/MB: the flush codec regressed by an order of magnitude"
+  end
 end
