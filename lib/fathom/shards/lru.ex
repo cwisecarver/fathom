@@ -133,7 +133,9 @@ defmodule Fathom.Shards.Lru do
   streams never re-touch, so they sank to the cold end, and every at-capacity admission walked past
   all of them (an ETS next + 3 lookups each, uncharged against the probe limit). With no key they
   cost the walk nothing. The release edge (`count == 0`) re-inserts the shard with the RELEASE
-  stamp, which is more correct LRU recency than the checkout stamp. A rotating cursor was
+  stamp, which is more correct LRU recency than the checkout stamp — unless its current stamp is
+  younger than `@stamp_granularity`, in which case it re-inserts at that stamp rather than writing
+  the ordered_set's right-most slot (expert review 2026-10-19 #5). A rotating cursor was
   rejected: it can starve idle shards that sit behind it.
   """
   @spec record_conns(String.t(), non_neg_integer()) :: :ok
@@ -149,12 +151,37 @@ defmodule Fathom.Shards.Lru do
       else
         stamp = System.monotonic_time()
 
+        # COARSENED like `touch/1` (expert review 2026-10-19 #5). A fresh `System.monotonic_time`
+        # key is by construction the RIGHT-MOST slot of the ordered_set, so every coordinator's
+        # release edge wrote the same CA-tree slot: a delete + insert pair measured 0.16 us with one
+        # writer and 218 us/op at 18 concurrent writers (dev host), and pinned checkout+checkin
+        # across 18 shards ran at ~150k/s with the Lru on against ~850k/s with it off. Within the
+        # granularity window the release instead RE-INSERTS the key the grant removed, at the
+        # shard's EXISTING stamp — a per-shard key spread over the last second, not the tail
+        # (~9 us/op at 18 writers on adjacent keys). Busy shards still leave the order table at
+        # the grant (2026-10-13 #29 holds: the walk never visits them). Measured: pinned
+        # checkout+checkin, 18 workers 136-150k -> 268-272k ops/s, 4 workers 450-530k -> 876-890k.
+        #
+        # NOT done, deliberately: also skipping the grant's delete measured 740k/s at 18 workers
+        # (the delete is a CA-tree structural change; overwriting an existing key is far cheaper),
+        # but it leaves busy shards in the walk, which is exactly what #29 removed. That trade is a
+        # design decision (expert review 2026-10-19 #5, parked), not a free win.
+        #
+        # Safe for the same reason touch/1's coarsening is: recency is a HINT and `evict/2` is the
+        # arbiter. A stamp up to one window stale can only pick a slightly-less-cold idle victim,
+        # whose cost is one cold re-open of a bottomless-backed shard; it can never evict a busy
+        # one. A stream held longer than the window still re-stamps at its release.
         case :ets.lookup(@table, shard_id) do
-          [{^shard_id, prev}] -> :ets.delete(@order_table, {prev, shard_id})
-          _ -> :ok
-        end
+          [{^shard_id, prev}] when stamp - prev < @stamp_granularity ->
+            :ets.insert(@order_table, {{prev, shard_id}})
 
-        write_stamp(shard_id, stamp)
+          [{^shard_id, prev}] ->
+            :ets.delete(@order_table, {prev, shard_id})
+            write_stamp(shard_id, stamp)
+
+          _ ->
+            write_stamp(shard_id, stamp)
+        end
       end
     end
 
