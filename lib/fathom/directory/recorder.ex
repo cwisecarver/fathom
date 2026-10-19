@@ -620,14 +620,13 @@ defmodule Fathom.Directory.Recorder do
   # thing that makes each row's removal atomic.
   defp drain_chunk(table) do
     case :ets.select(table, [{{:"$1", :_}, [], [:"$1"]}], @drain_chunk) do
-      {ids, _cont} -> Enum.flat_map(ids, &take_row(table, &1))
+      # Only the touch buffer is drained here (the flush buffer goes through `take_joint/1`), so
+      # every take also drops the touch's coalescing owner.
+      {ids, _cont} -> Enum.flat_map(ids, &take_touch/1)
       :"$end_of_table" -> []
     end
   rescue
     # Table gone (teardown).
     ArgumentError -> []
   end
-
-  defp take_row(@table, id), do: take_touch(id)
-  defp take_row(table, id), do: :ets.take(table, id)
 end
