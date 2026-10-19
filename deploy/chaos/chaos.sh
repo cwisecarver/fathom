@@ -2256,13 +2256,16 @@ cmd_pool_fleet() {
   set -f; set -- $caps_csv; set +f
   unset IFS
   local round=0 cap h0 m0 h1 m1 json tps p50 p99 errs nops hits
+  # A per-invocation tag, so two pool-fleet runs on one rig never share a shard (2026-10-19: a
+  # 1x32 run reused the 1x16 run's pf1_0 and its numbers could not be told apart).
+  local run_tag; run_tag=$(date +%H%M%S)
   for cap in "$@"; do
     round=$(( round + 1 ))
     for n in "${NODES[@]}"; do
       rpc "$n" "Application.put_env(:fathom, :connection_pool_opts, Keyword.put(Application.get_env(:fathom, :connection_pool_opts, []), :max_per_scope, $cap))" >/dev/null
     done
     read -r h0 m0 <<< "$(pool_takes)"
-    json=$(tpc_run oneshot-fleet --domain "$DOMAIN" --shard "pf$round" \
+    json=$(tpc_run oneshot-fleet --domain "$DOMAIN" --shard "pf${run_tag}r$round" \
       --worker-timeout "${TPC_WORKER_TIMEOUT:-300000}" --accounts 1000 \
       --clients "$tenants" --streams "$streams" --txns $(( tenants * streams * ops )) 2>/dev/null)
     read -r h1 m1 <<< "$(pool_takes)"
