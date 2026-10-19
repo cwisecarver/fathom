@@ -217,18 +217,13 @@ defmodule Fathom.Shard.PoolCloseLifecycleTest do
   test "a handle evicted by a full pool bucket is closed off the coordinator (2026-10-17 #19)", %{
     shard: shard
   } do
-    # Pinned to a cap of 1 so the test does not depend on the prod default for `max_per_scope`.
-    prev_opts = Application.get_env(:fathom, :connection_pool_opts)
-    Application.put_env(:fathom, :connection_pool_opts, max_per_scope: 1)
-    on_exit(fn -> restore(:connection_pool_opts, prev_opts) end)
-
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, hb} = ShardExecutor.open(shard)
     {:ok, hc} = ShardExecutor.open(shard)
     pid = pid_of(ha)
     conn_a = conn_of(ha)
-    assert :sys.get_state(pid).pool.max_per_scope == 1, "precondition: bucket cap of 1"
+    assert :sys.get_state(pid).pool.max_per_scope == 1, "precondition: default bucket cap of 1"
 
     trace_closes(pid)
     # A is pooled (the shard is busy). B's checkin overflows the bucket and evicts A.

@@ -10,7 +10,7 @@ defmodule Fathom.Shard.HandlePoolTest do
   alias Fathom.Shard.HandlePool
 
   test "new/1 takes max_per_scope and ttl, with defaults" do
-    assert %HandlePool{max_per_scope: 2, ttl_ms: 30_000} = HandlePool.new()
+    assert %HandlePool{max_per_scope: 1, ttl_ms: 30_000} = HandlePool.new()
 
     assert %HandlePool{max_per_scope: 4, ttl_ms: 500} =
              HandlePool.new(max_per_scope: 4, ttl_ms: 500)

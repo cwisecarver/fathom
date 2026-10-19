@@ -670,11 +670,11 @@ defmodule Fathom.ShardExecutorTest do
     assert log =~ "2000 connections"
     refute log =~ "connection_pool is ON"
 
-    # Both on: 1 + 2*2 (default max_per_scope 2) + 1.
+    # Both on: 1 + 2*1 (default max_per_scope 1) + 1.
     Application.put_env(:fathom, :connection_pool, true)
     Application.delete_env(:fathom, :connection_pool_opts)
     log = capture_log(fn -> Fathom.Application.check_pool_fd_budget!() end)
-    assert log =~ "6000 connections"
+    assert log =~ "4000 connections"
 
     # Replication off and pool off: quiet.
     Application.put_env(:fathom, :connection_pool, false)
