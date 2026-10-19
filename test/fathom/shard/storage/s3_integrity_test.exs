@@ -151,6 +151,28 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
     end
   end
 
+  # Expert review 2026-10-19 #1: the coordinator's last ownership check rides the `:pre_put`
+  # callback, which runs after the compress. `{:abort, reason}` from it must stop the flush before
+  # any bytes go out, and surface as `{:error, reason}`.
+  test "a :pre_put veto ({:abort, reason}) fails the flush before any PUT", %{dir: dir} do
+    test_pid = self()
+
+    put_s3_config(fn conn ->
+      send(test_pid, {:put, conn.method})
+      Plug.Conn.send_resp(conn, 200, "")
+    end)
+
+    local = Path.join(dir, "s.db")
+    File.write!(local, @good)
+
+    assert {:error, :ownership_unconfirmed_before_put} =
+             S3.flush("s", local, nil, nil, nil,
+               pre_put: fn _md5 -> {:abort, :ownership_unconfirmed_before_put} end
+             )
+
+    refute_received {:put, "PUT"}
+  end
+
   # Expert review 2026-10-08 #15: a compressed upload whose source changed under it (or a codec
   # defect) became an object every pull refuses — and on an idle drop the local copy was deleted on
   # the PUT's success. Perf review 2026-10-14 #6 made the hash and the compress ONE read, so the

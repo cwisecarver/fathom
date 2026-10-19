@@ -508,6 +508,10 @@ defmodule Fathom.Shard.Storage.S3 do
   # The `:pre_put` flush option. The fun is awaited (it is a durable local write); a result other
   # than `:ok` is logged and ignored, because losing the intent only re-opens the old, quarantining
   # behaviour for a crash in the gap — it must never fail a durability flush.
+  #
+  # `{:abort, reason}` is the one exception: the caller vetoes the PUT (its last ownership check,
+  # which must run AFTER the compress, expert review 2026-10-19 #1) and the flush fails with
+  # `{:error, reason}` before any bytes go out.
   defp run_pre_put(opts, md5_hex) do
     case Keyword.get(opts, :pre_put) do
       nil ->
@@ -515,11 +519,16 @@ defmodule Fathom.Shard.Storage.S3 do
 
       fun ->
         case fun.(md5_hex) do
-          :ok -> :ok
-          other -> Logger.warning("flush pre_put hook did not record: #{inspect(other)}")
-        end
+          :ok ->
+            :ok
 
-        :ok
+          {:abort, reason} ->
+            {:error, reason}
+
+          other ->
+            Logger.warning("flush pre_put hook did not record: #{inspect(other)}")
+            :ok
+        end
     end
   end
 

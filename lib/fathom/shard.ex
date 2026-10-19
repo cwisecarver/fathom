@@ -1758,7 +1758,8 @@ defmodule Fathom.Shard do
              settle_waiters(%{state | lease_lost: true}, {:error, :lease_lost})}
 
           {{:error, reason}, state} ->
-            {:noreply, schedule_flush(settle_waiters(state, {:error, reason}))}
+            {:noreply,
+             schedule_flush_after_failure(settle_waiters(state, {:error, reason}), reason)}
         end
 
       # The pre-flush fence found a real steal (lock superseded) — self-fence, never clobber the new
@@ -1777,11 +1778,12 @@ defmodule Fathom.Shard do
       # full 60s @flush_now_timeout instead of getting a retryable answer immediately.
       :fence_skip ->
         {:noreply,
-         schedule_flush(
+         schedule_flush_after_failure(
            settle_waiters(
              record_flush_failure(note_not_valid(state), :ownership_unconfirmed),
              {:error, :ownership_unconfirmed}
-           )
+           ),
+           :ownership_unconfirmed
          )}
     end
   end
@@ -4689,7 +4691,7 @@ defmodule Fathom.Shard do
                state.etag,
                Position.snapshot_position(state, pre),
                Position.lineage_arg(state),
-               flush_intent_opts(state.path)
+               flush_intent_opts(state.path, fn -> recheck_before_put(state) end)
              )
              |> guard_pre_touch(state) do
         {:ok, new_etag, carried}
@@ -4814,7 +4816,23 @@ defmodule Fathom.Shard do
   # `.db` that descends from E1, which `Fork` read as a divergence and quarantined (acked writes
   # hidden in `.forked.<ts>`). The backend hands us the md5 of the exact bytes it is about to PUT;
   # `Fork.resolve` adopts a stored object whose `fathom-md5` equals it. See `Provenance`.
-  defp flush_intent_opts(path), do: [pre_put: &Provenance.record_intent(path, &1)]
+  #
+  # `recheck` is the LAST ownership check before the bytes go out (expert review 2026-10-19 #1).
+  # The backend calls `:pre_put` after its compress+hash stage and immediately before the PUT, so a
+  # check made here covers the codec time (~5.6 ms/MB, ~10 s at 1.8 GB — as long as the ttl/3
+  # margin) that the earlier `recheck_before_put/1` cannot. A `{:error, reason}` becomes the
+  # backend's `{:abort, reason}`: no PUT, the flush fails with `reason`. The default is a no-op, so
+  # the drop path (which has its own fence) is unchanged.
+  defp flush_intent_opts(path, recheck \\ fn -> :ok end) do
+    [
+      pre_put: fn md5 ->
+        case recheck.() do
+          :ok -> Provenance.record_intent(path, md5)
+          {:error, reason} -> {:abort, reason}
+        end
+      end
+    ]
+  end
 
   # Re-check ownership between the SNAPSHOT and the PUT (expert review 2026-08-01 #28).
   #
@@ -5728,9 +5746,9 @@ defmodule Fathom.Shard do
   # Reschedule after the node-wide flush cap (Fathom.Shard.FlushGate) refused a slot (#17): a short,
   # jittered backoff so the shard retries soon (it stayed dirty) without the backed-off shards
   # forming their own lockstep retry herd. Bounded well below the full interval.
-  defp schedule_flush_backoff(state) do
+  defp schedule_flush_backoff(state, base_ms \\ flush_backoff_ms()) do
     state = cancel_flush(state)
-    delay = jitter_interval(flush_backoff_ms())
+    delay = jitter_interval(base_ms)
 
     %{
       state
@@ -5738,6 +5756,32 @@ defmodule Fathom.Shard do
         flush_timer_slow?: false
     }
   end
+
+  # Reschedule after a TRANSIENT flush failure or an unconfirmed-ownership skip (expert review
+  # 2026-10-19 #2). These used to wait a full jittered interval, so an S3 503 or a timeout — routine
+  # on real S3 — stretched the object-RPO window to the interval (up to 300 s configured) with the
+  # shard still dirty. Retry on the short flush backoff instead, doubling per consecutive failure
+  # (`record_flush_failure/2` has already counted this one, so the first retry waits one backoff)
+  # and capped at the normal interval, so an outage degrades to the old cadence rather than
+  # storming the store. The counter resets on the first durable flush (`clear_flush_failures/1`).
+  #
+  # NOT for failures a retry cannot fix: `corrupt_local` and `object_too_large` keep the normal
+  # interval (a faster retry only repeats a full snapshot + codec for the same refusal). Flush
+  # disabled (non-positive interval) is also left alone.
+  defp schedule_flush_after_failure(state, reason) do
+    interval = flush_interval_ms()
+
+    if permanent_flush_failure?(reason) or not (is_integer(interval) and interval > 0) do
+      schedule_flush(state)
+    else
+      doublings = min(max(state.flush_failures - 1, 0), 20)
+      schedule_flush_backoff(state, min(flush_backoff_ms() * Bitwise.bsl(1, doublings), interval))
+    end
+  end
+
+  defp permanent_flush_failure?({:corrupt_local, _}), do: true
+  defp permanent_flush_failure?({:object_too_large, _}), do: true
+  defp permanent_flush_failure?(_), do: false
 
   # A flush deferred behind another lease-touching operation (lapse revalidation, legacy renew): the
   # normal interval, unless a `:flush_now` caller is parked, which must not wait a whole interval
