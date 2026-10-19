@@ -505,7 +505,7 @@ defmodule Fathom.Application do
     if Application.get_env(:fathom, :env) == :prod and (pooled? or replicating?) and
          is_integer(cap) do
       cfg = Application.get_env(:fathom, :connection_pool_opts, [])
-      per_scope = Keyword.get(cfg, :max_per_scope, 1)
+      per_scope = Keyword.get(cfg, :max_per_scope, 2)
 
       # The coordinator's own working connection plus up to max_per_scope idle handles in each of the
       # two scopes (:ro, :rw), plus the held WAL fd when replicating.

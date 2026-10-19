@@ -2635,7 +2635,7 @@ defmodule Fathom.Shard do
       cfg = Application.get_env(:fathom, :connection_pool_opts, [])
 
       HandlePool.new(
-        max_per_scope: Keyword.get(cfg, :max_per_scope, 1),
+        max_per_scope: Keyword.get(cfg, :max_per_scope, 2),
         ttl_ms: Keyword.get(cfg, :ttl_ms, 30_000),
         drain_grace_ms: Keyword.get(cfg, :drain_grace_ms, 250)
       )

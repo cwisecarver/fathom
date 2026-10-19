@@ -33,10 +33,10 @@ defmodule Fathom.Shard.HandlePool do
           drain_grace_ms: non_neg_integer()
         }
 
-  defstruct idle: %{ro: [], rw: []}, max_per_scope: 1, ttl_ms: 30_000, drain_grace_ms: 250
+  defstruct idle: %{ro: [], rw: []}, max_per_scope: 2, ttl_ms: 30_000, drain_grace_ms: 250
 
   @doc """
-  A new empty pool. `:max_per_scope` caps idle handles held per scope (default 1); `:ttl_ms` is how
+  A new empty pool. `:max_per_scope` caps idle handles held per scope (default 2); `:ttl_ms` is how
   long an idle handle may sit before `sweep/2` closes it (default 30_000); `:drain_grace_ms` is how
   long the coordinator keeps the pool after the shard's LAST stream checks in before it drains it
   (default 250; 0 drains on that checkin, the pre-2026-10-14 behaviour). The grace is the
@@ -46,7 +46,7 @@ defmodule Fathom.Shard.HandlePool do
   def new(opts \\ []) do
     %__MODULE__{
       idle: %{ro: [], rw: []},
-      max_per_scope: Keyword.get(opts, :max_per_scope, 1),
+      max_per_scope: Keyword.get(opts, :max_per_scope, 2),
       ttl_ms: Keyword.get(opts, :ttl_ms, 30_000),
       drain_grace_ms: Keyword.get(opts, :drain_grace_ms, 250)
     }
