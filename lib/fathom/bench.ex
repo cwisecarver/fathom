@@ -902,6 +902,7 @@ defmodule Fathom.Bench do
           {c, [t | acc]}
         end)
 
+      assert_load_recorded!("benchrt", "hrana_rt_us")
       %{p50_us: p50(us), p99_us: percentile(us, 99)}
     end)
   end
@@ -2256,6 +2257,45 @@ defmodule Fathom.Bench do
 
     ensure_started(Registry, keys: :unique, name: Fathom.ShardRegistry)
     ensure_started(DynamicSupervisor, name: Fathom.ShardSupervisor, strategy: :one_for_one)
+
+    # The per-shard load/latency tables prod always has. `mix fathom.bench` runs MIX_ENV=prod, where
+    # runtime.exs turns `:shard_load` ON, but the bench does not boot the supervision tree - so
+    # before this every query paid two raised-and-rescued ArgumentErrors (ShardLoad.bump/2,
+    # ShardLatency.record/2) that prod never pays: ~+17 us on a ~40 us execute (expert review
+    # 2026-10-19 #4). SERIES BREAK (user-approved 2026-10-19): hrana_* and the open metrics read
+    # ~15-20% faster from this commit on and are not comparable with earlier perf_history entries.
+    ensure_started(Fathom.ShardLoad, [])
+    ensure_started(Fathom.ShardLatency, [])
+    assert_load_tables!()
+    :ok
+  end
+
+  # Raises unless both tables exist: a bench that silently falls back to the rescue path measures a
+  # topology prod does not run (expert review 2026-10-19 #4).
+  defp assert_load_tables! do
+    for t <- [Fathom.ShardLoad, Fathom.ShardLatency], :ets.whereis(t) == :undefined do
+      raise "bench setup: #{inspect(t)} table is missing - the metrics would measure the rescue path"
+    end
+
+    :ok
+  end
+
+  # When `:shard_load` is on (prod), the timed loop must have actually fed the tables: an empty
+  # ShardLoad/ShardLatency row means the executor never recorded and the bench is again off prod's
+  # topology (expert review 2026-10-19 #4). A no-op when the gate is off (dev/test).
+  defp assert_load_recorded!(shard, label) do
+    if Fathom.ShardLoad.enabled?() do
+      queries = (Fathom.ShardLoad.get(shard) || %{queries: 0}).queries
+      latencies = shard |> Fathom.ShardLatency.histogram() |> Enum.sum()
+
+      if queries == 0 or latencies == 0,
+        do:
+          raise(
+            "#{label}: shard_load is on but ShardLoad/ShardLatency recorded nothing for " <>
+              "#{shard} (queries=#{queries}, latency samples=#{latencies})"
+          )
+    end
+
     :ok
   end
 
