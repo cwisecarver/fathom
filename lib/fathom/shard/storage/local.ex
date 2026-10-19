@@ -137,11 +137,15 @@ defmodule Fathom.Shard.Storage.Local do
 
       fun ->
         case file_md5_hex(local_path) do
-          {:ok, hex} -> fun.(hex)
+          {:ok, hex} -> normalize_pre_put(fun.(hex))
           {:error, _} = error -> error
         end
     end
   end
+
+  # `{:abort, reason}` is the caller's veto (expert review 2026-10-19 #1); same shape as S3's.
+  defp normalize_pre_put({:abort, reason}), do: {:error, reason}
+  defp normalize_pre_put(other), do: other
 
   @md5_chunk 256 * 1024
   defp file_md5_hex(path) do

@@ -4689,7 +4689,7 @@ defmodule Fathom.Shard do
                state.etag,
                Position.snapshot_position(state, pre),
                Position.lineage_arg(state),
-               flush_intent_opts(state.path)
+               flush_intent_opts(state.path, fn -> recheck_before_put(state) end)
              )
              |> guard_pre_touch(state) do
         {:ok, new_etag, carried}
@@ -4814,7 +4814,23 @@ defmodule Fathom.Shard do
   # `.db` that descends from E1, which `Fork` read as a divergence and quarantined (acked writes
   # hidden in `.forked.<ts>`). The backend hands us the md5 of the exact bytes it is about to PUT;
   # `Fork.resolve` adopts a stored object whose `fathom-md5` equals it. See `Provenance`.
-  defp flush_intent_opts(path), do: [pre_put: &Provenance.record_intent(path, &1)]
+  #
+  # `recheck` is the LAST ownership check before the bytes go out (expert review 2026-10-19 #1).
+  # The backend calls `:pre_put` after its compress+hash stage and immediately before the PUT, so a
+  # check made here covers the codec time (~5.6 ms/MB, ~10 s at 1.8 GB — as long as the ttl/3
+  # margin) that the earlier `recheck_before_put/1` cannot. A `{:error, reason}` becomes the
+  # backend's `{:abort, reason}`: no PUT, the flush fails with `reason`. The default is a no-op, so
+  # the drop path (which has its own fence) is unchanged.
+  defp flush_intent_opts(path, recheck \\ fn -> :ok end) do
+    [
+      pre_put: fn md5 ->
+        case recheck.() do
+          :ok -> Provenance.record_intent(path, md5)
+          {:error, reason} -> {:abort, reason}
+        end
+      end
+    ]
+  end
 
   # Re-check ownership between the SNAPSHOT and the PUT (expert review 2026-08-01 #28).
   #
