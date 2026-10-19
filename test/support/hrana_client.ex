@@ -62,7 +62,9 @@ defmodule Fathom.Bench.HranaClient do
 
     children = [
       {Filo.Streams, name: streams},
-      {Bandit, plug: {Filo.Plug, plug_opts}, scheme: :http, ip: {127, 0, 0, 1}, port: port}
+      {Bandit,
+       [plug: {Filo.Plug, plug_opts}, scheme: :http, ip: {127, 0, 0, 1}, port: port] ++
+         Keyword.take(opts, [:thousand_island_options])}
     ]
 
     {:ok, sup} = Supervisor.start_link(children, strategy: :one_for_one)

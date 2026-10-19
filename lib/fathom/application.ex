@@ -1202,7 +1202,18 @@ defmodule Fathom.Application do
 
     [
       num_listen_sockets: max(sockets, 1),
-      transport_options: transport
+      transport_options: transport,
+      # The WebSocket connection process (django-libsql, the PRIMARY prod path) is the
+      # ThousandIsland handler itself: Bandit upgrades in place, so `Filo.Socket` runs in the
+      # process started with THESE genserver options. The `hibernate_after` / `spawn_opt` in the
+      # Filo.Plug opts reach only `Filo.Stream` (HTTP), so before this a WS connection held the
+      # heap of the largest result it ever materialized (~951 KiB idle after one 2000-row x 8-col
+      # response) for hours between requests (expert review 2026-10-19 #6). Same 5 s policy as the
+      # HTTP stream. `fullsweep_after` rides along in `spawn_opt` (GenServer.start_link honours it).
+      genserver_options: [
+        hibernate_after: Application.get_env(:fathom, :hrana_ws_hibernate_ms, 5_000),
+        spawn_opt: [fullsweep_after: 10]
+      ]
     ]
   end
 
