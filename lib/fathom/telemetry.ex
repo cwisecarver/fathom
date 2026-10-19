@@ -1096,10 +1096,10 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :replication, :commit_stage],
         measurement: :duration,
         unit: {:native, :millisecond},
-        tags: [:stage],
+        tags: [:stage, :reset],
         reporter_options: [buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]],
         description:
-          "Per-round commit stage latency: build (WAL read + stability recheck + compress) vs collect (quorum wait)"
+          "Per-round commit stage latency: build (WAL read + stability recheck + compress) vs collect (quorum wait). reset=true is the first commit after a checkpoint (waits on the follower absorb)"
       ),
       distribution("fathom.replication.catchup.fails",
         event_name: [:fathom, :replication, :catchup],

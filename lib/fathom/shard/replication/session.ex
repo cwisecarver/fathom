@@ -1072,7 +1072,7 @@ defmodule Fathom.Shard.Replication.Session do
 
       t_build = System.monotonic_time()
       built = build_pushes(state, wal_path, epoch, header, sendable)
-      stage_duration(:build, t_build)
+      stage_duration(:build, t_build, reset_round?(sendable))
 
       case built do
         {:ok, pushes, state} ->
@@ -1316,21 +1316,30 @@ defmodule Fathom.Shard.Replication.Session do
         {:ok, state, for({s, :already_in_flight} <- skipped, do: {s, :already_in_flight, 0})}
 
       needed ->
-        collect(state, pushes, needed, skipped)
+        collect(state, pushes, needed, skipped, reset_round?(plans))
     end
   end
 
   # Per-round stage timing for the commit path (expert review 2026-10-17 #10): `:build` is the WAL
   # read + stability re-check + compress, `:collect` is the quorum wait. Bounded `stage` tag.
-  defp stage_duration(stage, t0) do
+  #
+  # `reset` (expert review 2026-10-19 #9, MEASURE ONLY) is true when any follower in the round was
+  # planned a `{:reset, ...}` — the first commit after a checkpoint, which waits for the follower's
+  # absorb (two fsync-bearing checkpoints) before it acks. Tagging it lets the rig compare reset vs
+  # plain `:collect` p99 and decide whether the async-absorb redesign is worth building. Bounded
+  # (`true | false`).
+  defp stage_duration(stage, t0, reset?) do
     :telemetry.execute(
       [:fathom, :replication, :commit_stage],
       %{duration: System.monotonic_time() - t0},
-      %{stage: stage}
+      %{stage: stage, reset: reset?}
     )
   end
 
-  defp collect(state, pushes, needed, skipped) do
+  defp reset_round?(plans),
+    do: Enum.any?(plans, fn {_shipper, {kind, _, _}} -> kind == :reset end)
+
+  defp collect(state, pushes, needed, skipped, reset?) do
     t_collect = System.monotonic_time()
 
     result =
@@ -1339,7 +1348,7 @@ defmodule Fathom.Shard.Replication.Session do
         shard_id: state.shard_id
       )
 
-    stage_duration(:collect, t_collect)
+    stage_duration(:collect, t_collect, reset?)
 
     case result do
       {:ok, acked, rejects} ->
