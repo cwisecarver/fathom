@@ -199,7 +199,8 @@ defmodule Fathom.Telemetry.FastHistogramTest do
     assert Enum.sort(counters) ==
              Enum.sort([
                [:fathom, :shard, :pool_take, :count],
-               [:fathom, :replication, :checkpoint, :count]
+               [:fathom, :replication, :checkpoint, :count],
+               [:fathom, :replication, :held_fd, :count]
              ])
 
     all = [core, fast, counters]

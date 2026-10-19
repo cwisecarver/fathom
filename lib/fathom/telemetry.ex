@@ -147,6 +147,14 @@ defmodule Fathom.Telemetry do
         tags: [:result],
         description: "Connection-pool takes on a stream open, by hit/miss"
       ),
+      # Held-WAL-fd cache hit/miss on a follower append (expert review 2026-10-19 #16). Tagged by
+      # result only (:hit | :miss), never by shard.
+      counter("fathom.replication.held_fd.count",
+        event_name: [:fathom, :replication, :held_fd],
+        tags: [:result],
+        description:
+          "Follower WAL appends served from the held-fd cache (hit) vs needing an open (miss)"
+      ),
       # Checkins closed instead of pooled because the node-wide idle budget was full (perf review
       # 2026-10-14 #16). Untagged: shard_id rides the metadata for logs only.
       counter("fathom.shard.pool_budget_full.count",

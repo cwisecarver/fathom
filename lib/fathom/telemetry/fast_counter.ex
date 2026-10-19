@@ -24,7 +24,9 @@ defmodule Fathom.Telemetry.FastCounter do
   # Counters on a per-operation hot path. Anything not listed stays on Core.
   @hot [
     [:fathom, :shard, :pool_take, :count],
-    [:fathom, :replication, :checkpoint, :count]
+    [:fathom, :replication, :checkpoint, :count],
+    # One per follower append (expert review 2026-10-19 #16); tag `result` is :hit | :miss.
+    [:fathom, :replication, :held_fd, :count]
   ]
 
   @doc "True for the metrics this module records instead of `TelemetryMetricsPrometheus.Core`."

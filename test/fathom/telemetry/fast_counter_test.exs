@@ -39,6 +39,7 @@ defmodule Fathom.Telemetry.FastCounterTest do
   test "the two hot counters are exactly the ones FastCounter claims" do
     assert hot_metrics() |> Enum.map(& &1.name) |> Enum.sort() == [
              [:fathom, :replication, :checkpoint, :count],
+             [:fathom, :replication, :held_fd, :count],
              [:fathom, :shard, :pool_take, :count]
            ]
   end
