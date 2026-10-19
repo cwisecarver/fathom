@@ -1771,22 +1771,28 @@ defmodule Fathom.Shard.Replication.Session do
           {:ok, ref} ->
             send(parent, {tag, :held})
 
-            try do
-              # TEST seam: a 0-arity fun run inside the task before the checkpoint, so
-              # `replication_unshipped_checkpoint_test.exs` can hold a checkpoint open and show the
-              # commit's reply (and the next commit's ship) do not wait for it. Unset in prod.
-              if hook = Application.get_env(:fathom, :replication_checkpoint_hook), do: hook.()
-              result = checkpoint(wal_path)
+            result =
+              try do
+                # TEST seam: a 0-arity fun run inside the task before the checkpoint, so
+                # `replication_unshipped_checkpoint_test.exs` can hold a checkpoint open and show
+                # the commit's reply (and the next commit's ship) do not wait for it. Unset in prod.
+                if hook = Application.get_env(:fathom, :replication_checkpoint_hook), do: hook.()
+                checkpoint(wal_path)
+              after
+                release_pin(pin)
+                Fathom.Shard.checkin(coordinator, ref)
+              end
 
-              :telemetry.execute(
-                [:fathom, :replication, :checkpoint],
-                %{count: 1},
-                %{shard_id: shard_id, verdict: verdict, result: result}
-              )
-            after
-              release_pin(pin)
-              Fathom.Shard.checkin(coordinator, ref)
-            end
+            # AFTER the pin is released, not inside the try: the pin is an open read snapshot, and
+            # while it is held the next writer cannot restart the log. Emitted before the release,
+            # the event told a listener "checkpointed" while a write made right then still appended
+            # to the old log (replication_unshipped_checkpoint_test flaked on exactly that under
+            # full-suite load, seed 527250, 2026-10-19).
+            :telemetry.execute(
+              [:fathom, :replication, :checkpoint],
+              %{count: 1},
+              %{shard_id: shard_id, verdict: verdict, result: result}
+            )
 
           _ ->
             release_pin(pin)

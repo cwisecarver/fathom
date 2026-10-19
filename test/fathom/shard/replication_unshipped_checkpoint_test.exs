@@ -456,6 +456,44 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
     assert {:ok, _} = await_rows(s.followers, ctx.id, "t2", [0, 2], ctx.root)
   end
 
+  # Flake 2026-10-19 (seed 527250): the checkpoint event fired INSIDE the task, before the task
+  # released its pin (an open read snapshot). A writer that ran on the event, while the pin was
+  # still held, could not restart the log, so the test above saw the old salt and failed "never
+  # checkpointed". The event must mean "checkpointed AND the snapshot is gone". This writes from
+  # inside the handler, which runs synchronously in the emitting task, so it lands in that exact
+  # window every time.
+  test "the checkpoint event fires only after the pin is released", ctx do
+    low_threshold!()
+    s = setup_shard!(ctx)
+    test = self()
+    handler = "ckpt-after-pin-#{ctx.id}"
+    id = ctx.id
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :replication, :checkpoint],
+      fn
+        _event, _measure, %{shard_id: ^id}, _ ->
+          {:ok, _} = Connection.query(s.c1, "INSERT INTO t1 VALUES (4, NULL)", [])
+          send(test, {:wal_at_event, Wal.read(s.wal)})
+
+        _event, _measure, _meta, _ ->
+          :ok
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    grown = grow_past_threshold!(ctx, s)
+
+    {:ok, _} = Connection.query(s.c2, "INSERT INTO t2 VALUES (2)", [])
+    assert :ok = Session.commit(ctx.id, s.wal, s.coordinator)
+    assert_receive {:wal_at_event, {:ok, at_event}}, 5_000
+
+    assert {at_event.ckpt_seq, at_event.salt1} != {grown.ckpt_seq, grown.salt1},
+           "a write made on the checkpoint event did not restart the log: the pin was still held"
+  end
+
   test "a tenant handle cannot call the replication registration function", ctx do
     s = setup_shard!(ctx)
     {:ok, tenant} = Connection.open(s.path, tenant?: true, scope: :rw)
