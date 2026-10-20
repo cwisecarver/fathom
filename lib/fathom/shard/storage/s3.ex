@@ -1420,6 +1420,11 @@ defmodule Fathom.Shard.Storage.S3 do
   # ourselves so every attempt writes a clean temp.
   @download_attempts 3
 
+  # Statuses that mean "try again": S3's throttle (503 SlowDown) and transient server faults. A 4xx
+  # is the caller's problem and is never retried. 429 is not S3's signal, so it is left out.
+  # (expert review 2026-10-20 #14)
+  @transient_statuses [500, 502, 503, 504]
+
   defp download(url, local_path, headers \\ [], opts \\ []) do
     Storage.ensure_dir(Path.dirname(local_path))
     do_download(url, local_path, headers, opts, @download_attempts)
@@ -1650,6 +1655,19 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, %{status: 404}} ->
         :absent
 
+      # Throttled or transiently failing: the whole download is retried with a fresh temp, after a
+      # backoff. A Retry-After from the store is honoured (see retry_or/7).
+      {:ok, %{status: status} = resp} when status in @transient_statuses ->
+        retry_or(
+          {:error, {:s3_get_status, status}},
+          url,
+          local_path,
+          headers,
+          opts,
+          attempts_left,
+          retry_after_ms(resp.headers)
+        )
+
       {:ok, %{status: status}} ->
         {:error, {:s3_get_status, status}}
 
@@ -1683,11 +1701,32 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
-  defp retry_or(error, url, local_path, headers, opts, attempts_left) do
+  # Every whole-download retry waits first (expert review 2026-10-20 #14). Before this it recursed
+  # at once, so N cold opens that failed together retried together, into the same throttle. The
+  # wait is exponential (50 ms, then 200 ms) with full jitter, and never shorter than the store's
+  # Retry-After hint, which is capped at 2 s so a bad header cannot stall a cold open.
+  defp retry_or(error, url, local_path, headers, opts, attempts_left, hint_ms \\ 0) do
     if attempts_left > 1 do
+      retry_backoff(attempts_left, hint_ms)
       do_download(url, local_path, headers, opts, attempts_left - 1)
     else
       error
+    end
+  end
+
+  defp retry_backoff(attempts_left, hint_ms) do
+    attempt = @download_attempts - attempts_left + 1
+    base = 50 * Integer.pow(4, attempt - 1)
+    Process.sleep(max(base + :rand.uniform(base), min(hint_ms, 2_000)))
+  end
+
+  # Retry-After in its delta-seconds form (the only form S3 sends). Anything else is no hint.
+  defp retry_after_ms(headers) do
+    with v when is_binary(v) <- header_value(headers, "retry-after"),
+         {secs, ""} when secs >= 0 <- Integer.parse(v) do
+      secs * 1_000
+    else
+      _ -> 0
     end
   end
 
