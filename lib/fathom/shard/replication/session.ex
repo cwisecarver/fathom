@@ -779,8 +779,9 @@ defmodule Fathom.Shard.Replication.Session do
   # runs on a shard with no traffic, and anything that does arrive queues behind it — which IS the
   # serialization this is staying inside rather than routing around.
   # The coordinator's covered-idle-close ask (expert review 2026-10-20 #7): may its idle drain run
-  # the close-time checkpoint now? See `request_idle_close/2`. Always answered, `:ready` or `:wait`;
-  # the coordinator re-asks on `:wait` and gives up (drains anyway) after a bounded number of asks.
+  # the close-time checkpoint now? See `request_idle_close/2`. Always answered, `:ready`, `:wait` or
+  # `:retry`; the coordinator re-asks on `:wait` and gives up (drains anyway) after a bounded number
+  # of asks.
   def handle_info({:idle_close?, coordinator, token}, state) do
     {verdict, state} = idle_close_verdict(state)
     send(coordinator, {:idle_close_verdict, token, verdict})
@@ -1492,25 +1493,38 @@ defmodule Fathom.Shard.Replication.Session do
   # that failed their quorum and were then folded away by the close-time checkpoint, or by the
   # forced checkpoint at the WAL cap (`start_checkpoint/3`). Frames the Session never read are the
   # case this CANNOT see, which is why checkpoints of a replicated WAL are pinned instead.
+  #
+  # AND A WHOLE GENERATION MISSED (round-4 replication review 2026-10-20). Everything above measures
+  # the follower against ITS OWN generation. A follower still in g-1 when this header is g+1 — down
+  # or disconnected for the whole of g — held all of g-1, so it was told "complete", absorbed, and
+  # cleared `torn` over a replica missing every page only g wrote: untorn, ranked equal to its
+  # peers, promotable, and short of quorum-acked writes. So when the generations this Session read
+  # show one WITH FRAMES between the follower's and the current one, the follower is short whatever
+  # it holds of its own: `own + 1` is the smallest statement that says so, and the follower answers
+  # it with a seed request (`Follower.short_reset?/3`). `missed_generation?/3` has the rule.
   defp outgoing_extent(state, shipper) do
     case Map.get(state.followers, shipper) do
       %{wal_gen: gen, salt1: salt, offset: own} when is_integer(own) ->
-        peers =
-          state.followers
-          |> Map.values()
-          |> Enum.filter(
-            &match?(%{wal_gen: ^gen, salt1: ^salt, offset: o} when is_integer(o), &1)
-          )
-          |> Enum.map(& &1.offset)
-          |> Enum.max(fn -> own end)
-
-        case Enum.find(state.seen, &match?({^gen, ^salt, _}, &1)) do
-          {_, _, read} -> max(peers, read)
-          nil -> peers
-        end
+        if missed_generation?(state.seen, gen, salt),
+          do: own + 1,
+          else: own_generation_extent(state, gen, salt, own)
 
       _ ->
         0
+    end
+  end
+
+  defp own_generation_extent(state, gen, salt, own) do
+    peers =
+      state.followers
+      |> Map.values()
+      |> Enum.filter(&match?(%{wal_gen: ^gen, salt1: ^salt, offset: o} when is_integer(o), &1))
+      |> Enum.map(& &1.offset)
+      |> Enum.max(fn -> own end)
+
+    case Enum.find(state.seen, &match?({^gen, ^salt, _}, &1)) do
+      {_, _, read} -> max(peers, read)
+      nil -> peers
     end
   end
 
@@ -1880,7 +1894,8 @@ defmodule Fathom.Shard.Replication.Session do
 
   Asynchronous on purpose: the Session calls its coordinator while it works (epoch, ordinal,
   checkout grants), so a synchronous ask from the coordinator could deadlock until a timeout. The
-  answer arrives at the caller as `{:idle_close_verdict, token, :ready | :wait}`. Returns `:none`
+  answer arrives at the caller as `{:idle_close_verdict, token, :ready | :wait | :retry}` (`:retry`:
+  the WAL header could not be read, so nothing was judged). Returns `:none`
   when there is no Session to ask (replication off, or nothing shipped yet under this coordinator):
   the caller then drains as it always did.
   """
@@ -2098,6 +2113,35 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   defp note_header(state, _empty), do: state
+
+  # Did a follower recorded in generation `{gen, salt}` miss a whole generation WITH FRAMES since?
+  # (round-4 replication review 2026-10-20, `outgoing_extent/2`.) `seen` is newest first and its
+  # head is the header being planned from (`ship/7` notes it before planning).
+  #
+  #   * the follower's generation IS the head: a same-generation reset (the WAL shrank), nothing
+  #     skipped;
+  #   * it is further down: every generation between it and the head was skipped by it, and one
+  #     holding a commit (extent past the bare WAL header) is pages it never received;
+  #   * it is not in `seen` at all: older than the horizon when `seen` is full — everything listed
+  #     after the head was skipped. With `seen` NOT full this Session has read every generation since
+  #     it started, so an unlisted one is a generation it never read (a seed's own header after a
+  #     restart race): no evidence, the old rule applies.
+  #
+  # A false positive costs one seed (an ack lost after the follower applied a push, say); a false
+  # negative is a promotable replica missing acked writes.
+  defp missed_generation?([{gen, salt, _} | _], gen, salt), do: false
+
+  defp missed_generation?([_head | older] = seen, gen, salt) do
+    case Enum.split_while(older, &(not match?({^gen, ^salt, _}, &1))) do
+      {between, [_found | _]} -> holds_frames?(between)
+      {between, []} -> length(seen) >= @seen_generations and holds_frames?(between)
+    end
+  end
+
+  defp missed_generation?([], _gen, _salt), do: false
+
+  defp holds_frames?(generations),
+    do: Enum.any?(generations, fn {_, _, extent} -> extent > Wal.header_bytes() end)
 
   defp checkpoint_due?(%{last_header: %{commit_extent: e, salt1: s}, ckpt_at: at}) do
     e >= checkpoint_bytes() and
@@ -2366,8 +2410,10 @@ defmodule Fathom.Shard.Replication.Session do
           {if(nothing_owed?(state, header), do: :ready, else: :wait), state}
         end
 
+      # `:retry`, not `:wait`: nothing was read, so this is not the answer the coordinator's bounded
+      # fallback needs (round-4 replication review 2026-10-20; `Fathom.Shard.covered_idle_drain/1`).
       {:error, _reason, fd} ->
-        {:wait, %{state | wal_fd: fd}}
+        {:retry, %{state | wal_fd: fd}}
     end
   end
 
