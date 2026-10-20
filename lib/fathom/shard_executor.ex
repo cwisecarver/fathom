@@ -395,7 +395,7 @@ defmodule Fathom.ShardExecutor do
            dml?: dml?,
            read?: read?,
            deadline: true,
-           conn_state?: repl_on?
+           conn_state?: repl_on? and (dml? or commit_boundary?(head))
          ) do
       {:ok, result} ->
         # A write bumps the shard's write counter so the periodic durability flush knows local

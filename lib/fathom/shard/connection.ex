@@ -825,9 +825,12 @@ defmodule Fathom.Shard.Connection do
   When the statement also returns columns, `sqlite3_changes()` is not fetched (a dirty-NIF
   dispatch) and `num_changes` is reported as 0; the caller must not need the inherited count.
 
-  `conn_state?: true` (DML only) fetches changes, last rowid and the autocommit flag in one
-  statement step via the extension's `fathom_conn_state()` and reports the flag as `autocommit?`
-  (expert review 2026-10-17 #6); `autocommit?` is nil when that path was not taken.
+  `conn_state?: true` fetches changes, last rowid and the autocommit flag in one statement step
+  via the extension's `fathom_conn_state()` and reports the flag as `autocommit?` (expert review
+  2026-10-17 #6); `autocommit?` is nil when that path was not taken. The CALLER decides when it is
+  worth it: it replaces the single `changes` fetch one-for-one, so it only pays off where the
+  caller would otherwise ask `autocommit?/1` right after (a DML statement, or a COMMIT boundary
+  that may ship, expert review 2026-10-20 #27).
   """
   @spec query(reference(), String.t(), list() | {list(), [{String.t(), term()}]}, keyword()) ::
           {:ok, map()} | {:error, term()}
@@ -908,9 +911,12 @@ defmodule Fathom.Shard.Connection do
           # in ONE statement step: 1 dirty dispatch instead of 3 (changes + rowid + the executor's
           # separate `transaction_status`). Not used otherwise: without the autocommit read, the
           # step costs about what `changes` + `last_insert_rowid` cost (measured 4.0 vs 3.9 us), so
-          # it would be no win, and BEGIN/COMMIT (not DML) keep the single `changes` fetch.
+          # it would be no win. Expert review 2026-10-20 #27: the executor ALSO asks for it on a
+          # COMMIT/END/RELEASE boundary under replication, where it would otherwise follow the
+          # `changes` fetch with an `autocommit?/1` dispatch (2 extra -> 1). A BEGIN keeps the
+          # single `changes` fetch: nothing reads its autocommit flag.
           {changes, fast_rowid, autocommit} =
-            case if(state? and dml?, do: fetch_conn_state(conn)) do
+            case if(state?, do: fetch_conn_state(conn)) do
               {:ok, ch, rid, ac} ->
                 {ch, rid, ac}
 
