@@ -1,35 +1,15 @@
 defmodule Fathom.ConnectionWatchdogTest do
   @moduledoc """
-  The statement-deadline watchdog must not leak `{:timed_out, ref}` into its owner's mailbox
-  (expert review 2026-08-01 #46).
+  The statement-deadline watchdog must never leave anything in its owner's mailbox, and a fire for
+  one statement must never cancel another.
 
-  `with_deadline/3` peeks for `{:timed_out, ref}` with `after 0` once the statement returns.
-  The watchdog used to `Sqlite3.cancel(conn)` and THEN send that message, so a query finishing
-  naturally in the gap between those two statements let the owner reach the peek first, find
-  nothing, and return — after which the message landed in a mailbox where nothing would ever
-  match it again (the next call uses a fresh `make_ref/0`).
-
-  A stream holds its connection for the stream's life, and the watchdog is per-connection, so
-  the residue accumulates in exactly the longest-lived processes.
-
-  ## The reorder narrowed the race; it did not close it — CI proved that
-
-  #46's fix (send before cancel) makes the message provably present before the cancel can let
-  the statement return, which covers a query the watchdog actually interrupts. It does NOT cover
-  a query that finishes on its own in the instant after the watchdog committed to firing: the
-  `after 0` peek runs first, finds nothing, and the message lands afterwards in a mailbox where
-  no later peek can match it (every call uses a fresh `make_ref/0`).
-
-  That is not theoretical. `"a long run of fast queries under a deadline"` below drives 400
-  queries at a **1 ms** deadline precisely to sit on that boundary, and it FAILED on CI (OTP 29,
-  2026-08-03) — a 2–4 core runner widens the window enough to hit it, while an 18-core dev box
-  does not. The original version of this moduledoc said these tests pass against the unfixed
-  code; on a slow enough machine, one of them does not.
-
-  `with_deadline/3` now sweeps stale `{:timed_out, _}` at ARM, before the fresh ref exists, so
-  anything found is necessarily residue. `"a stale timeout message is swept"` pins that
-  deterministically — it injects the residue rather than racing for it, and fails without the
-  sweep.
+  History: the watchdog used to answer with a `{:timed_out, ref}` message, and every race around
+  that message (expert review 2026-08-01 #46, 2026-10-08 #27) produced residue in a long-lived
+  `Filo.Stream` mailbox, fixed with a sweep and then an alias. Expert review 2026-10-20 #24
+  removed the messages altogether: arm is a BEAM timer plus a generation counter in an `:atomics`,
+  and the watchdog reports a timeout through a mark in the same atomics, so these tests assert the
+  structural property (the owner's mailbox stays EMPTY) and the generation guard (a fire for a
+  disarmed statement is ignored), rather than sweeping or aliasing.
 
   Not async: drives real SQLite connections and flips `:query_timeout_ms`.
   """
@@ -60,8 +40,8 @@ defmodule Fathom.ConnectionWatchdogTest do
   defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
   defp mailbox_size do
-    {:messages, msgs} = Process.info(self(), :messages)
-    Enum.count(msgs, &match?({:timed_out, _}, &1))
+    {:message_queue_len, n} = Process.info(self(), :message_queue_len)
+    n
   end
 
   test "a long run of fast queries under a deadline leaves no timeout residue", %{conn: conn} do
@@ -94,7 +74,7 @@ defmodule Fathom.ConnectionWatchdogTest do
     Application.put_env(:fathom, :query_timeout_ms, 5_000)
     assert {:ok, _} = query(conn, "SELECT 1", [])
 
-    watchdog = Process.get({Connection, :watchdog, conn})
+    {watchdog, _flags} = Process.get({Connection, :watchdog, conn})
     assert is_pid(watchdog), "the query did not start a watchdog to test"
 
     # ONE process suspends AND resumes. A suspension belongs to the process that made it, so the
@@ -122,42 +102,6 @@ defmodule Fathom.ConnectionWatchdogTest do
 
     refute Process.alive?(watchdog),
            "the watchdog outlived the handoff, so a late cancel can hit the next stream"
-  end
-
-  test "a stale timeout message is swept by the next guarded query", %{conn: conn} do
-    # Deterministic where the race is not: inject exactly the residue the race produces, then run
-    # one ordinary guarded query and assert the mailbox came back clean. Fails without the sweep.
-    Application.put_env(:fathom, :query_timeout_ms, 5_000)
-    :ok = Connection.exec(conn, "CREATE TABLE t (a INTEGER)")
-
-    send(self(), {:timed_out, make_ref()})
-    send(self(), {:timed_out, make_ref()})
-    assert mailbox_size() == 2, "the fixture did not plant the residue it is about to check for"
-
-    assert {:ok, _} = query(conn, "SELECT 1", [])
-
-    assert mailbox_size() == 0,
-           "residue from an earlier deadline survives into a long-lived stream's mailbox, one " <>
-             "message per near-miss, with nothing that can ever match it"
-  end
-
-  test "the sweep does not eat the CURRENT query's timeout", %{conn: conn} do
-    # The sweep runs before `ref` exists, so it cannot consume this call's own message — but that
-    # is the obvious way to break it, so pin it: a genuine timeout must still be reported.
-    Application.put_env(:fathom, :query_timeout_ms, 5)
-    :ok = Connection.exec(conn, "CREATE TABLE big (a INTEGER)")
-    send(self(), {:timed_out, make_ref()})
-
-    result =
-      query(
-        conn,
-        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 90000000) " <>
-          "SELECT count(*) FROM c",
-        []
-      )
-
-    assert {:error, :query_timeout} = result
-    assert mailbox_size() == 0
   end
 
   test "a genuine timeout is still reported", %{conn: conn} do
@@ -260,45 +204,114 @@ defmodule Fathom.ConnectionWatchdogTest do
   #
   # Deterministic where CI was lucky: rather than racing for a scheduler stall, arm the
   # watchdog by hand and let it fire while the connection is IDLE, which is the same state.
-  test "a deadline that fires before the statement starts still bounds the query", %{conn: conn} do
+  test "a deadline that fires before the statement starts still bounds the query", %{conn: _} do
     Application.put_env(:fathom, :query_timeout_ms, 60)
+
+    # A PLAIN handle: a tenant handle also carries the extension's on-thread backstop, which would
+    # stop the slow statement by itself and make this test measure nothing.
+    path = Path.join(System.tmp_dir!(), "watchdog_plain_#{System.unique_integer([:positive])}.db")
+    on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(path <> s) end)
+    {:ok, conn} = Connection.open(path)
+    on_exit(fn -> Connection.close(conn) end)
 
     # One guarded query, so the per-connection watchdog exists and is parked in its outer receive.
     assert {:ok, _} = query(conn, "SELECT 1", [])
 
-    watchdog = Process.get({Connection, :watchdog, conn})
+    {watchdog, flags} = Process.get({Connection, :watchdog, conn})
 
     assert is_pid(watchdog) and Process.alive?(watchdog),
            "fixture: no per-connection watchdog is armed, so this test would measure nothing"
 
-    # Arm against a ref we never disarm and let it fire with the connection idle.
-    ref = make_ref()
-    send(watchdog, {:arm, ref, 20, self()})
-    assert_receive {:timed_out, ^ref}, 2_000
+    # Arm a generation by hand (as `with_deadline/3` does) and never disarm it; let it fire while the
+    # connection is idle.
+    gen = :atomics.add_get(flags, 1, 1)
+    _ = :erlang.start_timer(20, watchdog, {:fire, gen})
+    await_fired(flags, gen)
 
-    # NOW start a statement. Before the fix the watchdog is parked forever on `{:done, ref}`, so
-    # this query's own `{:arm, …}` is never processed and nothing bounds it — it runs to
-    # completion, exactly as CI observed. After the fix the retried cancel lands on the running
-    # statement and errors it. Reported as a plain error, not `:query_timeout`: the watchdog
-    # never processed this call's arm, so there is no `{:timed_out, ref}` for the peek to find.
-    # What is being pinned is that the WORK is bounded, which is what the knob is for.
+    # NOW start a statement, unguarded so it arms nothing of its own. The fire is still current, so
+    # the watchdog's retried cancel lands on the running statement and errors it. Before the retry
+    # existed the single cancel was lost and the statement ran to completion, exactly as CI observed.
+    # Reported as a plain error, not `:query_timeout` (the owner did not arm this call). What is
+    # pinned is that the WORK is bounded, which is what the knob is for.
     slow = """
     WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 20000000)
     SELECT count(*) FROM c
     """
 
-    assert {:error, _} = query(conn, slow, []),
+    assert {:error, _} = Connection.query(conn, slow, []),
            "the statement outran its deadline: a cancel issued before it started was lost and " <>
              "never retried, so :query_timeout_ms did not bound the query at all"
 
-    # Release the hand-armed watchdog so it stops cancelling this connection.
-    send(watchdog, {:done, ref})
+    # Disarm the hand-armed generation, as the owner would, so the watchdog stops cancelling.
+    :atomics.add(flags, 1, 1)
+    send(watchdog, :disarmed)
+  end
+
+  # Expert review 2026-10-20 #24 (the generation guard that replaced the message protocol). A timer
+  # delivered as the owner disarms reaches the watchdog AFTER the statement finished. It must be
+  # ignored: acting on it would cancel the NEXT statement on this connection, a spurious interrupt
+  # on a healthy query. Deterministic: deliver the stale fire by hand after the generation moved on,
+  # then run a statement that a stray cancel would error.
+  test "a fire for a disarmed statement does not cancel a later statement", %{conn: conn} do
+    Application.put_env(:fathom, :query_timeout_ms, 30_000)
+    assert {:ok, _} = query(conn, "SELECT 1", [])
+    {watchdog, flags} = Process.get({Connection, :watchdog, conn})
+
+    gen = :atomics.add_get(flags, 1, 1)
+    # Disarm: the generation moves on...
+    :atomics.add(flags, 1, 1)
+    # ...and the timer for `gen` is delivered anyway.
+    send(watchdog, {:timeout, make_ref(), {:fire, gen}})
+
+    # The watchdog consumed the stale fire (the queue drains; it is a high-priority process).
+    wait_queue_empty(watchdog)
+    assert :atomics.get(flags, 2) != gen, "the stale fire was acted on"
+
+    slow = """
+    WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 3000000)
+    SELECT count(*) FROM c
+    """
+
+    assert {:ok, %{rows: [[3_000_000]]}} = query(conn, slow, [])
+  end
+
+  # Bounded poll without `Process.sleep`.
+  defp await_fired(flags, gen, tries \\ 200) do
+    cond do
+      :atomics.get(flags, 2) == gen ->
+        :ok
+
+      tries == 0 ->
+        flunk("the hand-armed deadline never fired")
+
+      true ->
+        receive do
+        after
+          10 -> await_fired(flags, gen, tries - 1)
+        end
+    end
+  end
+
+  defp wait_queue_empty(pid, tries \\ 200) do
+    case Process.info(pid, :message_queue_len) do
+      {:message_queue_len, 0} ->
+        :ok
+
+      _ when tries == 0 ->
+        flunk("the watchdog never drained its mailbox")
+
+      _ ->
+        receive do
+        after
+          5 -> wait_queue_empty(pid, tries - 1)
+        end
+    end
   end
 
   # The watchdog runs at `:high` priority so a saturated scheduler cannot starve its deadline
   # cancels (CI, OTP 28/29, 2026-08-29, run 33234915078). The failure was the "re-arms" test's
   # SECOND slow query returning `{:ok, rows: [[200000000]]}` — a 200M-row recursive CTE that RAN TO
-  # COMPLETION under a 60 ms deadline. `await_disarm/3` re-issues its cancel every @cancel_retry_ms,
+  # COMPLETION under a 60 ms deadline. `await_disarm/4` re-issues its cancel every @cancel_retry_ms,
   # but that only bounds the query if the watchdog actually gets a scheduler slot to run the cancel;
   # while the owner is blocked in the `multi_step` DIRTY NIF, a normal-priority watchdog on a loaded
   # 2-core runner was not scheduled for the whole life of the query, so no cancel ever landed and
@@ -312,7 +325,7 @@ defmodule Fathom.ConnectionWatchdogTest do
     # One guarded query so the per-connection watchdog is spawned and parked.
     assert {:ok, _} = query(conn, "SELECT 1", [])
 
-    watchdog = Process.get({Connection, :watchdog, conn})
+    {watchdog, _flags} = Process.get({Connection, :watchdog, conn})
 
     assert is_pid(watchdog) and Process.alive?(watchdog),
            "fixture: no per-connection watchdog is armed, so this test would measure nothing"
@@ -340,7 +353,7 @@ defmodule Fathom.ConnectionWatchdogTest do
     dref = Process.monitor(dead)
     assert_receive {:DOWN, ^dref, :process, ^dead, _}, 1_000
     refute Process.alive?(dead)
-    Process.put({Connection, :watchdog, conn}, dead)
+    Process.put({Connection, :watchdog, conn}, {dead, :atomics.new(2, signed: false)})
 
     # Slow BY CONSTRUCTION so it cannot finish inside the 60 ms deadline on its own.
     slow = """
@@ -353,7 +366,7 @@ defmodule Fathom.ConnectionWatchdogTest do
              "watchdog, never a corpse"
 
     # And a fresh, live watchdog now backs the connection.
-    replacement = Process.get({Connection, :watchdog, conn})
+    {replacement, _} = Process.get({Connection, :watchdog, conn})
     assert is_pid(replacement) and Process.alive?(replacement)
     refute replacement == dead
   end
@@ -386,7 +399,7 @@ defmodule Fathom.ConnectionWatchdogTest do
     # One process suspends AND resumes (a suspension belongs to its suspender).
     defp freeze_watchdog!(conn) do
       assert {:ok, _} = query(conn, "SELECT 1", [])
-      watchdog = Process.get({Connection, :watchdog, conn})
+      {watchdog, _flags} = Process.get({Connection, :watchdog, conn})
       assert is_pid(watchdog)
       test = self()
 

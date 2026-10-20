@@ -209,6 +209,8 @@ defmodule Fathom.ShardExecutor do
     ddl? = ddl?(head)
     write? = dml? or ddl?
     note_session_state(conn, sql, head)
+    # ONE ETS read for both fence clauses below (expert review 2026-10-20 #35); it used to be two.
+    fenced? = WriteFence.fenced?(shard_id)
 
     cond do
       # Statements no tenant may run, regardless of scope or config (expert review 2026-08-01
@@ -271,7 +273,7 @@ defmodule Fathom.ShardExecutor do
       # `write_candidate?/1`, NOT `write?` (expert review 2026-08-26 #1). See its definition for
       # why the fence needs a wider, fail-closed predicate than the one driving `read_only?`.
       # Cheap ETS membership first, the head test only when fenced (expert review 2026-10-17 #11).
-      WriteFence.fenced?(shard_id) and write_candidate?(head) ->
+      fenced? and write_candidate?(head) ->
         {:error,
          %Error{
            message:
@@ -292,7 +294,7 @@ defmodule Fathom.ShardExecutor do
       # un-ACK, no client wedged); on the terminate fence it is true. ROLLBACK is
       # `commit_boundary?`-false and left alone, so the stream's teardown can still abandon the
       # transaction and the client retries against the successor with nothing acknowledged.
-      WriteFence.fenced?(shard_id) and commit_boundary?(head) and txn_wrote?(conn) ->
+      fenced? and commit_boundary?(head) and txn_wrote?(conn) ->
         {:error,
          %Error{
            message:
@@ -338,6 +340,17 @@ defmodule Fathom.ShardExecutor do
            status: 403
          }}
 
+      # The migration capture on the template records positional args only; replaying a named
+      # statement from it would bind nothing. Refuse loudly rather than capture a broken chain
+      # (expert review 2026-10-20 #10).
+      opts.template? and stmt.named_args != [] ->
+        {:error,
+         %Error{
+           message: "named_args are not supported on the template shard (migration capture)",
+           code: "FILO_NAMED_ARGS_UNSUPPORTED",
+           status: 400
+         }}
+
       true ->
         run_statement(handle, stmt, head, dml?, ddl?)
     end
@@ -355,11 +368,14 @@ defmodule Fathom.ShardExecutor do
 
   defp run_statement(
          {pid, _ref, conn, shard_id, _scope, _ver, opts},
-         %Stmt{sql: sql, args: args},
+         %Stmt{sql: sql, args: args, named_args: named_args},
          head,
          dml?,
          ddl?
        ) do
+    # Hrana `named_args` (expert review 2026-10-20 #10) are bound by name in `Connection.query`;
+    # the common positional-only statement keeps the plain list.
+    bind = if named_args == [], do: args, else: {args, named_args}
     started = System.monotonic_time()
     schema_before = if ddl?, do: schema_version(conn)
 
@@ -375,11 +391,11 @@ defmodule Fathom.ShardExecutor do
     # 2026-10-17 #6).
     repl_on? = Session.enabled?()
 
-    case Connection.query(conn, sql, args,
+    case Connection.query(conn, sql, bind,
            dml?: dml?,
            read?: read?,
            deadline: true,
-           conn_state?: repl_on?
+           conn_state?: repl_on? and (dml? or commit_boundary?(head))
          ) do
       {:ok, result} ->
         # A write bumps the shard's write counter so the periodic durability flush knows local
@@ -419,7 +435,7 @@ defmodule Fathom.ShardExecutor do
         # track_txn_write/3, which clears the in-transaction flag this decision reads.
         repl = maybe_replicate(shard_id, pid, conn, head, wrote?, repl_on?, result.autocommit?)
 
-        track_txn_write(conn, head, wrote?)
+        track_txn_write(conn, sql, head, wrote?)
 
         # On the reserved template shard, feed each successful statement to the
         # migration capture so a Django migrate becomes a fleet version.
@@ -698,7 +714,7 @@ defmodule Fathom.ShardExecutor do
   # so a subsequent read-only transaction can't inherit this one's dirtiness. Any write sets it.
   # Order matters: a write is recorded even on a statement that also ends a transaction (there is
   # no such statement in SQLite today, but the ordering makes the flag's meaning unambiguous).
-  defp track_txn_write(conn, head, wrote?) do
+  defp track_txn_write(conn, sql, head, wrote?) do
     key = {__MODULE__, @txn_wrote_key, conn}
 
     cond do
@@ -709,7 +725,7 @@ defmodule Fathom.ShardExecutor do
       # Only a statement that actually ENDS the transaction may clear the flag. Notably absent:
       # RELEASE (an inner savepoint release commits nothing — the outer COMMIT must still re-bump
       # if a flush straddles it) and `ROLLBACK TO <savepoint>` (see rolls_back?/1).
-      ends_transaction?(head) or rolls_back?(head) -> Process.delete(key)
+      ends_transaction?(head) or rolls_back?(sql, head) -> Process.delete(key)
       true -> :ok
     end
 
@@ -879,8 +895,14 @@ defmodule Fathom.ShardExecutor do
   # flag there would drop that write's re-bump at the eventual COMMIT and lose it on idle drop —
   # exactly Django's nested-atomic-raises-then-outer-commit shape. When in doubt, KEEP the flag:
   # keeping over-bumps (safe), clearing loses data.
-  defp rolls_back?(head) do
-    String.starts_with?(head, "rollback") and not String.contains?(head, " to ")
+  # The 12-byte head cannot see past `rollback` far enough to tell a full ROLLBACK from `ROLLBACK
+  # [TRANSACTION] TO <savepoint>`, so only a rollback pays for the long form (the same 40 bytes the
+  # head used to carry for every statement; expert review 2026-10-20 #35).
+  @rollback_head_bytes 40
+
+  defp rolls_back?(sql, head) do
+    String.starts_with?(head, "rollback") and
+      not String.contains?(head(sql, @rollback_head_bytes), " to ")
   end
 
   # The assignment form (`pragma [db.]name = value`) of a header-writing pragma; the
@@ -1840,16 +1862,19 @@ defmodule Fathom.ShardExecutor do
   # fold (U+212A KELVIN SIGN -> "k") no longer makes a non-ASCII spelling match a keyword SQLite
   # would not. A cut mid-codepoint is harmless: nothing compares past an ASCII keyword prefix. It
   # is computed ONCE per statement in `do_execute/2` and passed to the prefix classifiers.
-  @head_bytes 40
+  @head_bytes 12
 
   # The head must reach the end of the longest `@read_shaped` verb or that verb can never match
-  # (the 2026-09-05 ROLLBACK/SAVEPOINT regression); `rolls_back?/1` needs room for " to ".
+  # (the 2026-09-05 ROLLBACK/SAVEPOINT regression). It is the SINGLE normaliser every classifier and
+  # authorization gate reads (expert review 2026-10-20 #35 shortened it from 40 to 12 bytes: the
+  # longest verb any classifier matches is 9, `savepoint`; only `rolls_back?/2` needs more, and
+  # takes it from `head/2` itself). Do not add a second normaliser.
   if @head_bytes < @read_shaped_lead,
     do: raise("@head_bytes shorter than the longest @read_shaped verb")
 
-  defp head(sql) when is_binary(sql) do
+  defp head(sql, bytes \\ @head_bytes) when is_binary(sql) do
     stripped = strip_lead_noise(sql)
-    stripped |> binary_part(0, min(byte_size(stripped), @head_bytes)) |> String.downcase(:ascii)
+    stripped |> binary_part(0, min(byte_size(stripped), bytes)) |> String.downcase(:ascii)
   end
 
   defp lead(sql, n) do

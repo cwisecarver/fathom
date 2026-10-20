@@ -396,6 +396,52 @@ defmodule Fathom.Shard.NifDispatchTest do
       assert {total, by_fun} == {2, %{multi_step: 2}}
       {:ok, _} = ShardExecutor.execute(conn, stmt("ROLLBACK"))
     end
+
+    # Expert review 2026-10-20 #27. A COMMIT that closes a transaction which wrote is a ship
+    # candidate under replication, so the executor asked `autocommit?/1` (a dirty `transaction_status`
+    # dispatch) AFTER the `changes` fetch, and a COMMIT inheriting changes()>0 also fetched the rowid:
+    # multi_step + changes + last_insert_rowid + transaction_status = 4. The extension's
+    # `fathom_conn_state()` returns all three in one step: 2.
+    # Only the dispatch count is asserted; with no followers the ship itself is allowed to refuse.
+    test "a replicated-mode COMMIT of a writing transaction is 2 dispatches (was 4)" do
+      shard = "test_nifd_cm_#{System.unique_integer([:positive])}"
+      {:ok, conn} = ShardExecutor.open(shard)
+
+      on_exit(fn ->
+        ShardExecutor.close(conn)
+
+        for base <- [
+              Path.join(Fathom.Shard.data_dir(), "#{shard}.db"),
+              Path.join(Fathom.Shard.Storage.Local.dir(), "#{shard}.db")
+            ],
+            suffix <- ["", "-wal", "-shm"],
+            do: File.rm(base <> suffix)
+      end)
+
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER PRIMARY KEY, v)"))
+
+      prev = Application.get_env(:fathom, :replication_enabled)
+      Application.put_env(:fathom, :replication_enabled, true)
+
+      on_exit(fn ->
+        if prev == nil,
+          do: Application.delete_env(:fathom, :replication_enabled),
+          else: Application.put_env(:fathom, :replication_enabled, prev)
+      end)
+
+      # One full transaction first, so BEGIN / INSERT / COMMIT are all in the statement cache and the
+      # measured COMMIT is a cache hit.
+      for k <- [1, 2] do
+        {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
+        {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (?, 'w')", [k]))
+        if k == 1, do: ShardExecutor.execute(conn, stmt("COMMIT"))
+      end
+
+      {_res, total, by_fun} = count(fn -> ShardExecutor.execute(conn, stmt("COMMIT")) end)
+
+      # The ship (no followers here) may add its own non-dirty work, never a dirty dispatch.
+      assert {total, by_fun} == {2, %{multi_step: 2}}
+    end
   end
 
   # A statement left un-reset keeps its read transaction (a WAL read mark), which blocks a

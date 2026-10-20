@@ -837,11 +837,15 @@ defmodule Fathom.Shard.Connection do
   When the statement also returns columns, `sqlite3_changes()` is not fetched (a dirty-NIF
   dispatch) and `num_changes` is reported as 0; the caller must not need the inherited count.
 
-  `conn_state?: true` (DML only) fetches changes, last rowid and the autocommit flag in one
-  statement step via the extension's `fathom_conn_state()` and reports the flag as `autocommit?`
-  (expert review 2026-10-17 #6); `autocommit?` is nil when that path was not taken.
+  `conn_state?: true` fetches changes, last rowid and the autocommit flag in one statement step
+  via the extension's `fathom_conn_state()` and reports the flag as `autocommit?` (expert review
+  2026-10-17 #6); `autocommit?` is nil when that path was not taken. The CALLER decides when it is
+  worth it: it replaces the single `changes` fetch one-for-one, so it only pays off where the
+  caller would otherwise ask `autocommit?/1` right after (a DML statement, or a COMMIT boundary
+  that may ship, expert review 2026-10-20 #27).
   """
-  @spec query(reference(), String.t(), list(), keyword()) :: {:ok, map()} | {:error, term()}
+  @spec query(reference(), String.t(), list() | {list(), [{String.t(), term()}]}, keyword()) ::
+          {:ok, map()} | {:error, term()}
   def query(conn, sql, args, opts \\ []) do
     dml? = Keyword.get(opts, :dml?, true)
     read? = Keyword.get(opts, :read?, false)
@@ -897,7 +901,7 @@ defmodule Fathom.Shard.Connection do
       # A `bind` failure never steps the statement, so there is nothing to reset. Pinned by
       # `NifDispatchTest`: a second handle's `wal_checkpoint(TRUNCATE)` after every outcome.
       try do
-        with :ok <- Sqlite3.bind(stmt, args),
+        with :ok <- bind_args(stmt, args),
              {:ok, rows, row_count} <-
                reset_if_abandoned(stmt, step_all(conn, stmt, row_cap(), deadline_at)) do
           # Post-step column read when the schema moved under this connection (expert review
@@ -922,9 +926,12 @@ defmodule Fathom.Shard.Connection do
           # in ONE statement step: 1 dirty dispatch instead of 3 (changes + rowid + the executor's
           # separate `transaction_status`). Not used otherwise: without the autocommit read, the
           # step costs about what `changes` + `last_insert_rowid` cost (measured 4.0 vs 3.9 us), so
-          # it would be no win, and BEGIN/COMMIT (not DML) keep the single `changes` fetch.
+          # it would be no win. Expert review 2026-10-20 #27: the executor ALSO asks for it on a
+          # COMMIT/END/RELEASE boundary under replication, where it would otherwise follow the
+          # `changes` fetch with an `autocommit?/1` dispatch (2 extra -> 1). A BEGIN keeps the
+          # single `changes` fetch: nothing reads its autocommit flag.
           {changes, fast_rowid, autocommit} =
-            case if(state? and dml?, do: fetch_conn_state(conn)) do
+            case if(state?, do: fetch_conn_state(conn)) do
               {:ok, ch, rid, ac} ->
                 {ch, rid, ac}
 
@@ -1058,6 +1065,73 @@ defmodule Fathom.Shard.Connection do
       end
     else
       _ -> :error
+    end
+  end
+
+  # Plain positional args take exqlite's bind untouched (the hot path). `{positional, named}` is a
+  # Hrana statement carrying `named_args` (expert review 2026-10-20 #10): each name is resolved to
+  # its parameter index with `sqlite3_bind_parameter_index` (exqlite's `bind_parameter_index`), the
+  # values are merged with the positional ones into ONE index-ordered list, and exqlite's own bind
+  # does the (parameterized) binding and the count check. No SQL parsing, no interpolation.
+  # exqlite's own map bind cannot be used: it needs every parameter named and every name prefixed.
+  # Per the Hrana spec a client may send the name with or without its `:`/`@`/`$` prefix.
+  defp bind_args(stmt, args) when is_list(args) or is_nil(args), do: Sqlite3.bind(stmt, args)
+
+  defp bind_args(stmt, {positional, named}) do
+    case Sqlite3.bind_parameter_count(stmt) do
+      {:error, reason} ->
+        {:error, reason}
+
+      count ->
+        slots =
+          positional
+          |> Enum.with_index(1)
+          |> Map.new(fn {value, idx} -> {idx, value} end)
+
+        slots =
+          Enum.reduce(named, slots, fn {name, value}, acc ->
+            idx = named_index(stmt, name)
+
+            cond do
+              idx == 0 ->
+                raise ArgumentError, "unknown named parameter: #{inspect(name)}"
+
+              Map.has_key?(acc, idx) ->
+                raise ArgumentError,
+                      "parameter #{inspect(name)} (index #{idx}) is bound twice " <>
+                        "(positional and named arguments overlap)"
+
+              true ->
+                Map.put(acc, idx, value)
+            end
+          end)
+
+        if map_size(slots) != count or Enum.any?(Map.keys(slots), &(&1 > count)) do
+          raise ArgumentError,
+                "expected #{count} arguments, got #{map_size(slots)} " <>
+                  "(#{length(positional)} positional, #{length(named)} named)"
+        end
+
+        Sqlite3.bind(stmt, for(i <- 1..count//1, do: Map.fetch!(slots, i)))
+    end
+  end
+
+  defp named_index(stmt, <<c, _::binary>> = name) when c in [?:, ?@, ?$],
+    do: param_index(stmt, name)
+
+  defp named_index(stmt, name) do
+    Enum.find_value([":", "@", "$"], 0, fn prefix ->
+      case param_index(stmt, prefix <> name) do
+        0 -> nil
+        idx -> idx
+      end
+    end)
+  end
+
+  defp param_index(stmt, name) do
+    case Exqlite.Sqlite3NIF.bind_parameter_index(stmt, name) do
+      idx when is_integer(idx) -> idx
+      _ -> 0
     end
   end
 
@@ -1325,7 +1399,13 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  # How often the watchdog re-issues a cancel that has not yet taken effect. See await_disarm/3.
+  # Atomics layout shared by the owner and its watchdog: slot 1 is the running generation (bumped at
+  # arm and again at disarm, so "armed" generations are odd and a finished one is never current);
+  # slot 2 is the last generation whose deadline actually fired.
+  @gen_slot 1
+  @fired_slot 2
+
+  # How often the watchdog re-issues a cancel that has not yet taken effect. See await_disarm/4.
   @cancel_retry_ms 5
 
   # Run `fun` (the query) in THIS process while a watchdog process interrupts `conn` if the
@@ -1341,59 +1421,44 @@ defmodule Fathom.Shard.Connection do
   # connection; it lives in the owner's process dictionary beside the statement cache and dies
   # with the owner (it monitors it) or at close/1.
   defp with_deadline(conn, ms, fun) do
-    # Sweep residue from an EARLIER deadline before arming this one (expert review 2026-08-01
-    # #46's residual race, which its own tests said they did not close).
+    # NO MESSAGES PER STATEMENT (expert review 2026-10-20 #24). The deadline used to cost two sends
+    # to a second process per statement (`{:arm}` + `{:done}`), a `make_ref`, an alias, and a
+    # selective receive pair, and after idle each send woke the watchdog from a cold scheduler
+    # (measured +2-3.5 us hot, +29-34 us median after 100 ms idle). Now:
     #
-    # The peek below is `after 0` — non-blocking — so it misses a `{:timed_out, ref}` the watchdog
-    # sent in the instant between the query finishing and that peek running. The ref is unique per
-    # call, so no later peek can ever match it either: the message sits in the stream process's
-    # mailbox forever, one per near-miss, growing without bound.
-    #
-    # CI found it, not reading: `connection_watchdog_test` drives 400 queries at a 1 ms deadline
-    # specifically to sit on that boundary, and a loaded 2–4 core runner widens the window enough
-    # that it fires. It passed on an 18-core dev box for the same reason the other two CI-only
-    # failures did.
-    #
-    # Swept at ARM rather than acknowledged at disarm: a synchronous disarm handshake would close
-    # the window completely but costs a round trip on every guarded query. Anything still in the
-    # mailbox at this point is necessarily stale — `ref` does not exist yet — so this is exact,
-    # and it is O(residue): normally the mailbox is empty and the receive returns immediately.
-    drain_stale_timeouts()
+    #   * arm: bump the connection's generation counter (an `:atomics`, shared with the watchdog)
+    #     and start a BEAM timer addressed to the watchdog. No wake-up: the timer wheel holds it.
+    #   * disarm: bump the generation again and cancel the timer asynchronously. A timer that was
+    #     already delivered is harmless: the watchdog compares the generation it carries with the
+    #     live one before doing anything, so a fire for a finished statement is ignored.
+    #   * the watchdog, on a genuine fire, sets the "timed out" mark for that generation BEFORE it
+    #     cancels (same ordering as the old send-before-cancel, expert review 2026-08-01 #46), and
+    #     the owner reads the mark after the statement returns. A mark in a shared atomic replaces
+    #     the `{:timed_out, ref}` message, so there is no mailbox residue to sweep, nothing a
+    #     `Filo.Stream` GenServer could crash on (2026-10-08 #27), and no alias.
+    {watchdog, flags} = ensure_watchdog(conn)
+    gen = :atomics.add_get(flags, @gen_slot, 1)
+    tref = :erlang.start_timer(ms, watchdog, {:fire, gen})
 
-    ref = make_ref()
-    # THE WATCHDOG ANSWERS AN ALIAS, NOT THIS PID (expert review 2026-10-08 #27). The sweep above
-    # only helps if the owner runs another guarded query; when the near-miss is the LAST statement
-    # of a request, the stray `{:timed_out, ref}` reached the owner's mailbox and — the owner being
-    # a `Filo.Stream` GenServer with no catch-all `handle_info` — crashed the stream (lost
-    # interactive transaction, STREAM_NOT_FOUND to the client, an over-dirtied shard). The alias is
-    # dropped below, after which the runtime discards any late send to it outright.
-    reply_to = Process.alias()
-    watchdog = arm_watchdog(conn, ref, ms, reply_to)
-
-    # Always disarm, even if fun raises (Sqlite3.bind raises ArgumentError on a bad bind
-    # value — the reason query/3 has a rescue). Without try/after the raise unwinds before the
-    # {:done, ref} send, leaving the watchdog armed to interrupt a LATER statement reusing this
-    # connection `ms` later — a spurious FILO_QUERY_TIMEOUT on a healthy query (expert review
-    # 2026-07-18 #13). The raise then propagates to query/3's rescue as before.
+    # Always disarm, even if fun raises (Sqlite3.bind raises ArgumentError on a bad bind value —
+    # the reason query/3 has a rescue). Without try/after the raise unwinds before the disarm,
+    # leaving the deadline armed to interrupt a LATER statement reusing this connection `ms` later
+    # — a spurious FILO_QUERY_TIMEOUT on a healthy query (expert review 2026-07-18 #13).
     started = System.monotonic_time(:millisecond)
 
     result =
       try do
         fun.(started + ms)
       after
-        send(watchdog, {:done, ref})
+        :atomics.add(flags, @gen_slot, 1)
+        _ = :erlang.cancel_timer(tref, async: true, info: false)
       end
 
-    # Unalias BEFORE the peek: a send that beat the unalias is already in the mailbox and the peek
-    # finds it; one after it is discarded by the runtime and can never become residue.
-    Process.unalias(reply_to)
+    timed_out? = :atomics.get(flags, @fired_slot) == gen
 
-    timed_out? =
-      receive do
-        {:timed_out, ^ref} -> true
-      after
-        0 -> false
-      end
+    # A fire is in flight (or retrying its cancel): wake it so it stops now instead of at its next
+    # retry tick, which keeps the synchronous `stop_watchdog/1` at pooled checkin immediate.
+    if timed_out?, do: send(watchdog, :disarmed)
 
     case {timed_out?, result} do
       {true, {:error, _}} ->
@@ -1418,51 +1483,19 @@ defmodule Fathom.Shard.Connection do
   defp deadline_error?(reason) when is_binary(reason), do: reason =~ "interrupt"
   defp deadline_error?(_reason), do: false
 
-  defp drain_stale_timeouts do
-    receive do
-      {:timed_out, _stale} -> drain_stale_timeouts()
-    after
-      0 -> :ok
-    end
-  end
-
-  # Arm THIS query's deadline, re-checking liveness AFTER the send (expert review 2026-08-31 #22).
-  # `ensure_watchdog/1` replaces a watchdog that is already dead, but there is a TOCTOU between it
-  # returning a LIVE pid and the fire-and-forget `{:arm}` send: the watchdog can die in that window
-  # (it dies abnormally — e.g. a stale `await_disarm` cancel on a torn-down conn), and a send to a
-  # just-dead pid is dropped silently, leaving the query with NO deadline until the next query
-  # replaces the pid. Re-check after the send and re-arm a FRESH watchdog if it is gone.
-  #
-  # An async re-check, not a synchronous ack: the module deliberately rejected a per-query handshake
-  # round trip (see with_deadline). A vanishing residual window remains — a death after this
-  # `Process.alive?` check but before the `{:arm}` is processed — and it self-heals on the next
-  # query. That residual is why this race is NOT unit-testable: `ensure_watchdog/1` gatekeeps every
-  # non-race dead-pid case, so no test can inject a pid that reaches the send dead without also
-  # dying in a scheduler-dependent window a test cannot force. Bounded retries so a conn being torn
-  # down (its fresh watchdogs die immediately) cannot spin forever — after that the query is failing
-  # anyway.
-  @arm_attempts 3
-
-  defp arm_watchdog(conn, ref, ms, reply_to, attempts \\ @arm_attempts) do
-    watchdog = ensure_watchdog(conn)
-    send(watchdog, {:arm, ref, ms, reply_to})
-
-    cond do
-      Process.alive?(watchdog) -> watchdog
-      attempts > 0 -> arm_watchdog(conn, ref, ms, reply_to, attempts - 1)
-      true -> watchdog
-    end
-  end
-
+  # `{pid, flags}` lives in the owner's dictionary beside the statement cache. A dead watchdog (it
+  # can only die abnormally — e.g. a cancel on a torn-down conn) must not silently disable the
+  # deadline for the rest of the stream: replace it. This is the ONE liveness check per statement;
+  # the post-arm re-check the message protocol needed (2026-08-31 #22) is gone with it. The
+  # residual window — the watchdog dying between this check and `start_timer` — self-heals on the
+  # next statement, the same class the old re-check also left open.
   defp ensure_watchdog(conn) do
     key = {__MODULE__, :watchdog, conn}
 
     case Process.get(key) do
-      pid when is_pid(pid) ->
-        # A dead watchdog (it can only die abnormally — e.g. interrupt on a torn-down conn)
-        # must not silently disable the deadline for the rest of the stream: replace it.
+      {pid, _flags} = entry when is_pid(pid) ->
         if Process.alive?(pid) do
-          pid
+          entry
         else
           Process.delete(key)
           ensure_watchdog(conn)
@@ -1470,13 +1503,15 @@ defmodule Fathom.Shard.Connection do
 
       nil ->
         owner = self()
-        pid = spawn(fn -> watchdog_init(conn, owner) end)
-        Process.put(key, pid)
-        pid
+        flags = :atomics.new(2, signed: false)
+        pid = spawn(fn -> watchdog_init(conn, owner, flags) end)
+        entry = {pid, flags}
+        Process.put(key, entry)
+        entry
     end
   end
 
-  defp watchdog_init(conn, owner) do
+  defp watchdog_init(conn, owner, flags) do
     # HIGH PRIORITY so a saturated scheduler cannot starve the deadline (CI, OTP 28/29, 2026-08-29).
     #
     # `await_disarm/3` re-issues its cancel every @cancel_retry_ms until the owner disarms, and its
@@ -1495,48 +1530,40 @@ defmodule Fathom.Shard.Connection do
     # processes and can wedge the scheduler.
     Process.flag(:priority, :high)
     mon = Process.monitor(owner)
-    watchdog_loop(conn, mon)
+    watchdog_loop(conn, flags, mon)
   end
 
-  defp watchdog_loop(conn, mon) do
+  # Runs only when a deadline timer fires (or on `:stop` / owner death): between fires it sits in
+  # `receive` and is never woken by a healthy statement.
+  defp watchdog_loop(conn, flags, mon) do
     receive do
-      {:arm, ref, ms, parent} ->
-        receive do
-          {:done, ^ref} ->
-            :ok
-
-          {:DOWN, ^mon, :process, _, _} ->
-            owner_down(conn)
-        after
-          ms ->
-            # cancel/1, not interrupt/1 (expert review 2026-07-24 #1): interrupt only aborts VDBE
-            # execution, so a statement parked in the busy handler waiting for the write lock
-            # ignored it and slept out the full busy timeout. cancel/1 is a superset — it sets the
-            # flag the busy handler polls AND calls sqlite3_interrupt — so the deadline now bounds
-            # lock waits too. It is a non-dirty NIF that deliberately avoids the connection mutex,
-            # so it cannot block behind the running query. A spurious late cancel is still a no-op:
-            # exqlite resets `cancelled` at the top of every subsequent db op.
-            # Tell the owner BEFORE cancelling (expert review 2026-08-01 #46). Cancelling first
-            # opens a window: the query can finish naturally between `cancel/1` and this send,
-            # in which case the owner's `after 0` peek for `{:timed_out, ref}` already ran and
-            # found nothing, and the message lands in a long-lived stream process's mailbox
-            # where nothing will ever match it again (the next call uses a fresh `make_ref/0`).
-            #
-            # Sending first makes the ordering structural: the message is in the mailbox before
-            # the cancel can let `fun.()` return, so the peek either sees it or the query was
-            # never cancelled at all. A spurious late cancel is already a no-op — exqlite resets
-            # `cancelled` at the top of every subsequent db op.
-            send(parent, {:timed_out, ref})
-            await_disarm(conn, ref, mon)
+      {:timeout, _tref, {:fire, gen}} ->
+        # A fire for a statement that already finished (timer delivered as the owner disarmed) is
+        # ignored: the generation moved on. cancel/1, not interrupt/1 (expert review 2026-07-24 #1):
+        # interrupt only aborts VDBE execution, so a statement parked in the busy handler waiting
+        # for the write lock ignored it and slept out the full busy timeout. cancel/1 is a superset
+        # — it sets the flag the busy handler polls AND calls sqlite3_interrupt — and is a
+        # non-dirty NIF that deliberately avoids the connection mutex, so it cannot block behind
+        # the running query. A spurious late cancel is a no-op: exqlite resets `cancelled` at the
+        # top of every subsequent db op.
+        if :atomics.get(flags, @gen_slot) == gen do
+          # Mark BEFORE cancelling (expert review 2026-08-01 #46): the cancel is what lets the
+          # statement return, so the owner's read of the mark afterwards cannot miss it.
+          :atomics.put(flags, @fired_slot, gen)
+          await_disarm(conn, flags, gen, mon)
         end
 
-        watchdog_loop(conn, mon)
+        watchdog_loop(conn, flags, mon)
 
       :stop ->
         exit(:normal)
 
       {:DOWN, ^mon, :process, _, _} ->
         owner_down(conn)
+
+      # A `:disarmed` that raced past the fire it was meant for.
+      :disarmed ->
+        watchdog_loop(conn, flags, mon)
     end
   end
 
@@ -1569,35 +1596,41 @@ defmodule Fathom.Shard.Connection do
   #
   # Retrying latches it: whenever the statement finally reaches a scheduler, the next cancel
   # lands on a RUNNING statement and errors it. Overshoot is bounded by @cancel_retry_ms, and
-  # the healthy path pays nothing — an interrupted query's `{:done, ref}` arrives long before
+  # the healthy path pays nothing — an interrupted query's `:disarmed` arrives long before
   # the first retry.
   #
-  # Still blocking until `{:done, ref}`, so the 2026-07-23 #26 guarantee is intact: the
-  # watchdog cannot process a NEWER `{:arm, …}` while these cancels are in flight. A retry
-  # issued in the sliver between the statement finishing (`multi_step` returning) and `{:done, ref}` is the same no-op class
-  # the single cancel already accepted, not a new hazard.
-  defp await_disarm(conn, ref, mon) do
+  # Still blocking until the owner disarms (`:disarmed`, or the generation moving on), so the
+  # watchdog cannot act on a NEWER statement's fire while these cancels are in flight. A retry
+  # issued in the sliver between the statement finishing (`multi_step` returning) and the disarm is
+  # the same no-op class the single cancel already accepted, not a new hazard.
+  defp await_disarm(conn, flags, gen, mon) do
     Sqlite3.cancel(conn)
 
     receive do
-      {:done, ^ref} -> :ok
+      :disarmed -> :ok
       {:DOWN, ^mon, :process, _, _} -> owner_down(conn)
     after
-      @cancel_retry_ms -> await_disarm(conn, ref, mon)
+      @cancel_retry_ms ->
+        # The owner normally sends `:disarmed`; the generation check also ends the loop when it
+        # could not (the fire raced the owner's mark read), so the watchdog never keeps cancelling
+        # a LATER statement.
+        if :atomics.get(flags, @gen_slot) == gen,
+          do: await_disarm(conn, flags, gen, mon),
+          else: :ok
     end
   end
 
   # SYNCHRONOUS: wait for the watchdog to be gone (expert review 2026-09-29 #33). With pooling the
   # handle is handed to ANOTHER stream right after this, and a watchdog that fired on this stream's
-  # last query can still be between its retry timer and `Sqlite3.cancel/1` when `{:done, ref}` is
-  # sent — a fire-and-forget `:stop` let that cancel land on the NEXT stream's running statement: a
+  # last query can still be between its retry timer and `Sqlite3.cancel/1` when the disarm is
+  # signalled — a fire-and-forget `:stop` let that cancel land on the NEXT stream's running statement: a
   # SQLITE_INTERRUPT on an unrelated request, not even mapped to FILO_QUERY_TIMEOUT (that stream
   # never armed the ref). The watchdog handles its mailbox in order, so once it has exited every
   # cancel it issued has returned, and a returned cancel cannot touch a later statement (exqlite
   # resets its flag at the next op; `sqlite3_interrupt` with nothing running is a no-op).
   #
   # Cheap: an idle watchdog is blocked in `receive`, so this is one message round trip, paid only
-  # when `:query_timeout_ms` is set. Bounded: a watchdog mid-`await_disarm` sees `{:done, ref}`
+  # when `:query_timeout_ms` is set. Bounded: a watchdog mid-`await_disarm` sees `:disarmed`
   # within @cancel_retry_ms; past @watchdog_stop_ms it is killed rather than waited on.
   @watchdog_stop_ms 1_000
 
@@ -1606,7 +1639,7 @@ defmodule Fathom.Shard.Connection do
       nil ->
         :ok
 
-      pid ->
+      {pid, _flags} ->
         mon = Process.monitor(pid)
         send(pid, :stop)
 
@@ -1978,7 +2011,7 @@ defmodule Fathom.Shard.Connection do
 
         if is_integer(cap) and count > cap,
           do: {:error, {:too_many_rows, cap}},
-          else: {:ok, [rows | batches] |> Enum.reverse() |> Enum.concat(), count}
+          else: {:ok, finish_batches(rows, batches), count}
 
       # Retryable (see `step_all/4`) only when nothing has been returned yet.
       :busy ->
@@ -1988,6 +2021,11 @@ defmodule Fathom.Shard.Connection do
         {:error, reason}
     end
   end
+
+  # The common result is ONE batch (a point read): return its rows as they are instead of
+  # reverse + concat copying them (expert review 2026-10-20 #35).
+  defp finish_batches(rows, []), do: rows
+  defp finish_batches(rows, batches), do: [rows | batches] |> Enum.reverse() |> Enum.concat()
 
   defp timeout_ms, do: Application.get_env(:fathom, :query_timeout_ms)
 

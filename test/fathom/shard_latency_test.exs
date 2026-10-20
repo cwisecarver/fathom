@@ -53,6 +53,19 @@ defmodule Fathom.ShardLatencyTest do
     assert Enum.at(hist, 3) == 1, "1500µs belongs to the [1000,2000)µs bucket"
   end
 
+  # Expert review 2026-10-20 #35: the bucket lookup became a comparison ladder. Invariant: it agrees
+  # with the scan it replaced at every edge, one
+  # below and one above, plus negatives and the overflow.
+  test "bucket_index/1 matches the edge scan at every boundary" do
+    for edge <- ShardLatency.edges(), delta <- [-1, 0, 1], us <- [edge + delta] do
+      assert ShardLatency.bucket_index(us) == ShardLatency.bucket_index_scan(us), "us=#{us}"
+    end
+
+    for us <- [-5, 0, 99, 100, 4_999_999, 5_000_000, 10_000_000_000] do
+      assert ShardLatency.bucket_index(us) == ShardLatency.bucket_index_scan(us), "us=#{us}"
+    end
+  end
+
   test "histogram is an all-zero vector for an unrecorded shard" do
     hist = ShardLatency.histogram("never")
     assert length(hist) == length(ShardLatency.edges())
