@@ -43,6 +43,11 @@ config :fathom, health_server: false
 # finding #4). The dedicated #4 regression test flips this to false locally to prove the gate.
 config :fathom, :allow_shard_override, true
 
+# Compile the replication Session's test seams in (expert review 2026-10-20 #9:
+# `:replication_build_hook` lands a WAL restart inside a push round). Compile-time, so prod and dev
+# builds carry an empty function rather than a per-round env lookup.
+config :fathom, :replication_test_hooks, true
+
 # Fallback shard for the shard_from_conn tests (unset in prod ⇒ fail closed — finding #26; the
 # #26 regression test flips this to nil to prove the fail-closed path).
 config :fathom, :default_shard, "demo"

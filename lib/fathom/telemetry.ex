@@ -1107,6 +1107,13 @@ defmodule Fathom.Telemetry do
         description:
           "Replicated-commit latency as the CALLER sees it (Session mailbox wait + ensure_started + commit), by outcome. Compare with replication.commit.duration: the gap is queue wait"
       ),
+      # Commit calls the Session dropped because their caller had already timed out (expert review
+      # 2026-10-20 #5(a)). Nonzero means the Session was stalled long enough to queue past callers.
+      counter("fathom.replication.commit_dropped.count",
+        event_name: [:fathom, :replication, :commit_dropped],
+        description:
+          "Replicated-commit calls dropped unexecuted because the caller's timeout had already passed when the Session reached them (a stalled Session's queue)"
+      ),
       distribution("fathom.replication.commit_stage.duration",
         event_name: [:fathom, :replication, :commit_stage],
         measurement: :duration,

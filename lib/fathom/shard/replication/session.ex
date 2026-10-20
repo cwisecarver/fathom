@@ -90,6 +90,9 @@ defmodule Fathom.Shard.Replication.Session do
   # (or success). The margin covers that head-start + reply delivery; floored at half the timeout so
   # a large margin config can't gut a small timeout.
   @default_reply_margin_ms 100
+  # How many times one commit re-plans after its WAL restarted mid-round (expert review 2026-10-20
+  # #9) before failing. A restart race is transient; this only bounds a failure that is not.
+  @max_replans 3
   # How long `ensure_started/3` waits for a stale predecessor to stop politely before killing it.
   @stale_stop_ms 1_000
 
@@ -126,7 +129,11 @@ defmodule Fathom.Shard.Replication.Session do
 
   defp commit_call(shard_id, wal_path, coordinator) do
     with {:ok, pid} <- ensure_started(shard_id, coordinator) do
-      GenServer.call(pid, {:commit, wal_path}, timeout())
+      # The caller's own give-up time travels with the request (expert review 2026-10-20 #5(a)),
+      # so a request still queued when its caller has gone is dropped instead of executed. Taken
+      # immediately before the call, on the same clock `GenServer.call`'s timer runs on.
+      t = timeout()
+      GenServer.call(pid, {:commit, wal_path, :checkpoint, now_ms() + t}, t)
     end
   catch
     :exit, reason -> {:error, {:session_down, reason}}
@@ -338,6 +345,9 @@ defmodule Fathom.Shard.Replication.Session do
        # subsequent `:unknown_shard` from that follower silently swallowed — silent, permanent
        # under-replication of one shard while the quorum reports healthy.
        seeding: %{},
+       # Bytes per ms of the last completed seed, nil until one completes (expert review 2026-10-20
+       # #6): lets a missed-quorum commit skip waiting for a seed that cannot land in time.
+       seed_rate: nil,
        # Deferred-retry bookkeeping. `catchup_ref` is the armed timer (nil when none); `commits`
        # counts commit cycles and `catchup_at` records the count at arm time, so the retry can tell
        # a QUIET shard from a busy one. See `handle_info(:catch_up, ...)`.
@@ -374,22 +384,34 @@ defmodule Fathom.Shard.Replication.Session do
   # A checkpoint opens connections on the shard's files, which is only safe while a stream holds a
   # checked-out connection (so the coordinator cannot be dropping or unlinking those files); a
   # tenant's commit always does, the catch-up timer never does.
-  def handle_call({:commit, wal_path, mode}, _from, state) do
-    state = ensure_registered(state, wal_path)
-    {pin, state} = if mode == :checkpoint, do: maybe_pin(state, wal_path), else: {nil, state}
-    t0 = System.monotonic_time()
-    {:reply, reply, state} = do_commit(wal_path, state)
+  def handle_call({:commit, wal_path, mode}, from, state),
+    do: handle_call({:commit, wal_path, mode, nil}, from, state)
 
-    # Commit -> quorum-ack latency (admin observability 2026-10-15 P1). ONE execute per commit,
-    # after the ack work and before the checkpoint start so it measures only what the tenant waits
-    # on. The outcome is a bounded 4-value tag; shard_id is deliberately not a tag.
-    :telemetry.execute(
-      [:fathom, :replication, :commit],
-      %{duration: System.monotonic_time() - t0},
-      %{outcome: commit_outcome(reply)}
-    )
+  # A COMMIT WHOSE CALLER HAS ALREADY GIVEN UP IS NOT EXECUTED (expert review 2026-10-20 #5(a)).
+  #
+  # `GenServer.call`'s timeout leaves the request in this mailbox. Executing it anyway, with a fresh
+  # deadline, is what made the 2026-10-19 same-shard collapse METASTABLE: once one stall (a seed, a
+  # far-behind follower) made calls time out, every abandoned call still ran — each able to burn
+  # another full deadline — so the queue drained at one caller timeout per entry while new callers
+  # kept joining it. Minutes of errors from a transient.
+  #
+  # Dropping it is safe: its frames were committed before it called, so they are at or below the
+  # extent the NEXT live call reads, and that call ships them and gates them on the same quorum and
+  # the same ownership check. Nobody is waiting for this reply (a late reply to an expired call is
+  # discarded by the caller's alias). A request without a deadline (the catch-up timer's, or an
+  # older caller's two- or three-tuple) is never dropped.
+  #
+  # The internal deadline is also bounded by the CALLER'S: a call that waited 4 s in the queue no
+  # longer gets a fresh `commit_deadline_budget/0` that would outlive its caller by 4 s.
+  def handle_call({:commit, wal_path, mode, caller_deadline}, _from, state) do
+    now = now_ms()
 
-    {:reply, reply, start_checkpoint(state, pin, wal_path)}
+    if is_integer(caller_deadline) and now >= caller_deadline do
+      :telemetry.execute([:fathom, :replication, :commit_dropped], %{count: 1}, %{})
+      {:reply, {:error, :timeout}, state}
+    else
+      run_commit(wal_path, mode, commit_deadline(now, caller_deadline), state)
+    end
   end
 
   # Whether quorum-acked replicas hold everything up to `header` — the question the coordinator's
@@ -398,6 +420,85 @@ defmodule Fathom.Shard.Replication.Session do
     do: {:reply, covered?(state, header), state}
 
   def handle_call(:lag_info, _from, state), do: {:reply, build_lag_info(state), state}
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
+
+  # The handler's own budget, further bounded by the caller's deadline less the reply margin (the
+  # same margin `commit_deadline_budget/0` keeps, so the reply still lands before the caller's timer).
+  # A caller with less than the margin left gets what it has left rather than nothing: a commit with
+  # nothing to wait for (a `:nothing` plan, an already-current quorum) still finishes in time.
+  @doc false
+  # `number()`: the budget is built from application env values dialyzer cannot prove integral.
+  @spec commit_deadline(integer(), integer() | nil) :: number()
+  def commit_deadline(now, nil), do: now + commit_deadline_budget()
+
+  def commit_deadline(now, caller_deadline) do
+    own = now + commit_deadline_budget()
+    capped = caller_deadline - reply_margin()
+    if capped > now, do: min(own, capped), else: min(own, caller_deadline)
+  end
+
+  defp run_commit(wal_path, mode, deadline, state) do
+    state = ensure_registered(state, wal_path)
+    {pin, state} = if mode == :checkpoint, do: maybe_pin(state, wal_path), else: {nil, state}
+    t0 = System.monotonic_time()
+    # The catch-up (no caller) holds the Session no longer than its own retry interval: it now
+    # drives laggards to current itself (expert review 2026-10-20 #3), and a tenant commit arriving
+    # meanwhile queues behind it.
+    deadline =
+      if mode == :no_checkpoint, do: min(deadline, now_ms() + catchup_ms()), else: deadline
+
+    # GROUP COMMIT (expert review 2026-10-20 #5(b)), before ANY header read: see `coalesce_queued/2`.
+    batch = if mode == :checkpoint, do: coalesce_queued(wal_path, []), else: []
+
+    {:reply, reply, state} = do_commit(wal_path, state, deadline, mode)
+
+    for from <- batch, do: GenServer.reply(from, reply)
+
+    # Commit -> quorum-ack latency (admin observability 2026-10-15 P1). ONE execute per commit
+    # cycle, after the ack work and before the checkpoint start so it measures only what the tenant
+    # waits on. The outcome is a bounded 4-value tag; shard_id is deliberately not a tag. `batch` is
+    # how many callers this cycle answered.
+    :telemetry.execute(
+      [:fathom, :replication, :commit],
+      %{duration: System.monotonic_time() - t0, batch: length(batch) + 1},
+      %{outcome: commit_outcome(reply)}
+    )
+
+    {:reply, reply, start_checkpoint(state, pin, wal_path)}
+  end
+
+  # GROUP COMMIT (expert review 2026-10-20 #5(b)). N streams committing to one shard used to be
+  # served one call at a time: the first shipped everything committed so far, and every later
+  # queued call still paid drain + `Wal.read_held` (stat + header + EOF preads on dirty-IO) + plan +
+  # ownership gate, to ship nothing -- ~3 wasted dirty-IO jobs per coalescable commit.
+  #
+  # So, BEFORE the header read, every commit request for the same WAL already in the mailbox joins
+  # this cycle and gets its reply. Correct because each such caller's SQLite commit RETURNED before
+  # it sent its request, and its request is in the mailbox before our header read: its frames are at
+  # or below the extent this cycle reads, so the same quorum ack and the same ownership gate cover
+  # them. A request arriving after this drain is NOT coalesced (its frames may be past the extent)
+  # and runs in the next cycle, which is today's behaviour. A request whose caller has already given
+  # up is dropped, as in `handle_call/3` (#5(a)). Only tenant commits (`:checkpoint`) coalesce.
+  #
+  # Reads the call envelopes directly; `GenServer.reply/2` is the documented way to answer them.
+  defp coalesce_queued(wal_path, acc) do
+    receive do
+      {:"$gen_call", from, {:commit, ^wal_path, :checkpoint, dl}} ->
+        if is_integer(dl) and now_ms() >= dl do
+          :telemetry.execute([:fathom, :replication, :commit_dropped], %{count: 1}, %{})
+          GenServer.reply(from, {:error, :timeout})
+          coalesce_queued(wal_path, acc)
+        else
+          coalesce_queued(wal_path, [from | acc])
+        end
+
+      {:"$gen_call", from, {:commit, ^wal_path}} ->
+        coalesce_queued(wal_path, [from | acc])
+    after
+      0 -> acc
+    end
+  end
 
   @doc false
   @spec commit_outcome(term()) :: :ok | :no_quorum | :timeout | :other
@@ -469,17 +570,15 @@ defmodule Fathom.Shard.Replication.Session do
     }
   end
 
-  defp do_commit(wal_path, state) do
-    # One deadline for the whole call, taken before any work: a seed wait that reset the clock
-    # could outlive the caller's `GenServer.call` timeout, and a reply nobody is waiting for is
-    # worse than a late failure — the caller has already given up and the tenant already has an
-    # error, while this process is still holding the shard's serialization point.
-    #
-    # `commit_deadline_budget/0` is SHORTER than the caller's call timeout by a reply margin (#21),
-    # so the handler finishes and replies BEFORE the caller gives up — turning a near-miss quorum
-    # into a clean `{:no_quorum, _}` reply rather than a `{:session_down, :timeout}` call exit.
-    deadline = System.monotonic_time(:millisecond) + commit_deadline_budget()
-
+  # `deadline` is one deadline for the whole call, taken before any work (`commit_deadline/2`): a
+  # seed wait that reset the clock could outlive the caller's `GenServer.call` timeout, and a reply
+  # nobody is waiting for is worse than a late failure — the caller has already given up and the
+  # tenant already has an error, while this process is still holding the shard's serialization point.
+  #
+  # `commit_deadline_budget/0` is SHORTER than the caller's call timeout by a reply margin (#21),
+  # so the handler finishes and replies BEFORE the caller gives up — turning a near-miss quorum
+  # into a clean `{:no_quorum, _}` reply rather than a `{:session_down, :timeout}` call exit.
+  defp do_commit(wal_path, state, deadline, mode) do
     state = %{state | commits: state.commits + 1}
 
     case with_epoch(state) do
@@ -487,6 +586,10 @@ defmodule Fathom.Shard.Replication.Session do
         {:reply, {:error, reason}, state}
 
       {:ok, state} ->
+        # The seeds already in flight when this call began. Only seeds started AFTER this point —
+        # by this call — are awaited on a missed quorum (expert review 2026-10-20 #6).
+        prior = seed_tokens(state)
+
         # Drain first: a straggler's reply that landed while the PREVIOUS call was still running has
         # not reached `handle_info/2` yet, and leaving it would let the next `collect/4` mistake it
         # for an answer to the push about to be sent.
@@ -495,7 +598,7 @@ defmodule Fathom.Shard.Replication.Session do
           |> drain_late_replies(wal_path)
           |> await_stragglers_if_short(wal_path, deadline)
 
-        case ship(state, wal_path, state.epoch, deadline) do
+        case ship(state, wal_path, state.epoch, deadline, mode) do
           {:ok, new_state, rejects} ->
             new_state = start_seeds(new_state, wal_path, rejects)
 
@@ -505,6 +608,9 @@ defmodule Fathom.Shard.Replication.Session do
             # That follower is now behind with nothing scheduled to fix it, and the tenant saw
             # `:ok` — so nothing anywhere looks wrong. This is the arm that matters.
             |> arm_if_rejected(rejects)
+            # A follower the quorum did not need may still be short (expert review 2026-10-20 #3:
+            # the commit no longer waits for it). The catch-up timer makes it good off the reply path.
+            |> arm_if_short()
             # Gate the ack on confirmed ownership (expert review 2026-09-05 #5) — a zombie that
             # reached quorum on stale-epoch followers must not report a write durable. See
             # `ack_if_owned/1`.
@@ -543,24 +649,34 @@ defmodule Fathom.Shard.Replication.Session do
           # bounded wait is the better side of that deal — and for the small shards fathom's whole
           # thesis is about, the wait is milliseconds.
           #
-          # Still bounded, and still fails honestly: `await_seeds/3` waits only for seeds THIS
+          # Still bounded, and still fails honestly: `await_seeds/4` waits only for seeds THIS
           # commit started, only until the caller's own deadline, and a shard too large to seed
           # inside it fails exactly as it did before, having spent time it was going to spend
           # anyway. Seeding remains write-gated — nothing seeds a shard nobody writes to, which is
           # the storm the durability `dirty` flag exists to prevent.
+          #
+          # "THIS commit started" was the comment's promise and not the code's until expert review
+          # 2026-10-20 #6: `await_seeds` waited until NO seed was in flight, so a commit that missed
+          # its quorum while an earlier commit's large seed streamed (145 s+ on the rig) sat out its
+          # whole deadline behind a seed it could not use — and under #5(a)'s queue, every queued
+          # commit did the same. `prior` excludes those; their results still land in `handle_info/2`.
           {:error, {:no_quorum, why}, new_state, rejects} ->
             seeded_state = start_seeds(new_state, wal_path, rejects)
 
-            case await_seeds(seeded_state, deadline, wal_path) do
+            case await_seeds(seeded_state, deadline, wal_path, prior) do
               {:ok, ready_state} ->
-                retry_after_seed(ready_state, wal_path, deadline, why)
+                retry_after_seed(ready_state, wal_path, deadline, why, mode)
 
               {:timeout, waited_state} ->
                 {:reply, {:error, {:no_quorum, why}}, waited_state}
             end
 
-          {:error, reason} ->
-            {:reply, {:error, reason}, state}
+          # A read failure keeps what the earlier rounds learned (expert review 2026-10-20 #9):
+          # followers' advances, outstanding expectations and the reopened fd. Replying with the
+          # PRE-ship state discarded them, so late acks for pushes really in flight were rejected
+          # and the next commit re-planned from stale positions (`:offset_mismatch` rounds).
+          {:error, reason, failed_state} ->
+            {:reply, {:error, reason}, failed_state}
         end
     end
   end
@@ -918,10 +1034,31 @@ defmodule Fathom.Shard.Replication.Session do
   # returned after one round could report success while the quorum was still short of the bytes it
   # just committed — the exact lie `Session`'s moduledoc refuses to tell.
   #
-  # So the round repeats until every follower is current, or the caller's own deadline passes. This
-  # is the SAME trade the seeding path made deliberately in `handle_call/3` below (see the long
-  # comment there): a bounded wait beats a guaranteed error, and the failure at the end of it is
-  # exactly as honest as the one round produced before.
+  # So the round repeats until A WRITE QUORUM HOLDS THIS COMMIT'S BYTES, or the caller's own deadline
+  # passes. This is the SAME trade the seeding path made deliberately in `handle_call/3` below (see
+  # the long comment there): a bounded wait beats a guaranteed error, and the failure at the end of
+  # it is exactly as honest as the one round produced before.
+  #
+  # THE STOPPING RULE IS THE QUORUM CONTRACT, NOT "EVERY FOLLOWER IS CURRENT" (expert review
+  # 2026-10-20 #3). The loop used to end only when EVERY planned follower — seeding and skipped
+  # in-flight ones included, none of which were sent anything — reached the extent of a header
+  # RE-READ each round, and `settle_inflight/3` waited for every outstanding follower between
+  # rounds. So one follower more than `max_push_bytes` behind (a seed in flight, a non-quorum laggard
+  # under 16-32 writers) made EVERY commit on the shard loop to its deadline and fail
+  # `{:no_quorum, :catching_up}`, although Q followers had acked every byte of it in round 1: the
+  # root of the 2026-10-19 same-shard collapse (1,700 -> 64-170 ops/s). Now a commit ends when
+  # `quorum_holds?/2`: Q followers (ACKED positions, not plans; seeding ones excluded) hold the
+  # extent of the FIRST round's header — this commit's extent. Exactly the single-round path's
+  # contract and the moduledoc's. A generation change in a later round retargets to the new header
+  # (the old frames were checkpointed; the reset carries what is left), as before.
+  #
+  # Followers left short at reply time are not abandoned: `arm_if_short/1` arms the catch-up timer,
+  # and the catch-up (`mode == :no_checkpoint`, no caller waiting) keeps the old stronger rule —
+  # it runs until every follower it could push to is current — under a deadline no longer than its
+  # own retry interval, so a quiet shard's laggards still converge without a tenant waiting on them.
+  #
+  # Between rounds a tenant commit waits only until enough followers are free to make the quorum
+  # (`await_stragglers_if_short/3`), never for a straggler the quorum does not need.
   #
   # The deadline is the caller's, threaded in rather than computed here. A second clock started at
   # this depth could outlive the `GenServer.call` that is waiting on it, and a reply nobody is
@@ -933,81 +1070,132 @@ defmodule Fathom.Shard.Replication.Session do
   # same thing next round and refuses again, so it resurfaces) but only by accident, and a seed
   # deferred to the next commit is precisely the silent under-replication the late-reply drain
   # exists to prevent.
-  # `first?` separates "this commit wrote no frames" (nothing to plan on the FIRST round) from "the
-  # catch-up converged" (nothing left on a LATER round). They used to be told apart by whether any
-  # reject had been seen, so a multi-round commit with no rejects returned `:nothing` from its last
-  # round and `handle_call/3` replied from the PRE-ship state, discarding every follower's advance
-  # (2026-10-02, the rig's residual `offset_mismatch` storm). A later round always returns its state.
-  defp ship(state, wal_path, epoch, deadline),
-    do: ship(state, wal_path, epoch, deadline, %{}, true)
+  # `target == nil` (the first round) separates "this commit wrote no frames" (nothing to plan on
+  # the FIRST round) from "the catch-up converged" (nothing left on a LATER round). They used to be
+  # told apart by whether any reject had been seen, so a multi-round commit with no rejects returned
+  # `:nothing` from its last round and `handle_call/3` replied from the PRE-ship state, discarding
+  # every follower's advance (2026-10-02, the rig's residual `offset_mismatch` storm). A later round
+  # always returns its state.
+  defp ship(state, wal_path, epoch, deadline, mode),
+    do: ship(state, wal_path, epoch, deadline, mode, %{}, nil)
 
-  defp ship(state, wal_path, epoch, deadline, seen, first?) do
+  defp ship(state, wal_path, epoch, deadline, mode, seen, target) do
     case Wal.read_held(state.wal_fd, wal_path) do
       {:ok, header, fd} ->
         state = %{state | wal_fd: fd} |> note_header(header)
 
-        case ship_planned(state, wal_path, epoch, header) do
+        case ship_planned(state, wal_path, epoch, header, deadline) do
           # Nothing left to plan. On the first round that means the commit wrote no frames; on a
-          # later one it means the catch-up converged.
-          :nothing when first? ->
+          # later one it means every follower is current.
+          :nothing when target == nil ->
             :nothing
 
           :nothing ->
-            {:ok, state, Map.values(seen)}
+            {:ok, state, seen_rejects(seen)}
 
-          {:ok, new_state, rejects, complete?} ->
+          {:ok, new_state, rejects, sent_complete?} ->
             seen = merge_rejects(seen, rejects)
+            target = retarget(target, header)
+            held? = quorum_holds?(new_state, target)
 
             cond do
-              complete? ->
-                {:ok, new_state, Map.values(seen)}
+              held? and (mode != :no_checkpoint or sent_complete?) ->
+                {:ok, new_state, seen_rejects(seen)}
 
-              # Out of time with a follower still behind. Fail rather than ack: the quorum does not
-              # hold this commit's bytes yet.
+              # Out of time. A catch-up whose quorum holds has nothing to report; a commit whose
+              # quorum does not hold its bytes fails rather than acks.
+              past?(deadline) and held? ->
+                {:ok, new_state, seen_rejects(seen)}
+
               past?(deadline) ->
-                {:error, {:no_quorum, :catching_up}, new_state, Map.values(seen)}
+                {:error, {:no_quorum, :catching_up}, new_state, seen_rejects(seen)}
 
               true ->
-                # LET THE ROUND SETTLE BEFORE STARTING THE NEXT ONE. Two distinct failures, both
-                # found the first time this loop ran against three real followers:
-                #
-                #   1. `ship_quorum/4` returns at the Q-th ack, so the straggler answers into this
-                #      mailbox afterwards — and the next round's `collect/4` reads that answer as a
-                #      reply to ITSELF. It carries the previous round's offset, so it is scored
-                #      `:offset_mismatch`, `reconcile/2` rewinds the follower to a position it has
-                #      already passed, and a catch-up that should converge in N rounds thrashes
-                #      until the deadline instead. The whole test file went from 0.1 s to 5.0 s.
-                #
-                #   2. The straggler's push is still outstanding in its SHIPPER, which holds one
-                #      waiter per shard. Shipping to it again is refused `:already_in_flight` — so
-                #      across a multi-round catch-up that follower is refused EVERY round and never
-                #      advances, while the quorum keeps succeeding without it. Silent
-                #      under-replication, the same class as the late-reply bugs `handle_info/2`
-                #      above exists to prevent.
-                #
-                # So the loop waits for the round's outstanding pushes, not just for a quorum's
-                # worth. That deliberately gives up the quorum's straggler win — but only here, on
-                # a shard that is ALREADY behind, and still bounded by the caller's deadline. In
-                # steady state `complete?` is true after the first round and this never runs.
+                # Re-read the header next round rather than reusing it. Other streams commit to
+                # this shard concurrently, so the WAL may have grown again; planning from a stale
+                # header would ship a delta that is already short by the time it lands.
                 new_state
-                |> settle_inflight(wal_path, deadline)
-                # Re-read the header rather than reusing it. Other streams commit to this shard
-                # concurrently, so the WAL may have grown again; planning from a stale header would
-                # ship a delta that is already short by the time it lands.
-                |> ship(wal_path, epoch, deadline, seen, false)
+                |> between_rounds(wal_path, deadline, mode)
+                |> ship(wal_path, epoch, deadline, mode, seen, target)
             end
 
           {:error, {:no_quorum, why}, new_state, rejects} ->
-            {:error, {:no_quorum, why}, new_state, Map.values(merge_rejects(seen, rejects))}
+            {:error, {:no_quorum, why}, new_state, seen_rejects(merge_rejects(seen, rejects))}
 
-          {:error, reason} ->
-            {:error, reason}
+          # THE WAL RESTARTED UNDER THIS ROUND (expert review 2026-10-20 #9): between the header read
+          # and the payload/recheck reads, a checkpoint plus a write began a new generation. The
+          # stability check correctly refused to ship bytes stamped with the old identity — and
+          # then FAILED THE TENANT'S COMMIT, a write that is durable locally and would have shipped
+          # had the round simply re-read (2-13 per pool-fleet run). The comments here always said
+          # "the next round re-plans"; now it does: re-read the header and plan again, inside the
+          # deadline, carrying this round's state. A new generation retargets (`retarget/2`), and
+          # the reset it plans carries `prev_extent`, so a follower missing frames the restart
+          # folded away is re-seeded rather than laundered complete. Bounded by the deadline AND a
+          # few attempts, so a persistent failure cannot spin on dirty-IO reads.
+          {:replan, reason, new_state} ->
+            if past?(deadline) or replans(seen) >= @max_replans do
+              read_failed(new_state, reason)
+            else
+              ship(new_state, wal_path, epoch, deadline, mode, bump_replans(seen), target)
+            end
+
+          {:error, _reason, _state} = failed ->
+            failed
         end
 
       {:error, reason, fd} ->
         read_failed(%{state | wal_fd: fd}, reason)
     end
   end
+
+  # Re-plans after a restart race this call has made, kept beside the per-shipper rejects in `seen`
+  # under a key no shipper can be (shippers are pids or names; this is a tagged tuple).
+  defp replans(seen), do: Map.get(seen, {__MODULE__, :replans}, 0)
+  defp bump_replans(seen), do: Map.update(seen, {__MODULE__, :replans}, 1, &(&1 + 1))
+
+  # The first round's header is the commit's target; a later round in a DIFFERENT generation (the
+  # log restarted between rounds) retargets to the new header.
+  defp retarget(nil, header), do: header
+  defp retarget(%{ckpt_seq: g, salt1: s} = target, %{ckpt_seq: g, salt1: s}), do: target
+  defp retarget(_target, header), do: header
+
+  # LET THE ROUND SETTLE BEFORE STARTING THE NEXT ONE — but only as far as the next round needs.
+  #
+  # Two failures made the original loop wait for every outstanding push between rounds, both found
+  # the first time it ran against three real followers: a straggler's late answer read by the next
+  # round's `collect` as a reply to ITSELF (an `:offset_mismatch` that rewound the follower), and a
+  # push to a follower whose shipper still held this shard's single waiter (refused
+  # `:already_in_flight` every round). Since expert review 2026-10-17 #9 a follower with a push in
+  # flight is SKIPPED rather than pushed to, so neither can happen to it any more — and waiting for
+  # it is exactly what made one held follower cost every commit its deadline (2026-10-20 #3).
+  #
+  # So a tenant commit waits only until enough followers are free to make the quorum. The catch-up,
+  # which has no caller and whose purpose IS the laggards, still settles every outstanding push.
+  defp between_rounds(state, wal_path, deadline, :no_checkpoint),
+    do: settle_inflight(state, wal_path, deadline)
+
+  defp between_rounds(state, wal_path, deadline, _mode),
+    do: await_stragglers_if_short(state, wal_path, deadline)
+
+  # Does a write quorum of CURRENT followers hold everything up to `target`, by acked position?
+  # Stricter than `covered?/2` (the checkpoint's question) in two ways that matter for an ACK: only
+  # followers in the current membership count, and a follower being seeded does not — its recorded
+  # position predates the seed it asked for, so it may no longer hold those bytes.
+  defp quorum_holds?(state, %{ckpt_seq: gen, salt1: salt, commit_extent: extent}) do
+    held =
+      Enum.count(shippers(), fn s ->
+        not Map.has_key?(state.seeding, s) and
+          match?(
+            %{wal_gen: ^gen, salt1: ^salt, offset: o} when is_integer(o) and o >= extent,
+            Map.get(state.followers, s)
+          )
+      end)
+
+    held >= quorum()
+  end
+
+  # The per-shipper rejects, without `bump_replans/1`'s counter.
+  defp seen_rejects(seen), do: seen |> Map.delete({__MODULE__, :replans}) |> Map.values()
 
   defp merge_rejects(seen, rejects) do
     Enum.reduce(rejects, seen, fn {shipper, _reason, _at} = r, acc ->
@@ -1028,7 +1216,7 @@ defmodule Fathom.Shard.Replication.Session do
   # tenant's commit. The quiet half: a follower that is up to date would have been treated as one
   # that had not answered, so the commit waited on strictly worse replicas than the ones it already
   # had.
-  defp ship_planned(state, wal_path, epoch, header) do
+  defp ship_planned(state, wal_path, epoch, header, deadline) do
     {plans, current} =
       Enum.reduce(shippers(), {[], 0}, fn shipper, {plans, current} ->
         case Primary.plan(Map.get(state.followers, shipper), header, max_push_bytes()) do
@@ -1076,7 +1264,16 @@ defmodule Fathom.Shard.Replication.Session do
 
       case built do
         {:ok, pushes, state} ->
-          tag(deliver(state, header, sendable, pushes, current, skipped), plans, header)
+          # Completeness over what was SENT (expert review 2026-10-20 #3): a skipped follower was
+          # sent nothing, so its capped plan says nothing about this round.
+          tag(
+            deliver(state, header, sendable, pushes, current, skipped, deadline),
+            sendable,
+            header
+          )
+
+        {:error, reason, state} when reason in [:checkpoint_during_push, :short_read] ->
+          {:replan, reason, state}
 
         {:error, reason, state} ->
           read_failed(state, reason)
@@ -1089,7 +1286,9 @@ defmodule Fathom.Shard.Replication.Session do
       now - Map.get(state.inflight_at, shipper, 0) < timeout()
   end
 
-  # Did this round hand every follower the whole WAL, or did `Primary.plan/3`'s cap stop short?
+  # Did this round hand every follower it SENT to the whole WAL, or did `Primary.plan/3`'s cap stop
+  # short? Only the catch-up's stopping rule reads it now; a tenant commit stops on
+  # `quorum_holds?/2` (expert review 2026-10-20 #3).
   #
   # Computed from the plans rather than signalled out of `plan/3`, so the cap stays a property of
   # the pure planner and `deliver/5`'s return shape is left alone. `{:reset, 0, len}` compares the
@@ -1124,6 +1323,8 @@ defmodule Fathom.Shard.Replication.Session do
           {:error, r, fd} -> {:halt, {{:error, r}, fd}}
         end
       end)
+
+    build_hook()
 
     # RE-READ THE HEADER AND CONFIRM IT DID NOT MOVE (expert review 2026-08-20 #16).
     #
@@ -1219,6 +1420,21 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
+  # TEST SEAM (expert review 2026-10-20 #9): lands a WAL restart between `build_pushes/5`'s payload
+  # reads and its header re-check, the window no test could otherwise hit deterministically. Compiled
+  # in only where `:replication_test_hooks` is set at compile time (config/test.exs); everywhere else
+  # it is an empty function.
+  if Application.compile_env(:fathom, :replication_test_hooks, false) do
+    defp build_hook do
+      case Application.get_env(:fathom, :replication_build_hook) do
+        f when is_function(f, 0) -> f.()
+        _ -> :ok
+      end
+    end
+  else
+    defp build_hook, do: :ok
+  end
+
   # The furthest this primary is KNOWN to have shipped in the generation `shipper` is about to
   # discard — the high-water mark across every follower still sitting in that same generation.
   #
@@ -1268,7 +1484,26 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  defp deliver(state, header, plans, pushes, current, skipped) do
+  # THE QUORUM WAIT GETS WHAT IS LEFT OF THE COMMIT'S DEADLINE, NOT A FRESH `timeout()` (expert
+  # review 2026-10-20 #4). `collect/6` used to hand `ship_quorum` the full call timeout every round,
+  # so a single round already outlived `commit_deadline_budget/0` — the handler then replied after
+  # the caller's `GenServer.call` had given up (`{:session_down, :timeout}`, the exact outcome the
+  # 2026-08-31 #21 reply margin exists to prevent), and a multi-round or post-seed commit could hold
+  # the Session for up to one more `timeout()` per round past its caller. A shorter wait can only
+  # refuse, never ack, so this is safety-neutral. Out of time before sending: refuse without sending
+  # — and without recording an expectation for a push that never left.
+  defp deliver(state, header, plans, pushes, current, skipped, deadline) do
+    needed = max(quorum() - current, 0)
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if needed > 0 and remaining <= 0 do
+      {:error, {:no_quorum, :timeout}, state, for({s, reason} <- skipped, do: {s, reason, 0})}
+    else
+      send_round(state, header, plans, pushes, skipped, needed, remaining)
+    end
+  end
+
+  defp send_round(state, header, plans, pushes, skipped, needed, remaining) do
     # Recorded BEFORE anything is sent, because a reply can be observed by a later commit's drain
     # with no plan in scope. See the `inflight` note in `init/1`.
     #
@@ -1305,7 +1540,7 @@ defmodule Fathom.Shard.Replication.Session do
         inflight_at: Map.merge(state.inflight_at, sent_at)
     }
 
-    case max(quorum() - current, 0) do
+    case needed do
       # Followers that are already current carry the quorum on their own. The laggards still get
       # their bytes — skipping them is how a replica falls behind forever — but the tenant does not
       # wait for an ack it does not need.
@@ -1317,8 +1552,8 @@ defmodule Fathom.Shard.Replication.Session do
         # laggard on a quiet shard (expert review 2026-10-17 #9). Seeding skips stay silent, as before.
         {:ok, state, for({s, :already_in_flight} <- skipped, do: {s, :already_in_flight, 0})}
 
-      needed ->
-        collect(state, pushes, needed, skipped, reset_round?(plans))
+      _ ->
+        collect(state, pushes, needed, skipped, reset_round?(plans), remaining)
     end
   end
 
@@ -1341,11 +1576,11 @@ defmodule Fathom.Shard.Replication.Session do
   defp reset_round?(plans),
     do: Enum.any?(plans, fn {_shipper, {kind, _, _}} -> kind == :reset end)
 
-  defp collect(state, pushes, needed, skipped, reset?) do
+  defp collect(state, pushes, needed, skipped, reset?, timeout) do
     t_collect = System.monotonic_time()
 
     result =
-      Replication.ship_quorum(pushes, needed, timeout(),
+      Replication.ship_quorum(pushes, needed, timeout,
         skip: skipped,
         shard_id: state.shard_id
       )
@@ -1432,7 +1667,7 @@ defmodule Fathom.Shard.Replication.Session do
 
   defp read_failed(state, reason) do
     Logger.warning("replication read failed for #{state.shard_id}: #{inspect(reason)}")
-    {:error, reason}
+    {:error, reason, state}
   end
 
   # ------------------------------------------------------------------------------------------
@@ -2107,58 +2342,91 @@ defmodule Fathom.Shard.Replication.Session do
   # `{:repl_reply, ...}` is drained alongside it. A straggler's answer to the push that just failed
   # arrives during exactly this window, and leaving it queued would let the retry's `collect/4`
   # mistake it for an answer to the retry.
-  defp await_seeds(%{seeding: seeding} = state, deadline, wal_path) do
-    if map_size(seeding) == 0 do
-      {:ok, state}
-    else
-      remaining = deadline - System.monotonic_time(:millisecond)
+  #
+  # `prior` is the set of seed tokens already in flight when the call began (expert review
+  # 2026-10-20 #6): those were started by an earlier call and are NOT waited on. A seed this call
+  # started is skipped too when the Session's last observed seed rate says it cannot land inside
+  # the time left — the wait would only burn the deadline. Either way the result still arrives in
+  # `handle_info/2` and is applied there.
+  defp await_seeds(state, deadline, wal_path, prior) do
+    remaining = deadline - System.monotonic_time(:millisecond)
 
-      if remaining <= 0 do
+    case own_seeds(state, prior) do
+      [] ->
+        {:ok, state}
+
+      _own when remaining <= 0 ->
         {:timeout, state}
-      else
-        refs = seed_refs(state)
 
-        receive do
-          {:seeded, shipper, token, result} ->
-            state
-            |> apply_seed_result(shipper, token, result)
-            |> await_seeds(deadline, wal_path)
+      own ->
+        if hopeless_seed?(state, own, remaining),
+          do: {:timeout, state},
+          else: await_seed_messages(state, deadline, wal_path, prior, remaining)
+    end
+  end
 
-          # A seed task that died WITHOUT answering (expert review 2026-10-13 #12). Only
-          # `handle_info/2` used to consume its DOWN, which cannot run inside this call, so the
-          # entry stayed in `seeding` and this loop ran to the commit deadline.
-          {:DOWN, ref, :process, _pid, reason} when is_map_key(refs, ref) ->
-            state
-            |> apply_seed_down(ref, reason)
-            |> await_seeds(deadline, wal_path)
+  defp seed_tokens(state), do: MapSet.new(state.seeding, fn {_shipper, e} -> e.token end)
 
-          {:repl_reply, from, {:ack, _shard, next}} ->
-            state
-            |> settle_late_ack(from, next)
-            |> await_seeds(deadline, wal_path)
+  defp own_seeds(state, prior),
+    do: for({_shipper, e} <- state.seeding, not MapSet.member?(prior, e.token), do: e)
 
-          # A REJECT MUST BE RECONCILED, NOT DROPPED. The first draft of this fell through to the
-          # catch-all and threw rejects away, and the rig showed exactly what this module's own
-          # moduledoc predicts: the follower stayed pinned at the position we THOUGHT it had, the
-          # retry planned a delta from there, it refused, and every subsequent commit failed
-          # `:impossible` — having fixed the first commit and broken all the rest.
-          #
-          # These are answers to the push that just failed, so reconciling them before the retry is
-          # the whole point: the retry plans from where each follower actually is.
-          {:repl_reply, from, {:reject, _shard, reason, follower_offset}} ->
-            rejects = [{from, reason, follower_offset}]
+  # Seeds to different followers stream concurrently, so the wait ends when the LAST one lands:
+  # hopeless when any of them, at the last observed rate, finishes past the time left. No observed
+  # rate yet (this Session's first seed) waits, as before. Underestimates the rate if anything (it
+  # is measured start-to-result, queueing included), which errs toward not waiting.
+  defp hopeless_seed?(%{seed_rate: rate}, own, remaining) when is_number(rate) and rate > 0 do
+    now = System.monotonic_time(:millisecond)
 
-            state
-            |> reconcile(rejects)
-            |> start_seeds(wal_path, rejects)
-            |> await_seeds(deadline, wal_path)
+    Enum.any?(own, fn
+      %{bytes: b, started_at: t} when is_integer(b) -> t + b / rate - now > remaining
+      _ -> false
+    end)
+  end
 
-          {:repl_reply, _from, _other} ->
-            await_seeds(state, deadline, wal_path)
-        after
-          remaining -> {:timeout, state}
-        end
-      end
+  defp hopeless_seed?(_state, _own, _remaining), do: false
+
+  defp await_seed_messages(state, deadline, wal_path, prior, remaining) do
+    refs = seed_refs(state)
+
+    receive do
+      {:seeded, shipper, token, result} ->
+        state
+        |> apply_seed_result(shipper, token, result)
+        |> await_seeds(deadline, wal_path, prior)
+
+      # A seed task that died WITHOUT answering (expert review 2026-10-13 #12). Only
+      # `handle_info/2` used to consume its DOWN, which cannot run inside this call, so the
+      # entry stayed in `seeding` and this loop ran to the commit deadline.
+      {:DOWN, ref, :process, _pid, reason} when is_map_key(refs, ref) ->
+        state
+        |> apply_seed_down(ref, reason)
+        |> await_seeds(deadline, wal_path, prior)
+
+      {:repl_reply, from, {:ack, _shard, next}} ->
+        state
+        |> settle_late_ack(from, next)
+        |> await_seeds(deadline, wal_path, prior)
+
+      # A REJECT MUST BE RECONCILED, NOT DROPPED. The first draft of this fell through to the
+      # catch-all and threw rejects away, and the rig showed exactly what this module's own
+      # moduledoc predicts: the follower stayed pinned at the position we THOUGHT it had, the
+      # retry planned a delta from there, it refused, and every subsequent commit failed
+      # `:impossible` — having fixed the first commit and broken all the rest.
+      #
+      # These are answers to the push that just failed, so reconciling them before the retry is
+      # the whole point: the retry plans from where each follower actually is.
+      {:repl_reply, from, {:reject, _shard, reason, follower_offset}} ->
+        rejects = [{from, reason, follower_offset}]
+
+        state
+        |> reconcile(rejects)
+        |> start_seeds(wal_path, rejects)
+        |> await_seeds(deadline, wal_path, prior)
+
+      {:repl_reply, _from, _other} ->
+        await_seeds(state, deadline, wal_path, prior)
+    after
+      remaining -> {:timeout, state}
     end
   end
 
@@ -2167,8 +2435,8 @@ defmodule Fathom.Shard.Replication.Session do
   # convert a bounded failure into a call that spins until the caller's timeout. `why` is the
   # ORIGINAL failure — reporting the retry's reason would blame the seed for a quorum that was
   # already short.
-  defp retry_after_seed(state, wal_path, deadline, why) do
-    case ship(state, wal_path, state.epoch, deadline) do
+  defp retry_after_seed(state, wal_path, deadline, why, mode) do
+    case ship(state, wal_path, state.epoch, deadline, mode) do
       {:ok, new_state, rejects} ->
         # Same ownership gate as the primary commit path (expert review 2026-09-05 #5): a post-seed
         # quorum is still only durable if this node still holds the lease.
@@ -2189,8 +2457,8 @@ defmodule Fathom.Shard.Replication.Session do
       {:error, {:no_quorum, _retry_why}, new_state, rejects} ->
         {:reply, {:error, {:no_quorum, why}}, start_seeds(new_state, wal_path, rejects)}
 
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
+      {:error, reason, failed_state} ->
+        {:reply, {:error, reason}, failed_state}
     end
   end
 
@@ -2214,6 +2482,7 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   defp apply_current_seed_result(state, shipper, result) do
+    state = note_seed_rate(state, Map.get(state.seeding, shipper), result)
     state = %{state | seeding: forget_seed(state.seeding, shipper)}
 
     case result do
@@ -2232,6 +2501,13 @@ defmodule Fathom.Shard.Replication.Session do
         state
     end
   end
+
+  # The last completed seed's throughput, bytes per ms (expert review 2026-10-20 #6), for
+  # `hopeless_seed?/3`. Wall time from start to result as this Session saw it.
+  defp note_seed_rate(state, %{bytes: b, started_at: t}, {:ok, _}) when is_integer(b) and b > 0,
+    do: %{state | seed_rate: b / max(System.monotonic_time(:millisecond) - t, 1)}
+
+  defp note_seed_rate(state, _entry, _result), do: state
 
   defp start_seeds(state, wal_path, rejects) do
     # EXPIRE FIRST. A monitor covers a task that DIED; it does not cover one that is alive and
@@ -2262,6 +2538,10 @@ defmodule Fathom.Shard.Replication.Session do
           {:ok, pin} = SeedPin.start(session, db_path)
           pin
       end
+
+    # What the batch is about to stream (one stat pair per batch, not per follower), recorded per
+    # entry so `hopeless_seed?/3` can price the wait (expert review 2026-10-20 #6). A seed is rare.
+    bytes = if needs == [], do: 0, else: seed_bytes(db_path, wal_path)
 
     seeded =
       Enum.reduce(needs, state, fn shipper, acc ->
@@ -2297,7 +2577,8 @@ defmodule Fathom.Shard.Replication.Session do
           ref: ref,
           token: token,
           pid: pid,
-          started_at: System.monotonic_time(:millisecond)
+          started_at: System.monotonic_time(:millisecond),
+          bytes: bytes
         }
 
         %{acc | seeding: Map.put(acc.seeding, shipper, entry)}
@@ -2791,6 +3072,26 @@ defmodule Fathom.Shard.Replication.Session do
 
   defp arm_if_rejected(state, rejects),
     do: arm_catchup(%{state | catchup_fails: state.catchup_fails + 1}, rejects)
+
+  # Arm the catch-up when a connected follower is behind the newest extent this Session has read
+  # (expert review 2026-10-20 #3). The commit loop used to keep every follower current itself, at
+  # the cost of every commit waiting on the slowest; it now stops at the quorum, so this is what
+  # keeps the rest converging. A follower being seeded is left to its seed. Not a failure: the
+  # backoff count is untouched, and an already-armed timer is only refreshed.
+  defp arm_if_short(%{seen: [{gen, salt, extent} | _]} = state) do
+    short? =
+      Enum.any?(shippers(), fn s ->
+        not Map.has_key?(state.seeding, s) and
+          not match?(
+            %{wal_gen: ^gen, salt1: ^salt, offset: o} when is_integer(o) and o >= extent,
+            Map.get(state.followers, s)
+          )
+      end)
+
+    if short?, do: arm_catchup(state, []), else: state
+  end
+
+  defp arm_if_short(state), do: state
 
   # BACKOFF, AND WHY THE FLAT 1 Hz RETRY WAS A CASCADING FAILURE (expert review 2026-08-20 #25).
   #

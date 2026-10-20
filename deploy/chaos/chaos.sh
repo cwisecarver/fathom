@@ -67,6 +67,10 @@
 #   TPC_DRIVER=elixir ./chaos.sh pool-fleet [tenants streams ops caps_csv]  CONNECTION-POOL A/B:
 #                                 `streams` concurrent one-shot (open+exec+close) workers per tenant
 #                                 shard, alternating max_per_scope over caps_csv; ops/s + pool hit%
+#   TPC_DRIVER=elixir ./chaos.sh pool-gap [tenants streams_csv ops gap_s cap]  SAME-SHARD COLLAPSE
+#                                 reproducer: rounds on the SAME shard(s) separated by an idle gap the
+#                                 coordinator+Session survive; prints seeds, checkpoint_during_push,
+#                                 session_down, catching_up and clock-lag counts per round
 #   TPC_DRIVER=elixir ./chaos.sh tpcb|tpc-fleet  drive with the Filo.Client BEAM driver
 #                                 (tpc_driver.exs): one process per client instead of python's
 #                                 thread-per-client, so one box models far more concurrent clients.
@@ -2286,6 +2290,97 @@ cmd_pool_fleet() {
   done
 }
 
+# -- pool-gap: the SAME-SHARD COLLAPSE reproducer (expert review 2026-10-20 #11) ---------------------
+# The 2026-10-19 collapse (1,700 -> 64-170 ops/s, 288-1,822 session_down) needed run 2 to hit the
+# SAME shard as run 1, after an idle gap, on a coordinator + replication Session that SURVIVED the gap.
+# pool-fleet's per-invocation namespace (cbbe3066) removed that, so no arm could reproduce it. This
+# one does it on purpose: every round drives the same shard(s) `pg<tag>_*`, separated by `gap_s`
+# seconds of idleness -- longer than the pool's drain_grace_ms (250 ms, so the idle drain's
+# close-time checkpoint runs) and far shorter than shard_idle_ms (pinned at 900 s here, so the
+# coordinator and Session stay up). Per round it prints ops/s and latency, plus what the collapse
+# looked like in the node logs: follower seed requests, checkpoint_during_push, session_down, the
+# no_quorum catching_up storm, and the `clock lags` count that invalidates a round (AGENTS.md).
+#
+# The pool cap is set ONCE, before round 1: a coordinator reads :connection_pool_opts at init
+# (`Fathom.Shard.init_pool/0`), so on a reused shard a per-round cap would silently not apply.
+# Each round also prints whether the coordinator and Session pids are the SAME as the previous
+# round's -- "NEW" means the gap outlived them and the round did not test reuse at all.
+#
+# Usage: TPC_DRIVER=elixir ./chaos.sh pool-gap [tenants streams_csv ops gap_s cap]
+#   defaults 1 "16,32" 300 5 1 -- the 2026-10-19 shape. Expect (pre-fix image) round 2 to collapse.
+cmd_pool_gap() {
+  local tenants=${1:-1} streams_csv=${2:-"16,32"} ops=${3:-300} gap_s=${4:-5} cap=${5:-1}
+  local n
+  echo "pool-gap: $tenants tenants, streams $streams_csv, $ops ops/stream, ${gap_s}s idle gap between rounds, pool cap $cap ($TPC_DRIVER driver)" >&2
+  [ "$TPC_DRIVER" = elixir ] || { echo "pool-gap needs TPC_DRIVER=elixir (the python driver has no oneshot mode)" >&2; return 1; }
+
+  for n in "${NODES[@]}"; do
+    rpc "$n" "Application.put_env(:fathom, :rebalancer_enabled, false); Application.put_env(:fathom, :shard_idle_ms, 900_000); Application.put_env(:fathom, :connection_pool_opts, Keyword.put(Application.get_env(:fathom, :connection_pool_opts, []), :max_per_scope, $cap))" >/dev/null
+  done
+  echo "  replicating on fathom1: $(rpc "${NODES[0]}" 'IO.puts(Fathom.Shard.Replication.Fleet.replicating?())')" >&2
+
+  tpc_prewarm
+
+  local run_tag; run_tag=$(date +%H%M%S)
+  local shard="pg${run_tag}"
+
+  # "<coordinator pids> | <session pids>" for this run's shards, across every node.
+  owners() {
+    local out="" o
+    for n in "${NODES[@]}"; do
+      o=$(rpc "$n" "ids = for i <- 0..($tenants - 1), do: \"${shard}_#{i}\"; f = fn reg -> Enum.flat_map(ids, fn id -> for {p, _} <- Registry.lookup(reg, id), do: inspect(p) end) end; IO.puts(Enum.join(f.(Fathom.ShardRegistry), \",\") <> \"|\" <> Enum.join(f.(Fathom.Shard.Replication.SessionRegistry), \",\"))")
+      [ "$o" != "|" ] && out="$out $n:$o"
+    done
+    echo "${out:- none}"
+  }
+
+  printf "  %-5s %7s %8s %9s %8s %8s %6s %6s %6s %7s %8s %6s\n" round streams ops "ops/s" "p50 ms" "p99 ms" errs seeds cdp sdown catchup clock
+  local IFS=,
+  set -f; set -- $streams_csv; set +f
+  unset IFS
+  local round=0 streams json tps p50 p99 errs nops t0 secs logs seeds cdp sdown catching clock prev_owners cur_owners
+  for streams in "$@"; do
+    round=$(( round + 1 ))
+    if [ "$round" -gt 1 ]; then
+      prev_owners=$(owners)
+      sleep "$gap_s"
+    fi
+    t0=$(date +%s)
+    json=$(tpc_run oneshot-fleet --domain "$DOMAIN" --shard "$shard" \
+      --worker-timeout "${TPC_WORKER_TIMEOUT:-300000}" --accounts 1000 \
+      --clients "$tenants" --streams "$streams" --txns $(( tenants * streams * ops )) 2>/dev/null)
+    secs=$(( $(date +%s) - t0 + 2 ))
+    logs=$(compose logs --since "${secs}s" "${NODES[@]}" 2>/dev/null)
+    seeds=$(printf '%s\n' "$logs" | grep -c "asking for a seed of ${shard}_" || true)
+    cdp=$(printf '%s\n' "$logs" | grep -c "checkpoint_during_push" || true)
+    sdown=$(printf '%s\n' "$logs" | grep -c "session_down" || true)
+    catching=$(printf '%s\n' "$logs" | grep -c "catching_up" || true)
+    clock=$(printf '%s\n' "$logs" | grep -c "clock lags" || true)
+    tps=$(printf '%s' "$json" | jq -r '.oneshot_tps // 0')
+    p50=$(printf '%s' "$json" | jq -r '.oneshot_p50_us // 0')
+    p99=$(printf '%s' "$json" | jq -r '.oneshot_p99_us // 0')
+    errs=$(printf '%s' "$json" | jq -r '.errors // 0')
+    nops=$(printf '%s' "$json" | jq -r '.ops // 0')
+    printf "  %-5s %7s %8s %9s %8s %8s %6s %6s %6s %7s %8s %6s\n" "$round" "$streams" "$nops" "$tps" \
+      "$(awk -v x="$p50" 'BEGIN{printf "%.2f", x/1000}')" \
+      "$(awk -v x="$p99" 'BEGIN{printf "%.2f", x/1000}')" "$errs" "$seeds" "$cdp" "$sdown" "$catching" "$clock"
+    printf "  err reasons: %s\n" "$(printf '%s' "$json" | jq -c '.err_reasons // {}')"
+    if [ "$round" -gt 1 ]; then
+      cur_owners=$(owners)
+      if [ "$cur_owners" = "$prev_owners" ]; then
+        echo "  coordinator+session REUSED across the gap:$cur_owners"
+      else
+        echo "  NEW coordinator/session after the gap (this round did NOT test reuse): before$prev_owners after$cur_owners"
+      fi
+    fi
+    [ "$clock" -gt 0 ] && echo "  WARNING: $clock 'clock lags' lines in this round -- colima clock step, the round is INVALID"
+  done
+
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, true); Application.put_env(:fathom, :shard_idle_ms, 20_000)' >/dev/null
+  done
+}
+
 # tpcc-fleet: the TPC-C analog of tpc-fleet — N concurrent TENANTS, each its own shard running a
 # 1-warehouse TPC-C mix (heavier: value-fed, multi-statement, held streams), swept by tenant count.
 # Reads aggregate tpmC + txn/s and the per-node split, like tpc-fleet. This is the multi-tenant path
@@ -3021,6 +3116,7 @@ case "${1:-}" in
   tpc-fleet)   shift; cmd_tpc_fleet "$@" ;;
   tpcc-fleet)  shift; cmd_tpcc_fleet "$@" ;;
   pool-fleet)  shift; cmd_pool_fleet "$@" ;;
+  pool-gap)    shift; cmd_pool_gap "$@" ;;
   rebalance)   shift; cmd_rebalance "$@" ;;
   hotspots)    shift; cmd_hotspots "$@" ;;
   replication) shift; cmd_replication "$@" ;;
