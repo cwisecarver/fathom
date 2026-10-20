@@ -53,12 +53,21 @@ defmodule Fathom.Shard.Replication.Wal do
   Returns `{:ok, :empty}` when the file is absent or too short to hold a header — a shard that has
   been opened but not yet written. That is deliberately distinct from an error: it is the normal
   state of a quiet tenant, and treating it as a failure would make every idle shard look broken.
+
+  ## Options
+
+    * `index: true` — derive the commit extent from the `-shm` wal-index header (see "THE COMMIT
+      EXTENT FROM THE WAL-INDEX" below) instead of walking frame headers, falling back to the walk
+      when the index is absent or unusable. **PRIMARY ONLY**: it is correct only for a `-wal` that
+      SQLite itself writes, because SQLite publishes `mxFrame` there on every commit. A follower's
+      replica WAL is written by fathom directly, so its `-shm` (if a connection ever mapped one)
+      does not track it and would under-report the extent. Default `false`.
   """
-  @spec read(Path.t()) :: {:ok, header()} | {:ok, :empty} | {:error, term()}
-  def read(path) do
+  @spec read(Path.t(), keyword()) :: {:ok, header()} | {:ok, :empty} | {:error, term()}
+  def read(path, opts \\ []) do
     case stat(path) do
       {:ok, %{size: size}} when size >= @header_bytes ->
-        read_header(path, size)
+        read_header(path, size, Keyword.get(opts, :index, false))
 
       {:ok, _} ->
         {:ok, :empty}
@@ -71,20 +80,21 @@ defmodule Fathom.Shard.Replication.Wal do
     end
   end
 
-  defp read_header(path, size) do
+  defp read_header(path, size, index?) do
     with {:ok, fd} <- :file.open(path, [:read, :raw, :binary]),
          {:ok, bin} <- :file.pread(fd, 0, @header_bytes) do
       result =
         case bin do
           <<magic::32, _fmt::32, page::32, seq::32, salt1::32, salt2::32, _ck::binary>>
           when magic in @magics ->
-            {:ok,
-             %{
-               ckpt_seq: seq,
-               salt1: salt1,
-               size: size,
-               commit_extent: commit_extent(fd, size, page, salt1, salt2)
-             }}
+            # The index is read AFTER the WAL header, the order the agreement check needs: SQLite
+            # publishes a restart's new salts in the index BEFORE it rewrites the WAL header, so an
+            # index read after a header of generation G shows G or a later one, never an earlier.
+            extent =
+              (index? && one_shot_index_extent(path, page, salt1, salt2)) ||
+                commit_extent(fd, size, page, salt1, salt2)
+
+            {:ok, %{ckpt_seq: seq, salt1: salt1, size: max(size, extent), commit_extent: extent}}
 
           _ ->
             # Not a WAL header. Refusing is the only safe answer: shipping bytes we cannot identify
@@ -204,15 +214,29 @@ defmodule Fathom.Shard.Replication.Wal do
   # happening to differ — which is not guaranteed.
 
   @typedoc """
-  A revalidated read handle: the path, the open fd, and the inode it was opened on. `nil` means
-  "no fd held", which is the starting state and the state after any error.
+  What the last header read through a handle found: the generation's identity, its page size, and
+  the commit extent. The index fast path reuses `ckpt_seq` while the index still shows these salts.
+  """
+  @type cursor :: %{
+          ckpt_seq: non_neg_integer(),
+          salt1: non_neg_integer(),
+          salt2: non_neg_integer(),
+          page: pos_integer(),
+          extent: non_neg_integer()
+        }
+
+  @typedoc """
+  A revalidated read handle: the path, the open fd, the inode it was opened on, and (primary
+  `-wal` paths only) a read fd on the `-shm` wal-index. `nil` means "no fd held", which is the
+  starting state and the state after any error.
   """
   @type handle ::
           %{
             path: Path.t(),
             fd: :file.fd(),
             inode: non_neg_integer(),
-            cursor: {non_neg_integer(), non_neg_integer(), non_neg_integer()} | nil
+            shm: :file.fd() | nil,
+            cursor: cursor() | nil
           }
           | nil
 
@@ -229,7 +253,7 @@ defmodule Fathom.Shard.Replication.Wal do
     case stat(path) do
       {:ok, %{size: size, inode: inode}} when size >= @header_bytes ->
         case ensure_fd(handle, path, inode) do
-          {:ok, h} -> header_from(h, size)
+          {:ok, h} -> h |> ensure_shm() |> header_from(size)
           {:error, reason} -> {:error, reason, close_held(handle)}
         end
 
@@ -353,23 +377,50 @@ defmodule Fathom.Shard.Replication.Wal do
   @spec close_held(handle()) :: nil
   def close_held(nil), do: nil
 
-  def close_held(%{fd: fd}) do
+  def close_held(%{fd: fd} = handle) do
     :file.close(fd)
+    if shm = Map.get(handle, :shm), do: :file.close(shm)
     nil
   end
 
   # Reuse the fd only when BOTH the path and the inode match. A different inode is an
   # unlink+recreate, and reading the old one would splice generations.
+  #
+  # The `-shm` fd is dropped with the WAL fd and reopened by `ensure_shm/1` on the next
+  # `read_held/2`, so it is always opened AFTER the WAL inode it is paired with was observed. That
+  # pairing is what makes holding it safe: SQLite unlinks `-shm` only in the same close that
+  # deletes `-wal` (`sqlite3WalClose` → `walIndexClose(isDelete)`, shm first, both under an
+  # EXCLUSIVE lock on the database), and fathom's own removals (`Materializer.promote_pull/2`,
+  # `drop_local/1`) remove both with no connection open. So a `-shm` replaced under a held fd
+  # implies a new `-wal` inode, which reopens both here. (Inode-number REUSE defeats this exactly as
+  # it already defeats the WAL fd's own check — no new exposure.)
   defp ensure_fd(%{path: path, inode: inode} = handle, path, inode), do: {:ok, handle}
 
   defp ensure_fd(handle, path, inode) do
     _ = close_held(handle)
 
     case :file.open(path, [:read, :raw, :binary]) do
-      {:ok, fd} -> {:ok, %{path: path, fd: fd, inode: inode, cursor: nil}}
+      {:ok, fd} -> {:ok, %{path: path, fd: fd, inode: inode, shm: nil, cursor: nil}}
       {:error, reason} -> {:error, reason}
     end
   end
+
+  # Open the wal-index once per WAL fd. Only for a `<db>-wal` path: the handle is the primary's
+  # (Session), whose WAL SQLite writes. Absent (no connection has mapped it yet, or a synthetic
+  # WAL in a test) is not an error — the extent falls back to the frame walk and the open is
+  # retried on the next read. In production a `-wal` holding a commit always has its `-shm`.
+  defp ensure_shm(%{shm: nil, path: path} = h) do
+    with true <- String.ends_with?(path, "-wal"),
+         {:ok, shm} <- :file.open(shm_path(path), [:read, :raw, :binary]) do
+      %{h | shm: shm}
+    else
+      _ -> h
+    end
+  end
+
+  defp ensure_shm(h), do: h
+
+  defp shm_path(wal_path), do: String.replace_suffix(wal_path, "-wal", "-shm")
 
   # THE COMMITTED EXTENT THROUGH A HELD FD, WITHOUT THE BACKWARD WALK (expert review 2026-10-01
   # perf #8). After a checkpoint SQLite restarts the WAL IN PLACE: the file keeps its high-water
@@ -390,6 +441,12 @@ defmodule Fathom.Shard.Replication.Wal do
   #   4. no cursor (a freshly opened fd): fall back to `scan_back/5`.
   # The forward walk stops at the first frame whose salts are not this generation's, which is
   # SQLite's own recovery rule: nothing after an invalid frame is valid.
+  #
+  # THIS IS NOW THE FALLBACK (expert review 2026-10-20 #1/#17): the wal-index read below answers
+  # first, and the walk runs only when the index is absent or unusable. The walk trusts a frame
+  # HEADER, which SQLite writes before the frame's page — see "THE COMMIT EXTENT FROM THE
+  # WAL-INDEX" below for why that is a torn-frame hazard over a stale tail, and why the index is
+  # not.
   defp held_extent(handle, size, page, salt1, salt2) when page > 0 do
     frame_bytes = @frame_header_bytes + page
     frames = div(size - @header_bytes, frame_bytes)
@@ -399,8 +456,8 @@ defmodule Fathom.Shard.Replication.Wal do
       frames > 0 and commit_frame?(handle.fd, limit - frame_bytes, salt1, salt2) ->
         limit
 
-      match?({^salt1, ^salt2, ext} when ext <= limit, handle.cursor) ->
-        {_, _, ext} = handle.cursor
+      match?(%{salt1: ^salt1, salt2: ^salt2, extent: ext} when ext <= limit, handle.cursor) ->
+        %{extent: ext} = handle.cursor
         scan_forward(handle.fd, ext, limit, frame_bytes, salt1, salt2, ext)
 
       handle.cursor != nil ->
@@ -460,14 +517,56 @@ defmodule Fathom.Shard.Replication.Wal do
     end
   end
 
+  # The held header read, index first (expert review 2026-10-20 #1/#17/#23).
+  #
+  # STEADY STATE IS ONE PREAD: when the index still shows the cursor's generation (same salts, same
+  # page size), the WAL header cannot have changed — `ckpt_seq` and the salts are written once per
+  # generation, and a restart publishes NEW salts in the index before it rewrites the WAL header —
+  # so `ckpt_seq` comes from the cursor and the WAL header is not read at all. That replaces the
+  # old header pread + EOF-frame pread pair, and in a stale-tail cycle the per-frame forward walk
+  # (panel 3: 6.0 / 9.2 / 21.6 preads per read at 1 / 4 / 16-row commits; now 1). A replicated
+  # commit's raw file jobs go 6 → 5 (stat, index, payload, recheck stat, recheck header), which is
+  # what #23 asked of the EOF-probe/payload fusion — with the index there is no EOF probe left
+  # to fuse, so #23 is subsumed rather than built.
+  #
+  # Inode recreation is still caught by the stat in `read_held/2` before this runs; a WAL restart
+  # after this read is still caught by the commit's trailing `recheck_held/2`, which reads the WAL
+  # header itself (SQLite rewrites it before overwriting any frame, so a payload that straddles a
+  # restart always fails `Session.stable?/3`).
   defp header_from(handle, size) do
+    index = read_index(handle.shm)
+
+    case {index, handle.cursor} do
+      {{:ok, %{salt1: s1, salt2: s2, page: page} = ix}, %{salt1: s1, salt2: s2, page: page} = c} ->
+        extent = max(frame_extent(ix.mx, page), c.extent)
+        header_reply(handle, c.ckpt_seq, s1, s2, page, size, extent)
+
+      _ ->
+        header_from_wal(handle, size, index)
+    end
+  end
+
+  defp header_from_wal(handle, size, index) do
     case :file.pread(handle.fd, 0, @header_bytes) do
       {:ok, <<magic::32, _fmt::32, page::32, seq::32, salt1::32, salt2::32, _ck::binary>>}
       when magic in @magics ->
-        extent = held_extent(handle, size, page, salt1, salt2)
+        extent =
+          case agreeing_extent(handle.shm, index, page, salt1, salt2) do
+            nil -> held_extent(handle, size, page, salt1, salt2)
+            ext -> ext
+          end
 
-        {:ok, %{ckpt_seq: seq, salt1: salt1, size: size, commit_extent: extent},
-         %{handle | cursor: {salt1, salt2, extent}}}
+        # Within one generation the reported extent never moves backward: a cursor taken from the
+        # walk can be ahead of the index for the microseconds between SQLite finishing a commit's
+        # frames and publishing it, and a smaller extent than a follower already holds would make
+        # `Primary.plan/3` order a full reset.
+        extent =
+          case handle.cursor do
+            %{salt1: ^salt1, salt2: ^salt2, extent: c} -> max(extent, c)
+            _ -> extent
+          end
+
+        header_reply(handle, seq, salt1, salt2, page, size, extent)
 
       {:ok, _} ->
         # Same refusal as `read_header/2`: bytes we cannot identify the generation of are the
@@ -481,4 +580,152 @@ defmodule Fathom.Shard.Replication.Wal do
         {:error, reason, close_held(handle)}
     end
   end
+
+  defp header_reply(handle, seq, salt1, salt2, page, size, extent) do
+    cursor = %{ckpt_seq: seq, salt1: salt1, salt2: salt2, page: page, extent: extent}
+
+    # `size` is the stat taken before the index read; a commit published in between can put the
+    # extent past it. Its frames are on disk (published ⇒ written), so report the larger.
+    {:ok, %{ckpt_seq: seq, salt1: salt1, size: max(size, extent), commit_extent: extent},
+     %{handle | cursor: cursor}}
+  end
+
+  # The index extent for a WAL header just read, or nil to fall back to the walk. `index` was read
+  # BEFORE that header (the held fast path tried it first); if it shows a different generation, the
+  # header may simply be newer than it, so read the index once more — now AFTER the header, the
+  # order in which a match is guaranteed for the current generation (see `read_header/3`).
+  defp agreeing_extent(shm, index, page, salt1, salt2) do
+    index_extent(index, page, salt1, salt2) ||
+      (match?({:ok, _}, index) && index_extent(read_index(shm), page, salt1, salt2)) || nil
+  end
+
+  defp one_shot_index_extent(wal_path, page, salt1, salt2) do
+    with true <- String.ends_with?(wal_path, "-wal"),
+         {:ok, shm} <- :file.open(shm_path(wal_path), [:read, :raw, :binary]) do
+      index = read_index(shm)
+      :file.close(shm)
+      index_extent(index, page, salt1, salt2)
+    else
+      _ -> nil
+    end
+  end
+
+  # --- THE COMMIT EXTENT FROM THE WAL-INDEX (expert review 2026-10-20 #1 / #17) ----------------
+  #
+  # WHY: the frame walk decides "committed" from a frame's 24-byte HEADER (salts + nTruncate), but
+  # SQLite's `walWriteOneFrame` writes the header and the page in two separate `write`s
+  # (sqlite3.c, `walWriteOneFrame`). In append mode a header-only frame is invisible (the file is
+  # not yet long enough, so `div(size - 32, frame_bytes)` floors it away), but over a STALE TAIL —
+  # every cycle after an in-place restart, since prod's `journal_size_limit` is 64 MiB — or over a
+  # rolled-back transaction's abandoned slots, the file is already long. A new commit header lands
+  # on an old slot, the walk counts it, and the payload pread returns the OLD page under it: a torn
+  # frame on the replica, whose checksum chain breaks there, so SQLite on the follower silently
+  # drops it and everything after while the primary counts the follower as holding them.
+  #
+  # `mxFrame` in the wal-index header is the authority SQLite's own readers use, and `walFrames`
+  # publishes it (`walIndexWriteHdr`) only AFTER every frame of the commit is written — and synced,
+  # when synchronous calls for it. Frames ≤ mxFrame are never rewritten until the next restart,
+  # which changes the salts. So `32 + mxFrame * (24 + page)` under matching salts is a committed,
+  # fully written extent by construction, with no frame walk.
+  #
+  # LAYOUT (`struct WalIndexHdr`, 48 bytes, NATIVE byte order — the index is never shared across
+  # machines), two copies at offsets 0 and 48:
+  #   0 iVersion u32 (3007000) · 4 unused · 8 iChange · 12 isInit u8 · 13 bigEndCksum u8 ·
+  #   14 szPage u16 (65536 encoded as 1) · 16 mxFrame u32 · 20 nPage · 24 aFrameCksum[2] ·
+  #   32 aSalt[2] (the WAL header's salt bytes, copied verbatim, so read big-endian like the WAL) ·
+  #   40 aCksum[2] = walChecksumBytes(native) over bytes 0..40.
+  #
+  # THE LOCK-FREE READ, and why a pread is as good as SQLite's mmap read here. SQLite's writer
+  # (`walIndexWriteHdr`) writes copy [1], a memory barrier, then copy [0]; its reader
+  # (`walIndexTryHdr`) copies [0], barrier, [1], and accepts only if the copies are byte-identical,
+  # isInit is set and the checksum matches — otherwise it retries. We do the same over one 96-byte
+  # pread:
+  #   - COHERENCE. SQLite maps `-shm` MAP_SHARED; `pread` copies out of the same page-cache page
+  #     (Linux page cache, macOS unified buffer cache), so it sees the writer's stores exactly as a
+  #     second mapping would. Freshness is causal: the tenant's COMMIT returned (after
+  #     `walIndexWriteHdr`) before the Session was asked to ship it, through BEAM message passing,
+  #     so the read observes at least that commit's header.
+  #   - ORDERING. A pread is one kernel memcpy of both copies with no barrier between them, so on a
+  #     weakly ordered CPU (arm64) its loads may be reordered. A torn read nevertheless has to pass
+  #     three independent checks: (1) both copies identical — each field of each copy is written
+  #     once per publish, copy [1] wholly before copy [0], so an identical-but-mixed pair needs the
+  #     loads of BOTH copies to straddle the writer at the same field boundary; (2) the checksum —
+  #     a mix of two headers' fields (iChange, mxFrame, nPage, the 64-bit running frame checksum)
+  #     must also reproduce a valid aCksum; (3) salts + page size equal to the WAL header's. The
+  #     overwhelmingly common torn case (copies differ) is retried, as SQLite does.
+  #   - STALENESS IS SAFE. An older consistent header is a smaller, still fully written extent; it
+  #     only ships less this round. Within a generation `header_from/2` never reports less than the
+  #     cursor already did.
+  #   - GENERATIONS. A restart (`walRestartHdr`) publishes the new salts with mxFrame = 0 BEFORE the
+  #     new WAL header is written. So a WAL header read FIRST and an index read SECOND agree for the
+  #     current generation (or the index has moved on, and the walk with the header's salts sees only
+  #     that finished generation's complete frames, the newer frames carrying other salts).
+  #
+  # FALLBACK to the walk (today's behaviour, unchanged) when the index is absent, short, never
+  # initialised, still mid-write after retries, of another generation, or of another page size.
+  #
+  # POSIX-LOCK CAVEAT, recorded because it is not obvious: SQLite holds fcntl byte-range locks on
+  # `-shm`, and closing ANY fd a process has on a file drops ALL of that process's fcntl locks on
+  # it. In-process SQLite does not depend on them (connections in one OS process share one
+  # `unixShmNode` and arbitrate in memory), so this is invisible to fathom — but a SECOND OS process
+  # opening a live shard's database could then believe nothing has the index mapped. Running a
+  # second process against a live shard was already unsupported; this makes it more so. The held
+  # fd is closed only with the WAL fd (a recreate, after which the old `-shm` inode is dead) or at
+  # Session exit; the one-shot `read(path, index: true)` opens and closes it per call.
+  @index_hdr_bytes 48
+  @index_version 3_007_000
+  # A copy mismatch means a writer is mid-publish (two ~48-byte memcpys); an immediate re-read is
+  # what SQLite does. Bounded, then the walk.
+  @index_attempts 3
+
+  defp read_index(nil), do: :none
+  defp read_index(fd), do: read_index(fd, @index_attempts)
+
+  defp read_index(_fd, 0), do: :none
+
+  defp read_index(fd, n) do
+    case :file.pread(fd, 0, 2 * @index_hdr_bytes) do
+      {:ok, <<a::binary-size(@index_hdr_bytes), b::binary-size(@index_hdr_bytes)>>} when a == b ->
+        parse_index(a)
+
+      {:ok, <<_::binary-size(@index_hdr_bytes), _::binary-size(@index_hdr_bytes)>>} ->
+        read_index(fd, n - 1)
+
+      # Short (SQLite truncates `-shm` to 3 bytes while the first connection rebuilds it), absent,
+      # or unreadable.
+      _ ->
+        :none
+    end
+  end
+
+  defp parse_index(
+         <<@index_version::32-native, _unused::32, _change::32, init::8, _bigend::8,
+           szpage::16-native, mx::32-native, _npage::32, _frame_ck::binary-size(8), salt1::32,
+           salt2::32, c1::32-native, c2::32-native>> = hdr
+       )
+       when init != 0 do
+    if index_checksum(binary_part(hdr, 0, 40), 0, 0) == {c1, c2},
+      do: {:ok, %{mx: mx, salt1: salt1, salt2: salt2, page: decode_page(szpage)}},
+      else: :none
+  end
+
+  defp parse_index(_), do: :none
+
+  # `szPage` is a u16, so 65536 is stored as 1: `(sz & 0xfe00) + ((sz & 1) << 16)` in SQLite.
+  defp decode_page(sz), do: Bitwise.band(sz, 0xFE00) + Bitwise.bsl(Bitwise.band(sz, 1), 16)
+
+  # `walChecksumBytes(nativeCksum = 1, …)`: pairs of native u32s, 32-bit wrapping.
+  defp index_checksum(<<a::32-native, b::32-native, rest::binary>>, s1, s2) do
+    s1 = Bitwise.band(s1 + a + s2, 0xFFFFFFFF)
+    index_checksum(rest, s1, Bitwise.band(s2 + b + s1, 0xFFFFFFFF))
+  end
+
+  defp index_checksum(<<>>, s1, s2), do: {s1, s2}
+
+  defp index_extent({:ok, %{salt1: salt1, salt2: salt2, page: page, mx: mx}}, page, salt1, salt2),
+    do: frame_extent(mx, page)
+
+  defp index_extent(_index, _page, _salt1, _salt2), do: nil
+
+  defp frame_extent(mx, page), do: @header_bytes + mx * (@frame_header_bytes + page)
 end

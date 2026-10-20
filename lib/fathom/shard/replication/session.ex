@@ -1569,7 +1569,9 @@ defmodule Fathom.Shard.Replication.Session do
 
   defp pinned_flush_checkpoint(conn, session, db_path, opts) do
     with_pin(db_path, fn ->
-      with {:ok, %{} = header} <- Wal.read(db_path <> "-wal"),
+      # `index: true` (expert review 2026-10-20 #17): one index pread instead of the backward walk
+      # over every stale frame (2.1 ms per 1,000) on each flush.
+      with {:ok, %{} = header} <- Wal.read(db_path <> "-wal", index: true),
            true <- GenServer.call(session, {:covers, header}, 1_000) do
         if hook = opts[:before_checkpoint], do: hook.()
         Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", [])
@@ -2529,14 +2531,19 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   defp stream_seed(shipper, shard_id, db_path, wal_path, epoch, lineage, known) do
-    with {:ok, before} <- Wal.read(wal_path),
+    # `index: true` (expert review 2026-10-20 #1): the extent comes from the wal-index `mxFrame`,
+    # which SQLite publishes only after a commit's frames are written. The backward walk could
+    # count a concurrent writer's commit HEADER sitting over a stale slot before its page lands,
+    # and the seed would stream that torn frame. The index read is still AFTER the snapshot pin,
+    # so the ordering argument above is unchanged (published extent at read time >= the mark).
+    with {:ok, before} <- Wal.read(wal_path, index: true),
          {:ok, db_size} <- file_size(db_path),
          wal_size = wal_size_of(before),
          ordinal = seed_ordinal(before, known),
          :ok <- open_seed(shipper, shard_id, epoch, before, db_size, wal_size, lineage, ordinal),
          :ok <- stream_part(shipper, shard_id, :db, db_path, db_size),
          :ok <- stream_part(shipper, shard_id, :wal, wal_path, wal_size),
-         {:ok, after_} <- Wal.read(wal_path),
+         {:ok, after_} <- Wal.read(wal_path, index: true),
          :ok <- stable?(before, after_) do
       Shipper.seed_end(shipper, shard_id)
       await_seed_reply(shipper, shard_id, before, wal_size)
