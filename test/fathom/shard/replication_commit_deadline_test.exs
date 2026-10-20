@@ -43,6 +43,35 @@ defmodule Fathom.Shard.Replication.CommitDeadlineTest do
     assert Session.commit_deadline_budget() == 500
   end
 
+  # Expert review 2026-10-20 #5(a): a call that waited in the Session's queue used to get a FRESH
+  # budget from the moment it was dequeued, so it could run up to that long past its caller. The
+  # internal deadline is now bounded by the caller's own deadline less the reply margin.
+  test "the commit deadline is bounded by the caller's deadline, not just the handler budget" do
+    prev_t = Application.get_env(:fathom, :replication_timeout_ms)
+    prev_m = Application.get_env(:fathom, :replication_reply_margin_ms)
+
+    on_exit(fn ->
+      restore(:replication_timeout_ms, prev_t)
+      restore(:replication_reply_margin_ms, prev_m)
+    end)
+
+    Application.put_env(:fathom, :replication_timeout_ms, 5_000)
+    Application.put_env(:fathom, :replication_reply_margin_ms, 100)
+    now = 1_000_000
+
+    # No caller deadline (the catch-up timer): the handler's own budget.
+    assert Session.commit_deadline(now, nil) == now + 4_900
+
+    # A fresh call: the caller's deadline less the margin, which equals the budget here.
+    assert Session.commit_deadline(now, now + 5_000) == now + 4_900
+
+    # A call that sat 4 s in the queue: 900 ms left for the caller -> 800 ms of work, not 4.9 s.
+    assert Session.commit_deadline(now, now + 900) == now + 800
+
+    # Less than the margin left: whatever the caller has, never a deadline already in the past.
+    assert Session.commit_deadline(now, now + 50) == now + 50
+  end
+
   defp restore(k, nil), do: Application.delete_env(:fathom, k)
   defp restore(k, v), do: Application.put_env(:fathom, k, v)
 end

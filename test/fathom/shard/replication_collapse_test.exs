@@ -141,6 +141,11 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     for name <- names, do: Follower.seed(name, id, epoch, 0, 0, 0, lineage)
   end
 
+  defp session!(id) do
+    [{pid, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+    pid
+  end
+
   defp timed_commit(id, wal, coordinator) do
     t0 = System.monotonic_time(:millisecond)
     reply = Session.commit(id, wal, coordinator)
@@ -179,5 +184,45 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
              "after #{ms} ms — the quorum wait ignored the commit deadline"
 
     assert ms <= Session.commit_deadline_budget() + 50
+  end
+
+  # ------------------------------------------------------------------------------------------
+  # #5(a)
+  # ------------------------------------------------------------------------------------------
+
+  # A stall queues callers; each gives up at `timeout()`, but its request stays in the Session's
+  # mailbox. Executing it anyway (with a fresh deadline) is what turned one stall into minutes: the
+  # queue drains at one caller-timeout per entry while new entries keep arriving.
+  test "#5(a): a commit whose caller already gave up is not executed", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    enable!(for({_, p} <- followers, do: p), timeout: 300, catchup: 0)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    preseed_current!(for({n, _} <- followers, do: n), id, coordinator)
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    session = session!(id)
+    before = :sys.get_state(session).commits
+    :ok = :sys.suspend(session)
+
+    callers =
+      for _ <- 1..8, do: Task.async(fn -> Session.commit(id, wal, coordinator) end)
+
+    replies = Task.await_many(callers, 5_000)
+    assert Enum.all?(replies, &match?({:error, {:session_down, _}}, &1)), inspect(replies)
+
+    :ok = :sys.resume(session)
+    # `get_state` is answered after every queued call has been handled (mailbox order).
+    executed = :sys.get_state(session).commits - before
+
+    assert executed == 0,
+           "#{executed} of 8 abandoned commit calls were executed after their callers gave up"
+
+    # And the Session still serves a live caller.
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    assert :ok = Session.commit(id, wal, coordinator)
   end
 end

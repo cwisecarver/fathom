@@ -126,7 +126,11 @@ defmodule Fathom.Shard.Replication.Session do
 
   defp commit_call(shard_id, wal_path, coordinator) do
     with {:ok, pid} <- ensure_started(shard_id, coordinator) do
-      GenServer.call(pid, {:commit, wal_path}, timeout())
+      # The caller's own give-up time travels with the request (expert review 2026-10-20 #5(a)),
+      # so a request still queued when its caller has gone is dropped instead of executed. Taken
+      # immediately before the call, on the same clock `GenServer.call`'s timer runs on.
+      t = timeout()
+      GenServer.call(pid, {:commit, wal_path, :checkpoint, now_ms() + t}, t)
     end
   catch
     :exit, reason -> {:error, {:session_down, reason}}
@@ -374,11 +378,64 @@ defmodule Fathom.Shard.Replication.Session do
   # A checkpoint opens connections on the shard's files, which is only safe while a stream holds a
   # checked-out connection (so the coordinator cannot be dropping or unlinking those files); a
   # tenant's commit always does, the catch-up timer never does.
-  def handle_call({:commit, wal_path, mode}, _from, state) do
+  def handle_call({:commit, wal_path, mode}, from, state),
+    do: handle_call({:commit, wal_path, mode, nil}, from, state)
+
+  # A COMMIT WHOSE CALLER HAS ALREADY GIVEN UP IS NOT EXECUTED (expert review 2026-10-20 #5(a)).
+  #
+  # `GenServer.call`'s timeout leaves the request in this mailbox. Executing it anyway, with a fresh
+  # deadline, is what made the 2026-10-19 same-shard collapse METASTABLE: once one stall (a seed, a
+  # far-behind follower) made calls time out, every abandoned call still ran — each able to burn
+  # another full deadline — so the queue drained at one caller timeout per entry while new callers
+  # kept joining it. Minutes of errors from a transient.
+  #
+  # Dropping it is safe: its frames were committed before it called, so they are at or below the
+  # extent the NEXT live call reads, and that call ships them and gates them on the same quorum and
+  # the same ownership check. Nobody is waiting for this reply (a late reply to an expired call is
+  # discarded by the caller's alias). A request without a deadline (the catch-up timer's, or an
+  # older caller's two- or three-tuple) is never dropped.
+  #
+  # The internal deadline is also bounded by the CALLER'S: a call that waited 4 s in the queue no
+  # longer gets a fresh `commit_deadline_budget/0` that would outlive its caller by 4 s.
+  def handle_call({:commit, wal_path, mode, caller_deadline}, _from, state) do
+    now = now_ms()
+
+    if is_integer(caller_deadline) and now >= caller_deadline do
+      :telemetry.execute([:fathom, :replication, :commit_dropped], %{count: 1}, %{})
+      {:reply, {:error, :timeout}, state}
+    else
+      run_commit(wal_path, mode, commit_deadline(now, caller_deadline), state)
+    end
+  end
+
+  # Whether quorum-acked replicas hold everything up to `header` — the question the coordinator's
+  # flush asks before it checkpoints (`checkpoint_after_snapshot/2`).
+  def handle_call({:covers, header}, _from, state),
+    do: {:reply, covered?(state, header), state}
+
+  def handle_call(:lag_info, _from, state), do: {:reply, build_lag_info(state), state}
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
+
+  # The handler's own budget, further bounded by the caller's deadline less the reply margin (the
+  # same margin `commit_deadline_budget/0` keeps, so the reply still lands before the caller's timer).
+  # A caller with less than the margin left gets what it has left rather than nothing: a commit with
+  # nothing to wait for (a `:nothing` plan, an already-current quorum) still finishes in time.
+  @doc false
+  @spec commit_deadline(integer(), integer() | nil) :: integer()
+  def commit_deadline(now, nil), do: now + commit_deadline_budget()
+
+  def commit_deadline(now, caller_deadline) do
+    own = now + commit_deadline_budget()
+    capped = caller_deadline - reply_margin()
+    if capped > now, do: min(own, capped), else: min(own, caller_deadline)
+  end
+
+  defp run_commit(wal_path, mode, deadline, state) do
     state = ensure_registered(state, wal_path)
     {pin, state} = if mode == :checkpoint, do: maybe_pin(state, wal_path), else: {nil, state}
     t0 = System.monotonic_time()
-    {:reply, reply, state} = do_commit(wal_path, state)
+    {:reply, reply, state} = do_commit(wal_path, state, deadline)
 
     # Commit -> quorum-ack latency (admin observability 2026-10-15 P1). ONE execute per commit,
     # after the ack work and before the checkpoint start so it measures only what the tenant waits
@@ -391,13 +448,6 @@ defmodule Fathom.Shard.Replication.Session do
 
     {:reply, reply, start_checkpoint(state, pin, wal_path)}
   end
-
-  # Whether quorum-acked replicas hold everything up to `header` — the question the coordinator's
-  # flush asks before it checkpoints (`checkpoint_after_snapshot/2`).
-  def handle_call({:covers, header}, _from, state),
-    do: {:reply, covered?(state, header), state}
-
-  def handle_call(:lag_info, _from, state), do: {:reply, build_lag_info(state), state}
 
   @doc false
   @spec commit_outcome(term()) :: :ok | :no_quorum | :timeout | :other
@@ -469,17 +519,15 @@ defmodule Fathom.Shard.Replication.Session do
     }
   end
 
-  defp do_commit(wal_path, state) do
-    # One deadline for the whole call, taken before any work: a seed wait that reset the clock
-    # could outlive the caller's `GenServer.call` timeout, and a reply nobody is waiting for is
-    # worse than a late failure — the caller has already given up and the tenant already has an
-    # error, while this process is still holding the shard's serialization point.
-    #
-    # `commit_deadline_budget/0` is SHORTER than the caller's call timeout by a reply margin (#21),
-    # so the handler finishes and replies BEFORE the caller gives up — turning a near-miss quorum
-    # into a clean `{:no_quorum, _}` reply rather than a `{:session_down, :timeout}` call exit.
-    deadline = System.monotonic_time(:millisecond) + commit_deadline_budget()
-
+  # `deadline` is one deadline for the whole call, taken before any work (`commit_deadline/2`): a
+  # seed wait that reset the clock could outlive the caller's `GenServer.call` timeout, and a reply
+  # nobody is waiting for is worse than a late failure — the caller has already given up and the
+  # tenant already has an error, while this process is still holding the shard's serialization point.
+  #
+  # `commit_deadline_budget/0` is SHORTER than the caller's call timeout by a reply margin (#21),
+  # so the handler finishes and replies BEFORE the caller gives up — turning a near-miss quorum
+  # into a clean `{:no_quorum, _}` reply rather than a `{:session_down, :timeout}` call exit.
+  defp do_commit(wal_path, state, deadline) do
     state = %{state | commits: state.commits + 1}
 
     case with_epoch(state) do
