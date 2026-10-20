@@ -51,7 +51,9 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
     :connection_pool_opts,
     :shard_idle_ms,
     :shard_idle_close_attempts,
-    :replication_ordinal_wire
+    :replication_ordinal_wire,
+    :replication_timeout_ms,
+    :shard_idle_close_unanswered_ms
   ]
 
   setup do
@@ -253,5 +255,107 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
            end),
            "a replica is missing acked rows: " <>
              inspect(for {n, _} <- followers, do: {n, replica_rows(n, id, root)})
+  end
+
+  # ROUND-4 REPLICATION REVIEW 2026-10-20. The bounded fallback ("after `:shard_idle_close_attempts`
+  # asks, drain anyway") was documented as safe because "the Session has READ every frame by then".
+  # Only if it ANSWERED. A Session busy past the asks (a seed wait, a quorum wait to its deadline —
+  # the collapse shape) answers none of them, and the commits queued behind it are dropped unread
+  # once their callers give up (#5(a)). The drain then folds frames the Session never read: the next
+  # reset cannot mention them, every follower absorbs its WAL as complete, and the next generation's
+  # pages land on a base missing them. Here the unread write splits `t`'s root, so the acked row
+  # written after the gap lands on a leaf the replicas' stale root never points to: an untorn,
+  # promotable replica that does not return a quorum-acked row.
+  test "the idle-close fallback does not fold frames the busy Session never read", %{
+    id: id,
+    root: root
+  } do
+    followers = start_followers!(root, 3)
+    enable!(followers)
+
+    h = open!(id)
+    exec!(h, "CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
+    for i <- 1..3, do: exec!(h, "INSERT INTO t VALUES (#{i}, randomblob(200))")
+    coordinator = pid_of(h)
+
+    assert eventually(fn ->
+             Enum.all?(followers, fn {n, _} -> replica_rows(n, id, root) == [1, 2, 3] end)
+           end),
+           "precondition: the followers never all held the first burst"
+
+    # The Session is busy (suspended stands in for a long seed/quorum wait). This write commits
+    # locally and its replication call times out in the Session's queue: the client sees an error,
+    # and the Session will drop the call without reading the WAL.
+    [{session, _} | _] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+    # The caller gives up after 1 s; the fallback's 8 asks span 0.8 s. Set only now: the first
+    # burst's seeds need the default budget.
+    Application.put_env(:fathom, :replication_timeout_ms, 1_000)
+    :ok = :sys.suspend(session)
+
+    split =
+      "WITH RECURSIVE c(x) AS (SELECT 100 UNION ALL SELECT x + 1 FROM c WHERE x < 140) " <>
+        "INSERT INTO t SELECT x, randomblob(2000) FROM c"
+
+    assert {:error, _} = ShardExecutor.execute(h, stmt(split)),
+           "precondition: the write's replication call did not time out behind the busy Session"
+
+    :ok = ShardExecutor.close(h)
+
+    # Long enough for every fallback ask to go unanswered (8 x 100 ms).
+    Process.sleep(1_500)
+    :ok = :sys.resume(session)
+
+    # Burst 2, after the gap: one ACKED row.
+    assert eventually(fn -> not Process.alive?(coordinator) or idle_settled?(coordinator) end)
+    h2 = open!(id)
+    exec!(h2, "INSERT INTO t VALUES (200, randomblob(200))")
+    :ok = ShardExecutor.close(h2)
+
+    primary = Enum.to_list(1..3) ++ Enum.to_list(100..140) ++ [200]
+
+    # Every replica that is promotable (untorn) must be the primary's state; a torn one is refused
+    # by promotion and is the safe outcome.
+    assert eventually(fn ->
+             Enum.all?(followers, fn {n, _} ->
+               case Follower.state_of(n, id) do
+                 %{torn: true} -> true
+                 _ -> replica_rows(n, id, root) == primary
+               end
+             end)
+           end),
+           "an untorn replica is not the primary's state (row 200 was quorum-acked): " <>
+             inspect(
+               for {n, _} <- followers,
+                   do: {n, Follower.state_of(n, id).torn, replica_rows(n, id, root)}
+             )
+  end
+
+  # The other side of the same rule: a Session that NEVER answers must not hold the shard's pool
+  # (and its durability flush) forever. Past `:shard_idle_close_unanswered_ms` the drain runs.
+  test "an idle close still drains once a silent Session's backstop passes", %{id: id, root: root} do
+    Application.put_env(:fathom, :shard_idle_close_unanswered_ms, 300)
+    followers = start_followers!(root, 3)
+    enable!(followers)
+
+    h = open!(id)
+    exec!(h, "CREATE TABLE t (a INTEGER)")
+    exec!(h, "INSERT INTO t VALUES (1)")
+    coordinator = pid_of(h)
+
+    [{session, _} | _] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+    :ok = :sys.suspend(session)
+    on_exit(fn -> if Process.alive?(session), do: :sys.resume(session) end)
+
+    :ok = ShardExecutor.close(h)
+
+    assert eventually(fn -> idle_settled?(coordinator) end, 500),
+           "the idle drain never ran while the Session stayed silent"
+
+    refute File.exists?(wal(id)), "the drain ran but its close did not fold the WAL"
+  end
+
+  defp idle_settled?(coordinator) do
+    st = :sys.get_state(coordinator)
+    st.idle_close == nil and Shard.HandlePool.count(st.pool) == 0
   end
 end

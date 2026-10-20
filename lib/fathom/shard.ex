@@ -2076,11 +2076,19 @@ defmodule Fathom.Shard do
   # since the ask makes `conns` non-empty, and its checkin is a new idle transition that resets
   # `idle_close`, so a verdict computed before a write can never authorize folding that write.
   # `:wait` needs nothing here — the re-ask timer covered_idle_drain/1 armed asks again.
+  #
+  # `:wait` also records that the Session ANSWERED (round-4 replication review 2026-10-20): it read
+  # the WAL after this idle period's last commit, which is what makes the bounded fallback safe.
+  # `:retry` (its header read failed) is not such an answer.
   def handle_info({:idle_close_verdict, token, verdict}, state) do
     case state do
-      %{idle_close: {^token, _}, conns: conns} when map_size(conns) == 0 and verdict == :ready ->
+      %{idle_close: {^token, _, _, _}, conns: conns}
+      when map_size(conns) == 0 and verdict == :ready ->
         :telemetry.execute([:fathom, :shard, :idle_close], %{count: 1}, %{result: :ready})
         {:noreply, drain_pool(state)}
+
+      %{idle_close: {^token, n, _, since}} when verdict == :wait ->
+        {:noreply, %{state | idle_close: {token, n, true, since}}}
 
       _ ->
         {:noreply, state}
@@ -3100,9 +3108,25 @@ defmodule Fathom.Shard do
   # lacks would be folded. The ask is a MESSAGE, never a call: the Session calls this process
   # (epoch, ordinal, checkout) while it works, so a synchronous ask could deadlock until a timeout.
   # The re-ask timer is the watchdog for a Session that never answers; after
-  # `:shard_idle_close_attempts` asks the drain runs anyway — today's behaviour, and still safe:
-  # the Session has READ every frame by then, so a follower it could not reach is marked short at
-  # the next reset and re-seeded, never laundered (`Session.outgoing_extent/2`).
+  # `:shard_idle_close_attempts` asks the drain runs anyway — today's behaviour, and safe ONLY
+  # BECAUSE THE SESSION HAS ANSWERED by then: an answer means it processed the ask, so it read the
+  # WAL header after every commit of this idle period (the ask is sent once the last stream checked
+  # in), and a follower it could not reach is marked short at the next reset and re-seeded, never
+  # laundered (`Session.outgoing_extent/2`).
+  #
+  # AN UNANSWERED ASK IS NOT AN ANSWER (round-4 replication review 2026-10-20). A Session busy past
+  # the asks — a seed wait or a quorum wait to its deadline, the 2026-10-19 collapse shape — answers
+  # none of them, and the commits queued behind it are dropped UNREAD once their callers give up
+  # (expert review 2026-10-20 #5(a)). Draining then folded frames the Session never read: the next
+  # reset could not mention them, every follower absorbed its WAL as complete, and the next
+  # generation's pages landed on a base missing them — every replica untorn and "database disk
+  # image is malformed" in replication_idle_close_test. So the attempts count toward the fallback
+  # only once the Session has answered (`:wait`); unanswered, the drain waits — without re-asking
+  # past the attempts, so the Session's mailbox does not fill — up to
+  # `idle_close_unanswered_ms/0` (4x the replication timeout: past every deadline the Session can
+  # be inside, since an idle shard has no live caller queued). Past that the drain runs: a Session
+  # wedged that long is the residual uncovered case below. A Session that is GONE answers `:none`
+  # at the next ask and the drain runs at once.
   #
   # NOT the finding's option (a), "stop the Session on idle drain": a fresh Session records no
   # follower, so its first reset states `prev_extent: 0` ("no evidence of a gap") and a short
@@ -3115,30 +3139,37 @@ defmodule Fathom.Shard do
   @default_idle_close_attempts 8
 
   defp covered_idle_drain(%{pool: %HandlePool{drain_grace_ms: grace} = pool} = state) do
-    attempts = idle_close_attempts_made(state)
-
     cond do
       HandlePool.count(pool) == 0 ->
         drain_pool(state)
 
-      attempts >= idle_close_attempts() ->
+      idle_close_exhausted?(state) ->
         :telemetry.execute([:fathom, :shard, :idle_close], %{count: 1}, %{result: :exhausted})
         drain_pool(state)
 
       true ->
-        token =
-          case state.idle_close do
-            {t, _} -> t
-            nil -> make_ref()
-          end
+        {token, attempts, answered?, since} =
+          state.idle_close || {make_ref(), 0, false, System.monotonic_time(:millisecond)}
 
-        case Fathom.Shard.Replication.Session.request_idle_close(state.id, token) do
+        # Out of asks but not yet answered: keep waiting for the answers already queued rather than
+        # adding to them (see the note above).
+        asked =
+          if attempts >= idle_close_attempts(),
+            do: :asked,
+            else: Fathom.Shard.Replication.Session.request_idle_close(state.id, token)
+
+        case asked do
           :asked ->
             state = cancel_pool_grace(state)
             # The re-ask (and watchdog) tick. Reuses :pool_grace, whose `left` is already <= 0 for
             # this idle period, so it lands straight back here.
             timer = Process.send_after(self(), :pool_grace, max(grace, 50))
-            %{state | idle_close: {token, attempts + 1}, pool_grace_timer: timer}
+
+            %{
+              state
+              | idle_close: {token, attempts + 1, answered?, since},
+                pool_grace_timer: timer
+            }
 
           :none ->
             drain_pool(state)
@@ -3146,13 +3177,28 @@ defmodule Fathom.Shard do
     end
   end
 
-  defp idle_close_attempts_made(%{idle_close: {_, n}}), do: n
-  defp idle_close_attempts_made(_state), do: 0
+  # The fallback: every ask made AND the Session has answered at least once, or it has been silent
+  # past `idle_close_unanswered_ms/0`.
+  defp idle_close_exhausted?(%{idle_close: {_, n, answered?, since}}) do
+    n >= idle_close_attempts() and
+      (answered? or System.monotonic_time(:millisecond) - since >= idle_close_unanswered_ms())
+  end
+
+  defp idle_close_exhausted?(_state), do: false
+
+  defp idle_close_unanswered_ms,
+    do:
+      Application.get_env(
+        :fathom,
+        :shard_idle_close_unanswered_ms,
+        4 * Fathom.Shard.Replication.Session.timeout()
+      )
 
   # Only while still idle: a stream that checked out since the ask has made it moot (its checkin
   # resets `idle_close`), and a busy shard's flush must not defer on it.
-  defp idle_close_pending?(%{idle_close: {_, n}, conns: conns}) when map_size(conns) == 0,
-    do: n < idle_close_attempts()
+  defp idle_close_pending?(%{idle_close: {_, _, _, _}, conns: conns} = state)
+       when map_size(conns) == 0,
+       do: not idle_close_exhausted?(state)
 
   defp idle_close_pending?(_state), do: false
 

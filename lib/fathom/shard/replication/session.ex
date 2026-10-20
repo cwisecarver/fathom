@@ -779,8 +779,9 @@ defmodule Fathom.Shard.Replication.Session do
   # runs on a shard with no traffic, and anything that does arrive queues behind it — which IS the
   # serialization this is staying inside rather than routing around.
   # The coordinator's covered-idle-close ask (expert review 2026-10-20 #7): may its idle drain run
-  # the close-time checkpoint now? See `request_idle_close/2`. Always answered, `:ready` or `:wait`;
-  # the coordinator re-asks on `:wait` and gives up (drains anyway) after a bounded number of asks.
+  # the close-time checkpoint now? See `request_idle_close/2`. Always answered, `:ready`, `:wait` or
+  # `:retry`; the coordinator re-asks on `:wait` and gives up (drains anyway) after a bounded number
+  # of asks.
   def handle_info({:idle_close?, coordinator, token}, state) do
     {verdict, state} = idle_close_verdict(state)
     send(coordinator, {:idle_close_verdict, token, verdict})
@@ -1893,7 +1894,8 @@ defmodule Fathom.Shard.Replication.Session do
 
   Asynchronous on purpose: the Session calls its coordinator while it works (epoch, ordinal,
   checkout grants), so a synchronous ask from the coordinator could deadlock until a timeout. The
-  answer arrives at the caller as `{:idle_close_verdict, token, :ready | :wait}`. Returns `:none`
+  answer arrives at the caller as `{:idle_close_verdict, token, :ready | :wait | :retry}` (`:retry`:
+  the WAL header could not be read, so nothing was judged). Returns `:none`
   when there is no Session to ask (replication off, or nothing shipped yet under this coordinator):
   the caller then drains as it always did.
   """
@@ -2408,8 +2410,10 @@ defmodule Fathom.Shard.Replication.Session do
           {if(nothing_owed?(state, header), do: :ready, else: :wait), state}
         end
 
+      # `:retry`, not `:wait`: nothing was read, so this is not the answer the coordinator's bounded
+      # fallback needs (round-4 replication review 2026-10-20; `Fathom.Shard.covered_idle_drain/1`).
       {:error, _reason, fd} ->
-        {:wait, %{state | wal_fd: fd}}
+        {:retry, %{state | wal_fd: fd}}
     end
   end
 
