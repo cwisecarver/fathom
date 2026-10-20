@@ -238,7 +238,11 @@ defmodule Fathom.Shard.PoolCloseLifecycleTest do
     refute closer == pid,
            "the coordinator closed an evicted pooled handle inline (expert review 2026-10-17 #19)"
 
-    assert is_pid(:sys.get_state(pid).closing), "the eviction close must ride the close chain"
+    # This asserted "the eviction close must ride the close chain" until expert review 2026-10-20
+    # #22: an eviction from a pool that keeps a handle is never the LAST connection, so it now runs
+    # in parallel, tracked in `side_closes` (awaited by the next chain link and by terminate —
+    # pool_eviction_close_test.exs), and the ordered chain no longer defers the flush behind it.
+    assert :sys.get_state(pid).closing == nil, "the eviction close must not ride the close chain"
     await_closes(pid)
     :ok = ShardExecutor.close(hc)
   end

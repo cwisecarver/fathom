@@ -329,6 +329,14 @@ defmodule Fathom.Telemetry do
         tags: [:result, :replicated],
         description: "Post-snapshot checkpoints of the durability flush, by outcome"
       ),
+      # The ordered close chain's depth at each new link (expert review 2026-10-20 #22): links spawned
+      # and not finished. A growing depth is the backlog that defers the durability flush.
+      distribution("fathom.shard.close_chain.depth",
+        event_name: [:fathom, :shard, :close_chain],
+        measurement: :depth,
+        reporter_options: [buckets: [1, 2, 4, 8, 16, 32, 64, 128, 256]],
+        description: "Close-chain links in flight when a new one is spawned"
+      ),
       # The covered idle close (expert review 2026-10-20 #7): `ready` = the Session cleared the
       # drain; `exhausted` = it drained anyway after `:shard_idle_close_attempts` asks (a follower
       # the Session could not catch up — expect re-seeds for that shard).

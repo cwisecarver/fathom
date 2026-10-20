@@ -979,6 +979,9 @@ defmodule Fathom.Shard do
         # connection, so it runs in parallel instead of on the ordered chain above; everything that
         # waits on the chain (the next chain link, terminate's close_pool/1) waits on these too.
         side_closes: %{},
+        # Close-chain links spawned and not yet finished (#22's depth gauge; see start_close/2).
+        # A `:counters` cell because the links decrement it from their own processes.
+        close_depth: :counters.new(1, []),
         # Has the open path's plain sidecar write been made durable yet? See sync_sidecar_once/1.
         sidecar_synced?: false,
         # The off-process first-write sidecar fsync (expert review 2026-10-17 #5); nil when none
@@ -1908,6 +1911,11 @@ defmodule Fathom.Shard do
     # Dirty (the task never landed) — re-kick so a flush_now waiter retries rather than hangs.
     {:noreply, settle_flushed_and_reschedule(state)}
   end
+
+  # An eviction close finished (expert review 2026-10-20 #22; see start_side_close/2).
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{side_closes: sc} = state)
+      when is_map_key(sc, ref),
+      do: {:noreply, %{state | side_closes: Map.delete(sc, ref)}}
 
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
@@ -2845,7 +2853,22 @@ defmodule Fathom.Shard do
       # checkout/checkin of the shard queues behind. ON the chain, not a bare `spawn`: terminate and
       # the periodic flush `await_closing/1` it so no close-time checkpoint races a drop/rename of the
       # files (see `close_pool/1`); the audit's "plain spawn" would drop that ordering.
-      state = if evicted == [], do: state, else: start_close(state, evicted)
+      #
+      # OFF the chain again, but still ORDERED (expert review 2026-10-20 #22): `put/4` keeps the
+      # incoming handle, so an eviction close is never the shard's last connection and has no
+      # close-time checkpoint to order. On the strictly serial chain it made every close wait for
+      # the previous one, and at ~570 evictions/s with slow dirty-IO the chain grew without bound
+      # while `closing_busy?/1` deferred the durability flush for the whole burst. It now runs in
+      # parallel (start_side_close/2), and everything that needed the ordering still waits for it:
+      # the next chain link (which may be the last close) and terminate's close_pool/1.
+      state =
+        cond do
+          evicted == [] -> state
+          HandlePool.count(pool) > 0 -> start_side_close(state, evicted)
+          # Nothing pooled stays open (a 0-handle cap): this close may be the last. Chain it.
+          true -> start_close(state, evicted)
+        end
+
       schedule_sweep(put_pool(state, pool))
     else
       :telemetry.execute([:fathom, :shard, :pool_budget_full], %{count: 1}, %{shard_id: state.id})
@@ -2879,7 +2902,14 @@ defmodule Fathom.Shard do
   # (expert review 2026-10-13 #19): a close is still checkpointing into the files, so the caller must
   # not unlink or flush-and-drop them (see `flush_and_drop_unless_tombstoned/2`).
   defp close_pool(state) do
-    waited = await_closing(state, terminate_close_wait_ms())
+    deadline = System.monotonic_time(:millisecond) + terminate_close_wait_ms()
+    # The parallel eviction closes too (#22): the inline closes below may be the last connection,
+    # and must not race one still closing (both would skip the close-time checkpoint).
+    sides_done? = await_side_closes(state, deadline)
+
+    waited =
+      await_closing(state, max(deadline - System.monotonic_time(:millisecond), 0))
+
     close_pending_checkins()
 
     case state do
@@ -2892,7 +2922,7 @@ defmodule Fathom.Shard do
         :ok
     end
 
-    if closing_busy?(waited), do: :close_timeout, else: :ok
+    if closing_busy?(waited) or not sides_done?, do: :close_timeout, else: :ok
   end
 
   # `:shard_terminate_close_wait_ms` is a test seam (a test cannot wait 5 s per case).
@@ -3177,31 +3207,94 @@ defmodule Fathom.Shard do
   # A plain `spawn`, not a Task: nobody reads a result, and an unlinked process still finishes its
   # closes if this coordinator dies first (a linked Task would be killed with it and strand the
   # handles until garbage collection, the stale-close hazard close_pool/1 describes).
+  #
+  # A link also waits for every parallel EVICTION close in flight when it is spawned (expert review
+  # 2026-10-20 #22, start_side_close/2): those are never the last connection, but this link may be,
+  # and two concurrent closes can both skip the close-time checkpoint.
+  #
+  # THE DEPTH GAUGE (#22): `close_depth` counts links spawned and not yet finished;
+  # `[:fathom, :shard, :close_chain]` reports it (and the parallel eviction closes in flight) at
+  # every spawn, so a backlog that holds back the durability flush is visible, not inferred.
   defp start_close(state, conns) do
     id = state.id
     prev = state.closing
-    %{state | closing: spawn(fn -> run_close(id, prev, conns) end)}
-  rescue
-    # `spawn/1` raises `:system_limit` with a full process table (see the flush-task spawn): close
-    # inline, the pre-#15 behaviour, rather than leak the handles.
-    _ ->
-      state = await_closing(state)
-      Enum.each(conns, &Connection.close_pooled/1)
-      state
+    sides = Map.values(Map.get(state, :side_closes, %{}))
+    depth = Map.get(state, :close_depth)
+    if depth, do: :counters.add(depth, 1, 1)
+
+    try do
+      pid = spawn(fn -> run_close(id, [prev | sides], conns, depth) end)
+
+      if depth do
+        :telemetry.execute(
+          [:fathom, :shard, :close_chain],
+          %{depth: :counters.get(depth, 1), side: length(sides)},
+          %{}
+        )
+      end
+
+      %{state | closing: pid}
+    rescue
+      # `spawn/1` raises `:system_limit` with a full process table (see the flush-task spawn): close
+      # inline, the pre-#15 behaviour, rather than leak the handles.
+      _ ->
+        if depth, do: :counters.sub(depth, 1, 1)
+        state = await_closing(state)
+        Enum.each(conns, &Connection.close_pooled/1)
+        state
+    end
   end
 
-  defp run_close(id, prev, conns) do
-    if is_pid(prev) do
+  # An eviction close (expert review 2026-10-20 #22): the handle was evicted from a pool that keeps
+  # at least one other handle open, so this close is never the shard's last connection and runs in
+  # parallel, off the ordered chain. Monitored (`side_closes`, cleared on its DOWN) so the next chain
+  # link and terminate's close_pool/1 can still wait for it.
+  defp start_side_close(state, conns) do
+    id = state.id
+    {pid, ref} = spawn_monitor(fn -> run_close(id, [], conns, nil) end)
+    %{state | side_closes: Map.put(state.side_closes, ref, pid)}
+  rescue
+    _ -> start_close(state, conns)
+  end
+
+  # Wait, bounded by `deadline`, for every eviction close in flight; true when all finished.
+  defp await_side_closes(state, deadline) do
+    state
+    |> Map.get(:side_closes, %{})
+    |> Map.values()
+    |> Enum.all?(fn pid ->
+      mref = Process.monitor(pid)
+
+      receive do
+        {:DOWN, ^mref, :process, ^pid, _} -> true
+      after
+        max(deadline - System.monotonic_time(:millisecond), 0) ->
+          Process.demonitor(mref, [:flush])
+          false
+      end
+    end)
+  end
+
+  defp run_close(id, waits, conns, depth) do
+    deadline = System.monotonic_time(:millisecond) + @close_wait_ms
+
+    for prev <- waits, is_pid(prev) do
       ref = Process.monitor(prev)
 
       receive do
         {:DOWN, ^ref, :process, ^prev, _} -> :ok
       after
-        @close_wait_ms ->
+        max(deadline - System.monotonic_time(:millisecond), 0) ->
           Logger.warning("shard #{id}: previous pooled-handle close still running after 30s")
       end
     end
 
+    close_handles(id, conns)
+  after
+    if depth, do: :counters.sub(depth, 1, 1)
+  end
+
+  defp close_handles(id, conns) do
     # Test seam (expert review 2026-10-12 #16): lets a test make a close slow. Runs in this close
     # process, never in the coordinator.
     hook = Application.get_env(:fathom, :shard_pool_close_hook)
