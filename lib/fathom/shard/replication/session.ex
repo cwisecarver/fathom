@@ -428,7 +428,8 @@ defmodule Fathom.Shard.Replication.Session do
   # A caller with less than the margin left gets what it has left rather than nothing: a commit with
   # nothing to wait for (a `:nothing` plan, an already-current quorum) still finishes in time.
   @doc false
-  @spec commit_deadline(integer(), integer() | nil) :: integer()
+  # `number()`: the budget is built from application env values dialyzer cannot prove integral.
+  @spec commit_deadline(integer(), integer() | nil) :: number()
   def commit_deadline(now, nil), do: now + commit_deadline_budget()
 
   def commit_deadline(now, caller_deadline) do
