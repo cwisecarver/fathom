@@ -51,6 +51,10 @@ config :fathom, :default_shard, "demo"
 # heartbeat tests start it themselves with a short TTL.
 config :fathom, heartbeat_server: false
 
+# Persisting the telemetry handler table makes every attach/detach a persistent_term update; the
+# suite attaches constantly (expert review 2026-10-20 #34). Covered by a peer node in telemetry_test.
+config :fathom, telemetry_persist: false
+
 # Deterministic flush timing in tests: no ±jitter on the periodic durability-flush timer
 # (expert review #17). The jitter unit test opts back in explicitly to check the range.
 config :fathom, :shard_flush_jitter_ratio, 0.0

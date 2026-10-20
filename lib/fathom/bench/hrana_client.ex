@@ -47,25 +47,63 @@ defmodule Fathom.Bench.HranaClient do
   a free port, auth disabled — the loopback the client connects to. Returns
   `{:ok, supervisor_pid, port}`. Usable outside ExUnit (the bench task starts it this way);
   tests may prefer `start_supervised!/1` on the same children.
+
+  Options: `:streams_name`, `:port`, `:thousand_island_options`, `:authorize` (Filo's callback;
+  default none), and `prod: true`, which runs the listener with PRODUCTION's settings instead of
+  Bandit's defaults (expert review 2026-10-20 #25): `Fathom.Application.hrana_transport_options/0`
+  (reuseport sockets, the WS connection process's hibernate_after / fullsweep_after),
+  `hrana_websocket_options/0` (`validate_text_frames: false`; Bandit's default `true` adds a
+  `String.valid?` walk per frame that prod does not pay), `hrana_http_options/0` and
+  `hrana_http_1_options/0`, plus the stream idle/hibernate policy. Off by default so every other
+  caller keeps its existing listener; `hrana_ws_rt_us` and `hrana_ws_sparse_rt_us` turn it on.
   """
   @spec start_listener(keyword()) :: {:ok, pid(), pos_integer()}
   def start_listener(opts \\ []) do
     streams = Keyword.get(opts, :streams_name, __MODULE__.Streams)
     port = Keyword.get(opts, :port, free_port())
+    prod? = Keyword.get(opts, :prod, false)
 
-    plug_opts = [
-      executor: ShardExecutor,
-      streams: streams,
-      key: Filo.Baton.new_key(),
-      open_arg: &ShardExecutor.shard_from_conn/1
-      # No :authorize — the bench runs with Hrana auth disabled.
-    ]
+    plug_opts =
+      [
+        executor: ShardExecutor,
+        streams: streams,
+        key: Filo.Baton.new_key(),
+        open_arg: &ShardExecutor.shard_from_conn/1
+        # No :authorize unless the caller passes one.
+      ] ++
+        Keyword.take(opts, [:authorize]) ++
+        if prod? do
+          [
+            idle_timeout: Application.get_env(:fathom, :hrana_stream_idle_ms, 30_000),
+            hibernate_after: Application.get_env(:fathom, :hrana_stream_hibernate_ms, 5_000),
+            spawn_opt: [fullsweep_after: 10]
+          ]
+        else
+          []
+        end
+
+    bandit_extra =
+      if prod? do
+        [
+          thousand_island_options:
+            Keyword.get(
+              opts,
+              :thousand_island_options,
+              Fathom.Application.hrana_transport_options()
+            ),
+          http_options: Fathom.Application.hrana_http_options(),
+          http_1_options: Fathom.Application.hrana_http_1_options(),
+          websocket_options: Fathom.Application.hrana_websocket_options()
+        ]
+      else
+        Keyword.take(opts, [:thousand_island_options])
+      end
 
     children = [
       {Filo.Streams, name: streams},
       {Bandit,
        [plug: {Filo.Plug, plug_opts}, scheme: :http, ip: {127, 0, 0, 1}, port: port] ++
-         Keyword.take(opts, [:thousand_island_options])}
+         bandit_extra}
     ]
 
     {:ok, sup} = Supervisor.start_link(children, strategy: :one_for_one)
@@ -87,10 +125,11 @@ defmodule Fathom.Bench.HranaClient do
 
   @doc """
   Connects to the loopback listener, upgrades to WS (`hrana3`, `Host: <shard>.local`),
-  handshakes `hello`, and opens one stream. Returns `{:ok, client}`.
+  handshakes `hello`, and opens one stream. Returns `{:ok, client}`. `auth_token: token` rides in
+  the hello's `jwt`, where libSQL clients put `authToken`.
   """
   @spec connect(pos_integer(), String.t(), keyword()) :: {:ok, t()} | {:error, term()}
-  def connect(port, shard, _opts \\ []) do
+  def connect(port, shard, opts \\ []) do
     host = "#{shard}.local"
 
     with {:ok, conn} <- Mint.HTTP.connect(:http, "127.0.0.1", port, protocols: [:http1]),
@@ -99,7 +138,7 @@ defmodule Fathom.Bench.HranaClient do
          {:ok, conn, websocket} <- await_upgrade(conn, ref) do
       client = %__MODULE__{conn: conn, ref: ref, websocket: websocket, stream_id: 0}
 
-      with {:ok, client, %{"type" => "hello_ok"}} <- rpc_raw(client, %{"type" => "hello"}),
+      with {:ok, client, %{"type" => "hello_ok"}} <- rpc_raw(client, hello_message(opts)),
            {:ok, client, _} <- request(client, %{"type" => "open_stream", "stream_id" => 0}) do
         {:ok, client}
       end
@@ -141,6 +180,17 @@ defmodule Fathom.Bench.HranaClient do
   end
 
   # --- internals -----------------------------------------------------------
+
+  # Public (@doc false) only because dialyzer's opaque Mint.WebSocket inference (see await_upgrade/2)
+  # marks `connect/3`'s success path dead, which would flag a private helper only it calls.
+  @doc false
+  @spec hello_message(keyword()) :: map()
+  def hello_message(opts) do
+    case Keyword.get(opts, :auth_token) do
+      nil -> %{"type" => "hello"}
+      token -> %{"type" => "hello", "jwt" => token}
+    end
+  end
 
   # A `request` frame (post-hello): wraps the payload with a monotonic request_id and
   # unwraps the response_ok's inner response (or surfaces a response_error).

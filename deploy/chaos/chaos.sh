@@ -2752,7 +2752,14 @@ PY
 # the node, a :reductions delta per ROLE (module.function of the process's initial call: Session, Shipper,
 # the follower reader / per-connection workers / per-shard tasks, ...), the summed run-queue length, an
 # :msacc busy% per scheduler type (scheduler, dirty_io_scheduler, dirty_cpu_scheduler, poll), and the
-# delta of replicated commits (fathom_replication_commit_duration_count{outcome="ok"}). Reductions are
+# delta of replicated commits (fathom_replication_commit_duration_count{outcome="ok"}).
+# Expert review 2026-10-20 #16/#26: msacc busy% now excludes :other (busy-wait spin) and prints
+# :other / emulator / nif separately, `scheduler_wall_time` is added per scheduler type, the
+# normal / dirty-CPU / dirty-IO run queues are sampled every 100 ms (mean, p99, nonzero fraction), and
+# roles also come from Process.set_label (the follower per-shard workers and push tasks are
+# spawn_opt funs, initial_call {:erlang,:apply,2}); an "unattributed" row = node-total reductions minus
+# the attributed roles. Per-txn dirty job counts (trace call_count on the NIFs) are NOT implemented.
+# Reductions are
 # summed only over processes alive at BOTH ends of a window, so short-lived tasks that start and die
 # inside one window are UNDERCOUNTED (a lower bound for those roles; the long-lived Session / Shipper /
 # follower workers are exact). The driver (tpc-fleet) is launched in the background; sampling starts once
@@ -2763,6 +2770,12 @@ repl_cpu_node_script() { # args: tick_ms
   cat <<EOS
 tick = $1
 role = fn p ->
+  lbl =
+    case Process.info(p, :label) do
+      {:label, l} when l != :undefined and l != nil -> l
+      _ -> nil
+    end
+
   ic =
     case Process.info(p, :dictionary) do
       {:dictionary, d} -> Keyword.get(d, :"\$initial_call")
@@ -2776,13 +2789,19 @@ role = fn p ->
         _ -> nil
       end
 
-  case ic do
-    {m, f, _} ->
-      ms = inspect(m)
-      if String.contains?(ms, "Replication"), do: ms <> "." <> to_string(f), else: nil
+  cond do
+    lbl != nil ->
+      "label=" <> inspect(lbl)
 
-    _ ->
-      nil
+    true ->
+      case ic do
+        {m, f, _} ->
+          ms = inspect(m)
+          if String.contains?(ms, "Replication"), do: ms <> "." <> to_string(f), else: nil
+
+        _ ->
+          nil
+      end
   end
 end
 
@@ -2800,14 +2819,45 @@ commits = fn ->
 end
 
 queries = fn -> Fathom.ShardLoad.snapshot() |> Enum.reduce(0, fn m, a -> a + m.queries end) end
+
+# Run-queue sampler (expert review 2026-10-20 #16): the dirty-IO queue is the LAST element of
+# run_queue_lengths_all (dirty CPU is second-last, the rest are normal). Sampled every 100 ms across
+# the window instead of one instantaneous end sample.
+sampler =
+  Task.async(fn ->
+    deadline = System.monotonic_time(:millisecond) + tick
+
+    loop = fn loop, acc ->
+      if System.monotonic_time(:millisecond) >= deadline do
+        acc
+      else
+        q = :erlang.statistics(:run_queue_lengths_all)
+        {dio, rest} = List.pop_at(q, -1)
+        {dcpu, normal} = List.pop_at(rest, -1)
+        Process.sleep(100)
+        loop.(loop, [{Enum.sum(normal), dcpu, dio} | acc])
+      end
+    end
+
+    loop.(loop, [])
+  end)
+
+# scheduler_wall_time is ref-counted per process: this one process turns it on and reads both ends.
+:erlang.system_flag(:scheduler_wall_time, true)
 a = snap.()
+red_total0 = :erlang.statistics(:reductions) |> elem(0)
 c0 = commits.()
 q0 = queries.()
+sw0 = :erlang.statistics(:scheduler_wall_time_all) |> Enum.sort()
 :msacc.start(tick)
 d = :msacc.stats()
+sw1 = :erlang.statistics(:scheduler_wall_time_all) |> Enum.sort()
+:erlang.system_flag(:scheduler_wall_time, false)
 b = snap.()
+red_total1 = :erlang.statistics(:reductions) |> elem(0)
 c1 = commits.()
 q1 = queries.()
+qs = Task.await(sampler, tick + 5_000)
 
 roles =
   for {p, {r, red1}} <- b, {^r, red0} <- [Map.get(a, p)], reduce: %{} do
@@ -2815,14 +2865,45 @@ roles =
   end
 
 Enum.each(roles, fn {r, {n, s}} -> IO.puts("ROLE\t#{r}\t#{n}\t#{s}") end)
-IO.puts("RQ\t#{:erlang.statistics(:run_queue_lengths_all) |> Enum.sum()}")
+# Node-total reductions (every process, incl. ones that died inside the window) so the report can
+# print an UNATTRIBUTED row (expert review 2026-10-20 #26).
+IO.puts("TOTALRED\t#{red_total1 - red_total0}")
 IO.puts("COMMITS\t#{c1 - c0}")
 IO.puts("QUERIES\t#{q1 - q0}")
 
+n = max(length(qs), 1)
+normal_mean = Enum.sum(for {x, _, _} <- qs, do: x) / n
+dcpu_mean = Enum.sum(for {_, x, _} <- qs, do: x) / n
+dio = for {_, _, x} <- qs, do: x
+dio_sorted = Enum.sort(dio)
+dio_p99 = if dio_sorted == [], do: 0, else: Enum.at(dio_sorted, min(length(dio_sorted) - 1, trunc(0.99 * length(dio_sorted))))
+dio_nz = Enum.count(dio, &(&1 > 0)) / n
+IO.puts("RQ\t#{Float.round(normal_mean, 2)}\t#{Float.round(dcpu_mean, 2)}\t#{Float.round(Enum.sum(dio) / n, 2)}\t#{dio_p99}\t#{Float.round(dio_nz, 3)}\t#{length(qs)}")
+
+# msacc: non-extended, so busy-waiting (scheduler spin) is charged to :other. Report busy EXCLUDING
+# :other as the real-work figure, and :other (spin + unaccounted) separately; busy_incl is the old,
+# spin-inflated number. emulator/nif/gc/check_io are the named work states.
 for {t, l} <- Enum.group_by(d, & &1.type), t in [:scheduler, :dirty_io_scheduler, :dirty_cpu_scheduler, :poll] do
+  sum = fn k -> l |> Enum.map(fn x -> Map.get(x.counters, k, 0) end) |> Enum.sum() end
   tot = l |> Enum.map(fn x -> x.counters |> Map.values() |> Enum.sum() end) |> Enum.sum()
-  sl = l |> Enum.map(fn x -> Map.get(x.counters, :sleep, 0) end) |> Enum.sum()
-  IO.puts("MSACC\t#{t}\t#{if tot > 0, do: Float.round((tot - sl) / tot * 100, 1), else: 0.0}")
+  pct = fn v -> if tot > 0, do: Float.round(v / tot * 100, 1), else: 0.0 end
+  other = sum.(:other)
+  sleep = sum.(:sleep)
+  nif = sum.(:nif)
+  IO.puts("MSACC\t#{t}\t#{pct.(tot - sleep - other)}\t#{pct.(other)}\t#{pct.(sum.(:emulator))}\t#{pct.(nif)}\t#{pct.(tot - sleep)}")
+end
+
+# scheduler_wall_time (active/total per scheduler id) by type; ids past normal+dirty_cpu are dirty IO.
+{ns, nc} = {:erlang.system_info(:schedulers), :erlang.system_info(:dirty_cpu_schedulers)}
+ty = fn id -> cond do id <= ns -> :scheduler; id <= ns + nc -> :dirty_cpu_scheduler; true -> :dirty_io_scheduler end end
+
+sw =
+  for {{id, a1, t1}, {id, a0, t0}} <- Enum.zip(sw1, sw0), reduce: %{} do
+    acc -> Map.update(acc, ty.(id), {a1 - a0, t1 - t0}, fn {x, y} -> {x + a1 - a0, y + t1 - t0} end)
+  end
+
+for {t, {act, tot}} <- sw do
+  IO.puts("SWT\t#{t}\t#{if tot > 0, do: Float.round(act / tot * 100, 1), else: 0.0}")
 end
 EOS
 }
@@ -2874,8 +2955,11 @@ cmd_repl_cpu() {
 import sys, glob, collections
 d, tick_s = sys.argv[1], float(sys.argv[2])
 red = collections.Counter(); nproc = collections.defaultdict(list)
-commits = queries = rq = 0; nsamp = 0
-msacc = collections.defaultdict(list)
+commits = queries = nsamp = 0
+totalred = 0
+rq = []  # (normal_mean, dcpu_mean, dio_mean, dio_p99, dio_nonzero_frac)
+msacc = collections.defaultdict(list)  # type -> [(busy_excl_other, other, emulator, nif, busy_incl)]
+swt = collections.defaultdict(list)
 for f in glob.glob(d + "/fathom*.txt"):
     nsamp += 1
     for line in open(f):
@@ -2884,21 +2968,38 @@ for f in glob.glob(d + "/fathom*.txt"):
             red[p[1]] += int(p[3]); nproc[p[1]].append(int(p[2]))
         elif p[0] == "COMMITS": commits += int(p[1])
         elif p[0] == "QUERIES": queries += int(p[1])
-        elif p[0] == "RQ": rq += int(p[1])
-        elif p[0] == "MSACC" and len(p) == 3: msacc[p[1]].append(float(p[2]))
+        elif p[0] == "TOTALRED": totalred += int(p[1])
+        elif p[0] == "RQ" and len(p) == 8: rq.append(tuple(float(x) for x in p[1:6]))
+        elif p[0] == "MSACC" and len(p) == 7: msacc[p[1]].append(tuple(float(x) for x in p[2:7]))
+        elif p[0] == "SWT" and len(p) == 3: swt[p[1]].append(float(p[2]))
 if nsamp == 0:
     print("  no samples collected"); sys.exit(0)
 secs = nsamp * tick_s  # node-seconds
 print(f"  node-windows sampled: {nsamp}  ({secs:.0f} node-seconds)   replicated commits: {commits}   queries: {queries}")
-print(f"  mean summed run-queue length per sample: {rq / nsamp:.1f}")
+if rq:
+    m = lambda i: sum(r[i] for r in rq) / len(rq)
+    print(f"  run queues, sampled every 100 ms per window (mean over node-windows):")
+    print(f"    normal mean {m(0):.2f}   dirty-cpu mean {m(1):.2f}   dirty-io mean {m(2):.2f}  p99 mean {m(3):.1f} max {max(r[3] for r in rq):.0f}  nonzero-fraction {m(4):.3f}")
+print("  msacc, % of scheduler time. busy_real = total - sleep - other (EXCLUDES busy-wait spin); other = spin + unaccounted;")
+print("  busy_incl = total - sleep (the OLD figure; counts spin as work). Only busy_real is evidence of dirty-IO work.")
+print(f"  {'type':20s} {'busy_real':>10s} {'other':>7s} {'emulator':>9s} {'nif':>6s} {'busy_incl':>10s}")
 for t in sorted(msacc):
-    v = msacc[t]; print(f"  msacc busy% {t:20s} mean {sum(v)/len(v):5.1f}  max {max(v):5.1f}")
+    v = msacc[t]; mm = lambda i: sum(x[i] for x in v) / len(v)
+    print(f"  {t:20s} {mm(0):10.1f} {mm(1):7.1f} {mm(2):9.1f} {mm(3):6.1f} {mm(4):10.1f}   (max busy_real {max(x[0] for x in v):.1f})")
+for t in sorted(swt):
+    v = swt[t]; print(f"  scheduler_wall_time {t:20s} mean {sum(v)/len(v):5.1f}  max {max(v):5.1f}   (active/total)")
 tot = sum(red.values())
 print(f"  {'role':58s} {'procs/win':>9s} {'Mred/s':>9s} {'red/commit':>11s} {'share':>6s}")
 for r, s in sorted(red.items(), key=lambda kv: -kv[1]):
     pn = sum(nproc[r]) / max(len(nproc[r]), 1)
     per = (s / commits) if commits else float("nan")
-    print(f"  {r[:58]:58s} {pn:9.0f} {s / secs / 1e6:9.2f} {per:11.0f} {100 * s / tot if tot else 0:5.1f}%")
+    print(f"  {r[:58]:58s} {pn:9.0f} {s / secs / 1e6:9.2f} {per:11.0f} {100 * s / totalred if totalred else 0:5.1f}%")
+un = totalred - tot
+per = (un / commits) if commits else float("nan")
+print(f"  {'(unattributed: everything else, incl. short-lived tasks)':58s} {'':9s} {un / secs / 1e6:9.2f} {per:11.0f} {100 * un / totalred if totalred else 0:5.1f}%")
+print(f"  {'(node total reductions)':58s} {'':9s} {totalred / secs / 1e6:9.2f} {(totalred / commits) if commits else float('nan'):11.0f} {100.0:5.1f}%")
+print("  (share is of NODE-TOTAL reductions, not of attributed roles; reductions are not CPU time, but a role's")
+print("   share of the total bounds how much of the node the replication roles can explain)")
 if commits == 0:
     print("  (0 replicated commits: replication is OFF on this fleet — this is the baseline; compare Mred/s and msacc)")
 PY

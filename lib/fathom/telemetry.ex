@@ -1405,6 +1405,20 @@ defmodule Fathom.Telemetry do
     ]
   end
 
+  @doc """
+  Freeze the `:telemetry` handler table into `persistent_term` once boot-time attaches are done
+  (expert review 2026-10-20 #34). Without it every hot `:telemetry.execute` copies the matching
+  handler records out of ETS (measured `[:fathom,:shard,:query]` 374 -> 99 ns, `checkout.stop`
+  303 -> 53 ns). Later `attach`/`detach` still work but each becomes a `persistent_term` update
+  (a global GC scan), so they should stay rare: reporter restarts, `Rpo`, the bench harness.
+  Needs telemetry >= 1.3 (`persist/0`; the lock is on 1.4.2). Gated by `:telemetry_persist`
+  (default true; off in test, where the suite attaches and detaches handlers constantly).
+  """
+  @spec persist_handlers() :: :ok
+  def persist_handlers do
+    if Application.get_env(:fathom, :telemetry_persist, true), do: :telemetry.persist(), else: :ok
+  end
+
   @doc false
   def measure_active_shards do
     :telemetry.execute([:fathom, :shards], %{active: Fathom.Shards.open_count()}, %{})

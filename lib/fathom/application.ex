@@ -63,7 +63,12 @@ defmodule Fathom.Application do
     opts =
       [strategy: :one_for_one, name: Fathom.Supervisor] ++ restart_budget(:top)
 
-    Supervisor.start_link(children, opts)
+    # Every boot-time `:telemetry.attach` (reporters, OTel bridge, admin events) has run once the
+    # tree is up: freeze the handler table (expert review 2026-10-20 #34).
+    with {:ok, _pid} = started <- Supervisor.start_link(children, opts) do
+      :ok = Fathom.Telemetry.persist_handlers()
+      started
+    end
   end
 
   # Run the BOUNDED drain before the supervision tree comes down (expert review 2026-08-01 #16).

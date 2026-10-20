@@ -453,6 +453,37 @@ defmodule Fathom.BenchTest do
     assert us > 10 and us < 20_000, "WS round trip #{us}us outside the order-of-magnitude band"
   end
 
+  # expert review 2026-10-20 #25. The sparse metric: tiny size (3 samples x 30 ms gap). It asserts its
+  # own preconditions (gap elapsed, same socket, [[1]] replies, auth enforced, floor cached) and
+  # raises when any fails, so a number coming back means those held. Prod ~150-400 us.
+  test "hrana_ws_sparse_rt_us measures a sparse, authenticated WS round trip" do
+    prev = Application.get_env(:fathom, :hrana_auth)
+    us = Fathom.Bench.hrana_ws_sparse_rt_us(hrana_sparse_samples: 3, hrana_sparse_gap_ms: 30)
+    IO.puts("hrana_ws_sparse_rt_us: #{inspect(us)}")
+    assert is_float(us)
+
+    assert us > 10 and us < 50_000,
+           "sparse WS round trip #{us}us outside the order-of-magnitude band"
+
+    assert Application.get_env(:fathom, :hrana_auth) == prev, "the metric leaked its auth env"
+  end
+
+  # The prod-listener option set must be the one the real listener uses, and it must still serve a
+  # WS round trip (reuseport transport options boot, validate_text_frames off).
+  test "HranaClient.start_listener(prod: true) serves a WS round trip with prod's options" do
+    alias Fathom.Bench.HranaClient
+    Application.put_env(:fathom, :shard_base_domain, nil)
+
+    {:ok, sup, port} =
+      HranaClient.start_listener(prod: true, streams_name: __MODULE__.ProdStreams)
+
+    on_exit(fn -> HranaClient.stop_listener(sup) end)
+    {:ok, c} = HranaClient.connect(port, "prodlistenerprobe")
+    assert {:ok, c, %{rows: [[1]]}} = HranaClient.execute(c, "SELECT 1")
+    HranaClient.close(c)
+    Fathom.Shards.drain("prodlistenerprobe", 5_000)
+  end
+
   # expert review 2026-10-19 #10. An 8-column point read over HTTP; the metric asserts every
   # reply carries the 8 columns and the seeded row. Prod ~100-200 us.
   test "hrana_wide_rt_us measures an 8-column read to an order of magnitude" do
