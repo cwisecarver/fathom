@@ -255,6 +255,66 @@ defmodule Fathom.Shard.Storage.S3 do
     :ok
   end
 
+  @body_hash_key {__MODULE__, :body_hash}
+
+  @doc """
+  Boot probe for the compressed PUT's transit checksum (expert review 2026-10-20 #29).
+
+  The compressed path used to send `content-md5` over the body (MD5 ~1.2 ms/MB, ~13% of flush codec
+  CPU); `x-amz-checksum-crc32` is the same transit check at ~0.03 ms/MB. It is only a check if the
+  store ENFORCES it, and a store that ignores an unknown checksum header answers 200 to a PUT whose
+  checksum is wrong, silently dropping the integrity gate. So: a PUT with a deliberately wrong
+  CRC32 must be refused with a 4xx (AWS: 400 BadDigest) and one with the right CRC32 must succeed.
+  Both hold -> `:crc32` is used for compressed PUTs. Anything else (accepted a wrong checksum,
+  refused a right one, store unreachable) -> keep `content-md5` and say so. Never raises: the
+  fence self-test already fails closed on an unreachable store. The `:none` (uncompressed) path
+  always keeps `content-md5`, where it is also the identity digest.
+
+  Until this runs (tests, `:verify_storage_fence` off) the answer is `:md5`.
+  """
+  @spec probe_body_checksum!() :: :md5 | :crc32
+  def probe_body_checksum! do
+    key = prefix() <> "fence-probe/" <> to_string(node()) <> ".crc32"
+    body = "fathom-checksum-probe"
+    good = body_integrity_header(:crc32, <<:erlang.crc32(body)::32>>)
+    wrong = Bitwise.bxor(:erlang.crc32(body), 1)
+    bad = {"x-amz-checksum-crc32", Base.encode64(<<wrong::32>>)}
+
+    kind =
+      with {:ok, %{status: bs}} when bs in 400..499 <-
+             Req.put(req(), url: url_path(key), body: body, headers: [bad], retry: false),
+           {:ok, %{status: gs}} when gs in 200..299 <-
+             Req.put(req(), url: url_path(key), body: body, headers: [good], retry: false) do
+        :crc32
+      else
+        other ->
+          Logger.warning(
+            "shard storage: store does not enforce x-amz-checksum-crc32 (#{inspect(other)}); " <>
+              "compressed PUTs keep content-md5 (expert review 2026-10-20 #29)"
+          )
+
+          :md5
+      end
+
+    _ = Req.delete(req(), url: url_path(key))
+    :persistent_term.put(@body_hash_key, kind)
+    kind
+  end
+
+  @doc false
+  @spec body_hash_kind() :: :md5 | :crc32
+  def body_hash_kind, do: :persistent_term.get(@body_hash_key, :md5)
+
+  @doc false
+  @spec reset_body_hash_kind() :: :ok
+  def reset_body_hash_kind do
+    :persistent_term.erase(@body_hash_key)
+    :ok
+  end
+
+  defp body_integrity_header(:md5, digest), do: {"content-md5", Base.encode64(digest)}
+  defp body_integrity_header(:crc32, digest), do: {"x-amz-checksum-crc32", Base.encode64(digest)}
+
   # Test-store escape hatch for the conditional-DELETE probe above (expert review 2026-09-05 #8).
   # DEFAULT OFF, so production refuses to boot on a store without conditional DELETE exactly as
   # before; only a test rig on a limited store (MinIO) turns it on.
@@ -433,7 +493,7 @@ defmodule Fathom.Shard.Storage.S3 do
 
   @impl true
   def flush(shard_id, local_path) do
-    with_body(local_path, fn body_path, size, md5, md5_hex, enc_headers ->
+    with_body(local_path, fn body_path, size, integrity, md5_hex, enc_headers ->
       with {:ok, %{status: status}} <-
              Req.put(req(),
                url: object_path(shard_id),
@@ -441,7 +501,7 @@ defmodule Fathom.Shard.Storage.S3 do
                headers:
                  [
                    {"content-length", Integer.to_string(size)},
-                   {"content-md5", md5},
+                   integrity,
                    # Etag-form-independent integrity hash (expert review 2026-07-14 #17). Always
                    # the UNCOMPRESSED database's hash, so an object's identity doesn't depend on
                    # how it was stored (#38).
@@ -466,7 +526,7 @@ defmodule Fathom.Shard.Storage.S3 do
     # inside the streaming upload's callback where a reader would miss it.
     {header, carried} = carried_lineage_header(shard_id, expected_etag, lineage)
 
-    with_body(local_path, fn body_path, size, md5, md5_hex, enc_headers ->
+    with_body(local_path, fn body_path, size, integrity, md5_hex, enc_headers ->
       # The caller's chance to record "I am about to PUT bytes hashing to md5_hex" durably, BEFORE
       # the object can change (expert review 2026-10-10 #6). A caller that cannot record it must
       # not stop the flush — the recording only buys a crash-recovery adoption.
@@ -478,7 +538,7 @@ defmodule Fathom.Shard.Storage.S3 do
                headers:
                  [
                    {"content-length", Integer.to_string(size)},
-                   {"content-md5", md5},
+                   integrity,
                    # Etag-form-independent integrity hash (expert review 2026-07-14 #17), over the
                    # UNCOMPRESSED bytes (#38).
                    {@md5_meta, md5_hex} | cond_headers
@@ -547,10 +607,12 @@ defmodule Fathom.Shard.Storage.S3 do
     case Codec.encoding() do
       :none ->
         with {:ok, size, md5, md5_hex} <- stat_and_md5(local_path) do
-          fun.(local_path, size, md5, md5_hex, [])
+          fun.(local_path, size, {"content-md5", md5}, md5_hex, [])
         end
 
       encoding ->
+        body_hash = body_hash_kind()
+
         # The plaintext hash must NOT go through stat_and_md5: that applies the single-PUT
         # ceiling, and the plaintext is not what gets PUT.
         #
@@ -577,13 +639,19 @@ defmodule Fathom.Shard.Storage.S3 do
         # is not the plaintext MD5. So a body that would not decode to its label never reaches this
         # `with`, and the temp file is not re-read to prove it.
         with {:ok, %{size: psize, mtime: pmtime}} <- File.stat(local_path),
-             {:ok, tmp, size, md5, plain_hex} <-
-               Codec.compress_to_temp_hashed(local_path, encoding) do
+             {:ok, tmp, size, body_digest, plain_hex} <-
+               Codec.compress_to_temp_hashed(local_path, encoding, body_hash) do
           try do
             with :ok <- after_compress(local_path),
                  :ok <- source_unchanged(local_path, psize, pmtime),
                  :ok <- check_single_put(size) do
-              fun.(tmp, size, Base.encode64(md5), plain_hex, Codec.upload_headers(encoding))
+              fun.(
+                tmp,
+                size,
+                body_integrity_header(body_hash, body_digest),
+                plain_hex,
+                Codec.upload_headers(encoding)
+              )
             end
           after
             File.rm(tmp)

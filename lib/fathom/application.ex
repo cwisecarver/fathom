@@ -244,6 +244,8 @@ defmodule Fathom.Application do
     if Application.get_env(:fathom, :shard_storage) == Fathom.Shard.Storage.S3 and
          Application.get_env(:fathom, :verify_storage_fence, true) do
       Fathom.Shard.Storage.S3.verify_conditional_writes!()
+      # Expert review 2026-10-20 #29: crc32 transit checksum on compressed PUTs iff enforced.
+      Fathom.Shard.Storage.S3.probe_body_checksum!()
     end
   end
 
