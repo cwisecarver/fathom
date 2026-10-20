@@ -1581,6 +1581,38 @@ defmodule Fathom.Shard.Replication.Session do
     :exit, _ -> :skipped
   end
 
+  @doc """
+  Run `fun.(pin_conn)` while a read snapshot is pinned on `db_path` (expert review 2026-10-20 #28).
+
+  The pin is a read transaction on its own handle, so no checkpoint can backfill into the
+  `.db` while it is held (the checkpointer takes read-lock 0 exclusively to write pages, and
+  limits itself to the oldest read mark): the main file's bytes are frozen for the duration, and
+  `pin_conn` reads exactly them. `:skipped` if the pin could not be opened.
+
+  Unlike the `:ro` pins of `pinned_flush_checkpoint/4`, this handle is opened READ-WRITE (and only
+  ever reads): the flush's caller may hold no other connection, so this close can be the LAST one,
+  and the last close must run SQLite's close-time checkpoint and unlink `-wal`/`-shm` exactly as
+  the flush's old snapshot connection did. A `:ro` handle leaves a zero-length `-wal` and a stale
+  `-shm` behind (`PoolGraceTest` pins the unlink).
+  """
+  @spec with_flush_pin(Path.t(), (reference() -> result)) :: result | :skipped
+        when result: var
+  def with_flush_pin(db_path, fun) when is_function(fun, 1) do
+    with {:ok, _} <- File.stat(db_path),
+         {:ok, pin} <- Connection.open(db_path) do
+      try do
+        case pin_snapshot(pin) do
+          :ok -> fun.(pin)
+          {:error, _} -> :skipped
+        end
+      after
+        release_pin(pin)
+      end
+    else
+      _ -> :skipped
+    end
+  end
+
   # Holds a read snapshot on `db_path` around `fun`. The pin's connection is closed only after
   # `fun` returns, and every caller holds another connection to the same file across it (a stream's,
   # or the flush's), so this close is never the LAST one — the close that runs SQLite's close-time

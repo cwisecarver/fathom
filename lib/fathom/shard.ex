@@ -4685,19 +4685,7 @@ defmodule Fathom.Shard do
       # Integrity BEFORE the snapshot: quarantine_corrupt!/2 renames the live path, so checking
       # after would spend a full VACUUM on a file we are about to refuse and move aside.
       with :ok <- flush_space_preflight(state),
-           :ok <- verify_and_snapshot(state, temp),
-           :ok <- after_snapshot_hook(state),
-           :ok <- recheck_before_put(state),
-           {:ok, new_etag, carried} <-
-             state.id
-             |> Storage.flush(
-               temp,
-               state.etag,
-               Position.snapshot_position(state, pre),
-               Position.lineage_arg(state),
-               flush_intent_opts(state.path, fn -> recheck_before_put(state) end)
-             )
-             |> guard_pre_touch(state) do
+           {:ok, new_etag, carried} <- scan_and_upload(state, temp, pre) do
         {:ok, new_etag, carried}
       else
         {:error, :superseded} = superseded ->
@@ -4713,6 +4701,113 @@ defmodule Fathom.Shard do
     after
       Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
     end
+  end
+
+  @scan_permit_wait_ms 60_000
+
+  # The scan + upload half of `snapshot_and_upload/1`: the folded-WAL route when it applies, else
+  # `quick_check` + `VACUUM INTO` a temp and upload that.
+  defp scan_and_upload(state, temp, pre) do
+    case pinned_live_upload(state, pre) do
+      :fallback ->
+        emit_flush_route(state, :vacuum)
+
+        with :ok <- verify_and_snapshot(state, temp),
+             :ok <- after_snapshot_hook(state),
+             :ok <- recheck_before_put(state) do
+          upload_flush_object(state, temp, pre)
+        end
+
+      result ->
+        result
+    end
+  end
+
+  defp upload_flush_object(state, path, pre) do
+    state.id
+    |> Storage.flush(
+      path,
+      state.etag,
+      Position.snapshot_position(state, pre),
+      Position.lineage_arg(state),
+      flush_intent_opts(state.path, fn -> recheck_before_put(state) end)
+    )
+    |> guard_pre_touch(state)
+  end
+
+  # THE FOLDED-WAL ROUTE (expert review 2026-10-20 #28). An idle-dirty shard's drained close has
+  # already checkpointed and unlinked `-wal`, so the periodic flush's `VACUUM INTO` was rewriting a
+  # database whose main file already IS the full committed state (~60-70% of the snapshot's local
+  # work). When the WAL is empty, upload the live `.db` itself, under a read pin:
+  #
+  #   * WHY THE BYTES ARE THE SAME STATE. With `-wal` absent/zero-length no committed frame lives
+  #     outside the `.db`. The pin (a read transaction on its own handle) stops any checkpoint from
+  #     backfilling into the main file while it is held (the checkpointer needs read-lock 0
+  #     exclusively to write pages and caps itself at the oldest read mark), so tenant commits that
+  #     land during the upload go to the WAL and the main file's bytes are FROZEN. The emptiness is
+  #     checked again UNDER the pin: WAL growth between the two checks only means a tenant wrote, and
+  #     the route falls back to the VACUUM path. (A WAL that is empty under the pin cannot have been
+  #     non-empty at the pin's snapshot: turning a non-empty WAL empty needs a checkpoint backfill +
+  #     restart, which the pin blocks.)
+  #   * THE INTEGRITY GATE RUNS ON THE UPLOADED BYTES. `quick_check` runs on the pin's own handle,
+  #     which reads those same frozen pages, and the pin is held across `Storage.flush`. The S3
+  #     backend's own stat-before/stat-after (`source_unchanged`) and the decode proof still apply.
+  #     (`VACUUM INTO` never gave the gate more than this: it already ran on the LIVE file, and
+  #     VACUUM rewrites pages, so it was not a check of the temp. Index-content drift is invisible
+  #     to `quick_check` on either route, per "WHAT THIS GATE CANNOT SEE".)
+  #   * THE STAMP STILL UNDER-CLAIMS. `pre` was read before the pin; the uploaded state is at least
+  #     that (empty WAL at `pre` => every commit up to it is in the main file).
+  #   * WHAT IT COSTS. The pin holds a read mark across the PUT, so a checkpoint cannot make
+  #     progress for that long; on a shard that was idle a moment ago that only delays WAL
+  #     truncation. The upload is the live file's size, not its VACUUMed size (free pages included).
+  #
+  # `:fallback` (the VACUUM route) when disabled, the WAL is non-empty at either check, or the pin
+  # cannot be opened. Disable with `config :fathom, :flush_pinned_live_upload, false`.
+  defp pinned_live_upload(state, pre) do
+    wal = state.path <> "-wal"
+
+    if Application.get_env(:fathom, :flush_pinned_live_upload, true) and wal_empty?(wal) do
+      result =
+        Fathom.Shard.Replication.Session.with_flush_pin(state.path, fn pin ->
+          if wal_empty?(wal) do
+            emit_flush_route(state, :pinned_live)
+
+            with :ok <-
+                   Fathom.Shard.ScanGate.with_permit(
+                     @scan_permit_wait_ms,
+                     fn -> Integrity.run_quick_check(pin) end
+                   ),
+                 :ok <- after_snapshot_hook(state),
+                 :ok <- recheck_before_put(state) do
+              upload_flush_object(state, state.path, pre)
+            end
+          else
+            :fallback
+          end
+        end)
+
+      if result == :skipped, do: :fallback, else: result
+    else
+      :fallback
+    end
+  end
+
+  # Absent or zero-length `-wal`: no frame, committed or not, outside the main file. A WAL that
+  # holds only a header (restarted, nothing written) counts as non-empty: the conservative answer.
+  defp wal_empty?(wal) do
+    case File.stat(wal) do
+      {:error, :enoent} -> true
+      {:ok, %{size: 0}} -> true
+      _ -> false
+    end
+  end
+
+  defp emit_flush_route(state, route) do
+    :telemetry.execute(
+      [:fathom, :shard, :flush, :route],
+      %{count: 1},
+      %{shard_id: state.id, route: route}
+    )
   end
 
   # TEST SEAM between the snapshot and the PUT (expert review 2026-10-15 #5): the only way to land a
@@ -4985,10 +5080,8 @@ defmodule Fathom.Shard do
   # THE SCAN PERMIT (expert review 2026-10-20 #19): `quick_check` + `VACUUM INTO` each hold a
   # dirty-IO thread for the whole page scan, and the upload cap can equal the dirty-IO thread count,
   # so a flush wave could hold every thread. `ScanGate` bounds concurrent scans to SDio-2, held
-  # across the open..close here and NOT across the PUT. Bounded wait, then scan anyway: a durability
-  # flush must not fail because the gate was busy.
-  @scan_permit_wait_ms 60_000
-
+  # across the open..close here and NOT across the PUT. Bounded wait (`@scan_permit_wait_ms`), then
+  # scan anyway: a durability flush must not fail because the gate was busy.
   defp verify_and_snapshot(state, temp) do
     Fathom.Shard.ScanGate.with_permit(@scan_permit_wait_ms, fn ->
       verify_and_snapshot_unpermitted(state, temp)
