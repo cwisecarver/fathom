@@ -523,37 +523,44 @@ defmodule Fathom.ShardDurabilityTest do
   # per-transaction write flag, so the eventual COMMIT skipped its boundary re-bump and a
   # straddling flush lost the pre-savepoint INSERT. This is Django's nested-atomic-block-raises,
   # outer-block-commits shape.
-  test "a rollback to savepoint does not discard the outer transaction's write", %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+  # The second spelling is expert review 2026-10-20 #35's pin: the statement head is only 12 bytes
+  # now, so "rollback tran" cannot show the " to " that distinguishes it from a full ROLLBACK; the
+  # classifier must read the long form for a rollback, or this spelling clears the write flag.
+  for rollback <- ["ROLLBACK TO s", "ROLLBACK TRANSACTION TO SAVEPOINT s"] do
+    @rollback rollback
+    test "a #{rollback} does not discard the outer transaction's write", %{shard: shard} do
+      Application.put_env(:fathom, :shard_idle_ms, 50)
 
-    {:ok, conn} = ShardExecutor.open(shard)
-    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
 
-    {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
-    refute dirty?(shard)
+      {:ok, coordinator} = Shards.ensure(shard)
+      flush_now(coordinator)
+      refute dirty?(shard)
 
-    {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
-    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1, 'alice')"))
-    {:ok, _} = ShardExecutor.execute(conn, stmt("SAVEPOINT s"))
-    # The inner block's work, then it "raises" — rewound, and it zeroes sqlite3_changes() so the
-    # COMMIT cannot ride inherited changes.
-    {:ok, _} = ShardExecutor.execute(conn, stmt("UPDATE kv SET v = 'x' WHERE 1 = 0"))
-    {:ok, _} = ShardExecutor.execute(conn, stmt("ROLLBACK TO s"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1, 'alice')"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("SAVEPOINT s"))
 
-    flush_now(coordinator)
-    {:ok, _} = ShardExecutor.execute(conn, stmt("COMMIT"))
+      # The inner block's work, then it "raises" — rewound, and it zeroes sqlite3_changes() so the
+      # COMMIT cannot ride inherited changes.
+      {:ok, _} = ShardExecutor.execute(conn, stmt("UPDATE kv SET v = 'x' WHERE 1 = 0"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt(@rollback))
 
-    close_and_stop(shard, conn)
-    refute File.exists?(local_db(shard)), "idle drop removed the local copy"
+      flush_now(coordinator)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("COMMIT"))
 
-    {:ok, conn2} = ShardExecutor.open(shard)
+      close_and_stop(shard, conn)
+      refute File.exists?(local_db(shard)), "idle drop removed the local copy"
 
-    assert {:ok, %StmtResult{rows: [["alice"]]}} =
-             ShardExecutor.execute(conn2, stmt("SELECT v FROM kv WHERE k = 1")),
-           "the outer transaction's row must survive a ROLLBACK TO savepoint"
+      {:ok, conn2} = ShardExecutor.open(shard)
 
-    ShardExecutor.close(conn2)
+      assert {:ok, %StmtResult{rows: [["alice"]]}} =
+               ShardExecutor.execute(conn2, stmt("SELECT v FROM kv WHERE k = 1")),
+             "the outer transaction's row must survive a ROLLBACK TO savepoint"
+
+      ShardExecutor.close(conn2)
+    end
   end
 
   # Expert review 2026-07-14 #14: a stream holding a checked-out connection can be killed in the

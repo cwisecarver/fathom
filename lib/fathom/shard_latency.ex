@@ -123,7 +123,31 @@ defmodule Fathom.ShardLatency do
 
   # The largest bucket index whose lower edge is ≤ us (µs ≥ last edge land in the overflow
   # bucket). Mirrors Fathom.Rebalancer.Stats.bucket_index/1 exactly.
-  defp bucket_index(us), do: max(Enum.count(@edges_us, &(&1 <= us)) - 1, 0)
+  #
+  # Comparison ladder, not a scan of `@edges_us` (expert review 2026-10-20 #35: `Enum.count` over the
+  # 14 edges per query). Ascending, because nearly every query is under 500 us, so it exits within
+  # two comparisons. A clause per edge; `shard_latency_test` pins it against the scan at every edge.
+  @doc false
+  @spec bucket_index(integer()) :: non_neg_integer()
+  def bucket_index(us) when us < 100, do: 0
+  def bucket_index(us) when us < 500, do: 1
+  def bucket_index(us) when us < 1_000, do: 2
+  def bucket_index(us) when us < 2_000, do: 3
+  def bucket_index(us) when us < 5_000, do: 4
+  def bucket_index(us) when us < 10_000, do: 5
+  def bucket_index(us) when us < 25_000, do: 6
+  def bucket_index(us) when us < 50_000, do: 7
+  def bucket_index(us) when us < 100_000, do: 8
+  def bucket_index(us) when us < 250_000, do: 9
+  def bucket_index(us) when us < 500_000, do: 10
+  def bucket_index(us) when us < 1_000_000, do: 11
+  def bucket_index(us) when us < 5_000_000, do: 12
+  def bucket_index(_us), do: 13
+
+  @doc false
+  # Test seam: the scan this ladder replaced, so the test can compare them edge by edge.
+  @spec bucket_index_scan(integer()) :: non_neg_integer()
+  def bucket_index_scan(us), do: max(Enum.count(@edges_us, &(&1 <= us)) - 1, 0)
 
   @doc "Drops `shard_id`'s row — called from `Fathom.Shard.terminate` so stopped shards don't leak."
   @spec forget(String.t()) :: :ok
