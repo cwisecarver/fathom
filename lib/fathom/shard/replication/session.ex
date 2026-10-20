@@ -644,7 +644,7 @@ defmodule Fathom.Shard.Replication.Session do
           # every follower. It used to reply `:ok` straight away, so the first write was refused
           # and the next was acked quorum-durable by a node that no longer owned the shard. The
           # frames this commit is acking were shipped by someone; the ownership question is the same.
-          :nothing ->
+          {:nothing, state} ->
             ack_if_owned(state)
 
           # Out of time mid-catch-up. Answered here rather than falling into the seed-and-retry
@@ -1118,8 +1118,16 @@ defmodule Fathom.Shard.Replication.Session do
         case ship_planned(state, wal_path, epoch, header, deadline) do
           # Nothing left to plan. On the first round that means the commit wrote no frames; on a
           # later one it means every follower is current.
+          #
+          # It carries THIS state, not just the atom (round-4 rig rpo regression 2026-10-20). The
+          # header read above may have CLOSED the held fd — `Wal.read_held/2` releases it and hands
+          # back `nil` when the WAL is absent or shorter than a header (a flush's TRUNCATE, or the
+          # last close unlinking `-wal`). Replying from the pre-ship state kept the closed fd, and
+          # the next commit reused it once the WAL had the same inode again (the truncated file
+          # regrowing; on Linux, a recreated `-wal` reusing the freed inode number): `pread` on a
+          # closed fd is `{:error, :einval}`, so the first write after a flush failed its quorum.
           :nothing when target == nil ->
-            :nothing
+            {:nothing, state}
 
           :nothing ->
             {:ok, state, seen_rejects(seen)}
@@ -2722,7 +2730,7 @@ defmodule Fathom.Shard.Replication.Session do
       # NOTHING TO SHIP IS NOT PROOF OF OWNERSHIP, here either (expert review 2026-09-29 #7; rig
       # 2026-10-14 B3). This is the branch a write acked through a re-seed takes (the seed already
       # carried its frames), so it must be fenced exactly like the primary path's `:nothing`.
-      :nothing ->
+      {:nothing, state} ->
         ack_if_owned(state)
 
       {:error, {:no_quorum, _retry_why}, new_state, rejects} ->
