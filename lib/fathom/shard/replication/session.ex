@@ -90,6 +90,9 @@ defmodule Fathom.Shard.Replication.Session do
   # (or success). The margin covers that head-start + reply delivery; floored at half the timeout so
   # a large margin config can't gut a small timeout.
   @default_reply_margin_ms 100
+  # How many times one commit re-plans after its WAL restarted mid-round (expert review 2026-10-20
+  # #9) before failing. A restart race is transient; this only bounds a failure that is not.
+  @max_replans 3
   # How long `ensure_started/3` waits for a stale predecessor to stop politely before killing it.
   @stale_stop_ms 1_000
 
@@ -667,8 +670,12 @@ defmodule Fathom.Shard.Replication.Session do
                 {:reply, {:error, {:no_quorum, why}}, waited_state}
             end
 
-          {:error, reason} ->
-            {:reply, {:error, reason}, state}
+          # A read failure keeps what the earlier rounds learned (expert review 2026-10-20 #9):
+          # followers' advances, outstanding expectations and the reopened fd. Replying with the
+          # PRE-ship state discarded them, so late acks for pushes really in flight were rejected
+          # and the next commit re-planned from stale positions (`:offset_mismatch` rounds).
+          {:error, reason, failed_state} ->
+            {:reply, {:error, reason}, failed_state}
         end
     end
   end
@@ -1083,7 +1090,7 @@ defmodule Fathom.Shard.Replication.Session do
             :nothing
 
           :nothing ->
-            {:ok, state, Map.values(seen)}
+            {:ok, state, seen_rejects(seen)}
 
           {:ok, new_state, rejects, sent_complete?} ->
             seen = merge_rejects(seen, rejects)
@@ -1092,15 +1099,15 @@ defmodule Fathom.Shard.Replication.Session do
 
             cond do
               held? and (mode != :no_checkpoint or sent_complete?) ->
-                {:ok, new_state, Map.values(seen)}
+                {:ok, new_state, seen_rejects(seen)}
 
               # Out of time. A catch-up whose quorum holds has nothing to report; a commit whose
               # quorum does not hold its bytes fails rather than acks.
               past?(deadline) and held? ->
-                {:ok, new_state, Map.values(seen)}
+                {:ok, new_state, seen_rejects(seen)}
 
               past?(deadline) ->
-                {:error, {:no_quorum, :catching_up}, new_state, Map.values(seen)}
+                {:error, {:no_quorum, :catching_up}, new_state, seen_rejects(seen)}
 
               true ->
                 # Re-read the header next round rather than reusing it. Other streams commit to
@@ -1112,16 +1119,38 @@ defmodule Fathom.Shard.Replication.Session do
             end
 
           {:error, {:no_quorum, why}, new_state, rejects} ->
-            {:error, {:no_quorum, why}, new_state, Map.values(merge_rejects(seen, rejects))}
+            {:error, {:no_quorum, why}, new_state, seen_rejects(merge_rejects(seen, rejects))}
 
-          {:error, reason} ->
-            {:error, reason}
+          # THE WAL RESTARTED UNDER THIS ROUND (expert review 2026-10-20 #9): between the header read
+          # and the payload/recheck reads, a checkpoint plus a write began a new generation. The
+          # stability check correctly refused to ship bytes stamped with the old identity — and
+          # then FAILED THE TENANT'S COMMIT, a write that is durable locally and would have shipped
+          # had the round simply re-read (2-13 per pool-fleet run). The comments here always said
+          # "the next round re-plans"; now it does: re-read the header and plan again, inside the
+          # deadline, carrying this round's state. A new generation retargets (`retarget/2`), and
+          # the reset it plans carries `prev_extent`, so a follower missing frames the restart
+          # folded away is re-seeded rather than laundered complete. Bounded by the deadline AND a
+          # few attempts, so a persistent failure cannot spin on dirty-IO reads.
+          {:replan, reason, new_state} ->
+            if past?(deadline) or replans(seen) >= @max_replans do
+              read_failed(new_state, reason)
+            else
+              ship(new_state, wal_path, epoch, deadline, mode, bump_replans(seen), target)
+            end
+
+          {:error, _reason, _state} = failed ->
+            failed
         end
 
       {:error, reason, fd} ->
         read_failed(%{state | wal_fd: fd}, reason)
     end
   end
+
+  # Re-plans after a restart race this call has made, kept beside the per-shipper rejects in `seen`
+  # under a key no shipper can be (shippers are pids or names; this is a tagged tuple).
+  defp replans(seen), do: Map.get(seen, {__MODULE__, :replans}, 0)
+  defp bump_replans(seen), do: Map.update(seen, {__MODULE__, :replans}, 1, &(&1 + 1))
 
   # The first round's header is the commit's target; a later round in a DIFFERENT generation (the
   # log restarted between rounds) retargets to the new header.
@@ -1163,6 +1192,9 @@ defmodule Fathom.Shard.Replication.Session do
 
     held >= quorum()
   end
+
+  # The per-shipper rejects, without `bump_replans/1`'s counter.
+  defp seen_rejects(seen), do: seen |> Map.delete({__MODULE__, :replans}) |> Map.values()
 
   defp merge_rejects(seen, rejects) do
     Enum.reduce(rejects, seen, fn {shipper, _reason, _at} = r, acc ->
@@ -1239,6 +1271,9 @@ defmodule Fathom.Shard.Replication.Session do
             header
           )
 
+        {:error, reason, state} when reason in [:checkpoint_during_push, :short_read] ->
+          {:replan, reason, state}
+
         {:error, reason, state} ->
           read_failed(state, reason)
       end
@@ -1287,6 +1322,8 @@ defmodule Fathom.Shard.Replication.Session do
           {:error, r, fd} -> {:halt, {{:error, r}, fd}}
         end
       end)
+
+    build_hook()
 
     # RE-READ THE HEADER AND CONFIRM IT DID NOT MOVE (expert review 2026-08-20 #16).
     #
@@ -1380,6 +1417,21 @@ defmodule Fathom.Shard.Replication.Session do
     else
       {:error, reason} -> {:error, reason, state}
     end
+  end
+
+  # TEST SEAM (expert review 2026-10-20 #9): lands a WAL restart between `build_pushes/5`'s payload
+  # reads and its header re-check, the window no test could otherwise hit deterministically. Compiled
+  # in only where `:replication_test_hooks` is set at compile time (config/test.exs); everywhere else
+  # it is an empty function.
+  if Application.compile_env(:fathom, :replication_test_hooks, false) do
+    defp build_hook do
+      case Application.get_env(:fathom, :replication_build_hook) do
+        f when is_function(f, 0) -> f.()
+        _ -> :ok
+      end
+    end
+  else
+    defp build_hook, do: :ok
   end
 
   # The furthest this primary is KNOWN to have shipped in the generation `shipper` is about to
@@ -1614,7 +1666,7 @@ defmodule Fathom.Shard.Replication.Session do
 
   defp read_failed(state, reason) do
     Logger.warning("replication read failed for #{state.shard_id}: #{inspect(reason)}")
-    {:error, reason}
+    {:error, reason, state}
   end
 
   # ------------------------------------------------------------------------------------------
@@ -2370,8 +2422,8 @@ defmodule Fathom.Shard.Replication.Session do
       {:error, {:no_quorum, _retry_why}, new_state, rejects} ->
         {:reply, {:error, {:no_quorum, why}}, start_seeds(new_state, wal_path, rejects)}
 
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
+      {:error, reason, failed_state} ->
+        {:reply, {:error, reason}, failed_state}
     end
   end
 

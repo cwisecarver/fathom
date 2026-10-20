@@ -19,6 +19,9 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
       fresh deadline — the metastable queue that kept the shard collapsed for minutes.
     * #6 — a commit that missed its quorum waited for EVERY seed in flight, including ones it did not
       start, burning the whole deadline behind a seed it could not use.
+    * #5(b) — every queued same-shard commit re-read the WAL to plan nothing (no group commit).
+    * #9 — a WAL restart inside a push round (`checkpoint_during_push`, 13 in the rig run) failed
+      the tenant's commit instead of re-planning.
 
   Each test asserts the INVARIANT the collapse violated (a quorum that holds the bytes acks promptly;
   a failure is reported inside the caller's timeout; an abandoned call costs nothing), and each was
@@ -494,6 +497,104 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
 
     assert holders(names, id, File.read!(wal)) >= 2,
            "the batch was acked before a quorum held every caller's frames"
+  end
+
+  # ------------------------------------------------------------------------------------------
+  # #9
+  # ------------------------------------------------------------------------------------------
+
+  # The rig logged `checkpoint_during_push` 13 times in the collapse run: a WAL restart landed
+  # between a round's header read and its re-check, and the stability check — correctly refusing
+  # to ship bytes stamped with the old generation — then FAILED the tenant's commit, a write durable
+  # locally. The round now re-plans. The restart here is the dangerous kind (it folds this very
+  # commit's frames into the `.db` before any follower has them), so success must come through a
+  # re-seed, and the followers must end up holding every row, not just the bytes after the restart.
+  test "#9: a WAL restart inside a push round re-plans instead of failing the commit", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    names = for {n, _} <- followers, do: n
+    enable!(for({_, p} <- followers, do: p), timeout: 3_000, catchup: 0)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    # REAL seeds (a `.db` on every follower), not `preseed_current!/3`: the rows check below reads
+    # the replica's database, which a state-only preseed does not have.
+    assert :ok = Session.commit(id, wal, coordinator)
+    await_seeds_landed!(session!(id))
+
+    for i <- 1..5, do: {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?)", [i])
+    assert :ok = Session.commit(id, wal, coordinator)
+    for i <- 6..8, do: {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?)", [i])
+
+    # Fires ONCE, inside the Session, after the round read its payloads and before the re-check:
+    # backfill everything (no reader holds a mark) and write, which restarts the log in place.
+    fired = :counters.new(1, [])
+
+    Application.put_env(:fathom, :replication_build_hook, fn ->
+      if :counters.get(fired, 1) == 0 do
+        :counters.add(fired, 1, 1)
+        {:ok, c} = Connection.open(path)
+        {:ok, _} = Connection.query(c, "PRAGMA wal_checkpoint(PASSIVE)", [])
+        {:ok, _} = Connection.query(c, "INSERT INTO t VALUES (100)", [])
+        :ok = Connection.close(c)
+      end
+    end)
+
+    on_exit(fn -> Application.delete_env(:fathom, :replication_build_hook) end)
+    {:ok, %{salt1: salt_before}} = Fathom.Shard.Replication.Wal.read(wal)
+
+    reply = Session.commit(id, wal, coordinator)
+
+    {:ok, %{salt1: salt_after, commit_extent: extent}} = Fathom.Shard.Replication.Wal.read(wal)
+    assert :counters.get(fired, 1) == 1, "PRECONDITION: the restart hook never ran"
+    assert salt_after != salt_before, "PRECONDITION: the hook did not restart the WAL"
+
+    assert reply == :ok,
+           "the commit failed #{inspect(reply)} because its WAL restarted mid-round; the write " <>
+             "is durable locally and re-planning would have shipped it"
+
+    # A quorum holds the new generation's committed bytes AND every row (the seed carried the
+    # frames the restart folded into the `.db`).
+    expected = binary_part(File.read!(wal), 0, extent)
+
+    holding =
+      Enum.filter(names, fn n -> File.read(Follower.wal_path(n, id)) == {:ok, expected} end)
+
+    assert length(holding) >= 2, "only #{length(holding)} followers hold the new generation"
+
+    for n <- holding do
+      assert follower_rows(n, id) == 9,
+             "#{n} holds the WAL bytes but not every row: the restart's folded frames were lost"
+    end
+  end
+
+  defp await_seeds_landed!(session, timeout \\ 5_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn ->
+      cond do
+        :sys.get_state(session).seeding == %{} -> true
+        System.monotonic_time(:millisecond) > deadline -> false
+        true -> Process.sleep(10) && nil
+      end
+    end)
+    |> Enum.find(&is_boolean/1)
+    |> assert("the initial seeds never landed")
+  end
+
+  # Count the rows a follower's replica holds, on a COPY (opening the replica itself could
+  # checkpoint it under the follower).
+  defp follower_rows(name, id) do
+    src = String.replace_suffix(Follower.wal_path(name, id), "-wal", "")
+    dst = Path.join(System.tmp_dir!(), "rows_#{System.unique_integer([:positive])}.db")
+    on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(dst <> s) end)
+    File.cp!(src, dst)
+    File.cp!(src <> "-wal", dst <> "-wal")
+    {:ok, c} = Connection.open(dst)
+    {:ok, %{rows: [[n]]}} = Connection.query(c, "SELECT count(*) FROM t", [])
+    :ok = Connection.close(c)
+    n
   end
 
   # ------------------------------------------------------------------------------------------
