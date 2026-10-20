@@ -460,7 +460,7 @@ defmodule Fathom.Shard.Connection do
   # both values back after open, so a batch that silently dropped one would fail there.
   #
   # With the extension loaded the same batch turns on `fathom_busy_yield(1)` (expert review
-  # 2026-10-20 #2): an AUTOCOMMIT lock wait on a tenant handle gives up at once and `query/4`
+  # 2026-10-20 #2): a lock wait on a tenant handle gives up at once and `query/4`
   # retries it from the owner process instead of sleeping on a dirty-IO thread (see
   # `retry_busy/4`). Riding this batch keeps the open's dispatch count unchanged.
   defp maybe_harden(conn, true, :loaded),
@@ -982,17 +982,20 @@ defmodule Fathom.Shard.Connection do
   # of them for ALL SQLite work and file I/O, so more same-lock waiters than that stalled every
   # tenant on the node: measured 0 ms -> ~2.1 s for an unrelated shard's SELECT between 9 and 11
   # waiters, with the lock holder's own COMMIT queued behind its waiters. Tenant handles now carry
-  # `fathom_busy_yield(1)` (`maybe_harden/3`): in AUTOCOMMIT the handler gives up at once, and the
-  # wait happens here, in `receive after`, holding no thread.
+  # `fathom_busy_yield(1)` (`maybe_harden/3`): the handler gives up at once, and the wait happens
+  # here, in `receive after`, holding no thread.
   #
-  # Retried only when re-running the statement is valid, which is exactly AUTOCOMMIT before AND
-  # after: `multi_step` has already reset the statement, SQLite rolled back whatever it began, and no
-  # transaction snapshot exists to go stale. Checked by the extension (`fathom_busy_retry_ms()`, one
-  # dispatch) on the first BUSY only: the state cannot change between retries, this process being
-  # the only user of the handle. A BUSY
-  # inside an explicit transaction is returned as before — the handler still waits there itself, and
-  # `SQLITE_BUSY_SNAPSHOT` (exqlite reports it as the same `:busy`: it does not enable extended
-  # result codes) can never succeed on a re-step. A BUSY after rows were already returned is not
+  # Retried only when re-running the statement is valid, which is exactly when the BUSY came from
+  # the busy handler: SQLite calls it only while the connection holds no transaction on the database
+  # (no lock, no snapshot to go stale), and `multi_step` has already reset the statement. That is
+  # autocommit, `BEGIN IMMEDIATE`/`EXCLUSIVE` themselves, AND an explicit transaction's first
+  # statement — Django's `transaction.atomic` (BEGIN, then a write), the likeliest many-writer shape.
+  # A transaction that already READ and then cannot upgrade to a writer, or `SQLITE_BUSY_SNAPSHOT`,
+  # returns BUSY without calling the handler and can never succeed on a re-step; exqlite reports it
+  # as the same `:busy` (no extended result codes), so the extension remembers which statement it
+  # yielded for and `fathom_busy_retry_ms()` (one dispatch, run as the very next statement) answers 0
+  # for anything else — that BUSY fails at once, as before. Checked on the first BUSY only: a
+  # re-step reaches the same point in the same state. A BUSY after rows were already returned is not
   # retried either.
   #
   # BOUNDED by the handle's busy timeout (read from the extension, so `set_busy_timeout/2` and a
@@ -1047,7 +1050,8 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  # How long to keep retrying: the handle's busy timeout when it yields and is in autocommit, else 0
+  # How long to keep retrying: the handle's busy timeout when the handler yielded for the statement
+  # that just returned BUSY, else 0
   # (native/fathom_udf/src/backstop.rs `fathom_busy_retry_ms`). One dispatch on the contended path.
   defp busy_retry_budget_ms(conn) do
     with {:ok, stmt, _cols, _enc, _refresh} <- cached_stmt(conn, "SELECT fathom_busy_retry_ms()") do
