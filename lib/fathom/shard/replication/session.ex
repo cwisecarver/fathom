@@ -342,6 +342,9 @@ defmodule Fathom.Shard.Replication.Session do
        # subsequent `:unknown_shard` from that follower silently swallowed — silent, permanent
        # under-replication of one shard while the quorum reports healthy.
        seeding: %{},
+       # Bytes per ms of the last completed seed, nil until one completes (expert review 2026-10-20
+       # #6): lets a missed-quorum commit skip waiting for a seed that cannot land in time.
+       seed_rate: nil,
        # Deferred-retry bookkeeping. `catchup_ref` is the armed timer (nil when none); `commits`
        # counts commit cycles and `catchup_at` records the count at arm time, so the retry can tell
        # a QUIET shard from a busy one. See `handle_info(:catch_up, ...)`.
@@ -535,6 +538,10 @@ defmodule Fathom.Shard.Replication.Session do
         {:reply, {:error, reason}, state}
 
       {:ok, state} ->
+        # The seeds already in flight when this call began. Only seeds started AFTER this point —
+        # by this call — are awaited on a missed quorum (expert review 2026-10-20 #6).
+        prior = seed_tokens(state)
+
         # Drain first: a straggler's reply that landed while the PREVIOUS call was still running has
         # not reached `handle_info/2` yet, and leaving it would let the next `collect/4` mistake it
         # for an answer to the push about to be sent.
@@ -591,15 +598,21 @@ defmodule Fathom.Shard.Replication.Session do
           # bounded wait is the better side of that deal — and for the small shards fathom's whole
           # thesis is about, the wait is milliseconds.
           #
-          # Still bounded, and still fails honestly: `await_seeds/3` waits only for seeds THIS
+          # Still bounded, and still fails honestly: `await_seeds/4` waits only for seeds THIS
           # commit started, only until the caller's own deadline, and a shard too large to seed
           # inside it fails exactly as it did before, having spent time it was going to spend
           # anyway. Seeding remains write-gated — nothing seeds a shard nobody writes to, which is
           # the storm the durability `dirty` flag exists to prevent.
+          #
+          # "THIS commit started" was the comment's promise and not the code's until expert review
+          # 2026-10-20 #6: `await_seeds` waited until NO seed was in flight, so a commit that missed
+          # its quorum while an earlier commit's large seed streamed (145 s+ on the rig) sat out its
+          # whole deadline behind a seed it could not use — and under #5(a)'s queue, every queued
+          # commit did the same. `prior` excludes those; their results still land in `handle_info/2`.
           {:error, {:no_quorum, why}, new_state, rejects} ->
             seeded_state = start_seeds(new_state, wal_path, rejects)
 
-            case await_seeds(seeded_state, deadline, wal_path) do
+            case await_seeds(seeded_state, deadline, wal_path, prior) do
               {:ok, ready_state} ->
                 retry_after_seed(ready_state, wal_path, deadline, why)
 
@@ -2140,58 +2153,91 @@ defmodule Fathom.Shard.Replication.Session do
   # `{:repl_reply, ...}` is drained alongside it. A straggler's answer to the push that just failed
   # arrives during exactly this window, and leaving it queued would let the retry's `collect/4`
   # mistake it for an answer to the retry.
-  defp await_seeds(%{seeding: seeding} = state, deadline, wal_path) do
-    if map_size(seeding) == 0 do
-      {:ok, state}
-    else
-      remaining = deadline - System.monotonic_time(:millisecond)
+  #
+  # `prior` is the set of seed tokens already in flight when the call began (expert review
+  # 2026-10-20 #6): those were started by an earlier call and are NOT waited on. A seed this call
+  # started is skipped too when the Session's last observed seed rate says it cannot land inside
+  # the time left — the wait would only burn the deadline. Either way the result still arrives in
+  # `handle_info/2` and is applied there.
+  defp await_seeds(state, deadline, wal_path, prior) do
+    remaining = deadline - System.monotonic_time(:millisecond)
 
-      if remaining <= 0 do
+    case own_seeds(state, prior) do
+      [] ->
+        {:ok, state}
+
+      _own when remaining <= 0 ->
         {:timeout, state}
-      else
-        refs = seed_refs(state)
 
-        receive do
-          {:seeded, shipper, token, result} ->
-            state
-            |> apply_seed_result(shipper, token, result)
-            |> await_seeds(deadline, wal_path)
+      own ->
+        if hopeless_seed?(state, own, remaining),
+          do: {:timeout, state},
+          else: await_seed_messages(state, deadline, wal_path, prior, remaining)
+    end
+  end
 
-          # A seed task that died WITHOUT answering (expert review 2026-10-13 #12). Only
-          # `handle_info/2` used to consume its DOWN, which cannot run inside this call, so the
-          # entry stayed in `seeding` and this loop ran to the commit deadline.
-          {:DOWN, ref, :process, _pid, reason} when is_map_key(refs, ref) ->
-            state
-            |> apply_seed_down(ref, reason)
-            |> await_seeds(deadline, wal_path)
+  defp seed_tokens(state), do: MapSet.new(state.seeding, fn {_shipper, e} -> e.token end)
 
-          {:repl_reply, from, {:ack, _shard, next}} ->
-            state
-            |> settle_late_ack(from, next)
-            |> await_seeds(deadline, wal_path)
+  defp own_seeds(state, prior),
+    do: for({_shipper, e} <- state.seeding, not MapSet.member?(prior, e.token), do: e)
 
-          # A REJECT MUST BE RECONCILED, NOT DROPPED. The first draft of this fell through to the
-          # catch-all and threw rejects away, and the rig showed exactly what this module's own
-          # moduledoc predicts: the follower stayed pinned at the position we THOUGHT it had, the
-          # retry planned a delta from there, it refused, and every subsequent commit failed
-          # `:impossible` — having fixed the first commit and broken all the rest.
-          #
-          # These are answers to the push that just failed, so reconciling them before the retry is
-          # the whole point: the retry plans from where each follower actually is.
-          {:repl_reply, from, {:reject, _shard, reason, follower_offset}} ->
-            rejects = [{from, reason, follower_offset}]
+  # Seeds to different followers stream concurrently, so the wait ends when the LAST one lands:
+  # hopeless when any of them, at the last observed rate, finishes past the time left. No observed
+  # rate yet (this Session's first seed) waits, as before. Underestimates the rate if anything (it
+  # is measured start-to-result, queueing included), which errs toward not waiting.
+  defp hopeless_seed?(%{seed_rate: rate}, own, remaining) when is_number(rate) and rate > 0 do
+    now = System.monotonic_time(:millisecond)
 
-            state
-            |> reconcile(rejects)
-            |> start_seeds(wal_path, rejects)
-            |> await_seeds(deadline, wal_path)
+    Enum.any?(own, fn
+      %{bytes: b, started_at: t} when is_integer(b) -> t + b / rate - now > remaining
+      _ -> false
+    end)
+  end
 
-          {:repl_reply, _from, _other} ->
-            await_seeds(state, deadline, wal_path)
-        after
-          remaining -> {:timeout, state}
-        end
-      end
+  defp hopeless_seed?(_state, _own, _remaining), do: false
+
+  defp await_seed_messages(state, deadline, wal_path, prior, remaining) do
+    refs = seed_refs(state)
+
+    receive do
+      {:seeded, shipper, token, result} ->
+        state
+        |> apply_seed_result(shipper, token, result)
+        |> await_seeds(deadline, wal_path, prior)
+
+      # A seed task that died WITHOUT answering (expert review 2026-10-13 #12). Only
+      # `handle_info/2` used to consume its DOWN, which cannot run inside this call, so the
+      # entry stayed in `seeding` and this loop ran to the commit deadline.
+      {:DOWN, ref, :process, _pid, reason} when is_map_key(refs, ref) ->
+        state
+        |> apply_seed_down(ref, reason)
+        |> await_seeds(deadline, wal_path, prior)
+
+      {:repl_reply, from, {:ack, _shard, next}} ->
+        state
+        |> settle_late_ack(from, next)
+        |> await_seeds(deadline, wal_path, prior)
+
+      # A REJECT MUST BE RECONCILED, NOT DROPPED. The first draft of this fell through to the
+      # catch-all and threw rejects away, and the rig showed exactly what this module's own
+      # moduledoc predicts: the follower stayed pinned at the position we THOUGHT it had, the
+      # retry planned a delta from there, it refused, and every subsequent commit failed
+      # `:impossible` — having fixed the first commit and broken all the rest.
+      #
+      # These are answers to the push that just failed, so reconciling them before the retry is
+      # the whole point: the retry plans from where each follower actually is.
+      {:repl_reply, from, {:reject, _shard, reason, follower_offset}} ->
+        rejects = [{from, reason, follower_offset}]
+
+        state
+        |> reconcile(rejects)
+        |> start_seeds(wal_path, rejects)
+        |> await_seeds(deadline, wal_path, prior)
+
+      {:repl_reply, _from, _other} ->
+        await_seeds(state, deadline, wal_path, prior)
+    after
+      remaining -> {:timeout, state}
     end
   end
 
@@ -2247,6 +2293,7 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   defp apply_current_seed_result(state, shipper, result) do
+    state = note_seed_rate(state, Map.get(state.seeding, shipper), result)
     state = %{state | seeding: forget_seed(state.seeding, shipper)}
 
     case result do
@@ -2265,6 +2312,13 @@ defmodule Fathom.Shard.Replication.Session do
         state
     end
   end
+
+  # The last completed seed's throughput, bytes per ms (expert review 2026-10-20 #6), for
+  # `hopeless_seed?/3`. Wall time from start to result as this Session saw it.
+  defp note_seed_rate(state, %{bytes: b, started_at: t}, {:ok, _}) when is_integer(b) and b > 0,
+    do: %{state | seed_rate: b / max(System.monotonic_time(:millisecond) - t, 1)}
+
+  defp note_seed_rate(state, _entry, _result), do: state
 
   defp start_seeds(state, wal_path, rejects) do
     # EXPIRE FIRST. A monitor covers a task that DIED; it does not cover one that is alive and
@@ -2295,6 +2349,10 @@ defmodule Fathom.Shard.Replication.Session do
           {:ok, pin} = SeedPin.start(session, db_path)
           pin
       end
+
+    # What the batch is about to stream (one stat pair per batch, not per follower), recorded per
+    # entry so `hopeless_seed?/3` can price the wait (expert review 2026-10-20 #6). A seed is rare.
+    bytes = if needs == [], do: 0, else: seed_bytes(db_path, wal_path)
 
     seeded =
       Enum.reduce(needs, state, fn shipper, acc ->
@@ -2330,7 +2388,8 @@ defmodule Fathom.Shard.Replication.Session do
           ref: ref,
           token: token,
           pid: pid,
-          started_at: System.monotonic_time(:millisecond)
+          started_at: System.monotonic_time(:millisecond),
+          bytes: bytes
         }
 
         %{acc | seeding: Map.put(acc.seeding, shipper, entry)}

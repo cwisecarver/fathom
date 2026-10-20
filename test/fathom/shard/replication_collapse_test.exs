@@ -152,6 +152,30 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     {reply, System.monotonic_time(:millisecond) - t0}
   end
 
+  # A seed entry the Session believes is in flight, for a follower nothing is streaming to — the
+  # state a large or wedged seed leaves behind. Installed through `:sys.replace_state/2` so the
+  # monitor is the SESSION's (its in-call loops consume the DOWN of exactly these refs).
+  defp fake_seed_in_flight!(session, shipper) do
+    dummy = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Process.exit(dummy, :kill) end)
+
+    :sys.replace_state(session, fn state ->
+      entry = %{
+        ref: Process.monitor(dummy),
+        token: make_ref(),
+        pid: dummy,
+        started_at: System.monotonic_time(:millisecond)
+      }
+
+      %{state | seeding: Map.put(state.seeding, shipper, entry)}
+    end)
+  end
+
+  defp shipper_for(port) do
+    Enum.find(Fleet.shippers(), fn s -> :sys.get_state(s).port == port end) ||
+      flunk("no shipper for port #{port}")
+  end
+
   # ------------------------------------------------------------------------------------------
   # #4
   # ------------------------------------------------------------------------------------------
@@ -224,5 +248,86 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     # And the Session still serves a live caller.
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
     assert :ok = Session.commit(id, wal, coordinator)
+  end
+
+  # ------------------------------------------------------------------------------------------
+  # #6
+  # ------------------------------------------------------------------------------------------
+
+  # One follower is down (closed port), one is mid-seed (a seed NOT started by this commit), one is
+  # live: the quorum is impossible. `await_seeds` used to wait for every seed in flight, so the
+  # commit sat out its whole deadline behind a seed it could not use.
+  test "#6: a commit that misses quorum does not wait for a seed it did not start", ctx do
+    %{id: id, root: root} = ctx
+    [{a, pa}, {c, pc}] = start_followers!(root, 2)
+    # The middle follower is a closed port: every push to it is `:disconnected` at once.
+    enable!([pa, 1, pc], timeout: 1_000, catchup: 0, connected: 2)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    preseed_current!([a, c], id, coordinator)
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    fake_seed_in_flight!(session!(id), shipper_for(pc))
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+
+    {reply, ms} = timed_commit(id, wal, coordinator)
+    assert match?({:error, {:no_quorum, _}}, reply), inspect(reply)
+
+    assert ms < 300,
+           "the failing commit took #{ms} ms: it waited on a seed some earlier commit started"
+  end
+
+  # The second half of #6: a seed THIS commit started is waited on (that is what makes a tenant's
+  # first write succeed), but not when the Session's observed seed rate says it cannot land inside
+  # the time left — the rig's 16.5 MB seeds ran 145 s+, so the wait could only burn the deadline.
+  test "#6: a seed this commit started is not awaited when it cannot land in time", ctx do
+    %{id: id, root: root} = ctx
+    [{a, pa}, {_c, pc}] = start_followers!(root, 2)
+    enable!([pa, 1, pc], timeout: 1_000, catchup: 0, connected: 2)
+
+    # Hold the node's only seed slot, so the seed this commit starts cannot make progress.
+    prev_cap = Application.get_env(:fathom, :replication_seed_max_concurrency)
+    Application.put_env(:fathom, :replication_seed_max_concurrency, 1)
+
+    on_exit(fn ->
+      if is_nil(prev_cap),
+        do: Application.delete_env(:fathom, :replication_seed_max_concurrency),
+        else: Application.put_env(:fathom, :replication_seed_max_concurrency, prev_cap)
+    end)
+
+    test_pid = self()
+
+    holder =
+      spawn(fn ->
+        :ok = Fathom.Shard.Replication.SeedGate.acquire(1_000)
+        send(test_pid, :slot_held)
+        Process.sleep(:infinity)
+      end)
+
+    on_exit(fn -> Process.exit(holder, :kill) end)
+    assert_receive :slot_held, 2_000
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    # Only `a` is seeded: `c` answers :unknown_shard and this commit starts its seed.
+    preseed_current!([a], id, coordinator)
+
+    # The Session exists after a first (failing) commit; give it an observed rate so slow that no
+    # seed can land in a second. Then the commit under test starts a fresh seed for `c`.
+    _ = Session.commit(id, wal, coordinator)
+    session = session!(id)
+    :sys.replace_state(session, &%{&1 | seed_rate: 0.001, seeding: %{}})
+
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    {reply, ms} = timed_commit(id, wal, coordinator)
+    assert match?({:error, {:no_quorum, _}}, reply), inspect(reply)
+
+    assert map_size(:sys.get_state(session).seeding) == 1,
+           "PRECONDITION: the commit under test should have started a seed for the unseeded follower"
+
+    assert ms < 300, "the commit waited #{ms} ms for a seed it could not finish in time"
   end
 end
