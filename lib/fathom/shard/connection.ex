@@ -11,6 +11,7 @@ defmodule Fathom.Shard.Connection do
   require Logger
 
   alias Exqlite.Sqlite3
+  alias Filo.StmtResult
 
   @doc """
   Opens a connection to the shard file at `path` (WAL, synchronous=FULL, 5s busy
@@ -865,7 +866,7 @@ defmodule Fathom.Shard.Connection do
     # A 4-tuple with a plain pattern, not a 3-tuple plus a guard. A `with` whose pattern carries a
     # guard lets the unmatched value fall through as the function's return, which dialyzer caught
     # as `{:ok, _, _} | {:refresh, reference(), [any()]}` escaping `query/4`'s spec.
-    with {:ok, stmt, columns, refresh_columns?} <- cached_stmt(conn, sql) do
+    with {:ok, stmt, columns, cols_encoded, refresh_columns?} <- cached_stmt(conn, sql) do
       # The statement is owned by this connection's cache and must leave here RESET (sqlite3_reset
       # ends the execution, releasing its locks / read-transaction hold, while keeping the compiled
       # plan for the next execution of the same SQL).
@@ -888,8 +889,10 @@ defmodule Fathom.Shard.Connection do
           # 2026-08-26 #7). Only on the `:refresh` path — a DDL happened somewhere since this
           # statement was cached — so the ordinary hit pays nothing. See `cached_stmt/2` for why
           # this cannot be done any earlier.
-          columns =
-            if refresh_columns?, do: refreshed_columns(conn, stmt, sql, columns), else: columns
+          {columns, cols_encoded} =
+            if refresh_columns?,
+              do: refreshed_columns(conn, stmt, sql, columns, cols_encoded),
+              else: {columns, cols_encoded}
 
           # `sqlite3_changes()` is a dirty-NIF dispatch. `ShardExecutor.wrote?/2` ignores it for a
           # read-verb statement that returns columns (it answers `false` before looking), and
@@ -917,6 +920,9 @@ defmodule Fathom.Shard.Connection do
           {:ok,
            %{
              columns: columns,
+             # Wire form of `columns`, cached beside them (expert review 2026-10-19 #10); every
+             # path that replaces a cached column list replaces this with it.
+             cols_encoded: cols_encoded,
              rows: rows,
              row_count: row_count,
              num_changes: changes,
@@ -960,26 +966,27 @@ defmodule Fathom.Shard.Connection do
   # Re-read the column list now that the statement has stepped, and correct the cache entry so the
   # next execution takes the ordinary hit path. Falls back to the pre-step list if the read fails —
   # degrading to the old (possibly stale) answer rather than failing a query that already succeeded.
-  defp refreshed_columns(conn, stmt, sql, fallback) do
+  defp refreshed_columns(conn, stmt, sql, fallback, fallback_encoded) do
     case Sqlite3.columns(conn, stmt) do
       {:ok, cols} ->
         key = {__MODULE__, :stmt_cache, conn}
+        encoded = encode_cols(cols)
 
         case Process.get(key) do
-          {seq, %{^sql => {canonical, ^stmt, _cols, stamp, gen}} = cache} ->
+          {seq, %{^sql => {canonical, ^stmt, _cols, _enc, stamp, gen}} = cache} ->
             Process.put(
               key,
-              {seq, Map.put(cache, canonical, {canonical, stmt, cols, stamp, gen})}
+              {seq, Map.put(cache, canonical, {canonical, stmt, cols, encoded, stamp, gen})}
             )
 
           _ ->
             :ok
         end
 
-        cols
+        {cols, encoded}
 
       _ ->
-        fallback
+        {fallback, fallback_encoded}
     end
   end
 
@@ -1041,15 +1048,15 @@ defmodule Fathom.Shard.Connection do
     gen = Fathom.Shard.SchemaGen.current()
 
     case cache do
-      %{^sql => {canonical, stmt, cols, _stamp, ^gen}} ->
+      %{^sql => {canonical, stmt, cols, enc, _stamp, ^gen}} ->
         # Re-put under `canonical`, never the incoming sub-binary: a map that has grown past a
         # flatmap adopts the new key term, which would silently reinstate the pin.
         Process.put(
           key,
-          {seq + 1, Map.put(cache, canonical, {canonical, stmt, cols, seq + 1, gen})}
+          {seq + 1, Map.put(cache, canonical, {canonical, stmt, cols, enc, seq + 1, gen})}
         )
 
-        {:ok, stmt, cols, false}
+        {:ok, stmt, cols, enc, false}
 
       # Hit, but the schema moved since this entry was prepared. Re-prepare AND tell the caller to
       # re-read the columns AFTER the statement has stepped.
@@ -1067,17 +1074,19 @@ defmodule Fathom.Shard.Connection do
       # only exist after execution. The re-prepare is still worth doing — it drops a statement
       # compiled against a schema this connection has since left behind — but the authoritative
       # read happens in `do_query/4`.
-      %{^sql => {canonical, stmt, _stale_cols, _stamp, _older_gen}} ->
+      %{^sql => {canonical, stmt, _stale_cols, _stale_enc, _stamp, _older_gen}} ->
         Sqlite3.release(conn, stmt)
 
         with {:ok, fresh} <- Sqlite3.prepare(conn, canonical),
              {:ok, cols} <- Sqlite3.columns(conn, fresh) do
+          enc = encode_cols(cols)
+
           Process.put(
             key,
-            {seq + 1, Map.put(cache, canonical, {canonical, fresh, cols, seq + 1, gen})}
+            {seq + 1, Map.put(cache, canonical, {canonical, fresh, cols, enc, seq + 1, gen})}
           )
 
-          {:ok, fresh, cols, true}
+          {:ok, fresh, cols, enc, true}
         end
 
       _ ->
@@ -1086,12 +1095,14 @@ defmodule Fathom.Shard.Connection do
           canonical = :binary.copy(sql)
           cache = maybe_evict(conn, cache)
 
+          enc = encode_cols(cols)
+
           Process.put(
             key,
-            {seq + 1, Map.put(cache, canonical, {canonical, stmt, cols, seq + 1, gen})}
+            {seq + 1, Map.put(cache, canonical, {canonical, stmt, cols, enc, seq + 1, gen})}
           )
 
-          {:ok, stmt, cols, false}
+          {:ok, stmt, cols, enc, false}
         end
     end
   end
@@ -1100,8 +1111,8 @@ defmodule Fathom.Shard.Connection do
   # only on an over-cap miss — a workload cycling >64 distinct statements per stream is
   # re-preparing anyway, exactly as before the cache.
   defp maybe_evict(conn, cache) when map_size(cache) >= @stmt_cache_cap do
-    {lru_sql, {_canonical, stmt, _cols, _stamp, _gen}} =
-      Enum.min_by(cache, fn {_sql, {_canonical, _stmt, _cols, stamp, _gen}} -> stamp end)
+    {lru_sql, {_canonical, stmt, _cols, _enc, _stamp, _gen}} =
+      Enum.min_by(cache, fn {_sql, {_canonical, _stmt, _cols, _enc, stamp, _gen}} -> stamp end)
 
     Sqlite3.release(conn, stmt)
     Map.delete(cache, lru_sql)
@@ -1124,8 +1135,15 @@ defmodule Fathom.Shard.Connection do
     release_cache(conn, Process.delete({__MODULE__, :stmt_cache, conn}))
   end
 
+  # The cached wire form, flattened: `Filo.StmtResult.encode_cols/1` returns the protobuf fields as
+  # a nested iolist (~590 heap words for 30 columns); one binary is 35 words plus the bytes.
+  defp encode_cols(cols) do
+    %{json: json, protobuf: pb} = StmtResult.encode_cols(cols)
+    %{json: json, protobuf: IO.iodata_to_binary(pb)}
+  end
+
   defp release_cache(conn, {_seq, cache}) do
-    Enum.each(cache, fn {_sql, {_canonical, stmt, _cols, _stamp, _gen}} ->
+    Enum.each(cache, fn {_sql, {_canonical, stmt, _cols, _enc, _stamp, _gen}} ->
       Sqlite3.release(conn, stmt)
     end)
   end
@@ -1765,7 +1783,7 @@ defmodule Fathom.Shard.Connection do
   @spec temp_schema_empty?(reference()) :: boolean()
   def temp_schema_empty?(conn) do
     case cached_stmt(conn, @temp_probe_sql) do
-      {:ok, stmt, _cols, _refetch?} -> Sqlite3.step(conn, stmt) == :done
+      {:ok, stmt, _cols, _enc, _refetch?} -> Sqlite3.step(conn, stmt) == :done
       {:error, _} -> false
     end
   rescue
@@ -1847,7 +1865,7 @@ defmodule Fathom.Shard.Connection do
   # or any unexpected shape) sends the caller to the three separate NIF calls, so behaviour is
   # identical wherever the extension is absent. Rides the ordinary statement cache.
   defp fetch_conn_state(conn) do
-    with {:ok, stmt, _cols, _refresh} <- cached_stmt(conn, "SELECT fathom_conn_state()") do
+    with {:ok, stmt, _cols, _enc, _refresh} <- cached_stmt(conn, "SELECT fathom_conn_state()") do
       case Sqlite3.multi_step(conn, stmt, @multi_step_chunk) do
         {:done, [[<<changes::unsigned-little-64, rowid::signed-little-64, ac>>]]} ->
           {:ok, changes, rowid, ac == 1}

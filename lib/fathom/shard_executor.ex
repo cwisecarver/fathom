@@ -1735,6 +1735,7 @@ defmodule Fathom.ShardExecutor do
   defp to_stmt_result(
          %{
            columns: cols,
+           cols_encoded: cols_encoded,
            rows: rows,
            row_count: row_count,
            num_changes: changes,
@@ -1746,6 +1747,9 @@ defmodule Fathom.ShardExecutor do
 
     %StmtResult{
       cols: cols,
+      # Pre-built wire form from the statement cache (expert review 2026-10-19 #10): filo splices
+      # it instead of rebuilding a map per column on every execution.
+      cols_encoded: cols_encoded,
       rows: rows,
       affected_row_count: if(read_only?, do: 0, else: changes),
       last_insert_rowid: if(not read_only? and changes > 0, do: rowid, else: nil),
