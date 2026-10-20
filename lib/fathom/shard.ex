@@ -4982,7 +4982,20 @@ defmodule Fathom.Shard do
   #   (c) The extension stays loaded on this connection (`Connection.open/2` does it): `VACUUM INTO`
   #       and `quick_check` both touch the schema's indexes, so a Django expression index over a UDF
   #       would fail "no such function" without it.
+  # THE SCAN PERMIT (expert review 2026-10-20 #19): `quick_check` + `VACUUM INTO` each hold a
+  # dirty-IO thread for the whole page scan, and the upload cap can equal the dirty-IO thread count,
+  # so a flush wave could hold every thread. `ScanGate` bounds concurrent scans to SDio-2, held
+  # across the open..close here and NOT across the PUT. Bounded wait, then scan anyway: a durability
+  # flush must not fail because the gate was busy.
+  @scan_permit_wait_ms 60_000
+
   defp verify_and_snapshot(state, temp) do
+    Fathom.Shard.ScanGate.with_permit(@scan_permit_wait_ms, fn ->
+      verify_and_snapshot_unpermitted(state, temp)
+    end)
+  end
+
+  defp verify_and_snapshot_unpermitted(state, temp) do
     case Connection.open(state.path) do
       {:ok, conn} ->
         try do

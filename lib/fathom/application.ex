@@ -902,6 +902,9 @@ defmodule Fathom.Application do
       # Idle unless :shard_flush_max_concurrency is set. Before the shard supervisor so the table is
       # up before any coordinator flushes.
       Fathom.Shard.FlushGate,
+      # Scan-only permit (quick_check + VACUUM INTO), SDio-2: keeps a flush wave from holding every
+      # dirty-IO thread (expert review 2026-10-20 #19). Fails open if not running.
+      Fathom.Shard.ScanGate,
       # Owns the node-wide idle pooled-handle budget (perf review 2026-10-14 #16). Before the shard
       # supervisor so it outlives every coordinator's terminate-time pool close.
       Fathom.Shard.PoolBudget
