@@ -7,10 +7,12 @@ defmodule Fathom.Shard.BusyYieldTest do
   # behind sleepers: measured, an unrelated shard's SELECT took ~2.1 s at 11 waiters (0 ms at 9),
   # and the lock holder's own COMMIT queued behind its waiters (a convoy).
   #
-  # Fix: tenant handles yield an AUTOCOMMIT lock wait to the BEAM (`fathom_busy_yield(1)`), and
+  # Fix: tenant handles yield a lock wait to the BEAM (`fathom_busy_yield(1)`), and
   # `Connection.query/4` retries the statement from the owner process with a `receive after`
-  # backoff, bounded by the busy timeout and the statement deadline. Explicit transactions keep the
-  # in-handler wait (re-stepping there is not always valid), and so does the tenant script path.
+  # backoff, bounded by the busy timeout and the statement deadline. Only a BUSY the busy handler
+  # yielded is retried: autocommit, BEGIN IMMEDIATE, and an explicit transaction's FIRST lock
+  # (Django's `transaction.atomic`: BEGIN then a write). A transaction that already read and then
+  # cannot become a writer is never retried, and the tenant script path keeps the in-handler wait.
   #
   # async: false — the first test's whole point is the node-wide dirty-IO pool, and a concurrent
   # suite's NIF traffic would only add noise to the latency it measures.
@@ -57,7 +59,29 @@ defmodule Fathom.Shard.BusyYieldTest do
     {path, holder}
   end
 
-  test "more lock waiters than dirty-IO threads do not stall an unrelated shard" do
+  # Two waiter shapes: a bare autocommit INSERT, and Django's `transaction.atomic` (BEGIN, then the
+  # INSERT is the transaction's first lock, then COMMIT). The Django shape is the follow-up
+  # (approved 2026-10-20): e5fa30d9 yielded only in autocommit, and against it this variant still
+  # stalled the unrelated shard.
+  for shape <- [:autocommit, :django] do
+    @tag shape: shape
+    test "more lock waiters than dirty-IO threads do not stall an unrelated shard (#{shape})",
+         %{shape: shape} do
+      lock_waiters_do_not_stall_an_unrelated_shard(shape)
+    end
+  end
+
+  defp waiter_write(conn, i, :autocommit), do: q(conn, "INSERT INTO t VALUES (?1)", [i])
+
+  defp waiter_write(conn, i, :django) do
+    with {:ok, _} <- q(conn, "BEGIN"),
+         {:ok, inserted} <- q(conn, "INSERT INTO t VALUES (?1)", [i]),
+         {:ok, _} <- q(conn, "COMMIT") do
+      {:ok, inserted}
+    end
+  end
+
+  defp lock_waiters_do_not_stall_an_unrelated_shard(shape) do
     other = open!(db_path!("other"))
     :ok = Connection.exec(other, "CREATE TABLE u (x INTEGER); INSERT INTO u VALUES (1)")
     assert {:ok, %{rows: [[1]]}} = q(other, "SELECT x FROM u")
@@ -79,7 +103,7 @@ defmodule Fathom.Shard.BusyYieldTest do
           end
 
           send(test, {:waiting, self()})
-          send(test, {:result, self(), q(conn, "INSERT INTO t VALUES (?1)", [i])})
+          send(test, {:result, self(), waiter_write(conn, i, shape)})
           Connection.close(conn)
         end)
       end
@@ -141,7 +165,7 @@ defmodule Fathom.Shard.BusyYieldTest do
     assert us < 1_500_000, "stopped only after #{div(us, 1000)} ms"
   end
 
-  test "an explicit transaction's first write keeps waiting in the handler (unchanged)" do
+  test "an explicit transaction's first write is retried within the busy budget, transaction intact" do
     {path, _holder} = locked_shard!()
     blocked = open!(path)
     :ok = Connection.set_busy_timeout(blocked, 300)
@@ -149,10 +173,27 @@ defmodule Fathom.Shard.BusyYieldTest do
 
     {us, result} = :timer.tc(fn -> q(blocked, "INSERT INTO t VALUES (2)") end)
     assert {:error, :busy} = result
-    # Waited out the 300 ms in the handler; a yield would have returned in ~0 ms and the
-    # transaction must not be retried from the BEAM.
-    assert us >= 250_000, "returned after #{div(us, 1000)} ms: the in-transaction wait yielded"
+    assert us >= 250_000, "gave up after #{div(us, 1000)} ms: the first lock was not retried"
+    assert us < 1_500_000, "gave up only after #{div(us, 1000)} ms"
     refute Connection.autocommit?(blocked), "the BUSY must not have ended the transaction"
+  end
+
+  # The BUSY a transaction gets when it already READ and then tries to become a writer while
+  # another connection holds the write lock never reaches the busy handler, and re-stepping it can
+  # never succeed (once the holder commits, the snapshot is stale). It must fail at once, as before;
+  # a retry would burn the whole 5 s busy timeout. This is what the extension's "which statement
+  # yielded" bookkeeping exists for: exqlite reports both BUSYs as the same `:busy`.
+  test "a transaction that already read is not retried when its first write hits BUSY" do
+    {path, _holder} = locked_shard!()
+    reader = open!(path)
+
+    assert {:ok, _} = q(reader, "BEGIN")
+    assert {:ok, %{rows: [[0]]}} = q(reader, "SELECT count(*) FROM t")
+
+    {us, result} = :timer.tc(fn -> q(reader, "INSERT INTO t VALUES (2)") end)
+    assert {:error, :busy} = result
+    assert us < 200_000, "an upgrade BUSY took #{div(us, 1000)} ms: it was retried"
+    refute Connection.autocommit?(reader)
   end
 
   test "a stale-snapshot write inside a transaction fails at once (not retried)" do

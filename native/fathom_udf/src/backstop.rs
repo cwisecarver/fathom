@@ -34,7 +34,7 @@
 //! `Fathom.Shard.Connection`). Exqlite's `set_busy_timeout/2` sets only exqlite's own field, so
 //! `Connection.set_busy_timeout/2` calls both. A tenant can only LOWER it, never raise it.
 //!
-//! ## Yielding autocommit lock waits to the BEAM (expert review 2026-10-20 #2)
+//! ## Yielding lock waits to the BEAM (expert review 2026-10-20 #2)
 //!
 //! Every exqlite NIF that steps a statement is `ERL_NIF_DIRTY_JOB_IO_BOUND`, so a lock wait spent
 //! sleeping in this handler holds one of the node's `+SDio` (10) dirty-IO threads. Measured: with 11
@@ -43,18 +43,28 @@
 //! including the lock holder's own COMMIT (a convoy).
 //!
 //! `fathom_busy_yield(1)` (set by `Fathom.Shard.Connection` on TENANT handles) makes this handler
-//! give up AT ONCE when the connection is in AUTOCOMMIT, so the statement returns `SQLITE_BUSY`
-//! and the owning BEAM process retries it from its own mailbox wait (`receive after`), holding no
-//! thread. Autocommit only, because only there is re-running the statement always valid: nothing
-//! of the statement survived (SQLite rolled it back) and no transaction snapshot exists. Inside an
-//! explicit transaction the handler keeps today's in-NIF ladder (decision 2026-10-20). `BEGIN
-//! IMMEDIATE` waits with autocommit still set (its `OP_Transaction` runs before `OP_AutoCommit`),
-//! so it yields too, and retrying a `BEGIN` that failed is valid.
+//! give up AT ONCE, so the statement returns `SQLITE_BUSY` and the owning BEAM process retries it
+//! from its own mailbox wait (`receive after`), holding no thread.
+//!
+//! Re-running the statement is valid exactly when THIS HANDLER was what gave up, because SQLite's
+//! btree calls the busy handler only while the connection holds no transaction on the database
+//! (`sqlite3BtreeBeginTrans` retries only while `inTransaction == TRANS_NONE`): no read snapshot to
+//! go stale, no lock, and SQLite rolled back whatever the statement began. That covers autocommit,
+//! `BEGIN IMMEDIATE`/`EXCLUSIVE` themselves, and an explicit transaction's FIRST statement (Django's
+//! `transaction.atomic`: `BEGIN` then a write). A transaction that already READ and then fails to
+//! upgrade to a writer (or `SQLITE_BUSY_SNAPSHOT`) returns BUSY WITHOUT calling the handler, and
+//! re-stepping that can never succeed. exqlite reports both as the same `:busy` (no extended result
+//! codes), so the handler records WHICH statement it yielded (`yielded_seq`, against `stmt_seq`
+//! counted by the trace hook), and `fathom_busy_retry_ms()` grants a retry budget only when the
+//! statement just before it was the one that yielded.
 //!
 //! Unlike `fathom_backstop`, the flag can be turned back OFF: the tenant `sequence` (script) path
 //! runs several autocommit statements in one `sqlite3_exec`, where a mid-script retry is NOT valid,
-//! so fathom switches yielding off around it. A tenant can do the same for its own statements; that
-//! grants nothing it lacks already (an explicit transaction waits in-NIF anyway).
+//! so fathom switches yielding off around it. A tenant can do the same for its own statements, which
+//! lets its lock waits hold a dirty-IO thread for up to the busy timeout (capped by its deadline).
+//! That is deliberate self-harm with no more reach than a tenant already has: any heavy query holds
+//! a dirty thread for up to the statement deadline. The yield protects tenants from ordinary
+//! contention, not from a hostile tenant.
 //!
 //! ## Slots taken
 //!
@@ -97,10 +107,12 @@ struct Backstop {
     start_ns: AtomicU64,
     /// How long one lock wait may last, in ms.
     busy_timeout_ms: AtomicU64,
-    /// Give up a lock wait at once in autocommit (see "Yielding autocommit lock waits").
-    yield_autocommit: AtomicBool,
-    /// The connection, for `sqlite3_get_autocommit` inside the busy handler.
-    db: *mut ffi::sqlite3,
+    /// Give up a lock wait at once (see "Yielding lock waits to the BEAM").
+    yield_on: AtomicBool,
+    /// Top-level statements started on this connection (the trace hook; triggers excluded).
+    stmt_seq: AtomicU64,
+    /// `stmt_seq` of the statement the busy handler last gave up for. 0 = none.
+    yielded_seq: AtomicU64,
 }
 
 fn now_ns() -> u64 {
@@ -149,10 +161,10 @@ pub fn busy_step(
     Some(sleep)
 }
 
-/// Whether a busy-handler call gives up at once so the BEAM retries the statement. Pure, for the
-/// unit tests.
-pub fn yields_to_beam(yield_autocommit: bool, autocommit: bool) -> bool {
-    yield_autocommit && autocommit
+/// Whether the statement running NOW (`current_seq`, the retry-budget probe) directly follows the
+/// one the busy handler yielded for. Pure, for the unit tests.
+pub fn retry_allowed(yield_on: bool, yielded_seq: u64, current_seq: u64) -> bool {
+    yield_on && yielded_seq != 0 && yielded_seq.wrapping_add(1) == current_seq
 }
 
 /// The trace text SQLite passes for a TRIGGER subprogram starts with "--". Those fire mid-statement
@@ -176,10 +188,10 @@ unsafe extern "C" fn on_progress(ctx: *mut c_void) -> c_int {
 
 unsafe extern "C" fn on_busy(ctx: *mut c_void, count: c_int) -> c_int {
     let state = &*(ctx as *const Backstop);
-    if yields_to_beam(
-        state.yield_autocommit.load(Ordering::Relaxed),
-        ffi::sqlite3_get_autocommit(state.db) != 0,
-    ) {
+    if state.yield_on.load(Ordering::Relaxed) {
+        state
+            .yielded_seq
+            .store(state.stmt_seq.load(Ordering::Relaxed), Ordering::Relaxed);
         return 0;
     }
     match busy_step(
@@ -208,6 +220,7 @@ unsafe extern "C" fn on_trace(
         let is_trigger = !x.is_null()
             && is_trigger_trace(std::ffi::CStr::from_ptr(x as *const c_char).to_bytes());
         if !is_trigger {
+            state.stmt_seq.fetch_add(1, Ordering::Relaxed);
             state.start_ns.store(now_ns(), Ordering::Relaxed);
         }
     }
@@ -255,7 +268,7 @@ unsafe extern "C" fn set_busy_timeout(
     ffi::sqlite3_result_int64(ctx, state.busy_timeout_ms.load(Ordering::Relaxed) as i64);
 }
 
-/// `fathom_busy_yield(on)`: 1 = give up autocommit lock waits at once (the BEAM retries), 0 = wait
+/// `fathom_busy_yield(on)`: 1 = give up lock waits at once (the BEAM retries), 0 = wait
 /// in the handler. Returns the setting in force (1/0). Any other argument only reads it.
 unsafe extern "C" fn set_busy_yield(
     ctx: *mut ffi::sqlite3_context,
@@ -265,30 +278,31 @@ unsafe extern "C" fn set_busy_yield(
     let state = &*(ffi::sqlite3_user_data(ctx) as *const Backstop);
     if argc == 1 {
         match ffi::sqlite3_value_int64(*argv) {
-            0 => state.yield_autocommit.store(false, Ordering::Relaxed),
-            1 => state.yield_autocommit.store(true, Ordering::Relaxed),
+            0 => state.yield_on.store(false, Ordering::Relaxed),
+            1 => state.yield_on.store(true, Ordering::Relaxed),
             _ => {}
         }
     }
     ffi::sqlite3_result_int64(
         ctx,
-        i64::from(state.yield_autocommit.load(Ordering::Relaxed)),
+        i64::from(state.yield_on.load(Ordering::Relaxed)),
     );
 }
 
 /// `fathom_busy_retry_ms()`: how long the BEAM may keep retrying a statement that just returned
-/// `SQLITE_BUSY` — the busy timeout when this connection yields AND is in autocommit, else 0 (do not
-/// retry: the handler already waited, or re-stepping is not valid). One call instead of a separate
-/// autocommit read and busy-timeout read on the contended path.
+/// `SQLITE_BUSY` — the busy timeout when this handler yielded for the statement just before this
+/// one, else 0 (do not retry: the handler already waited, or the BUSY never reached the handler and
+/// re-stepping is not valid). Call it as the very next statement after the BUSY.
 unsafe extern "C" fn busy_retry_ms(
     ctx: *mut ffi::sqlite3_context,
     _argc: c_int,
     _argv: *mut *mut ffi::sqlite3_value,
 ) {
     let state = &*(ffi::sqlite3_user_data(ctx) as *const Backstop);
-    let ms = if yields_to_beam(
-        state.yield_autocommit.load(Ordering::Relaxed),
-        ffi::sqlite3_get_autocommit(state.db) != 0,
+    let ms = if retry_allowed(
+        state.yield_on.load(Ordering::Relaxed),
+        state.yielded_seq.load(Ordering::Relaxed),
+        state.stmt_seq.load(Ordering::Relaxed),
     ) {
         state.busy_timeout_ms.load(Ordering::Relaxed)
     } else {
@@ -307,8 +321,9 @@ pub fn install(db: &Connection) -> Result<()> {
         timeout_ns: AtomicU64::new(0),
         start_ns: AtomicU64::new(0),
         busy_timeout_ms: AtomicU64::new(DEFAULT_BUSY_TIMEOUT_MS),
-        yield_autocommit: AtomicBool::new(false),
-        db: unsafe { db.handle() },
+        yield_on: AtomicBool::new(false),
+        stmt_seq: AtomicU64::new(0),
+        yielded_seq: AtomicU64::new(0),
     }));
     let name = CString::new("fathom_backstop").expect("static name");
     let busy_name = CString::new("fathom_busy_timeout").expect("static name");
@@ -456,13 +471,15 @@ mod tests {
     }
 
     #[test]
-    fn only_an_autocommit_wait_with_yield_on_goes_to_the_beam() {
-        assert!(yields_to_beam(true, true));
-        // Explicit transaction: keep the in-handler ladder (re-stepping is not always valid).
-        assert!(!yields_to_beam(true, false));
-        // Yield off (fathom's own handles, the tenant script path): unchanged.
-        assert!(!yields_to_beam(false, true));
-        assert!(!yields_to_beam(false, false));
+    fn a_retry_is_granted_only_for_the_statement_the_handler_yielded() {
+        // The probe (seq 8) directly follows the yielded statement (seq 7).
+        assert!(retry_allowed(true, 7, 8));
+        // The BUSY never reached the handler (a snapshot / upgrade BUSY): the last yield is older.
+        assert!(!retry_allowed(true, 5, 8));
+        // Nothing ever yielded.
+        assert!(!retry_allowed(true, 0, 1));
+        // Yield off (fathom's own handles, the tenant script path): the handler waited itself.
+        assert!(!retry_allowed(false, 7, 8));
     }
 
     #[test]
