@@ -946,7 +946,7 @@ defmodule Fathom.Shard.Replication.Session do
       {:ok, header, fd} ->
         state = %{state | wal_fd: fd} |> note_header(header)
 
-        case ship_planned(state, wal_path, epoch, header) do
+        case ship_planned(state, wal_path, epoch, header, deadline) do
           # Nothing left to plan. On the first round that means the commit wrote no frames; on a
           # later one it means the catch-up converged.
           :nothing when first? ->
@@ -1028,7 +1028,7 @@ defmodule Fathom.Shard.Replication.Session do
   # tenant's commit. The quiet half: a follower that is up to date would have been treated as one
   # that had not answered, so the commit waited on strictly worse replicas than the ones it already
   # had.
-  defp ship_planned(state, wal_path, epoch, header) do
+  defp ship_planned(state, wal_path, epoch, header, deadline) do
     {plans, current} =
       Enum.reduce(shippers(), {[], 0}, fn shipper, {plans, current} ->
         case Primary.plan(Map.get(state.followers, shipper), header, max_push_bytes()) do
@@ -1076,7 +1076,7 @@ defmodule Fathom.Shard.Replication.Session do
 
       case built do
         {:ok, pushes, state} ->
-          tag(deliver(state, header, sendable, pushes, current, skipped), plans, header)
+          tag(deliver(state, header, sendable, pushes, current, skipped, deadline), plans, header)
 
         {:error, reason, state} ->
           read_failed(state, reason)
@@ -1268,7 +1268,26 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  defp deliver(state, header, plans, pushes, current, skipped) do
+  # THE QUORUM WAIT GETS WHAT IS LEFT OF THE COMMIT'S DEADLINE, NOT A FRESH `timeout()` (expert
+  # review 2026-10-20 #4). `collect/6` used to hand `ship_quorum` the full call timeout every round,
+  # so a single round already outlived `commit_deadline_budget/0` — the handler then replied after
+  # the caller's `GenServer.call` had given up (`{:session_down, :timeout}`, the exact outcome the
+  # 2026-08-31 #21 reply margin exists to prevent), and a multi-round or post-seed commit could hold
+  # the Session for up to one more `timeout()` per round past its caller. A shorter wait can only
+  # refuse, never ack, so this is safety-neutral. Out of time before sending: refuse without sending
+  # — and without recording an expectation for a push that never left.
+  defp deliver(state, header, plans, pushes, current, skipped, deadline) do
+    needed = max(quorum() - current, 0)
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if needed > 0 and remaining <= 0 do
+      {:error, {:no_quorum, :timeout}, state, for({s, reason} <- skipped, do: {s, reason, 0})}
+    else
+      send_round(state, header, plans, pushes, skipped, needed, remaining)
+    end
+  end
+
+  defp send_round(state, header, plans, pushes, skipped, needed, remaining) do
     # Recorded BEFORE anything is sent, because a reply can be observed by a later commit's drain
     # with no plan in scope. See the `inflight` note in `init/1`.
     #
@@ -1305,7 +1324,7 @@ defmodule Fathom.Shard.Replication.Session do
         inflight_at: Map.merge(state.inflight_at, sent_at)
     }
 
-    case max(quorum() - current, 0) do
+    case needed do
       # Followers that are already current carry the quorum on their own. The laggards still get
       # their bytes — skipping them is how a replica falls behind forever — but the tenant does not
       # wait for an ack it does not need.
@@ -1317,8 +1336,8 @@ defmodule Fathom.Shard.Replication.Session do
         # laggard on a quiet shard (expert review 2026-10-17 #9). Seeding skips stay silent, as before.
         {:ok, state, for({s, :already_in_flight} <- skipped, do: {s, :already_in_flight, 0})}
 
-      needed ->
-        collect(state, pushes, needed, skipped, reset_round?(plans))
+      _ ->
+        collect(state, pushes, needed, skipped, reset_round?(plans), remaining)
     end
   end
 
@@ -1341,11 +1360,11 @@ defmodule Fathom.Shard.Replication.Session do
   defp reset_round?(plans),
     do: Enum.any?(plans, fn {_shipper, {kind, _, _}} -> kind == :reset end)
 
-  defp collect(state, pushes, needed, skipped, reset?) do
+  defp collect(state, pushes, needed, skipped, reset?, timeout) do
     t_collect = System.monotonic_time()
 
     result =
-      Replication.ship_quorum(pushes, needed, timeout(),
+      Replication.ship_quorum(pushes, needed, timeout,
         skip: skipped,
         shard_id: state.shard_id
       )
