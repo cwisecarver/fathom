@@ -743,6 +743,13 @@ defmodule Fathom.Telemetry do
         description:
           "Drop-flush route taken (#3) — :snapshot when connections are still checked out (VACUUM INTO, quiescent), :checkpoint when the shard is idle (uploads the live file in place). The live-file path is unsafe with live writers because the change guard between the Content-MD5 read and the body read compares second-resolution mtime"
       ),
+      # Expert review 2026-10-20 #28: which scan route a periodic flush took. Bounded two-value tag.
+      counter("fathom.shard.flush.route.count",
+        event_name: [:fathom, :shard, :flush, :route],
+        tags: [:route],
+        description:
+          "Periodic-flush route (2026-10-20 #28) — :pinned_live uploads the live .db under a read pin when the WAL is folded (no VACUUM INTO), :vacuum is the snapshot route. A busy fleet that never takes :pinned_live is expected; an idle-dirty one that never does means the folded-WAL check is not firing"
+      ),
       counter("fathom.shard.flush.too_large.count",
         event_name: [:fathom, :shard, :flush, :too_large],
         description:

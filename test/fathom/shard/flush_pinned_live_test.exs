@@ -187,6 +187,45 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
     assert object_rows(id) == [1]
   end
 
+  # Expert review 2026-10-20 #32: mmap for the flush scan is DEFAULT OFF and only ever applied to a
+  # flush-scan handle (never a tenant's). Off => the pragma stays at SQLite's own default.
+  test "mmap_size is untouched by default and set only when :flush_scan_mmap_bytes is" do
+    {:ok, conn} =
+      Connection.open(
+        Path.join(System.tmp_dir!(), "mmap_#{System.unique_integer([:positive])}.db")
+      )
+
+    on_exit(fn -> Connection.close(conn) end)
+
+    {:ok, default} = Connection.pragma(conn, "mmap_size")
+    Fathom.Shard.apply_scan_mmap(conn)
+    assert Connection.pragma(conn, "mmap_size") == {:ok, default}, "applied with the flag unset"
+
+    Application.put_env(:fathom, :flush_scan_mmap_bytes, 8 * 1_048_576)
+    on_exit(fn -> Application.delete_env(:fathom, :flush_scan_mmap_bytes) end)
+    Fathom.Shard.apply_scan_mmap(conn)
+    assert {:ok, n} = Connection.pragma(conn, "mmap_size")
+    assert n == 8 * 1_048_576 or n == 0, "pragma not applied (n=#{n})"
+  end
+
+  test "with mmap on, both flush routes still upload a complete, sound object", ctx do
+    %{id: id, coordinator: coordinator, path: path} = ctx
+    Application.put_env(:fathom, :flush_scan_mmap_bytes, 8 * 1_048_576)
+    on_exit(fn -> Application.delete_env(:fathom, :flush_scan_mmap_bytes) end)
+
+    write_then_go_idle(id, path, 1..20)
+    flush!(coordinator)
+    assert_received {:route, :pinned_live}
+    assert object_rows(id) == Enum.to_list(1..20)
+
+    {:ok, conn} = ShardExecutor.open(id)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (21)"))
+    on_exit(fn -> ShardExecutor.close(conn) end)
+    flush!(coordinator)
+    assert_received {:route, :vacuum}
+    assert object_rows(id) == Enum.to_list(1..21)
+  end
+
   test "the flag off keeps the VACUUM INTO route for a folded shard", ctx do
     %{id: id, coordinator: coordinator, path: path} = ctx
     Application.put_env(:fathom, :flush_pinned_live_upload, false)

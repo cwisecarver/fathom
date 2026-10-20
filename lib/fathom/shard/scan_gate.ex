@@ -44,7 +44,11 @@ defmodule Fathom.Shard.ScanGate do
 
   @doc "Pure derivation of the default: leave 2 dirty-IO threads free, never below 1."
   @spec default_cap(pos_integer()) :: pos_integer()
-  def default_cap(dirty_io_schedulers), do: max(1, dirty_io_schedulers - 2)
+  def default_cap(dirty_io_schedulers)
+      when is_integer(dirty_io_schedulers) and dirty_io_schedulers > 3,
+      do: dirty_io_schedulers - 2
+
+  def default_cap(_dirty_io_schedulers), do: 1
 
   @doc """
   Wait for a scan permit, up to `timeout_ms`. `:ok` — held until `release/1` or the caller exits.

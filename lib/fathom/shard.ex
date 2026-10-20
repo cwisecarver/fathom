@@ -3988,6 +3988,8 @@ defmodule Fathom.Shard do
         result =
           case classify_checkpoint(cp) do
             :ok ->
+              apply_scan_mmap(conn)
+
               Integrity.classify_quick_check(Connection.query(conn, "PRAGMA quick_check", []))
 
             err ->
@@ -4775,7 +4777,10 @@ defmodule Fathom.Shard do
             with :ok <-
                    Fathom.Shard.ScanGate.with_permit(
                      @scan_permit_wait_ms,
-                     fn -> Integrity.run_quick_check(pin) end
+                     fn ->
+                       apply_scan_mmap(pin)
+                       Integrity.run_quick_check(pin)
+                     end
                    ),
                  :ok <- after_snapshot_hook(state),
                  :ok <- recheck_before_put(state) do
@@ -5088,10 +5093,32 @@ defmodule Fathom.Shard do
     end)
   end
 
+  # MMAP FOR THE FLUSH SCAN (expert review 2026-10-20 #32), DEFAULT OFF. `quick_check` and
+  # `VACUUM INTO` pread every page of the shard on a dirty-IO thread (measured 20-35% of the scan on
+  # macOS; Linux unmeasured — `scripts/flush_scan_mmap_probe.exs` measures it). `:flush_scan_mmap_bytes`
+  # (a positive integer) sets `PRAGMA mmap_size` on the FLUSH-SCAN handles only: this snapshot
+  # connection, the pinned-live pin, and the drop path's `checkpoint_and_verify/1`. NEVER on tenant
+  # handles and never process-wide (`SQLITE_DEFAULT_MMAP_SIZE`): a mapped page that disappears
+  # (file truncated under the map, bad media) is SIGBUS, which kills the whole node, where a pread
+  # returns an error and fails one shard's flush. That blast-radius trade is why this ships off
+  # until the Linux probe says the win is worth it. Best effort: a failing pragma is ignored.
+  @doc false
+  @spec apply_scan_mmap(reference()) :: :ok
+  def apply_scan_mmap(conn) do
+    case Application.get_env(:fathom, :flush_scan_mmap_bytes) do
+      n when is_integer(n) and n > 0 -> _ = Connection.exec(conn, "PRAGMA mmap_size=#{n}")
+      _ -> :ok
+    end
+
+    :ok
+  end
+
   defp verify_and_snapshot_unpermitted(state, temp) do
     case Connection.open(state.path) do
       {:ok, conn} ->
         try do
+          apply_scan_mmap(conn)
+
           with :ok <- Integrity.run_quick_check(conn) do
             do_snapshot(conn, temp, state.id)
           end
