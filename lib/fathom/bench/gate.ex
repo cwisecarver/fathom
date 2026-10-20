@@ -180,6 +180,9 @@ defmodule Fathom.Bench.Gate do
     # The WebSocket round trip, django-libsql's path (expert review 2026-10-19 #12); every other
     # wire metric is HTTP. Needs mint_web_socket, now a prod-compiled dep. Watch-only.
     {:hrana_ws_rt_us, :higher_worse, :watch},
+    # The same WS round trip after an idle gap, auth on, prod listener settings (expert review
+    # 2026-10-20 #25). The only gated metric that is not a hot loop. Watch-only until a band exists.
+    {:hrana_ws_sparse_rt_us, :higher_worse, :watch},
     # An 8-column point read (expert review 2026-10-19 #10): the per-column encode cost the
     # one-cell SELECT 1 metrics cannot see. Watch-only until a band is measured.
     {:hrana_wide_rt_us, :higher_worse, :watch},

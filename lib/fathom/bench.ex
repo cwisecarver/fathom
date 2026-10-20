@@ -87,6 +87,9 @@ defmodule Fathom.Bench do
   # always was concurrent S3-pull throughput, kept under its original series name for continuity.
   @warm_shards 200
   @hrana_rt_samples 200
+  # hrana_ws_sparse_rt_us: few samples, each after an idle gap (expert review 2026-10-20 #25).
+  @hrana_sparse_samples 20
+  @hrana_sparse_gap_ms 200
   @wire_rows 1_000
 
   @all_metrics [
@@ -118,6 +121,7 @@ defmodule Fathom.Bench do
     :pull_decode,
     :s3_loopback,
     :hrana_ws,
+    :hrana_ws_sparse,
     :same_shard_stmt,
     :serial_checkout,
     :hrana_wide
@@ -258,6 +262,11 @@ defmodule Fathom.Bench do
       # WATCH-ONLY (expert review 2026-10-19 #12): the WebSocket round trip, the path django-libsql
       # uses. Every other wire metric is HTTP.
       hrana_ws_rt_us: run_if(only, :hrana_ws, fn -> hrana_ws_rt_us(opts) end),
+      # WATCH-ONLY (expert review 2026-10-20 #25): the same WS round trip but SPARSE (an idle gap
+      # before every request), auth on, prod listener settings. Every other hrana_* metric is a hot
+      # loop; sparse traffic measured ~10x the hot cost.
+      hrana_ws_sparse_rt_us:
+        run_if(only, :hrana_ws_sparse, fn -> hrana_ws_sparse_rt_us(opts) end),
       # HOT-SHARD CONTENTION, watch-only (expert review 2026-10-19 #5). Last for the same reason as
       # the two above: each starts the ShardLoad/ShardLatency/Lru tables in its own scoped setup.
       # Many streams on ONE shard through the executor (the per-statement counter keys), and one
@@ -1101,7 +1110,10 @@ defmodule Fathom.Bench do
     {:ok, _} = Application.ensure_all_started(:bandit)
     {:ok, _} = Application.ensure_all_started(:mint)
 
-    {:ok, sup, port} = Fathom.Bench.HranaClient.start_listener()
+    # Production's listener settings (expert review 2026-10-20 #25). SERIES BREAK: until 2026-10-20 this
+    # ran Bandit's defaults (validate_text_frames: true, no hibernate_after), which prod does not;
+    # earlier hrana_ws_rt_us entries are not comparable.
+    {:ok, sup, port} = Fathom.Bench.HranaClient.start_listener(prod: true)
 
     try do
       {:ok, client} = Fathom.Bench.HranaClient.connect(port, shard)
@@ -1121,6 +1133,124 @@ defmodule Fathom.Bench do
     after
       Fathom.Bench.HranaClient.stop_listener(sup)
       Fathom.Shards.drain(shard, 5_000)
+    end
+  end
+
+  @doc """
+  `hrana_ws_sparse_rt_us` - median µs of a `SELECT 1` over the Hrana WEBSOCKET path when each request
+  follows an IDLE GAP (default 200 ms; `:hrana_sparse_gap_ms`), with Hrana auth REQUIRED and
+  production's listener settings (expert review 2026-10-20 #25). Watch-only.
+
+  Every other `hrana_*` metric is a hot loop: the previous request's work keeps the scheduler awake,
+  caches warm and the connection process un-hibernated. Real django-libsql traffic is sparse, and
+  sparse requests measured ~10x the hot cost (in-process 8 µs at a 0 ms gap vs 103-110 µs at
+  200 ms-1 s; WS 230-370 µs after 1.5 s idle vs ~55 µs), so wake-dependent regressions (a per-request
+  timer or watchdog, hibernation, scheduler wake) passed the gate unseen. The auth-on per-statement
+  path (`HranaAuth.version_current?` -> `Revocations.cached_floor/1`) is also exercised here and
+  nowhere else.
+
+  Kept small (default 20 samples x gap) so it adds ~4 s, not minutes. The default gap is below the 5 s
+  hibernate delay, so it measures the idle wake, not the hibernate wake; a `:hrana_sparse_gap_ms`
+  above `:hrana_ws_hibernate_ms` measures that.
+
+  Asserts its own preconditions: the gap really elapsed before every timed request, every request ran
+  on the SAME socket, every reply is `[[1]]`, auth was enforced (a missing token is refused and the
+  authorize callback ran at `hello`), and the revocation floor stayed a cache hit.
+  """
+  @spec hrana_ws_sparse_rt_us(keyword()) :: float() | nil
+  def hrana_ws_sparse_rt_us(opts \\ []) do
+    alias Fathom.Bench.HranaClient
+    alias Fathom.HranaAuth
+    alias Fathom.HranaAuth.Revocations
+
+    samples = Keyword.get(opts, :hrana_sparse_samples, @hrana_sparse_samples)
+    gap_ms = Keyword.get(opts, :hrana_sparse_gap_ms, @hrana_sparse_gap_ms)
+    shard = "benchwssparse"
+    keys = [:hrana_auth, :hrana_token_max_age, :hrana_token_secret]
+    prev = Map.new(keys, &{&1, Application.get_env(:fathom, &1)})
+
+    setup(opts)
+    Application.put_env(:fathom, :shard_base_domain, nil)
+    Application.put_env(:fathom, :default_shard, nil)
+    {:ok, _} = Application.ensure_all_started(:bandit)
+    {:ok, _} = Application.ensure_all_started(:mint)
+
+    Application.put_env(:fathom, :hrana_auth, :required)
+    Application.put_env(:fathom, :hrana_token_max_age, 3_600)
+
+    if Application.get_env(:fathom, :hrana_token_secret) in [nil, ""],
+      do: Application.put_env(:fathom, :hrana_token_secret, String.duplicate("a", 64))
+
+    revocations =
+      case Revocations.start_link([]) do
+        {:ok, pid} -> pid
+        {:error, {:already_started, _}} -> nil
+      end
+
+    calls = :counters.new(1, [])
+
+    authorize = fn arg, tok ->
+      :counters.add(calls, 1, 1)
+      HranaAuth.authorize(arg, tok)
+    end
+
+    {:ok, sup, port} = HranaClient.start_listener(prod: true, authorize: authorize)
+
+    try do
+      # Signed directly (see hrana_open_auth_rt): the public mint writes a Postgres ledger.
+      token =
+        Phoenix.Token.sign(
+          Application.fetch_env!(:fathom, :hrana_token_secret),
+          "fathom hrana shard",
+          %{"s" => shard, "v" => 1, "e" => System.system_time(:second) + 3_600}
+        )
+
+      Revocations.put(shard, 1, nil)
+
+      unless match?({:error, %Filo.Error{status: 401}}, HranaAuth.authorize(shard, nil)) and
+               match?({:ok, {:rw, _}}, HranaAuth.authorize(shard, token)),
+             do:
+               raise("hrana_ws_sparse_rt_us: :required auth is not enforcing - measuring nothing")
+
+      {:ok, client} = HranaClient.connect(port, shard, auth_token: token)
+
+      unless :counters.get(calls, 1) >= 1,
+        do: raise("hrana_ws_sparse_rt_us: the authorize callback never ran at hello")
+
+      # Warm the shard and the stream; not timed.
+      {:ok, client, _} = HranaClient.execute(client, "SELECT 1")
+      socket = client.conn.socket
+
+      {client, us, _done} =
+        Enum.reduce(1..samples, {client, [], System.monotonic_time(:millisecond)}, fn _,
+                                                                                      {c, acc,
+                                                                                       done} ->
+          Process.sleep(gap_ms)
+          started = System.monotonic_time(:millisecond)
+
+          unless started - done >= gap_ms,
+            do: raise("hrana_ws_sparse_rt_us: idle gap #{started - done} ms < #{gap_ms} ms")
+
+          {t, {:ok, c, %{rows: [[1]]}}} = :timer.tc(fn -> HranaClient.execute(c, "SELECT 1") end)
+
+          unless c.conn.socket == socket,
+            do: raise("hrana_ws_sparse_rt_us: the socket changed mid-run (reconnected)")
+
+          {c, [t | acc], System.monotonic_time(:millisecond)}
+        end)
+
+      now = System.monotonic_time(:millisecond)
+
+      unless match?([{_, 1, nil, exp}] when exp > now, :ets.lookup(Revocations, shard)),
+        do: raise("hrana_ws_sparse_rt_us: the revocation floor lapsed mid-run")
+
+      HranaClient.close(client)
+      p50(us)
+    after
+      HranaClient.stop_listener(sup)
+      Fathom.Shards.drain(shard, 5_000)
+      if revocations, do: GenServer.stop(revocations)
+      Enum.each(keys, &restore_env(&1, Map.fetch!(prev, &1)))
     end
   end
 
