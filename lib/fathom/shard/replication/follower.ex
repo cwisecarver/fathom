@@ -944,6 +944,9 @@ defmodule Fathom.Shard.Replication.Follower do
   defp worker_init(sock, name, binding, reader, closed) do
     # Replies are sealed with this connection's binding, which lives in the process dictionary of
     # whoever encodes them (see `Protocol.seal/1`).
+    # `spawn_opt(fn -> ...)` makes initial_call `{:erlang, :apply, 2}`, invisible to role attribution;
+    # the label is what `chaos.sh repl-cpu` reads (expert review 2026-10-20 #26).
+    Process.set_label(:replication_follower_worker)
     Protocol.adopt_binding(binding)
     worker_loop(sock, name, reader, closed, %{}, %{})
   end
@@ -1039,6 +1042,8 @@ defmodule Fathom.Shard.Replication.Follower do
 
     :erlang.spawn_opt(
       fn ->
+        # Labelled for `chaos.sh repl-cpu` role attribution (expert review 2026-10-20 #26).
+        Process.set_label(:replication_follower_push_task)
         Protocol.adopt_binding(binding)
         _ = handle_frame(sock, name, %{}, push)
         send(reader, {:frame_done, size})
