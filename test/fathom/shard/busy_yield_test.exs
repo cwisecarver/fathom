@@ -231,6 +231,43 @@ defmodule Fathom.Shard.BusyYieldTest do
     assert {:ok, %{rows: [[1]]}} = q(blocked, "SELECT fathom_busy_yield(-1)")
   end
 
+  # Round-4 durability review 2026-10-20 F3 (claim DISPROVEN; this is an invariant guard, not a
+  # regression test). The review predicted that in rollback-journal mode (a tenant can pick it) a
+  # COMMIT needing EXCLUSIVE yields at once and is never retried, so the client gets an instant
+  # BUSY. Measured: the same test passes with and without the prescribed `txn_state < WRITE`
+  # check, because `fathom_busy_retry_ms()` grants the retry whenever the previous statement
+  # yielded, and re-stepping a BUSY COMMIT is valid. This pins the behaviour the review feared
+  # losing, so a future change to the retry bookkeeping cannot silently drop it.
+  test "a rollback-journal COMMIT waits for readers instead of failing BUSY at once" do
+    path = db_path!("rollback")
+    {:ok, writer} = Connection.open(path, tenant?: true, wal?: false)
+    on_exit(fn -> Connection.close(writer) end)
+    {:ok, reader} = Connection.open(path, tenant?: true, wal?: false)
+    on_exit(fn -> Connection.close(reader) end)
+
+    assert {:ok, %{rows: [["delete"]]}} = q(writer, "PRAGMA journal_mode")
+    :ok = Connection.exec(writer, "CREATE TABLE t (a INTEGER)")
+
+    # The reader holds a SHARED lock (explicit transaction that has read).
+    assert {:ok, _} = q(reader, "BEGIN")
+    assert {:ok, %{rows: [[0]]}} = q(reader, "SELECT count(*) FROM t")
+
+    assert {:ok, _} = q(writer, "BEGIN")
+    assert {:ok, _} = q(writer, "INSERT INTO t VALUES (1)")
+
+    release =
+      Task.async(fn ->
+        Process.sleep(300)
+        q(reader, "COMMIT")
+      end)
+
+    {us, result} = :timer.tc(fn -> q(writer, "COMMIT") end)
+    assert {:ok, _} = result, "COMMIT failed after #{div(us, 1000)} ms: #{inspect(result)}"
+    assert us >= 250_000, "COMMIT returned after #{div(us, 1000)} ms: it did not wait for readers"
+    assert {:ok, _} = Task.await(release)
+    assert Connection.autocommit?(writer)
+  end
+
   test "fathom's own (non-tenant) handles never yield" do
     conn = Connection.open(db_path!("own")) |> then(fn {:ok, c} -> c end)
     on_exit(fn -> Connection.close(conn) end)
