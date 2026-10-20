@@ -829,7 +829,8 @@ defmodule Fathom.Shard.Connection do
   statement step via the extension's `fathom_conn_state()` and reports the flag as `autocommit?`
   (expert review 2026-10-17 #6); `autocommit?` is nil when that path was not taken.
   """
-  @spec query(reference(), String.t(), list(), keyword()) :: {:ok, map()} | {:error, term()}
+  @spec query(reference(), String.t(), list() | {list(), [{String.t(), term()}]}, keyword()) ::
+          {:ok, map()} | {:error, term()}
   def query(conn, sql, args, opts \\ []) do
     dml? = Keyword.get(opts, :dml?, true)
     read? = Keyword.get(opts, :read?, false)
@@ -883,7 +884,7 @@ defmodule Fathom.Shard.Connection do
       # A `bind` failure never steps the statement, so there is nothing to reset. Pinned by
       # `NifDispatchTest`: a second handle's `wal_checkpoint(TRUNCATE)` after every outcome.
       try do
-        with :ok <- Sqlite3.bind(stmt, args),
+        with :ok <- bind_args(stmt, args),
              {:ok, rows, row_count} <- reset_if_abandoned(stmt, collect(conn, stmt, row_cap())) do
           # Post-step column read when the schema moved under this connection (expert review
           # 2026-08-26 #7). Only on the `:refresh` path — a DDL happened somewhere since this
@@ -950,6 +951,73 @@ defmodule Fathom.Shard.Connection do
           _ = Sqlite3.reset(stmt)
           :erlang.raise(kind, reason, __STACKTRACE__)
       end
+    end
+  end
+
+  # Plain positional args take exqlite's bind untouched (the hot path). `{positional, named}` is a
+  # Hrana statement carrying `named_args` (expert review 2026-10-20 #10): each name is resolved to
+  # its parameter index with `sqlite3_bind_parameter_index` (exqlite's `bind_parameter_index`), the
+  # values are merged with the positional ones into ONE index-ordered list, and exqlite's own bind
+  # does the (parameterized) binding and the count check. No SQL parsing, no interpolation.
+  # exqlite's own map bind cannot be used: it needs every parameter named and every name prefixed.
+  # Per the Hrana spec a client may send the name with or without its `:`/`@`/`$` prefix.
+  defp bind_args(stmt, args) when is_list(args), do: Sqlite3.bind(stmt, args)
+
+  defp bind_args(stmt, {positional, named}) do
+    case Sqlite3.bind_parameter_count(stmt) do
+      {:error, reason} ->
+        {:error, reason}
+
+      count ->
+        slots =
+          positional
+          |> Enum.with_index(1)
+          |> Map.new(fn {value, idx} -> {idx, value} end)
+
+        slots =
+          Enum.reduce(named, slots, fn {name, value}, acc ->
+            idx = named_index(stmt, name)
+
+            cond do
+              idx == 0 ->
+                raise ArgumentError, "unknown named parameter: #{inspect(name)}"
+
+              Map.has_key?(acc, idx) ->
+                raise ArgumentError,
+                      "parameter #{inspect(name)} (index #{idx}) is bound twice " <>
+                        "(positional and named arguments overlap)"
+
+              true ->
+                Map.put(acc, idx, value)
+            end
+          end)
+
+        if map_size(slots) != count or Enum.any?(Map.keys(slots), &(&1 > count)) do
+          raise ArgumentError,
+                "expected #{count} arguments, got #{map_size(slots)} " <>
+                  "(#{length(positional)} positional, #{length(named)} named)"
+        end
+
+        Sqlite3.bind(stmt, for(i <- 1..count//1, do: Map.fetch!(slots, i)))
+    end
+  end
+
+  defp named_index(stmt, <<c, _::binary>> = name) when c in [?:, ?@, ?$],
+    do: param_index(stmt, name)
+
+  defp named_index(stmt, name) do
+    Enum.find_value([":", "@", "$"], 0, fn prefix ->
+      case param_index(stmt, prefix <> name) do
+        0 -> nil
+        idx -> idx
+      end
+    end)
+  end
+
+  defp param_index(stmt, name) do
+    case Exqlite.Sqlite3NIF.bind_parameter_index(stmt, name) do
+      idx when is_integer(idx) -> idx
+      _ -> 0
     end
   end
 

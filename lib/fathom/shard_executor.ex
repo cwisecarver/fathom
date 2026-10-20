@@ -338,6 +338,17 @@ defmodule Fathom.ShardExecutor do
            status: 403
          }}
 
+      # The migration capture on the template records positional args only; replaying a named
+      # statement from it would bind nothing. Refuse loudly rather than capture a broken chain
+      # (expert review 2026-10-20 #10).
+      opts.template? and stmt.named_args != [] ->
+        {:error,
+         %Error{
+           message: "named_args are not supported on the template shard (migration capture)",
+           code: "FILO_NAMED_ARGS_UNSUPPORTED",
+           status: 400
+         }}
+
       true ->
         run_statement(handle, stmt, head, dml?, ddl?)
     end
@@ -355,11 +366,14 @@ defmodule Fathom.ShardExecutor do
 
   defp run_statement(
          {pid, _ref, conn, shard_id, _scope, _ver, opts},
-         %Stmt{sql: sql, args: args},
+         %Stmt{sql: sql, args: args, named_args: named_args},
          head,
          dml?,
          ddl?
        ) do
+    # Hrana `named_args` (expert review 2026-10-20 #10) are bound by name in `Connection.query`;
+    # the common positional-only statement keeps the plain list.
+    bind = if named_args == [], do: args, else: {args, named_args}
     started = System.monotonic_time()
     schema_before = if ddl?, do: schema_version(conn)
 
@@ -375,7 +389,7 @@ defmodule Fathom.ShardExecutor do
     # 2026-10-17 #6).
     repl_on? = Session.enabled?()
 
-    case Connection.query(conn, sql, args,
+    case Connection.query(conn, sql, bind,
            dml?: dml?,
            read?: read?,
            deadline: true,

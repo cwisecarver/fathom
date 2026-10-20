@@ -111,9 +111,20 @@ defmodule Fathom.Bench.HranaClient do
   `{:ok, client, %{rows: rows, cols: cols, affected_row_count: n}}` with rows as native Elixir
   values — the client comes back because `next_id` and the Mint conn advance on every request.
   """
-  @spec execute(t(), String.t(), list()) :: {:ok, t(), map()} | {:error, term()}
-  def execute(client, sql, args \\ []) do
+  @spec execute(t(), String.t(), list(), [{String.t(), term()}]) ::
+          {:ok, t(), map()} | {:error, term()}
+  def execute(client, sql, args \\ [], named_args \\ []) do
     stmt = %{"sql" => sql, "args" => Enum.map(args, &encode_value/1)}
+
+    stmt =
+      if named_args == [],
+        do: stmt,
+        else:
+          Map.put(
+            stmt,
+            "named_args",
+            Enum.map(named_args, fn {n, v} -> %{"name" => n, "value" => encode_value(v)} end)
+          )
 
     case request(client, %{"type" => "execute", "stream_id" => client.stream_id, "stmt" => stmt}) do
       {:ok, client, %{"result" => result}} ->
