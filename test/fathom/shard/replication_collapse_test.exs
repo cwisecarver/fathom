@@ -34,6 +34,8 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   alias Fathom.Shards
   alias Fathom.Test.PausablePeer
 
+  @small_cap 16_384
+
   setup do
     id = "repl_collapse_#{System.unique_integer([:positive])}"
     root = Path.join(System.tmp_dir!(), "replcollapse_#{System.unique_integer([:positive])}")
@@ -141,6 +143,10 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     for name <- names, do: Follower.seed(name, id, epoch, 0, 0, 0, lineage)
   end
 
+  defp holders(names, id, expected) do
+    Enum.count(names, fn name -> File.read(Follower.wal_path(name, id)) == {:ok, expected} end)
+  end
+
   defp session!(id) do
     [{pid, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
     pid
@@ -171,9 +177,195 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     end)
   end
 
+  defp await_no_inflight!(session, timeout \\ 3_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn ->
+      cond do
+        :sys.get_state(session).inflight == %{} -> true
+        System.monotonic_time(:millisecond) > deadline -> false
+        true -> Process.sleep(10) && nil
+      end
+    end)
+    |> Enum.find(&is_boolean/1)
+    |> assert("the released follower's reply never settled")
+  end
+
   defp shipper_for(port) do
     Enum.find(Fleet.shippers(), fn s -> :sys.get_state(s).port == port end) ||
       flunk("no shipper for port #{port}")
+  end
+
+  # ------------------------------------------------------------------------------------------
+  # #3
+  # ------------------------------------------------------------------------------------------
+
+  # The rig's dominant failure: with 16-32 writers the WAL grows MB/s, one follower (a non-quorum
+  # laggard, here held by a PausablePeer) falls more than one per-push cap behind, and from then on
+  # `complete?/2` — "every planned follower reached the CURRENT extent" — is false every round, so
+  # every commit waited out its deadline for a follower the quorum did not need.
+  test "#3: one follower held past the per-push cap does not fail every commit", ctx do
+    %{id: id, root: root} = ctx
+    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3)
+    {peer, pcx} = proxy!(pc)
+    enable!([pa, pb, pcx], cap: @small_cap, timeout: 1_000, catchup: 0)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b TEXT)", [])
+    preseed_current!([a, b, c], id, coordinator)
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    :ok = PausablePeer.pause(peer)
+    blob = String.duplicate("x", 3_000)
+
+    for i <- 1..8 do
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?, ?)", [i, blob])
+      {reply, ms} = timed_commit(id, wal, coordinator)
+
+      assert reply == :ok,
+             "commit #{i} failed #{inspect(reply)} after #{ms} ms although two followers (a " <>
+               "quorum) are live and only the third is held — the catch-up loop waited for a " <>
+               "follower the quorum does not need"
+
+      assert ms < 500, "commit #{i} took #{ms} ms: it waited on the held follower"
+
+      assert holders([a, b], id, File.read!(wal)) == 2,
+             "the commit acked before the quorum held its bytes"
+    end
+
+    # PRECONDITION: the held follower really is more than one cap behind, so the capped-plan path
+    # the bug lived on was exercised (otherwise this passes both ways).
+    gap = byte_size(File.read!(wal)) - Follower.state_of(c, id).next_offset
+
+    assert gap > @small_cap,
+           "the held follower is only #{gap} B behind — the test measured nothing"
+  end
+
+  # Same mechanism, reached through a seed in flight: a follower being seeded is planned (it counts
+  # in the quorum's denominator) but not pushed to, and once the WAL outgrew the cap its capped
+  # plan kept `complete?/2` false — the loop then SPUN (nothing left to send) until the deadline.
+  test "#3: a follower being seeded does not fail a commit the other two acked", ctx do
+    %{id: id, root: root} = ctx
+    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3)
+    enable!([pa, pb, pc], cap: @small_cap, timeout: 1_000, catchup: 0)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b TEXT)", [])
+    preseed_current!([a, b, c], id, coordinator)
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    fake_seed_in_flight!(session!(id), shipper_for(pc))
+
+    blob = String.duplicate("y", 3_000)
+
+    for i <- 1..12,
+        do: {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?, ?)", [i, blob])
+
+    assert byte_size(File.read!(wal)) > 3 * @small_cap, "the WAL never outgrew the cap"
+
+    {reply, ms} = timed_commit(id, wal, coordinator)
+    assert reply == :ok, "failed #{inspect(reply)} after #{ms} ms behind a seeding follower"
+    assert ms < 500, "took #{ms} ms: the catch-up loop waited on the seeding follower"
+    assert holders([a, b], id, File.read!(wal)) == 2
+  end
+
+  # THE SAFETY HALF of #3: stopping at the quorum must not become stopping SHORT of it. `b` is more
+  # than a push behind, `c` is mid-seed, `a` is current: the commit's first round is acked by `a`
+  # and `b` (a quorum of ACKS) while `b` still holds only a capped prefix. The commit may return
+  # only once BOTH hold every byte of it — a rule that counted acks, or one follower too few, would
+  # ack here with one replica of the write. (Checked: `quorum() - 1` in `quorum_holds?/2` fails it.)
+  test "#3: a commit is acked only once a quorum holds ALL of its bytes", ctx do
+    %{id: id, root: root} = ctx
+    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3)
+    {peer_b, pbx} = proxy!(pb)
+    enable!([pa, pbx, pc], cap: @small_cap, timeout: 1_000, catchup: 0)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b TEXT)", [])
+    preseed_current!([a, b, c], id, coordinator)
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    # Build `b` up as a laggard while `a` and `c` carry the quorum.
+    :ok = PausablePeer.pause(peer_b)
+    blob = String.duplicate("z", 3_000)
+
+    for i <- 1..8 do
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?, ?)", [i, blob])
+      assert :ok = Session.commit(id, wal, coordinator)
+    end
+
+    {:ok, _} = PausablePeer.release(peer_b)
+    session = session!(id)
+    await_no_inflight!(session)
+    assert byte_size(File.read!(wal)) - Follower.state_of(b, id).next_offset > 2 * @small_cap
+
+    # Now `c` cannot help, so the quorum is exactly {a, b}.
+    fake_seed_in_flight!(session, shipper_for(pc))
+    {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (99, 'tail')", [])
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    assert holders([a, b], id, File.read!(wal)) == 2,
+           "the commit was acked while `b` held only part of it: one replica, reported as a quorum"
+  end
+
+  # The other half: the commit no longer waits for the laggard, so something else must bring it
+  # current — on a QUIET shard, with no further write. `arm_if_short/1` arms the catch-up.
+  test "#3: a follower the commit did not wait for still converges with no further writes", ctx do
+    %{id: id, root: root} = ctx
+    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3)
+    {peer, pcx} = proxy!(pc)
+    # No catch-up while the laggard is built up, so nothing is armed by the held phase's
+    # `:already_in_flight` refusals; the property is exercised by ONE clean commit afterwards.
+    enable!([pa, pb, pcx], cap: @small_cap, timeout: 1_000, catchup: 0)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b TEXT)", [])
+    preseed_current!([a, b, c], id, coordinator)
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    :ok = PausablePeer.pause(peer)
+    blob = String.duplicate("w", 3_000)
+
+    for i <- 1..8 do
+      {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?, ?)", [i, blob])
+      assert :ok = Session.commit(id, wal, coordinator)
+    end
+
+    target = File.read!(wal)
+    {:ok, _} = PausablePeer.release(peer)
+    session = session!(id)
+    await_no_inflight!(session)
+
+    # PRECONDITION: the laggard is more than one push behind and nothing is scheduled for it.
+    assert byte_size(target) - Follower.state_of(c, id).next_offset > @small_cap
+    assert :sys.get_state(session).catchup_ref == nil
+
+    # One commit with nothing new: the other two plan nothing, the laggard gets ONE capped push
+    # without a reply anyone waits for, and no follower refuses. Before #3 the commit itself looped
+    # the laggard current; now `arm_if_short/1` must schedule the rest.
+    Application.put_env(:fathom, :replication_catchup_ms, 200)
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    deadline = System.monotonic_time(:millisecond) + 8_000
+
+    converged =
+      Stream.repeatedly(fn ->
+        cond do
+          File.read(Follower.wal_path(c, id)) == {:ok, target} -> true
+          System.monotonic_time(:millisecond) > deadline -> false
+          true -> Process.sleep(25) && nil
+        end
+      end)
+      |> Enum.find(&is_boolean/1)
+
+    assert converged,
+           "the laggard never caught up on a quiet shard: the commits acked without it and " <>
+             "nothing re-shipped to it (#{Follower.state_of(c, id).next_offset} of " <>
+             "#{byte_size(target)} B)"
   end
 
   # ------------------------------------------------------------------------------------------
