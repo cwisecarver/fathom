@@ -112,10 +112,14 @@ defmodule Fathom.Shard.Storage.Codec do
 
   Streamed both ways: a shard object is up to gigabytes and must never be materialized whole in
   the BEAM.
+
+  The `body_hash` argument picks the BODY digest (expert review 2026-10-20 #29): `:md5` (default;
+  `content-md5`, 16 raw bytes) or `:crc32` (`x-amz-checksum-crc32`, 4 big-endian bytes, ~40x
+  cheaper per MB). The plaintext identity hash is MD5 either way.
   """
-  @spec compress_to_temp_hashed(Path.t(), :zlib | :zstd) ::
+  @spec compress_to_temp_hashed(Path.t(), :zlib | :zstd, :md5 | :crc32) ::
           {:ok, Path.t(), non_neg_integer(), binary(), String.t()} | {:error, term()}
-  def compress_to_temp_hashed(path, encoding) do
+  def compress_to_temp_hashed(path, encoding, body_hash \\ :md5) do
     tmp = "#{path}.z.#{System.unique_integer([:positive])}"
     ctx = compressor(encoding)
     dctx = init(encoding)
@@ -132,26 +136,26 @@ defmodule Fathom.Shard.Storage.Codec do
         # a third plaintext-sized hash pass (~1 ms/MB of ~4.5) made redundant by the frame checksum
         # (expert review 2026-10-19 #8). This decodes the same bytes that are written, so it needs
         # no second read of the file, and the output is never collected.
-        write = fn piece, {size, md5} ->
+        write = fn piece, {size, h} ->
           piece = corrupt_piece(corrupt, piece)
           :ok = IO.binwrite(out, piece)
           decode_piece(dctx, piece)
-          {size + IO.iodata_length(piece), :crypto.hash_update(md5, piece)}
+          {size + IO.iodata_length(piece), body_hash_update(h, piece)}
         end
 
         {plain, body} =
           Enum.reduce(
             File.stream!(path, @chunk),
-            {:crypto.hash_init(:md5), {0, :crypto.hash_init(:md5)}},
+            {:crypto.hash_init(:md5), {0, body_hash_init(body_hash)}},
             fn chunk, {plain, body} ->
               {:crypto.hash_update(plain, chunk), write.(compress_chunk(ctx, chunk), body)}
             end
           )
 
-        {size, body_md5} = write.(compress_finish(ctx), body)
+        {size, body_h} = write.(compress_finish(ctx), body)
         plain_hex = Base.encode16(:crypto.hash_final(plain), case: :lower)
 
-        {size, :crypto.hash_final(body_md5), plain_hex}
+        {size, body_hash_final(body_h), plain_hex}
       end)
       |> then(fn {size, body_md5, plain_hex} -> {:ok, tmp, size, body_md5, plain_hex} end)
     rescue
@@ -167,6 +171,15 @@ defmodule Fathom.Shard.Storage.Codec do
       compress_close(ctx)
     end
   end
+
+  defp body_hash_init(:md5), do: {:md5, :crypto.hash_init(:md5)}
+  defp body_hash_init(:crc32), do: {:crc32, 0}
+
+  defp body_hash_update({:md5, ctx}, piece), do: {:md5, :crypto.hash_update(ctx, piece)}
+  defp body_hash_update({:crc32, crc}, piece), do: {:crc32, :erlang.crc32(crc, piece)}
+
+  defp body_hash_final({:md5, ctx}), do: :crypto.hash_final(ctx)
+  defp body_hash_final({:crc32, crc}), do: <<crc::32>>
 
   # Test seam (expert review 2026-10-17 #20): a corrupting codec step, applied to each compressed piece
   # before it is written, hashed or decoded, so the body on disk and the content-md5 agree with each

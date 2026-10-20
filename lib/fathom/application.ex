@@ -249,6 +249,8 @@ defmodule Fathom.Application do
     if Application.get_env(:fathom, :shard_storage) == Fathom.Shard.Storage.S3 and
          Application.get_env(:fathom, :verify_storage_fence, true) do
       Fathom.Shard.Storage.S3.verify_conditional_writes!()
+      # Expert review 2026-10-20 #29: crc32 transit checksum on compressed PUTs iff enforced.
+      Fathom.Shard.Storage.S3.probe_body_checksum!()
     end
   end
 
@@ -905,6 +907,9 @@ defmodule Fathom.Application do
       # Idle unless :shard_flush_max_concurrency is set. Before the shard supervisor so the table is
       # up before any coordinator flushes.
       Fathom.Shard.FlushGate,
+      # Scan-only permit (quick_check + VACUUM INTO), SDio-2: keeps a flush wave from holding every
+      # dirty-IO thread (expert review 2026-10-20 #19). Fails open if not running.
+      Fathom.Shard.ScanGate,
       # Owns the node-wide idle pooled-handle budget (perf review 2026-10-14 #16). Before the shard
       # supervisor so it outlives every coordinator's terminate-time pool close.
       Fathom.Shard.PoolBudget
