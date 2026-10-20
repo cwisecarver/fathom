@@ -3733,7 +3733,11 @@ defmodule Fathom.Shard do
     # the old code, stamped this object `{epoch, 0, 0}`: the LOWEST position for the epoch, on the
     # most complete copy of the shard that will ever exist. Every clean idle-drop, graceful drain
     # and rebalance handoff went out that way, and any lagging replica then outranked it.
-    pre = Fathom.Shard.Replication.Wal.read(state.path <> "-wal")
+    # round-4 durability review 2026-10-20 F1: `index: true` — the stamp must come from the -shm wal-index (mxFrame), like the Session paths,
+    # not the frame walk, which can count a commit-frame header whose page is not yet written
+    # (stale-tail slot) and so over-claim the object. PRIMARY, SQLite-written WAL only; promote.ex
+    # and follower.ex read fathom-written WALs and must stay on the walk.
+    pre = Fathom.Shard.Replication.Wal.read(state.path <> "-wal", index: true)
 
     # THE FAST PATH IS ONLY SAFE WITH NOTHING CHECKED OUT (expert review 2026-08-26 #3).
     #
@@ -4681,7 +4685,11 @@ defmodule Fathom.Shard do
     # committed during `VACUUM INTO` too — writes the object does not hold, so a replica holding
     # them (acked) lost to the object on failover. Also the 2026-08-20 #4 capture: the snapshot is
     # frequently the last connection, and its close unlinks `-wal`.
-    pre = Fathom.Shard.Replication.Wal.read(state.path <> "-wal")
+    # round-4 durability review 2026-10-20 F1: `index: true` — the stamp must come from the -shm wal-index (mxFrame), like the Session paths,
+    # not the frame walk, which can count a commit-frame header whose page is not yet written
+    # (stale-tail slot) and so over-claim the object. PRIMARY, SQLite-written WAL only; promote.ex
+    # and follower.ex read fathom-written WALs and must stay on the walk.
+    pre = Fathom.Shard.Replication.Wal.read(state.path <> "-wal", index: true)
 
     try do
       # Integrity BEFORE the snapshot: quarantine_corrupt!/2 renames the live path, so checking

@@ -146,7 +146,11 @@ defmodule Fathom.Shard.Position do
   end
 
   defp flush_position(state, pre, epoch) do
-    case Wal.read(state.path <> "-wal") do
+    # round-4 durability review 2026-10-20 F1: `index: true` — the stamp must come from the -shm wal-index (mxFrame), like the Session paths,
+    # not the frame walk, which can count a commit-frame header whose page is not yet written
+    # (stale-tail slot) and so over-claim the object. PRIMARY, SQLite-written WAL only; promote.ex
+    # and follower.ex read fathom-written WALs and must stay on the walk.
+    case Wal.read(state.path <> "-wal", index: true) do
       # commit_extent, not `size` (expert review 2026-08-20 #5): the file length is a high-water
       # mark that can include frames from a rolled-back transaction. A follower's position is
       # now the committed extent, so the object's stamp has to be on the same scale or the two
