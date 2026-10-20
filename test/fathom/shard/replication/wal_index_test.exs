@@ -149,6 +149,59 @@ defmodule Fathom.Shard.Replication.WalIndexTest do
     end
   end
 
+  describe "an unusable index with the -shm fd held (round-4 durability review 2026-10-20 F2)" do
+    # Symptom: the walk fallback trusts a frame header, so with the index transiently unreadable
+    # (-shm short during the first opener's rebuild, torn reads) it counted a torn commit header,
+    # and the cursor's max() kept that over-count for the rest of the generation. The fixture
+    # swaps the held -shm fd for an empty file, which `read_index` reports as :none.
+    defp blind_shm!(dir, h) do
+      empty = Path.join(dir, "empty-shm")
+      File.write!(empty, <<>>)
+      {:ok, fd} = :file.open(empty, [:read, :raw, :binary])
+      {real, h} = {h.shm, %{h | shm: fd}}
+      {real, h}
+    end
+
+    test "holds the cursor extent instead of walking onto a torn header", %{dir: dir} do
+      {db, wal} = open_db!(dir)
+      stale_tail!(db)
+      {:ok, before, h} = Wal.read_held(nil, wal)
+      write_torn_commit_header!(wal, before.commit_extent)
+      {_real, h} = blind_shm!(dir, h)
+
+      assert {:ok, again, h} = Wal.read_held(h, wal)
+
+      assert again.commit_extent == before.commit_extent,
+             "the walk fallback counted a torn commit header (#{before.commit_extent} -> " <>
+               "#{again.commit_extent})"
+
+      Wal.close_held(h)
+    end
+
+    test "after the index is usable again the extent is the index's, not a sticky over-count",
+         %{dir: dir} do
+      {db, wal} = open_db!(dir)
+      stale_tail!(db)
+      {:ok, before, h} = Wal.read_held(nil, wal)
+      write_torn_commit_header!(wal, before.commit_extent)
+      {real, h} = blind_shm!(dir, h)
+
+      # Exhaust the hold budget so the walk runs and over-counts the torn header.
+      h =
+        Enum.reduce(1..10, h, fn _, h ->
+          {:ok, r, h} = Wal.read_held(h, wal)
+          send(self(), {:extent, r.commit_extent})
+          h
+        end)
+
+      assert_received {:extent, last} when last > before.commit_extent
+
+      {:ok, back, h} = Wal.read_held(%{h | shm: real}, wal)
+      assert back.commit_extent == before.commit_extent
+      Wal.close_held(h)
+    end
+  end
+
   describe "agreement with the walk on a real SQLite WAL" do
     test "through appends, a rollback, restarts and a commit over abandoned slots", %{dir: dir} do
       {db, wal} = open_db!(dir)

@@ -222,7 +222,9 @@ defmodule Fathom.Shard.Replication.Wal do
           salt1: non_neg_integer(),
           salt2: non_neg_integer(),
           page: pos_integer(),
-          extent: non_neg_integer()
+          extent: non_neg_integer(),
+          src: :index | :walk,
+          blind: non_neg_integer()
         }
 
   @typedoc """
@@ -538,8 +540,8 @@ defmodule Fathom.Shard.Replication.Wal do
 
     case {index, handle.cursor} do
       {{:ok, %{salt1: s1, salt2: s2, page: page} = ix}, %{salt1: s1, salt2: s2, page: page} = c} ->
-        extent = max(frame_extent(ix.mx, page), c.extent)
-        header_reply(handle, c.ckpt_seq, s1, s2, page, size, extent)
+        extent = index_extent_over(frame_extent(ix.mx, page), c)
+        header_reply(handle, c.ckpt_seq, s1, s2, page, size, {extent, :index, 0})
 
       _ ->
         header_from_wal(handle, size, index)
@@ -550,23 +552,22 @@ defmodule Fathom.Shard.Replication.Wal do
     case :file.pread(handle.fd, 0, @header_bytes) do
       {:ok, <<magic::32, _fmt::32, page::32, seq::32, salt1::32, salt2::32, _ck::binary>>}
       when magic in @magics ->
-        extent =
-          case agreeing_extent(handle.shm, index, page, salt1, salt2) do
-            nil -> held_extent(handle, size, page, salt1, salt2)
-            ext -> ext
-          end
-
-        # Within one generation the reported extent never moves backward: a cursor taken from the
-        # walk can be ahead of the index for the microseconds between SQLite finishing a commit's
-        # frames and publishing it, and a smaller extent than a follower already holds would make
-        # `Primary.plan/3` order a full reset.
-        extent =
+        same =
           case handle.cursor do
-            %{salt1: ^salt1, salt2: ^salt2, extent: c} -> max(extent, c)
-            _ -> extent
+            %{salt1: ^salt1, salt2: ^salt2} = c -> c
+            _ -> nil
           end
 
-        header_reply(handle, seq, salt1, salt2, page, size, extent)
+        result =
+          case agreeing_extent(handle.shm, index, page, salt1, salt2) do
+            nil ->
+              walk_or_hold(handle, same, size, page, salt1, salt2)
+
+            ext ->
+              {if(same, do: index_extent_over(ext, same), else: ext), :index, 0}
+          end
+
+        header_reply(handle, seq, salt1, salt2, page, size, result)
 
       {:ok, _} ->
         # Same refusal as `read_header/2`: bytes we cannot identify the generation of are the
@@ -581,8 +582,45 @@ defmodule Fathom.Shard.Replication.Wal do
     end
   end
 
-  defp header_reply(handle, seq, salt1, salt2, page, size, extent) do
-    cursor = %{ckpt_seq: seq, salt1: salt1, salt2: salt2, page: page, extent: extent}
+  # THE INDEX IS UNUSABLE FOR THIS READ (round-4 durability review 2026-10-20 F2). With an `-shm` fd
+  # held the index is unusable only transiently (SQLite truncates it while the first connection
+  # rebuilds it; three torn reads under heavy commit), and the walk it would fall back to trusts a
+  # frame HEADER — the torn-frame hazard of #1. Worse, the cursor keeps the greater extent for the
+  # rest of the generation, so one over-count stuck. So: same generation as the cursor and an fd
+  # held — report the cursor's extent unchanged (ship nothing new this round; an older extent is a
+  # safe under-claim). Bounded by `@max_blind` consecutive rounds so a permanently unusable index
+  # (never expected) degrades to the walk instead of stalling replication. Everything else walks,
+  # as before, and tags the cursor `:walk` so the next usable index read REPLACES (not max-es
+  # against) the walk's possibly over-counted value.
+  @max_blind 8
+  defp walk_or_hold(%{shm: shm}, %{blind: blind} = same, _size, _page, _s1, _s2)
+       when shm != nil and blind < @max_blind,
+       do: {same.extent, same.src, blind + 1}
+
+  defp walk_or_hold(handle, same, size, page, salt1, salt2) do
+    walked = held_extent(handle, size, page, salt1, salt2)
+    # Within one generation the reported extent never moves backward: a cursor taken from the
+    # walk can be ahead of the index for the microseconds between SQLite finishing a commit's
+    # frames and publishing it, and a smaller extent than a follower already holds would make
+    # `Primary.plan/3` order a full reset.
+    {if(same, do: max(walked, same.extent), else: walked), :walk, 0}
+  end
+
+  # Index extents are monotone within a generation, so they max against an index-derived cursor;
+  # a walk-derived cursor extent is unverified and is replaced.
+  defp index_extent_over(ext, %{src: :index, extent: c}), do: max(ext, c)
+  defp index_extent_over(ext, _walked_cursor), do: ext
+
+  defp header_reply(handle, seq, salt1, salt2, page, size, {extent, src, blind}) do
+    cursor = %{
+      ckpt_seq: seq,
+      salt1: salt1,
+      salt2: salt2,
+      page: page,
+      extent: extent,
+      src: src,
+      blind: blind
+    }
 
     # `size` is the stat taken before the index read; a commit published in between can put the
     # extent past it. Its frames are on disk (published ⇒ written), so report the larger.

@@ -3980,7 +3980,11 @@ defmodule Fathom.Shard do
     # the old code, stamped this object `{epoch, 0, 0}`: the LOWEST position for the epoch, on the
     # most complete copy of the shard that will ever exist. Every clean idle-drop, graceful drain
     # and rebalance handoff went out that way, and any lagging replica then outranked it.
-    pre = Fathom.Shard.Replication.Wal.read(state.path <> "-wal")
+    # round-4 durability review 2026-10-20 F1: `index: true` — the stamp must come from the -shm wal-index (mxFrame), like the Session paths,
+    # not the frame walk, which can count a commit-frame header whose page is not yet written
+    # (stale-tail slot) and so over-claim the object. PRIMARY, SQLite-written WAL only; promote.ex
+    # and follower.ex read fathom-written WALs and must stay on the walk.
+    pre = Fathom.Shard.Replication.Wal.read(state.path <> "-wal", index: true)
 
     # THE FAST PATH IS ONLY SAFE WITH NOTHING CHECKED OUT (expert review 2026-08-26 #3).
     #
@@ -4928,7 +4932,11 @@ defmodule Fathom.Shard do
     # committed during `VACUUM INTO` too — writes the object does not hold, so a replica holding
     # them (acked) lost to the object on failover. Also the 2026-08-20 #4 capture: the snapshot is
     # frequently the last connection, and its close unlinks `-wal`.
-    pre = Fathom.Shard.Replication.Wal.read(state.path <> "-wal")
+    # round-4 durability review 2026-10-20 F1: `index: true` — the stamp must come from the -shm wal-index (mxFrame), like the Session paths,
+    # not the frame walk, which can count a commit-frame header whose page is not yet written
+    # (stale-tail slot) and so over-claim the object. PRIMARY, SQLite-written WAL only; promote.ex
+    # and follower.ex read fathom-written WALs and must stay on the walk.
+    pre = Fathom.Shard.Replication.Wal.read(state.path <> "-wal", index: true)
 
     try do
       # Integrity BEFORE the snapshot: quarantine_corrupt!/2 renames the live path, so checking
@@ -4995,9 +5003,14 @@ defmodule Fathom.Shard do
   #     exclusively to write pages and caps itself at the oldest read mark), so tenant commits that
   #     land during the upload go to the WAL and the main file's bytes are FROZEN. The emptiness is
   #     checked again UNDER the pin: WAL growth between the two checks only means a tenant wrote, and
-  #     the route falls back to the VACUUM path. (A WAL that is empty under the pin cannot have been
-  #     non-empty at the pin's snapshot: turning a non-empty WAL empty needs a checkpoint backfill +
-  #     restart, which the pin blocks.)
+  #     the route falls back to the VACUUM path. (Round-4 durability review 2026-10-20 F6 corrected
+  #     this comment: it used to claim an empty WAL under the pin cannot have been non-empty at the
+  #     pin's snapshot. That is FALSE for a fully checkpointed non-empty WAL: the pin takes read-lock
+  #     0 and a `wal_checkpoint(TRUNCATE)` needs only read-locks 1..N plus the writer lock, so it can
+  #     truncate under the pin. The bytes are still the right state: a read-lock-0 snapshot reads only
+  #     the `.db`, and the WAL was already fully backfilled; any newer commit would need read-lock 0
+  #     exclusively to backfill, which the pin blocks, so the WAL could not have become empty
+  #     holding newer data.)
   #   * THE INTEGRITY GATE RUNS ON THE UPLOADED BYTES. `quick_check` runs on the pin's own handle,
   #     which reads those same frozen pages, and the pin is held across `Storage.flush`. The S3
   #     backend's own stat-before/stat-after (`source_unchanged`) and the decode proof still apply.

@@ -186,6 +186,16 @@ unsafe extern "C" fn on_progress(ctx: *mut c_void) -> c_int {
     ))
 }
 
+// ROLLBACK-JOURNAL COMMIT (round-4 durability review 2026-10-20 F3, claim disproven). The review
+// said that a COMMIT needing EXCLUSIVE reaches this handler with autoCommit already 1, so yielding
+// returns an instant BUSY that nothing retries (`fathom_busy_retry_ms` -> 0), and prescribed
+// "yield only when sqlite3_txn_state < WRITE". Measured: the retry DOES happen.
+// `fathom_busy_retry_ms()` checks only that the previous statement is the one that yielded (it is
+// not consulted for autocommit state), so the COMMIT is re-stepped from the BEAM, succeeds when
+// the readers leave, and the transaction ends normally (pinned by busy_yield_test "a
+// rollback-journal COMMIT waits for readers..."). Re-stepping COMMIT is valid: a BUSY COMMIT leaves
+// the transaction open. The prescribed fix would make this wait happen INSIDE the handler again,
+// holding a dirty-IO thread: it would undo #2 for this case. Do not add the txn_state check.
 unsafe extern "C" fn on_busy(ctx: *mut c_void, count: c_int) -> c_int {
     let state = &*(ctx as *const Backstop);
     if state.yield_on.load(Ordering::Relaxed) {
