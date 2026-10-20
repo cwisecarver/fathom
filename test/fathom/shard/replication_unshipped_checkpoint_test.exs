@@ -379,6 +379,17 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
   # commit landing after it is the PIN, which bounds the PASSIVE backfill at the snapshot taken
   # before the check. The seam lands C1 exactly between the check and the PASSIVE.
   test "a commit landing between the covers check and the PASSIVE is protected by the pin", ctx do
+    # This pins the PIN, not the size gate (expert review 2026-10-20 #15): its WAL is a few frames,
+    # which the gate would now skip before the covers check, so the seam would never run.
+    prev = Application.get_env(:fathom, :replication_flush_checkpoint_min_bytes)
+    Application.put_env(:fathom, :replication_flush_checkpoint_min_bytes, 0)
+
+    on_exit(fn ->
+      if is_nil(prev),
+        do: Application.delete_env(:fathom, :replication_flush_checkpoint_min_bytes),
+        else: Application.put_env(:fathom, :replication_flush_checkpoint_min_bytes, prev)
+    end)
+
     s = setup_shard!(ctx)
     flush_conn = open!(s.path)
 
