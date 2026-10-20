@@ -241,7 +241,7 @@ defmodule Fathom.Shard.Connection do
          :ok <- maybe_foreign_keys(conn),
          :ok <- maybe_cache_size(conn),
          {:ok, ext} <- load_extension(conn, tenant?),
-         :ok <- maybe_harden(conn, tenant?),
+         :ok <- maybe_harden(conn, tenant?, ext),
          :ok <- maybe_authorizer(conn, tenant?, ext, guard_opts) do
       {:ok, conn}
     end
@@ -250,7 +250,7 @@ defmodule Fathom.Shard.Connection do
   defp configure_readwrite(conn, tenant?, scope, guard_opts, wal?) do
     with :ok <- configure(conn, wal?),
          {:ok, ext} <- load_extension(conn, tenant?),
-         :ok <- maybe_harden(conn, tenant?),
+         :ok <- maybe_harden(conn, tenant?, ext),
          :ok <- maybe_query_only(conn, scope),
          :ok <- maybe_authorizer(conn, tenant?, ext, guard_opts) do
       {:ok, conn}
@@ -452,13 +452,25 @@ defmodule Fathom.Shard.Connection do
   # handles only — the coordinator's VACUUM-INTO snapshot and the migration replay run fathom's
   # own SQL and legitimately need the unhardened engine. A failure to apply them fails the OPEN
   # (like the extension re-disable), because the alternative is a tenant handle without the floor.
-  defp maybe_harden(_conn, false), do: :ok
+  defp maybe_harden(_conn, false, _ext), do: :ok
 
   # ONE batch (expert review 2026-10-19 #23): both are plain PRAGMAs, and `sqlite3_exec` stops at
   # the first error, which is what the two-step `with` did. Probe: two executes 11-17 us mean per
   # open, one batch 5-9 us. The engine-level tests (`connection_test.exs`, "engine hardening") read
   # both values back after open, so a batch that silently dropped one would fail there.
-  defp maybe_harden(conn, true),
+  #
+  # With the extension loaded the same batch turns on `fathom_busy_yield(1)` (expert review
+  # 2026-10-20 #2): an AUTOCOMMIT lock wait on a tenant handle gives up at once and `query/4`
+  # retries it from the owner process instead of sleeping on a dirty-IO thread (see
+  # `retry_busy/4`). Riding this batch keeps the open's dispatch count unchanged.
+  defp maybe_harden(conn, true, :loaded),
+    do:
+      Sqlite3.execute(
+        conn,
+        "PRAGMA trusted_schema=OFF;PRAGMA cell_size_check=ON;SELECT fathom_busy_yield(1)"
+      )
+
+  defp maybe_harden(conn, true, :skipped),
     do: Sqlite3.execute(conn, "PRAGMA trusted_schema=OFF;PRAGMA cell_size_check=ON")
 
   # This file's actual page size. Falls back to SQLite's default rather than raising: an
@@ -850,19 +862,21 @@ defmodule Fathom.Shard.Connection do
     # it opts in.
     case Keyword.get(opts, :deadline, false) && timeout_ms() do
       falsy when falsy in [nil, false] ->
-        do_query(conn, sql, args, dml?, read?, state?)
+        do_query(conn, sql, args, dml?, read?, state?, nil)
 
       ms when is_integer(ms) and ms > 0 ->
-        with_deadline(conn, ms, fn -> do_query(conn, sql, args, dml?, read?, state?) end)
+        with_deadline(conn, ms, fn deadline_at ->
+          do_query(conn, sql, args, dml?, read?, state?, deadline_at)
+        end)
 
       _ ->
-        do_query(conn, sql, args, dml?, read?, state?)
+        do_query(conn, sql, args, dml?, read?, state?, nil)
     end
   rescue
     e in ArgumentError -> {:error, Exception.message(e)}
   end
 
-  defp do_query(conn, sql, args, dml?, read?, state?) do
+  defp do_query(conn, sql, args, dml?, read?, state?, deadline_at) do
     # A 4-tuple with a plain pattern, not a 3-tuple plus a guard. A `with` whose pattern carries a
     # guard lets the unmatched value fall through as the function's return, which dialyzer caught
     # as `{:ok, _, _} | {:refresh, reference(), [any()]}` escaping `query/4`'s spec.
@@ -884,7 +898,8 @@ defmodule Fathom.Shard.Connection do
       # `NifDispatchTest`: a second handle's `wal_checkpoint(TRUNCATE)` after every outcome.
       try do
         with :ok <- Sqlite3.bind(stmt, args),
-             {:ok, rows, row_count} <- reset_if_abandoned(stmt, collect(conn, stmt, row_cap())) do
+             {:ok, rows, row_count} <-
+               reset_if_abandoned(stmt, step_all(conn, stmt, row_cap(), deadline_at)) do
           # Post-step column read when the schema moved under this connection (expert review
           # 2026-08-26 #7). Only on the `:refresh` path — a DDL happened somewhere since this
           # statement was cached — so the ordinary hit pays nothing. See `cached_stmt/2` for why
@@ -950,6 +965,99 @@ defmodule Fathom.Shard.Connection do
           _ = Sqlite3.reset(stmt)
           :erlang.raise(kind, reason, __STACKTRACE__)
       end
+    end
+  end
+
+  # RETRY A YIELDED LOCK WAIT FROM THIS PROCESS (expert review 2026-10-20 #2).
+  #
+  # The busy handler used to sleep out a lock wait (SQLite's 1..100 ms ladder, up to the 5 s busy
+  # timeout) INSIDE the `multi_step` NIF, which runs on a dirty-IO thread. The node has +SDio (10)
+  # of them for ALL SQLite work and file I/O, so more same-lock waiters than that stalled every
+  # tenant on the node: measured 0 ms -> ~2.1 s for an unrelated shard's SELECT between 9 and 11
+  # waiters, with the lock holder's own COMMIT queued behind its waiters. Tenant handles now carry
+  # `fathom_busy_yield(1)` (`maybe_harden/3`): in AUTOCOMMIT the handler gives up at once, and the
+  # wait happens here, in `receive after`, holding no thread.
+  #
+  # Retried only when re-running the statement is valid, which is exactly AUTOCOMMIT before AND
+  # after: `multi_step` has already reset the statement, SQLite rolled back whatever it began, and no
+  # transaction snapshot exists to go stale. Checked by the extension (`fathom_busy_retry_ms()`, one
+  # dispatch) on the first BUSY only: the state cannot change between retries, this process being
+  # the only user of the handle. A BUSY
+  # inside an explicit transaction is returned as before — the handler still waits there itself, and
+  # `SQLITE_BUSY_SNAPSHOT` (exqlite reports it as the same `:busy`: it does not enable extended
+  # result codes) can never succeed on a re-step. A BUSY after rows were already returned is not
+  # retried either.
+  #
+  # BOUNDED by the handle's busy timeout (read from the extension, so `set_busy_timeout/2` and a
+  # tenant's own lowered `fathom_busy_timeout` still apply) and by the statement deadline, so a
+  # timeout still maps to FILO_QUERY_TIMEOUT in `with_deadline/3`. No extension (cargo absent) -> no
+  # yield, the handler waited out the full timeout already, and the budget read fails -> no retry.
+  #
+  # The backoff is SQLite's own ladder. A shorter one (capped at 20 ms) was tried and made same-shard
+  # write p99 WORSE (K=32 writers on one shard: ~38 ms -> 67-85 ms, in-process probe, 2026-10-20):
+  # more retriers collide on the lock. What this change does cost: with waiters on dirty threads,
+  # the dirty-IO run queue acted as a FIFO admission gate for the hot shard, so its write p99 was
+  # lower (K=16: ~0.5 ms vs ~11 ms now) — paid for by every OTHER tenant on the node (unrelated
+  # File.stat p99 33 ms / 153 ms at K=16 / 32, now ~0.1 ms). A per-shard FIFO write token would
+  # restore the hot shard's fairness without the cross-tenant cost; not built (expert review
+  # 2026-10-20 #2 option b).
+  @busy_ladder_ms {1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100}
+
+  defp step_all(conn, stmt, cap, deadline_at) do
+    case collect(conn, stmt, cap) do
+      :busy_before_rows -> retry_busy(conn, stmt, cap, deadline_at)
+      other -> other
+    end
+  end
+
+  defp retry_busy(conn, stmt, cap, deadline_at) do
+    with {:ok, budget_ms} when budget_ms > 0 <- busy_retry_budget_ms(conn) do
+      give_up_at = System.monotonic_time(:millisecond) + budget_ms
+      give_up_at = if deadline_at, do: min(give_up_at, deadline_at), else: give_up_at
+      retry_busy(conn, stmt, cap, give_up_at, 0)
+    else
+      _ -> {:error, :busy}
+    end
+  end
+
+  defp retry_busy(conn, stmt, cap, give_up_at, attempt) do
+    left = give_up_at - System.monotonic_time(:millisecond)
+
+    if left <= 0 do
+      {:error, :busy}
+    else
+      step = elem(@busy_ladder_ms, min(attempt, tuple_size(@busy_ladder_ms) - 1))
+
+      receive do
+      after
+        min(step, left) -> :ok
+      end
+
+      case collect(conn, stmt, cap) do
+        :busy_before_rows -> retry_busy(conn, stmt, cap, give_up_at, attempt + 1)
+        other -> other
+      end
+    end
+  end
+
+  # How long to keep retrying: the handle's busy timeout when it yields and is in autocommit, else 0
+  # (native/fathom_udf/src/backstop.rs `fathom_busy_retry_ms`). One dispatch on the contended path.
+  defp busy_retry_budget_ms(conn) do
+    with {:ok, stmt, _cols, _enc, _refresh} <- cached_stmt(conn, "SELECT fathom_busy_retry_ms()") do
+      case Sqlite3.multi_step(conn, stmt, 1) do
+        {:done, [[ms]]} when is_integer(ms) ->
+          {:ok, ms}
+
+        {:rows, [[ms]]} when is_integer(ms) ->
+          _ = Sqlite3.reset(stmt)
+          {:ok, ms}
+
+        _ ->
+          _ = Sqlite3.reset(stmt)
+          :error
+      end
+    else
+      _ -> :error
     end
   end
 
@@ -1271,7 +1379,7 @@ defmodule Fathom.Shard.Connection do
 
     result =
       try do
-        fun.()
+        fun.(started + ms)
       after
         send(watchdog, {:done, ref})
       end
@@ -1524,6 +1632,28 @@ defmodule Fathom.Shard.Connection do
   """
   @spec exec(reference(), String.t()) :: :ok | {:error, term()}
   def exec(conn, sql), do: Sqlite3.execute(conn, sql)
+
+  @doc """
+  `exec/2` for a TENANT script (Hrana `sequence`): lock waits stay in the busy handler for the
+  script's duration.
+
+  A script runs several statements in one `sqlite3_exec`, and in autocommit each one commits on its
+  own, so a BUSY halfway through cannot be retried from the BEAM the way `query/4` retries a single
+  statement (expert review 2026-10-20 #2): the statements before it already committed. Yielding is
+  switched off around the script and back on after it, whatever the outcome. Scripts are
+  migration-rare, so the two extra dispatches do not matter. Without the extension both toggles fail
+  harmlessly and the script runs exactly as `exec/2` would.
+  """
+  @spec exec_script(reference(), String.t()) :: :ok | {:error, term()}
+  def exec_script(conn, sql) do
+    _ = Sqlite3.execute(conn, "SELECT fathom_busy_yield(0)")
+
+    try do
+      Sqlite3.execute(conn, sql)
+    after
+      _ = Sqlite3.execute(conn, "SELECT fathom_busy_yield(1)")
+    end
+  end
 
   @doc """
   Reads a scalar `PRAGMA` off this connection — `pragma(conn, "synchronous")` ⇒ `{:ok, 2}`.
@@ -1850,8 +1980,9 @@ defmodule Fathom.Shard.Connection do
           do: {:error, {:too_many_rows, cap}},
           else: {:ok, [rows | batches] |> Enum.reverse() |> Enum.concat(), count}
 
+      # Retryable (see `step_all/4`) only when nothing has been returned yet.
       :busy ->
-        {:error, :busy}
+        if batches == [], do: :busy_before_rows, else: {:error, :busy}
 
       {:error, reason} ->
         {:error, reason}

@@ -1052,7 +1052,7 @@ defmodule Fathom.ShardExecutor do
     # schema before every one (expert review 2026-10-08 #9).
     cap_temp(conn)
 
-    case Connection.exec(conn, sql) do
+    case Connection.exec_script(conn, sql) do
       :ok ->
         # THE DURABILITY TRAP (#34): `exec` bypasses the `wrote?`-based WriteCounter bump in the
         # single-statement path, so a script-only session would leave the shard CLEAN and its
