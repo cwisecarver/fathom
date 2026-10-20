@@ -191,6 +191,20 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     |> assert("the released follower's reply never settled")
   end
 
+  defp await_queue!(pid, n, timeout \\ 3_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn ->
+      cond do
+        elem(Process.info(pid, :message_queue_len), 1) >= n -> true
+        System.monotonic_time(:millisecond) > deadline -> false
+        true -> Process.sleep(5) && nil
+      end
+    end)
+    |> Enum.find(&is_boolean/1)
+    |> assert("the callers never queued")
+  end
+
   defp shipper_for(port) do
     Enum.find(Fleet.shippers(), fn s -> :sys.get_state(s).port == port end) ||
       flunk("no shipper for port #{port}")
@@ -440,6 +454,46 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     # And the Session still serves a live caller.
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
     assert :ok = Session.commit(id, wal, coordinator)
+  end
+
+  # ------------------------------------------------------------------------------------------
+  # #5(b)
+  # ------------------------------------------------------------------------------------------
+
+  # Group commit: N same-shard commits queued behind one cycle are answered by ONE ship (the first
+  # cycle's header covers all their frames), not N cycles that each re-read the WAL to plan nothing.
+  test "#5(b): queued commits for the same WAL are answered by one commit cycle", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    names = for {n, _} <- followers, do: n
+    enable!(for({_, p} <- followers, do: p), timeout: 5_000, catchup: 0)
+
+    {coordinator, conn, path} = open_shard!(id)
+    wal = path <> "-wal"
+    {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    preseed_current!(names, id, coordinator)
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    session = session!(id)
+    before = :sys.get_state(session).commits
+    :ok = :sys.suspend(session)
+
+    # Eight streams each commit a row, then queue their replication call behind the stall.
+    callers =
+      for i <- 1..8 do
+        {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?)", [i])
+        Task.async(fn -> Session.commit(id, wal, coordinator) end)
+      end
+
+    await_queue!(session, 8)
+    :ok = :sys.resume(session)
+
+    assert Enum.all?(Task.await_many(callers, 10_000), &(&1 == :ok))
+    cycles = :sys.get_state(session).commits - before
+    assert cycles <= 2, "8 queued commits took #{cycles} commit cycles"
+
+    assert holders(names, id, File.read!(wal)) >= 2,
+           "the batch was acked before a quorum held every caller's frames"
   end
 
   # ------------------------------------------------------------------------------------------

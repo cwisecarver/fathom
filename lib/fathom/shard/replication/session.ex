@@ -444,18 +444,56 @@ defmodule Fathom.Shard.Replication.Session do
     deadline =
       if mode == :no_checkpoint, do: min(deadline, now_ms() + catchup_ms()), else: deadline
 
+    # GROUP COMMIT (expert review 2026-10-20 #5(b)), before ANY header read: see `coalesce_queued/2`.
+    batch = if mode == :checkpoint, do: coalesce_queued(wal_path, []), else: []
+
     {:reply, reply, state} = do_commit(wal_path, state, deadline, mode)
 
-    # Commit -> quorum-ack latency (admin observability 2026-10-15 P1). ONE execute per commit,
-    # after the ack work and before the checkpoint start so it measures only what the tenant waits
-    # on. The outcome is a bounded 4-value tag; shard_id is deliberately not a tag.
+    for from <- batch, do: GenServer.reply(from, reply)
+
+    # Commit -> quorum-ack latency (admin observability 2026-10-15 P1). ONE execute per commit
+    # cycle, after the ack work and before the checkpoint start so it measures only what the tenant
+    # waits on. The outcome is a bounded 4-value tag; shard_id is deliberately not a tag. `batch` is
+    # how many callers this cycle answered.
     :telemetry.execute(
       [:fathom, :replication, :commit],
-      %{duration: System.monotonic_time() - t0},
+      %{duration: System.monotonic_time() - t0, batch: length(batch) + 1},
       %{outcome: commit_outcome(reply)}
     )
 
     {:reply, reply, start_checkpoint(state, pin, wal_path)}
+  end
+
+  # GROUP COMMIT (expert review 2026-10-20 #5(b)). N streams committing to one shard used to be
+  # served one call at a time: the first shipped everything committed so far, and every later
+  # queued call still paid drain + `Wal.read_held` (stat + header + EOF preads on dirty-IO) + plan +
+  # ownership gate, to ship nothing -- ~3 wasted dirty-IO jobs per coalescable commit.
+  #
+  # So, BEFORE the header read, every commit request for the same WAL already in the mailbox joins
+  # this cycle and gets its reply. Correct because each such caller's SQLite commit RETURNED before
+  # it sent its request, and its request is in the mailbox before our header read: its frames are at
+  # or below the extent this cycle reads, so the same quorum ack and the same ownership gate cover
+  # them. A request arriving after this drain is NOT coalesced (its frames may be past the extent)
+  # and runs in the next cycle, which is today's behaviour. A request whose caller has already given
+  # up is dropped, as in `handle_call/3` (#5(a)). Only tenant commits (`:checkpoint`) coalesce.
+  #
+  # Reads the call envelopes directly; `GenServer.reply/2` is the documented way to answer them.
+  defp coalesce_queued(wal_path, acc) do
+    receive do
+      {:"$gen_call", from, {:commit, ^wal_path, :checkpoint, dl}} ->
+        if is_integer(dl) and now_ms() >= dl do
+          :telemetry.execute([:fathom, :replication, :commit_dropped], %{count: 1}, %{})
+          GenServer.reply(from, {:error, :timeout})
+          coalesce_queued(wal_path, acc)
+        else
+          coalesce_queued(wal_path, [from | acc])
+        end
+
+      {:"$gen_call", from, {:commit, ^wal_path}} ->
+        coalesce_queued(wal_path, [from | acc])
+    after
+      0 -> acc
+    end
   end
 
   @doc false
