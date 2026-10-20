@@ -394,8 +394,29 @@ defmodule Fathom.Shard.Replication.Session do
 
   # Whether quorum-acked replicas hold everything up to `header` — the question the coordinator's
   # flush asks before it checkpoints (`checkpoint_after_snapshot/2`).
-  def handle_call({:covers, header}, _from, state),
-    do: {:reply, covered?(state, header), state}
+  #
+  # The same laggard rule as the threshold checkpoint (expert review 2026-10-20 #8): Q-covered but
+  # a connected follower still owed frames ⇒ not yet, below `laggard_wait_bytes/0`, with the
+  # laggard kicked; the next flush asks again.
+  def handle_call({:covers, header}, _from, state) do
+    cond do
+      not covered?(state, header) ->
+        {:reply, false, state}
+
+      Map.get(header, :commit_extent, 0) < laggard_wait_bytes() and
+          laggards(state, header) != [] ->
+        :telemetry.execute(
+          [:fathom, :replication, :checkpoint_deferred],
+          %{count: 1},
+          %{source: :flush}
+        )
+
+        {:reply, false, arm_catchup(state, [])}
+
+      true ->
+        {:reply, true, state}
+    end
+  end
 
   def handle_call(:lag_info, _from, state), do: {:reply, build_lag_info(state), state}
 
@@ -641,6 +662,15 @@ defmodule Fathom.Shard.Replication.Session do
   # A fake `from` is safe: the clause ignores it (`_from`). Blocking here is fine because this only
   # runs on a shard with no traffic, and anything that does arrive queues behind it — which IS the
   # serialization this is staying inside rather than routing around.
+  # The coordinator's covered-idle-close ask (expert review 2026-10-20 #7): may its idle drain run
+  # the close-time checkpoint now? See `request_idle_close/2`. Always answered, `:ready` or `:wait`;
+  # the coordinator re-asks on `:wait` and gives up (drains anyway) after a bounded number of asks.
+  def handle_info({:idle_close?, coordinator, token}, state) do
+    {verdict, state} = idle_close_verdict(state)
+    send(coordinator, {:idle_close_verdict, token, verdict})
+    {:noreply, state}
+  end
+
   def handle_info(:catch_up, %{wal_path: nil} = state),
     do: {:noreply, clear_catchup(state)}
 
@@ -1472,8 +1502,17 @@ defmodule Fathom.Shard.Replication.Session do
   #   * a tenant's own `PRAGMA wal_checkpoint` is refused on a registered file by the extension's
   #     authorizer (`pragma_guard.rs`).
   #
-  # NOT covered, deliberately: the close-time checkpoint of the LAST connection and the drop path's
-  # TRUNCATE. Both run only with no stream checked out, so the unshipped frames they can erase are:
+  # The close-time checkpoint of the pool drain grace's LAST close is now COVERED, though not pinned
+  # (expert review 2026-10-20 #7): the coordinator asks this Session first (`request_idle_close/2`),
+  # which ships whatever a connected follower is still owed and answers `:ready` only when nothing a
+  # quorum or a connected follower lacks would be folded — and, having read the header, closes the
+  # "never read" case below for that path. No pin is needed there: the shard is idle, and any stream
+  # that checks out in between makes the coordinator discard the verdict. Past a bounded number of
+  # asks the coordinator drains anyway, with the uncovered properties below.
+  #
+  # NOT covered, deliberately: that bounded fallback, the other drains (write fence, terminate) and
+  # the drop path's TRUNCATE. All run only with no stream checked out, so the unshipped frames they
+  # can erase are:
   #
   #   * frames of commits that FAILED their quorum (a 503). This Session read them, and
   #     `outgoing_extent/2` counts what the Session read, so a follower missing them is marked short
@@ -1555,6 +1594,32 @@ defmodule Fathom.Shard.Replication.Session do
       end
     else
       Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", [])
+    end
+  end
+
+  @doc """
+  The coordinator's covered-idle-close ask (expert review 2026-10-20 #7), sent from the coordinator
+  that is about to drain an idle shard's pool — whose last close is SQLite's close-time checkpoint.
+
+  Asynchronous on purpose: the Session calls its coordinator while it works (epoch, ordinal,
+  checkout grants), so a synchronous ask from the coordinator could deadlock until a timeout. The
+  answer arrives at the caller as `{:idle_close_verdict, token, :ready | :wait}`. Returns `:none`
+  when there is no Session to ask (replication off, or nothing shipped yet under this coordinator):
+  the caller then drains as it always did.
+  """
+  @spec request_idle_close(String.t(), reference()) :: :asked | :none
+  def request_idle_close(shard_id, token) do
+    if enabled?() do
+      case lookup(shard_id) do
+        nil ->
+          :none
+
+        pid ->
+          send(pid, {:idle_close?, self(), token})
+          :asked
+      end
+    else
+      :none
     end
   end
 
@@ -1733,6 +1798,21 @@ defmodule Fathom.Shard.Replication.Session do
         release_pin(pin)
         state
 
+      # #8: Q-covered, but a connected follower has not been sent everything. Skip this attempt —
+      # `ckpt_at` (set by `maybe_pin/2`) makes the next one due one `checkpoint_step_bytes/0` later
+      # — and kick the laggard with the catch-up retry, which on a busy shard the next commit
+      # pre-empts anyway (a commit re-plans for every follower).
+      :deferred ->
+        release_pin(pin)
+
+        :telemetry.execute(
+          [:fathom, :replication, :checkpoint_deferred],
+          %{count: 1},
+          %{source: :threshold}
+        )
+
+        arm_catchup(state, [])
+
       verdict ->
         spawn_checkpoint(state, pin, wal_path, verdict)
         state
@@ -1742,7 +1822,9 @@ defmodule Fathom.Shard.Replication.Session do
   defp checkpoint_verdict(%{last_header: %{commit_extent: e} = header} = state) do
     cond do
       covered?(state, header) ->
-        :covered
+        if e < laggard_wait_bytes() and laggards(state, header) != [],
+          do: :deferred,
+          else: :covered
 
       e >= checkpoint_force_bytes() ->
         Logger.warning(
@@ -1842,8 +1924,11 @@ defmodule Fathom.Shard.Replication.Session do
     _, _ -> :ok
   end
 
+  # The cap-EXEMPT internal grant (expert review 2026-10-20 #13): a tenant at
+  # `:max_checkouts_per_shard` used to refuse this task its grant, abandoning the checkpoint until it
+  # ran FORCED at the WAL cap and re-seeded every lagging follower.
   defp safe_checkout(coordinator) do
-    case Fathom.Shard.checkout(coordinator) do
+    case Fathom.Shard.checkout_internal(coordinator) do
       {:ok, ref, _path} -> {:ok, ref}
       other -> other
     end
@@ -1878,6 +1963,75 @@ defmodule Fathom.Shard.Replication.Session do
       o -> o >= extent
     end
   end
+
+  # THE LAGGARDS OF A GENERATION (expert review 2026-10-20 #7/#8): followers that a restart of
+  # `header`'s WAL would leave SHORT — and therefore re-seed, a full db+wal transfer, at the next
+  # reset (`prev_extent` → `Follower.short_reset?/3`). Q-coverage alone leaves up to N−Q of them.
+  #
+  # A follower counts only if it is CONNECTED in the sense this Session can see without a call: it
+  # holds a position IN THIS VERY GENERATION (it acked something since the last restart). One that
+  # is down, or never shipped, sits in an older generation or nowhere, is re-seeded whatever we do,
+  # and must not hold the WAL hostage — it drops out at the next restart instead of every one.
+  # Seeding followers are excluded for the same reason (the seed carries everything up to its start).
+  #
+  # A push already IN FLIGHT to it counts as sent: the reset that follows travels the same shipper
+  # behind it, so the follower holds those bytes by the time it judges the reset. What makes a
+  # follower short is bytes never SENT — a push skipped `:already_in_flight` or refused locally.
+  defp laggards(state, %{ckpt_seq: gen, salt1: salt, commit_extent: extent}) do
+    for {shipper, %{wal_gen: ^gen, salt1: ^salt, offset: o}} <- state.followers,
+        is_integer(o),
+        not Map.has_key?(state.seeding, shipper),
+        sent_through(state, shipper, gen, salt, o) < extent,
+        do: shipper
+  end
+
+  defp laggards(_state, _empty), do: []
+
+  defp sent_through(state, shipper, gen, salt, acked) do
+    case Map.get(state.inflight, shipper) do
+      %{wal_gen: ^gen, salt1: ^salt, offset: o} when is_integer(o) -> max(o, acked)
+      _ -> acked
+    end
+  end
+
+  # #8: how far a Q-covered WAL may grow past the threshold while a connected laggard is still owed
+  # frames, before the checkpoint stops waiting for it and falls back to Q-coverage alone. 2x the
+  # threshold: one `checkpoint_step_bytes/0` deferral at a time (the `ckpt_at` rate limit), and
+  # `checkpoint_force_bytes/0` (4x) still bounds the WAL.
+  defp laggard_wait_bytes, do: 2 * checkpoint_bytes()
+
+  # The covered-idle-close verdict (#7, `request_idle_close/2`). `:ready` when the close-time
+  # checkpoint would fold nothing a connected follower lacks: a quorum holds the WAL and no connected
+  # follower is owed frames. Otherwise ship first — through the catch-up path, so every ordering rule
+  # of the commit path applies (drain late replies, settle, reconcile, seed) — and judge again on the
+  # header that ship read. Still owed after that (a follower whose push failed): `:wait`; the
+  # coordinator re-asks, and its bound decides when to drain regardless.
+  defp idle_close_verdict(%{wal_path: nil} = state), do: {:ready, state}
+
+  defp idle_close_verdict(state) do
+    case Wal.read_held(state.wal_fd, state.wal_path) do
+      {:ok, :empty, fd} ->
+        {:ready, %{state | wal_fd: fd}}
+
+      {:ok, header, fd} ->
+        state = note_header(%{state | wal_fd: fd}, header)
+
+        if nothing_owed?(state, header) do
+          {:ready, state}
+        else
+          {:reply, _discarded, state} =
+            handle_call({:commit, state.wal_path, :no_checkpoint}, {self(), make_ref()}, state)
+
+          header = state.last_header || header
+          {if(nothing_owed?(state, header), do: :ready, else: :wait), state}
+        end
+
+      {:error, _reason, fd} ->
+        {:wait, %{state | wal_fd: fd}}
+    end
+  end
+
+  defp nothing_owed?(state, header), do: covered?(state, header) and laggards(state, header) == []
 
   # ------------------------------------------------------------------------------------------
   # seeding
@@ -2409,13 +2563,29 @@ defmodule Fathom.Shard.Replication.Session do
   defp seed_outcome({:ok, _}), do: :ok
   defp seed_outcome({:error, _}), do: :error
 
-  defp seed_bytes(db_path, wal_path) do
-    Enum.reduce([db_path, wal_path], 0, fn path, acc ->
-      case File.stat(path) do
-        {:ok, %{size: size}} -> acc + size
-        _ -> acc
+  # db + the WAL's COMMIT EXTENT — what `stream_seed/7` actually sends (`wal_size_of/1`) — not the
+  # `-wal` FILE size (expert review 2026-10-20 #8). SQLite restarts a WAL in place and keeps its
+  # high-water mark, so on a hot shard the file sits near the 4000-frame threshold (~16.5 MB) while
+  # the extent after a restart is a few hundred KB: the rig's "14 seeds of 16.5 MB" (2026-10-19,
+  # pool-fleet reuse) were ~0.6 MB seeds reported at the file size, the follower's own
+  # "seeded … 20480B db + 618032B wal" lines show the real sizes. Probe:
+  # replication_seed_bytes_test.exs.
+  @doc false
+  @spec seed_bytes(Path.t(), Path.t()) :: non_neg_integer()
+  def seed_bytes(db_path, wal_path) do
+    db =
+      case File.stat(db_path) do
+        {:ok, %{size: size}} -> size
+        _ -> 0
       end
-    end)
+
+    wal =
+      case Wal.read(wal_path) do
+        {:ok, header} -> wal_size_of(header)
+        _ -> 0
+      end
+
+    db + wal
   end
 
   # Stream a CONSISTENT base copy.

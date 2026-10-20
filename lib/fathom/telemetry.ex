@@ -312,6 +312,29 @@ defmodule Fathom.Telemetry do
         description:
           "Session-run checkpoints of a replicated WAL, by verdict (covered | forced past the cap)"
       ),
+      # Checkpoints a Q-covered WAL put off because a connected follower had not been sent everything
+      # (expert review 2026-10-20 #8). `source` is :threshold (Session) | :flush (post-snapshot).
+      # Paired with the seed rate: deferrals up and "short reset" seeds down is the intended trade.
+      counter("fathom.replication.checkpoint_deferred.count",
+        event_name: [:fathom, :replication, :checkpoint_deferred],
+        tags: [:source],
+        description:
+          "Replicated-WAL checkpoints deferred one step for a connected laggard (threshold | flush)"
+      ),
+      # The covered idle close (expert review 2026-10-20 #7): `ready` = the Session cleared the
+      # drain; `exhausted` = it drained anyway after `:shard_idle_close_attempts` asks (a follower
+      # the Session could not catch up — expect re-seeds for that shard).
+      counter("fathom.shard.idle_close.count",
+        event_name: [:fathom, :shard, :idle_close],
+        tags: [:result],
+        description: "Idle-drain closes gated on the replication Session (ready | exhausted)"
+      ),
+      # Durability flush ticks deferred behind a pending idle close (expert review 2026-10-20 #22):
+      # a sustained rate on a busy shard is the close-chain backlog that holds back object RPO.
+      counter("fathom.shard.flush_close_deferred.count",
+        event_name: [:fathom, :shard, :flush_close_deferred],
+        description: "Durability flush ticks deferred behind an unfinished idle close"
+      ),
       counter("fathom.shards.at_capacity.count",
         event_name: [:fathom, :shards, :at_capacity],
         description:

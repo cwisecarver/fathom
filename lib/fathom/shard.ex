@@ -263,11 +263,33 @@ defmodule Fathom.Shard do
     :exit, _ -> :open
   end
 
+  @doc """
+  `checkout/1` for fathom's OWN work on the shard's files — today the replication Session's
+  threshold-checkpoint task — EXEMPT from the per-shard stream cap (`:max_checkouts_per_shard`;
+  expert review 2026-10-20 #13). Everything else about the grant is the same: monitored, counted in
+  `conns` (so it blocks idle-stop, drop and the flush exactly as a stream does), refused while
+  draining, released with `checkin/2`.
+
+  Why exempt: a tenant AT its cap got `:shard_at_stream_capacity` for the checkpoint, which was
+  abandoned and retried only every `checkpoint_step_bytes`, until at the 64 MiB force cap it ran
+  FORCED — re-seeding every lagging follower, on exactly the tenant already at its busiest. The cap
+  bounds one tenant's STREAMS; one internal grant per Session (its checkpoint task is one at a time)
+  is not a stream.
+  """
+  @spec checkout_internal(pid()) :: {:ok, reference(), Path.t()} | {:error, term()}
+  def checkout_internal(pid) when is_pid(pid), do: do_checkout(pid, make_ref(), :internal)
+
   defp do_checkout(pid, op, scope \\ nil) do
     # `scope` nil ⇒ the plain grant ({:checkout, op}); a scope folds the pool take into the same
     # reply ({:checkout, op, scope}) — one round-trip (#18). Both share the timeout budget and the
-    # :exit rescue below.
-    msg = if scope, do: {:checkout, op, scope}, else: {:checkout, op}
+    # :exit rescue below. `:internal` is the cap-exempt grant (`checkout_internal/1`).
+    msg =
+      case scope do
+        nil -> {:checkout, op}
+        :internal -> {:checkout_internal, op}
+        scope -> {:checkout, op, scope}
+      end
+
     # The open path (handle_continue) can legitimately block a queued :checkout for up to
     # @pull_timeout (a large cold pull, cross-region S3), and an inline durability flush can
     # add more. The default 5s GenServer.call timeout is far below that, so a slow-but-normal
@@ -947,6 +969,16 @@ defmodule Fathom.Shard do
         # flush gets past its close check, so a serial client cannot keep re-filling the pool in
         # front of it. See drain_idle_pool_for_flush/1.
         pool_flush_hold: false,
+        # The COVERED idle close (expert review 2026-10-20 #7): `{token, attempts}` while this idle
+        # shard is waiting for its replication Session to say the drain's close-time checkpoint
+        # folds nothing a connected follower still lacks, else nil. Reset by every idle transition.
+        # See covered_idle_drain/1.
+        idle_close: nil,
+        # Eviction closes (expert review 2026-10-20 #22): monitor ref => pid of each in-flight close
+        # of a handle evicted from a NON-EMPTY pool. Such a close is never the shard's last
+        # connection, so it runs in parallel instead of on the ordered chain above; everything that
+        # waits on the chain (the next chain link, terminate's close_pool/1) waits on these too.
+        side_closes: %{},
         # Has the open path's plain sidecar write been made durable yet? See sync_sidecar_once/1.
         sidecar_synced?: false,
         # The off-process first-write sidecar fsync (expert review 2026-10-17 #5); nil when none
@@ -1496,6 +1528,18 @@ defmodule Fathom.Shard do
     end
   end
 
+  # The cap-exempt internal grant (`checkout_internal/1`, expert review 2026-10-20 #13). Refused
+  # while draining like every checkout.
+  def handle_call({:checkout_internal, _op}, _from, %{draining: true} = state),
+    do: {:reply, {:error, :draining}, state}
+
+  def handle_call({:checkout_internal, op}, {caller, _tag}, state) do
+    case grant_checkout(op, caller, state, false) do
+      {:ok, ref, path, state} -> {:reply, {:ok, ref, path}, state}
+      {:error, reason, state} -> {:reply, {:error, reason}, state}
+    end
+  end
+
   def handle_call({:checkout, op, scope}, {caller, _tag}, state) when scope in [:ro, :rw] do
     case grant_checkout(op, caller, state) do
       {:ok, ref, path, state} ->
@@ -2013,11 +2057,27 @@ defmodule Fathom.Shard do
         {:noreply, %{state | pool_grace_timer: Process.send_after(self(), :pool_grace, left)}}
 
       true ->
-        {:noreply, drain_pool(state)}
+        {:noreply, covered_idle_drain(state)}
     end
   end
 
   def handle_info(:pool_grace, state), do: {:noreply, %{state | pool_grace_timer: nil}}
+
+  # The replication Session's answer to a covered-idle-close ask (expert review 2026-10-20 #7; see
+  # covered_idle_drain/1). Acted on only for the CURRENT ask of a STILL-idle shard: any checkout
+  # since the ask makes `conns` non-empty, and its checkin is a new idle transition that resets
+  # `idle_close`, so a verdict computed before a write can never authorize folding that write.
+  # `:wait` needs nothing here — the re-ask timer covered_idle_drain/1 armed asks again.
+  def handle_info({:idle_close_verdict, token, verdict}, state) do
+    case state do
+      %{idle_close: {^token, _}, conns: conns} when map_size(conns) == 0 and verdict == :ready ->
+        :telemetry.execute([:fathom, :shard, :idle_close], %{count: 1}, %{result: :ready})
+        {:noreply, drain_pool(state)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
 
   # `FlushWatermark` restarted with an empty table (expert review 2026-08-26 #17). Re-assert this
   # shard's row so the RPO gauge stops under-reporting; without it a shard only re-published after
@@ -2215,10 +2275,15 @@ defmodule Fathom.Shard do
     # the snapshot reads the empty WAL the stamp expects. `pool_flush_hold` keeps the grace off
     # until a tick gets past the close check, so a serial client cannot re-fill the pool forever.
     state = state |> drain_idle_pool_for_flush() |> reap_closing()
-    state = if closing_busy?(state), do: state, else: %{state | pool_flush_hold: false}
+
+    # An idle shard waiting on its covered close (expert review 2026-10-20 #7) is a close not yet
+    # started: the snapshot must not read the WAL that close is about to fold, so it defers alike.
+    close_pending? = closing_busy?(state) or idle_close_pending?(state)
+    state = if close_pending?, do: state, else: %{state | pool_flush_hold: false}
 
     cond do
-      closing_busy?(state) ->
+      close_pending? ->
+        :telemetry.execute([:fathom, :shard, :flush_close_deferred], %{count: 1}, %{})
         {:noreply, schedule_flush_backoff(state)}
 
       # A flush is already in flight — don't stack a second snapshot/PUT; the next
@@ -2650,13 +2715,14 @@ defmodule Fathom.Shard do
   # durability-timer re-arm, and the LRU busy hint. Shared by the plain (`{:checkout, op}`) and the
   # scope-carrying (`{:checkout, op, scope}`) checkout so the two cannot drift (expert review
   # 2026-09-18 #18). Returns `{:ok, ref, path, state}` or `{:error, reason, state}`.
-  defp grant_checkout(op, caller, state) do
+  defp grant_checkout(op, caller, state, capped? \\ true) do
     # Per-shard concurrent-stream cap (expert review 2026-07-14 #26): bound how many streams one
     # tenant can hold open at once, so a single tenant can't monopolize a node's streams (and,
     # combined with the timeout/row caps, can't wedge the shard un-drainable). Off by default
     # (`:max_checkouts_per_shard` unset ⇒ unlimited); the caller maps the refusal to a 503.
+    # `capped?` false is the internal grant (`checkout_internal/1`, 2026-10-20 #13): exempt.
     case max_checkouts() do
-      cap when is_integer(cap) and cap > 0 and map_size(state.conns) >= cap ->
+      cap when capped? and is_integer(cap) and cap > 0 and map_size(state.conns) >= cap ->
         {:error, :shard_at_stream_capacity, state}
 
       _ ->
@@ -2942,9 +3008,15 @@ defmodule Fathom.Shard do
   defp release_pool_on_idle(%{pool: nil} = state), do: state
 
   defp release_pool_on_idle(%{pool: %HandlePool{drain_grace_ms: grace} = pool} = state) do
+    # A NEW idle transition: whatever the last ask was about, a stream has written since.
+    state = %{state | idle_close: nil}
+
     cond do
-      grace <= 0 or state.pool_flush_hold or HandlePool.count(pool) == 0 ->
+      HandlePool.count(pool) == 0 ->
         drain_pool(state)
+
+      grace <= 0 or state.pool_flush_hold ->
+        covered_idle_drain(state)
 
       # Coalesced like the idle timer: one live timer, compared against `idle_since` when it fires.
       state.pool_grace_timer != nil ->
@@ -2970,12 +3042,92 @@ defmodule Fathom.Shard do
          %{pool: %HandlePool{} = pool, conns: conns, flush_task: nil} = state
        )
        when map_size(conns) == 0 do
-    if HandlePool.count(pool) > 0 and unflushed?(state),
-      do: %{drain_pool(state) | pool_flush_hold: true},
-      else: state
+    cond do
+      HandlePool.count(pool) == 0 or not unflushed?(state) ->
+        state
+
+      # Already waiting on the Session's verdict (#7): the flush defers behind it like a close.
+      idle_close_pending?(state) ->
+        state
+
+      true ->
+        %{covered_idle_drain(state) | pool_flush_hold: true}
+    end
   end
 
   defp drain_idle_pool_for_flush(state), do: state
+
+  # THE COVERED IDLE CLOSE (expert review 2026-10-20 #7). The grace's drain closes the shard's LAST
+  # SQLite connection, and that close is SQLite's close-time checkpoint: every frame is backfilled
+  # and `-wal` unlinked, so the next write starts a new WAL. The replication Session survives the
+  # gap, and a follower it has not yet SENT everything — one skipped `:already_in_flight` at the end
+  # of a burst, whose catch-up retry fires 1 s later while this drain fires at 250 ms — is then told
+  # by the next reset (`prev_extent`) that it is short, and answers with a full db+wal seed request
+  # (rig 2026-10-19, pool-fleet reuse: every gap and every later restart ended in a seed).
+  #
+  # So before closing, ask the Session. It reads the WAL header, ships to any connected follower it
+  # owes frames (its own catch-up path), and answers `:ready` once nothing a connected follower
+  # lacks would be folded. The ask is a MESSAGE, never a call: the Session calls this process
+  # (epoch, ordinal, checkout) while it works, so a synchronous ask could deadlock until a timeout.
+  # The re-ask timer is the watchdog for a Session that never answers; after
+  # `:shard_idle_close_attempts` asks the drain runs anyway — today's behaviour, and still safe:
+  # the Session has READ every frame by then, so a follower it could not reach is marked short at
+  # the next reset and re-seeded, never laundered (`Session.outgoing_extent/2`).
+  #
+  # NOT the finding's option (a), "stop the Session on idle drain": a fresh Session records no
+  # follower, so its first reset states `prev_extent: 0` ("no evidence of a gap") and a short
+  # follower ABSORBS its incomplete WAL as complete (`Follower.complete_through_reset?/2`) — the
+  # laundering `prev_extent` exists to prevent. Keeping the Session and covering the close is the
+  # direction that cannot lose a frame.
+  #
+  # With replication off (no Session) this is exactly `drain_pool/1`. Test:
+  # replication_idle_close_test.exs.
+  @default_idle_close_attempts 8
+
+  defp covered_idle_drain(%{pool: %HandlePool{drain_grace_ms: grace} = pool} = state) do
+    attempts = idle_close_attempts_made(state)
+
+    cond do
+      HandlePool.count(pool) == 0 ->
+        drain_pool(state)
+
+      attempts >= idle_close_attempts() ->
+        :telemetry.execute([:fathom, :shard, :idle_close], %{count: 1}, %{result: :exhausted})
+        drain_pool(state)
+
+      true ->
+        token =
+          case state.idle_close do
+            {t, _} -> t
+            nil -> make_ref()
+          end
+
+        case Fathom.Shard.Replication.Session.request_idle_close(state.id, token) do
+          :asked ->
+            state = cancel_pool_grace(state)
+            # The re-ask (and watchdog) tick. Reuses :pool_grace, whose `left` is already <= 0 for
+            # this idle period, so it lands straight back here.
+            timer = Process.send_after(self(), :pool_grace, max(grace, 50))
+            %{state | idle_close: {token, attempts + 1}, pool_grace_timer: timer}
+
+          :none ->
+            drain_pool(state)
+        end
+    end
+  end
+
+  defp idle_close_attempts_made(%{idle_close: {_, n}}), do: n
+  defp idle_close_attempts_made(_state), do: 0
+
+  # Only while still idle: a stream that checked out since the ask has made it moot (its checkin
+  # resets `idle_close`), and a busy shard's flush must not defer on it.
+  defp idle_close_pending?(%{idle_close: {_, n}, conns: conns}) when map_size(conns) == 0,
+    do: n < idle_close_attempts()
+
+  defp idle_close_pending?(_state), do: false
+
+  defp idle_close_attempts,
+    do: Application.get_env(:fathom, :shard_idle_close_attempts, @default_idle_close_attempts)
 
   # Close every pooled idle handle now (the grace's end and the barriers above; the pool is
   # per-shard, so this touches only this shard's handles). Distinct from `close_pool/1`, which is the
@@ -3003,7 +3155,9 @@ defmodule Fathom.Shard do
   # closed their own handles outside this process.
   defp drain_pool(%{pool: pool} = state) do
     {conns, pool} = HandlePool.drain(pool)
-    state = state |> put_pool(pool) |> cancel_sweep() |> cancel_pool_grace()
+
+    state =
+      %{state | idle_close: nil} |> put_pool(pool) |> cancel_sweep() |> cancel_pool_grace()
 
     case conns do
       [] -> state
