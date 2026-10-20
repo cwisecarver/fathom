@@ -63,6 +63,16 @@
 ## and read the queue as List.last(:erlang.statistics(:run_queue_lengths_all)) — note
 ## :erlang.statistics(:dirty_io_run_queue) is NOT a valid stat item and raises.
 ##
+## Swept DOWNWARD too (expert review 2026-10-20 #18: per-dispatch CPU grows with the thread count,
+## so fewer threads might win). Same rig, replication ON, 30 s flush, fresh VM per arm, after the
+## lock-waiter fix (#2) that stopped busy waits holding these threads, 2026-10-20:
+##   +SDio  4 : 4,066 tps  p99 799 ms  11 errors
+##   +SDio  6 : 4,221 tps  p99 646 ms
+##   +SDio 10 : 4,334 tps  p99 652 ms
+##   +SDio 16 : 4,095 tps  p99 611 ms
+## One run per arm (run-to-run spread on this rig is ~+-4%), so 6/10/16 are a tie and 4 is worse:
+## 10 stays. The round-3 "dirty-IO 82% busy" lead that prompted this was spin, not work (#16).
+##
 ## Dirty-IO threads sleep when idle; the cost is thread stacks (~1 MB RSS per 32 threads).
 ## Do NOT raise +SDcpu — it defaults to schedulers_online, which is correct here.
 +SDio 10
