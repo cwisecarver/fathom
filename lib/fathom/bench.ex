@@ -119,7 +119,8 @@ defmodule Fathom.Bench do
     :s3_loopback,
     :hrana_ws,
     :same_shard_stmt,
-    :serial_checkout
+    :serial_checkout,
+    :hrana_wide
   ]
 
   @doc false
@@ -262,7 +263,10 @@ defmodule Fathom.Bench do
       # Many streams on ONE shard through the executor (the per-statement counter keys), and one
       # worker per shard so every checkin is a 1 -> 0 Lru edge.
       same_shard_stmt_per_s: run_if(only, :same_shard_stmt, fn -> same_shard_stmt(opts) end),
-      serial_checkout_per_s: run_if(only, :serial_checkout, fn -> serial_checkout(opts) end)
+      serial_checkout_per_s: run_if(only, :serial_checkout, fn -> serial_checkout(opts) end),
+      # WATCH-ONLY (expert review 2026-10-19 #10): an 8-column point read, the per-COLUMN encode
+      # cost every other wire metric (one-cell SELECT 1) hides.
+      hrana_wide_rt_us: run_if(only, :hrana_wide, fn -> hrana_wide_rt_us(opts) end)
     }
   end
 
@@ -2080,6 +2084,66 @@ defmodule Fathom.Bench do
       after
         :telemetry.detach(handler)
       end
+    end)
+  end
+
+  # --- wide-row wire metric (expert review 2026-10-19 #10) -------------------
+
+  @doc """
+  `hrana_wide_rt_us` - median round trip of a warm-stream 8-column point `SELECT` over real
+  Hrana HTTP (`rows: :json`), the shape a Django model fetch has. `hrana_rt_us` returns one
+  unnamed cell, so a per-column cost (Filo rebuilding a map per column per execution, expert
+  review 2026-10-19 #10) is invisible to it. The one row is seeded straight into the shard file;
+  the shared `setup/1` is untouched.
+
+  PRECONDITION asserted on every sample: the reply carries all 8 columns and the seeded row, so
+  a broken query cannot report a fast empty result.
+  """
+  @spec hrana_wide_rt_us(keyword()) :: float() | nil
+  def hrana_wide_rt_us(opts \\ []) do
+    samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
+
+    with_wire(opts, "benchwide", fn client ->
+      # Seed through the shard's own file, as hrana_pooled_pipeline does: the prod-compiled bench
+      # has replication configured on but none of its processes started, so a wire write raises
+      # (`unknown registry: ...SessionRegistry`, first prod run of this metric, 2026-10-19).
+      path = Fathom.Shard.db_path("benchwide")
+      drop_db(path)
+      {:ok, db} = Exqlite.Sqlite3.open(path)
+
+      :ok =
+        Exqlite.Sqlite3.execute(
+          db,
+          "CREATE TABLE bench_wide (id INTEGER PRIMARY KEY, name TEXT, qty INTEGER, " <>
+            "price REAL, note TEXT, flags INTEGER, payload BLOB, created_at TEXT); " <>
+            "INSERT INTO bench_wide VALUES (1, 'widget', 3, 9.5, 'n', 0, x'00ff', " <>
+            "'2026-10-19T00:00:00Z')"
+        )
+
+      :ok = Exqlite.Sqlite3.close(db)
+      :ok = Fathom.Shard.stamp_local_provenance("benchwide")
+
+      select =
+        "SELECT id, name, qty, price, note, flags, payload, created_at FROM bench_wide WHERE id = 1"
+
+      {:ok, _, client} = Filo.Client.execute(client, select)
+
+      {_client, us} =
+        Enum.reduce(1..samples, {client, []}, fn _, {c, acc} ->
+          {t, result} = :timer.tc(fn -> Filo.Client.execute(c, select) end)
+          {:ok, %Filo.StmtResult{cols: cols, rows: rows}, c} = result
+
+          unless length(cols) == 8 and match?([[1 | _]], rows),
+            do:
+              raise(
+                "hrana_wide_rt_us: expected 8 columns and row 1, got #{inspect({cols, rows})}"
+              )
+
+          {c, [t | acc]}
+        end)
+
+      assert_load_recorded!("benchwide", "hrana_wide_rt_us")
+      p50(us)
     end)
   end
 

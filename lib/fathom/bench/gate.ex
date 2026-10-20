@@ -180,6 +180,9 @@ defmodule Fathom.Bench.Gate do
     # The WebSocket round trip, django-libsql's path (expert review 2026-10-19 #12); every other
     # wire metric is HTTP. Needs mint_web_socket, now a prod-compiled dep. Watch-only.
     {:hrana_ws_rt_us, :higher_worse, :watch},
+    # An 8-column point read (expert review 2026-10-19 #10): the per-column encode cost the
+    # one-cell SELECT 1 metrics cannot see. Watch-only until a band is measured.
+    {:hrana_wide_rt_us, :higher_worse, :watch},
     # THE TAIL, gated from 2026-08-03 (expert review #41.5). Every metric above is a p50, and
     # `delta/4` is a pure ratio — which AGENTS.md forbids in as many words ("Assert an absolute
     # floor, not only a ratio… The ratio holds while throughput collapses"). A change that leaves

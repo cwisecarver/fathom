@@ -100,7 +100,8 @@ defmodule Mix.Tasks.Fathom.Bench do
     :s3_loopback,
     :hrana_ws,
     :same_shard_stmt,
-    :serial_checkout
+    :serial_checkout,
+    :hrana_wide
   ]
 
   @doc false
@@ -286,6 +287,8 @@ defmodule Mix.Tasks.Fathom.Bench do
        "stmt/s (point SELECT, schedulers streams on ONE shard, shard_load on; watch-only)"},
       {"serial_checkout_per_s", metrics.serial_checkout_per_s,
        "ops/s  (checkout+checkin, one worker per shard: every checkin a 1->0 edge; watch-only)"},
+      {"hrana_wide_rt_us", metrics.hrana_wide_rt_us,
+       "\u00b5s   (Hrana round trip, 8-column point SELECT, warm stream; watch-only)"},
       {"wire_rows_per_s", metrics.wire_rows_per_s,
        "rows/s (result-set encode over the wire, keystone rows)"},
       {"wire_encode_rows_per_s", metrics.wire_encode_rows_per_s,

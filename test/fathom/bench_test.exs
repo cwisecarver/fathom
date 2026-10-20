@@ -393,7 +393,8 @@ defmodule Fathom.BenchTest do
   @tag timeout: 120_000
   test "observability_tick_us walks the seeded tables and empties them afterwards" do
     us = Fathom.Bench.observability_tick_us(tick_rows: 2_000, trials: 2)
-    assert is_float(us) and us > 0
+    # observability_tick_us/1 is typed float(); an is_float/1 check here is a compile warning.
+    assert us > 0
     assert Fathom.ShardLoad.snapshot_tuples() == []
     assert Fathom.Admin.FlushWatermark.size() == 0
   end
@@ -450,5 +451,14 @@ defmodule Fathom.BenchTest do
     IO.puts("hrana_ws_rt_us: #{inspect(us)}")
     assert is_float(us), "the WS listener/client did not come up - this measured nothing"
     assert us > 10 and us < 20_000, "WS round trip #{us}us outside the order-of-magnitude band"
+  end
+
+  # expert review 2026-10-19 #10. An 8-column point read over HTTP; the metric asserts every
+  # reply carries the 8 columns and the seeded row. Prod ~100-200 us.
+  test "hrana_wide_rt_us measures an 8-column read to an order of magnitude" do
+    us = Fathom.Bench.hrana_wide_rt_us(hrana_rt_samples: 30)
+    IO.puts("hrana_wide_rt_us: #{inspect(us)}")
+    assert is_float(us), "the listener/client did not come up - this measured nothing"
+    assert us > 10 and us < 20_000, "wide round trip #{us}us outside the order-of-magnitude band"
   end
 end
