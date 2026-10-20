@@ -153,6 +153,9 @@ x-fathom-env: &fathom-env
   # Held replica WAL fds per follower worker (expert review 2026-10-19 #16). Empty = the default 64;
   # the tpc-fleet 2048 A/B compares 64 with 256 through this switch.
   REPLICATION_HELD_WAL_FDS: "${REPLICATION_HELD_WAL_FDS:-}"
+  # Post-snapshot checkpoint size gate under replication (expert review 2026-10-20 #15). Empty = the
+  # default (1/4 of the 4000-frame threshold); 0 = a PASSIVE on every flush, the A/B control.
+  REPLICATION_FLUSH_CHECKPOINT_MIN_BYTES: "${REPLICATION_FLUSH_CHECKPOINT_MIN_BYTES:-}"
   # Deferred retry for a push OUR OWN shipper refused (:already_in_flight / :overloaded), which never
   # reached the follower. Empty ⇒ the shipped 1000 ms default; 0 disables, which is the A/B control.
   REPLICATION_CATCHUP_MS: "${REPLICATION_CATCHUP_MS:-}"

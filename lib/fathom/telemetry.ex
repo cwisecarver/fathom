@@ -321,6 +321,14 @@ defmodule Fathom.Telemetry do
         description:
           "Replicated-WAL checkpoints deferred one step for a connected laggard (threshold | flush)"
       ),
+      # The durability flush's post-snapshot PASSIVE, by outcome (expert review 2026-10-20 #15):
+      # result = ran | busy | skipped_not_covered | skipped_small | skipped_no_session | error;
+      # replicated = true | false. `ran` on replicated shards is a WAL generation reset per flush.
+      counter("fathom.shard.flush_checkpoint.count",
+        event_name: [:fathom, :shard, :flush_checkpoint],
+        tags: [:result, :replicated],
+        description: "Post-snapshot checkpoints of the durability flush, by outcome"
+      ),
       # The covered idle close (expert review 2026-10-20 #7): `ready` = the Session cleared the
       # drain; `exhausted` = it drained anyway after `:shard_idle_close_attempts` asks (a follower
       # the Session could not catch up — expect re-seeds for that shard).

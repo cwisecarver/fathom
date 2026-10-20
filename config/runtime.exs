@@ -982,6 +982,13 @@ if n = env_nonneg_int.("REPLICATION_HELD_WAL_FDS") do
   config :fathom, :replication_held_wal_fds, n
 end
 
+# The durability flush's post-snapshot checkpoint under replication runs only once the WAL's commit
+# extent reaches this many bytes (expert review 2026-10-20 #15; default 1/4 of the Session's
+# 4000-frame threshold). 0 restores a PASSIVE on every flush — the rig A/B lever.
+if n = env_nonneg_int.("REPLICATION_FLUSH_CHECKPOINT_MIN_BYTES") do
+  config :fathom, :replication_flush_checkpoint_min_bytes, n
+end
+
 # SEPARATE GATE FROM REPLICATION_ENABLED, and the reason is a real gap this closes (2026-08-10):
 # the `Follower` listener was only ever started by the test suite, so a node with replication on
 # shipped every commit to addresses where nothing listened, got no acks, and 503'd
