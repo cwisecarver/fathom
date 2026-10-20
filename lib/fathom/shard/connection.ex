@@ -884,7 +884,8 @@ defmodule Fathom.Shard.Connection do
     # A 4-tuple with a plain pattern, not a 3-tuple plus a guard. A `with` whose pattern carries a
     # guard lets the unmatched value fall through as the function's return, which dialyzer caught
     # as `{:ok, _, _} | {:refresh, reference(), [any()]}` escaping `query/4`'s spec.
-    with {:ok, stmt, columns, cols_encoded, refresh_columns?} <- cached_stmt(conn, sql) do
+    with {:ok, stmt, columns, cols_encoded, refresh_columns?} <-
+           cached_stmt(conn, sql, deadline_at) do
       # The statement is owned by this connection's cache and must leave here RESET (sqlite3_reset
       # ends the execution, releasing its locks / read-transaction hold, while keeping the compiled
       # plan for the next execution of the same SQL).
@@ -1013,6 +1014,9 @@ defmodule Fathom.Shard.Connection do
   # 2026-10-20 #2 option b).
   @busy_ladder_ms {1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100}
 
+  # exqlite's message for a `prepare` the busy handler gave up on (SQLITE_BUSY).
+  @locked "database is locked"
+
   defp step_all(conn, stmt, cap, deadline_at) do
     case collect(conn, stmt, cap) do
       :busy_before_rows -> retry_busy(conn, stmt, cap, deadline_at)
@@ -1045,6 +1049,49 @@ defmodule Fathom.Shard.Connection do
 
       case collect(conn, stmt, cap) do
         :busy_before_rows -> retry_busy(conn, stmt, cap, give_up_at, attempt + 1)
+        other -> other
+      end
+    end
+  end
+
+  # A BUSY AT PREPARE TIME (round-4 durability review 2026-10-20 F4). Preparing a statement on a
+  # handle whose schema is not loaded reads the schema, which needs a SHARED lock, so the busy handler
+  # can yield DURING `prepare` (e.g. while another handle holds EXCLUSIVE in rollback-journal mode, or
+  # a last-close checkpoint+unlink). `prepare` reports that as the message "database is locked", and
+  # only a step-time BUSY used to be retried, so this failed at once. Same budget and ladder as
+  # `retry_busy/5`; re-preparing is valid for the same reason (the handler runs only while the
+  # connection holds no transaction on the database).
+  defp prepare_retrying(conn, sql, deadline_at) do
+    case Sqlite3.prepare(conn, sql) do
+      {:error, @locked} = locked ->
+        with {:ok, budget_ms} when budget_ms > 0 <- busy_retry_budget_ms(conn) do
+          give_up_at = System.monotonic_time(:millisecond) + budget_ms
+          give_up_at = if deadline_at, do: min(give_up_at, deadline_at), else: give_up_at
+          retry_prepare(conn, sql, give_up_at, 0)
+        else
+          _ -> locked
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp retry_prepare(conn, sql, give_up_at, attempt) do
+    left = give_up_at - System.monotonic_time(:millisecond)
+
+    if left <= 0 do
+      {:error, @locked}
+    else
+      step = elem(@busy_ladder_ms, min(attempt, tuple_size(@busy_ladder_ms) - 1))
+
+      receive do
+      after
+        min(step, left) -> :ok
+      end
+
+      case Sqlite3.prepare(conn, sql) do
+        {:error, @locked} -> retry_prepare(conn, sql, give_up_at, attempt + 1)
         other -> other
       end
     end
@@ -1228,7 +1275,7 @@ defmodule Fathom.Shard.Connection do
   #
   # NOT the tempting `length(hd(rows)) != length(cols)` check, which the review names explicitly:
   # it cannot see the fault on a zero-row `SELECT *`, where the reported cols are still wrong.
-  defp cached_stmt(conn, sql) do
+  defp cached_stmt(conn, sql, deadline_at \\ nil) do
     key = {__MODULE__, :stmt_cache, conn}
     {seq, cache} = Process.get(key, {0, %{}})
     gen = Fathom.Shard.SchemaGen.current()
@@ -1263,7 +1310,7 @@ defmodule Fathom.Shard.Connection do
       %{^sql => {canonical, stmt, _stale_cols, _stale_enc, _stamp, _older_gen}} ->
         Sqlite3.release(conn, stmt)
 
-        with {:ok, fresh} <- Sqlite3.prepare(conn, canonical),
+        with {:ok, fresh} <- prepare_retrying(conn, canonical, deadline_at),
              {:ok, cols} <- Sqlite3.columns(conn, fresh) do
           enc = encode_cols(cols)
 
@@ -1276,7 +1323,7 @@ defmodule Fathom.Shard.Connection do
         end
 
       _ ->
-        with {:ok, stmt} <- Sqlite3.prepare(conn, sql),
+        with {:ok, stmt} <- prepare_retrying(conn, sql, deadline_at),
              {:ok, cols} <- Sqlite3.columns(conn, stmt) do
           canonical = :binary.copy(sql)
           cache = maybe_evict(conn, cache)
@@ -1484,6 +1531,7 @@ defmodule Fathom.Shard.Connection do
   # SQLITE_INTERRUPT arrives as SQLite's message ("interrupted"); a lock wait given up arrives as
   # exqlite's `:busy` from step. Only consulted when the deadline has already passed.
   defp deadline_error?(:busy), do: true
+  defp deadline_error?(@locked), do: true
   defp deadline_error?(reason) when is_binary(reason), do: reason =~ "interrupt"
   defp deadline_error?(_reason), do: false
 
@@ -1802,7 +1850,7 @@ defmodule Fathom.Shard.Connection do
   @spec describe(reference(), String.t()) ::
           {:ok, %{params: [nil], cols: [String.t()]}} | {:error, term()}
   def describe(conn, sql) do
-    with {:ok, stmt} <- Sqlite3.prepare(conn, sql) do
+    with {:ok, stmt} <- prepare_retrying(conn, sql, nil) do
       try do
         cols = with {:ok, c} <- Sqlite3.columns(conn, stmt), do: c, else: (_ -> [])
 

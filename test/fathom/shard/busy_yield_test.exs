@@ -268,6 +268,39 @@ defmodule Fathom.Shard.BusyYieldTest do
     assert Connection.autocommit?(writer)
   end
 
+  # Round-4 durability review 2026-10-20 F4. A statement that has to LOAD THE SCHEMA at prepare time
+  # needs a SHARED lock, so it reaches the busy handler during `prepare`, not during a step. With
+  # yield on that returned "database is locked" at once, and only a step-time BUSY was retried.
+  # Fixture: rollback-journal mode, where `BEGIN EXCLUSIVE` blocks readers, and a handle whose
+  # schema was just discarded (a rolled-back DDL transaction resets it), so preparing a NEW
+  # statement must read the schema again.
+  test "a BUSY at prepare time (schema load) is retried within the busy budget" do
+    path = db_path!("prepare")
+    {:ok, setup_conn} = Connection.open(path, tenant?: true, wal?: false)
+    :ok = Connection.exec(setup_conn, "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (7)")
+    Connection.close(setup_conn)
+
+    {:ok, fresh} = Connection.open(path, tenant?: true, wal?: false)
+    on_exit(fn -> Connection.close(fresh) end)
+    assert {:ok, _} = q(fresh, "BEGIN")
+    assert {:ok, _} = q(fresh, "CREATE TABLE scratch (x)")
+    assert {:ok, _} = q(fresh, "ROLLBACK")
+    {:ok, holder} = Connection.open(path, tenant?: true, wal?: false)
+    on_exit(fn -> Connection.close(holder) end)
+    assert {:ok, _} = q(holder, "BEGIN EXCLUSIVE")
+
+    release =
+      Task.async(fn ->
+        Process.sleep(300)
+        q(holder, "COMMIT")
+      end)
+
+    {us, result} = :timer.tc(fn -> q(fresh, "SELECT a FROM t") end)
+    assert {:ok, %{rows: [[7]]}} = result, "got #{inspect(result)} after #{div(us, 1000)} ms"
+    assert us >= 250_000, "returned after #{div(us, 1000)} ms: no wait for the lock"
+    assert {:ok, _} = Task.await(release)
+  end
+
   test "fathom's own (non-tenant) handles never yield" do
     conn = Connection.open(db_path!("own")) |> then(fn {:ok, c} -> c end)
     on_exit(fn -> Connection.close(conn) end)
