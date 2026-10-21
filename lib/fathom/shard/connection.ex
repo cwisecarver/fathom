@@ -837,6 +837,10 @@ defmodule Fathom.Shard.Connection do
   When the statement also returns columns, `sqlite3_changes()` is not fetched (a dirty-NIF
   dispatch) and `num_changes` is reported as 0; the caller must not need the inherited count.
 
+  `control?: true` is the caller's promise that the statement is transaction control (BEGIN /
+  COMMIT / END / ROLLBACK / SAVEPOINT / RELEASE): `num_changes` is reported as 0 and no rowid
+  without fetching either (expert review 2026-10-20-2027 #1).
+
   `conn_state?: true` fetches changes, last rowid and the autocommit flag in one statement step
   via the extension's `fathom_conn_state()` and reports the flag as `autocommit?` (expert review
   2026-10-17 #6); `autocommit?` is nil when that path was not taken. The CALLER decides when it is
@@ -849,6 +853,7 @@ defmodule Fathom.Shard.Connection do
   def query(conn, sql, args, opts \\ []) do
     dml? = Keyword.get(opts, :dml?, true)
     read? = Keyword.get(opts, :read?, false)
+    control? = Keyword.get(opts, :control?, false)
     state? = Keyword.get(opts, :conn_state?, false)
 
     # Statement deadline (expert review 2026-07-14 #26): when `:query_timeout_ms` is set, a runaway
@@ -866,21 +871,21 @@ defmodule Fathom.Shard.Connection do
     # it opts in.
     case Keyword.get(opts, :deadline, false) && timeout_ms() do
       falsy when falsy in [nil, false] ->
-        do_query(conn, sql, args, dml?, read?, state?, nil)
+        do_query(conn, sql, args, dml?, read?, control?, state?, nil)
 
       ms when is_integer(ms) and ms > 0 ->
         with_deadline(conn, ms, fn deadline_at ->
-          do_query(conn, sql, args, dml?, read?, state?, deadline_at)
+          do_query(conn, sql, args, dml?, read?, control?, state?, deadline_at)
         end)
 
       _ ->
-        do_query(conn, sql, args, dml?, read?, state?, nil)
+        do_query(conn, sql, args, dml?, read?, control?, state?, nil)
     end
   rescue
     e in ArgumentError -> {:error, Exception.message(e)}
   end
 
-  defp do_query(conn, sql, args, dml?, read?, state?, deadline_at) do
+  defp do_query(conn, sql, args, dml?, read?, control?, state?, deadline_at) do
     # A 4-tuple with a plain pattern, not a 3-tuple plus a guard. A `with` whose pattern carries a
     # guard lets the unmatched value fall through as the function's return, which dialyzer caught
     # as `{:ok, _, _} | {:refresh, reference(), [any()]}` escaping `query/4`'s spec.
@@ -937,8 +942,14 @@ defmodule Fathom.Shard.Connection do
                 {ch, rid, ac}
 
               _ ->
-                {if(read? and columns != [], do: 0, else: changes(conn)), :lazy, nil}
+                {if(control? or (read? and columns != []), do: 0, else: changes(conn)), :lazy,
+                 nil}
             end
+
+          # Expert review 2026-10-20-2027 #1: a transaction-control statement (BEGIN / SAVEPOINT /
+          # RELEASE / ROLLBACK / COMMIT) modifies nothing, so it reports 0 changes and no rowid
+          # even when the fast path returned the PREVIOUS write's inherited values.
+          changes = if control?, do: 0, else: changes
 
           {:ok,
            %{
@@ -1602,7 +1613,14 @@ defmodule Fathom.Shard.Connection do
           # Mark BEFORE cancelling (expert review 2026-08-01 #46): the cancel is what lets the
           # statement return, so the owner's read of the mark afterwards cannot miss it.
           :atomics.put(flags, @fired_slot, gen)
-          await_disarm(conn, flags, gen, mon)
+
+          # Expert review 2026-10-20-2027 #19: re-read the generation AFTER the mark. The owner
+          # disarms (bumps the generation) and THEN reads the mark; the watchdog marks and THEN
+          # re-reads the generation. Atomics are sequentially consistent, so either the owner sees
+          # the mark (and `stop_watchdog/1` waits for this process) or this re-read sees the
+          # disarm and no cancel is issued. That is what lets `stop_watchdog/1` skip the
+          # synchronous wait for a watchdog whose mark it has not seen.
+          if :atomics.get(flags, @gen_slot) == gen, do: await_disarm(conn, flags, gen, mon)
         end
 
         watchdog_loop(conn, flags, mon)
@@ -1686,24 +1704,35 @@ defmodule Fathom.Shard.Connection do
   # within @cancel_retry_ms; past @watchdog_stop_ms it is killed rather than waited on.
   @watchdog_stop_ms 1_000
 
+  #
+  # Expert review 2026-10-20-2027 #19: the wait is only needed when this watchdog EVER FIRED
+  # (`@fired_slot` != 0): an unfired watchdog has never called `Sqlite3.cancel` on this handle, and
+  # the re-read in `watchdog_loop/3` guarantees a fire the owner has not seen cannot cancel after
+  # its disarm. So the common pooled checkin sends `:stop` and moves on instead of a monitor +
+  # message + DOWN round trip (measured 15 us after a 20 ms gap vs 8 us spawn + async kill). The
+  # `Process.delete` below still drops the handle's entry, so the next stream spawns a fresh one.
   defp stop_watchdog(conn) do
     case Process.delete({__MODULE__, :watchdog, conn}) do
       nil ->
         :ok
 
-      {pid, _flags} ->
-        mon = Process.monitor(pid)
-        send(pid, :stop)
+      {pid, flags} ->
+        if :atomics.get(flags, @fired_slot) == 0 do
+          send(pid, :stop)
+        else
+          mon = Process.monitor(pid)
+          send(pid, :stop)
 
-        receive do
-          {:DOWN, ^mon, :process, _, _} -> :ok
-        after
-          @watchdog_stop_ms ->
-            Process.exit(pid, :kill)
+          receive do
+            {:DOWN, ^mon, :process, _, _} -> :ok
+          after
+            @watchdog_stop_ms ->
+              Process.exit(pid, :kill)
 
-            receive do
-              {:DOWN, ^mon, :process, _, _} -> :ok
-            end
+              receive do
+                {:DOWN, ^mon, :process, _, _} -> :ok
+              end
+          end
         end
     end
 
@@ -2003,6 +2032,36 @@ defmodule Fathom.Shard.Connection do
     end
   rescue
     _ -> false
+  end
+
+  # Expert review 2026-10-20-2027 #18: the pooled-stream CLOSE used to pay two dirty dispatches
+  # for two facts about the handle — the temp-schema probe (a `step`) and `rollback_if_open/1`'s
+  # `transaction_status`. Both are readable in ONE step of a cached statement: the extension's
+  # `fathom_conn_state()` carries the autocommit flag, and the EXISTS column is the temp probe.
+  # (The reuse-side `transaction_status` in `reset_for_reuse/2` is NOT touched: expert review
+  # 2026-10-17 #31 tried dropping it and one-shot got 12% slower, unexplained.)
+  @checkin_probe_sql "SELECT fathom_conn_state(), EXISTS(SELECT 1 FROM temp.sqlite_schema)"
+
+  @doc """
+  `{temp_schema_empty?, autocommit?}` for a handle about to be pooled, in ONE dirty dispatch when
+  the extension is loaded (expert review 2026-10-20-2027 #18). Same answers as
+  `temp_schema_empty?/1` + `autocommit?/1`, and the same failure direction: a handle whose temp
+  schema cannot be read is not poolable (`false`), an unreadable autocommit flag counts as `true`.
+  Falls back to the two separate calls when the fused statement is unavailable. Like
+  `temp_schema_empty?/1`, it must run BEFORE `detach_statements/1`.
+  """
+  @spec checkin_probe(reference()) :: {boolean(), boolean()}
+  def checkin_probe(conn) do
+    with {:ok, stmt, _cols, _enc, _refresh} <- cached_stmt(conn, @checkin_probe_sql),
+         # One row, so the chunk size is immaterial (`@multi_step_chunk` is defined further down).
+         {:done, [[<<_changes::unsigned-little-64, _rowid::signed-little-64, ac>>, exists]]} <-
+           Sqlite3.multi_step(conn, stmt, 2) do
+      {exists == 0, ac == 1}
+    else
+      _ -> {temp_schema_empty?(conn), autocommit?(conn)}
+    end
+  rescue
+    _ -> {false, true}
   end
 
   @doc """

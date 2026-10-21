@@ -385,6 +385,10 @@ defmodule Fathom.ShardExecutor do
     if ddl?, do: cap_temp(conn)
 
     read? = read_verb?(head)
+
+    # Expert review 2026-10-20-2027 #1: a transaction-control statement has no counters of its own;
+    # `Connection.query` skips both getters for it (see `txn_control?/1`).
+    control? = not dml? and not read? and txn_control?(head)
     # Read once per statement and shared with `maybe_replicate/6`: no extra `get_env`. With
     # replication ON a DML statement also needs the autocommit flag right after the step, which
     # `Connection.query` can return in the same dispatch as changes + rowid (expert review
@@ -394,6 +398,7 @@ defmodule Fathom.ShardExecutor do
     case Connection.query(conn, sql, bind,
            dml?: dml?,
            read?: read?,
+           control?: control?,
            deadline: true,
            conn_state?: repl_on? and (dml? or commit_boundary?(head))
          ) do
@@ -616,6 +621,18 @@ defmodule Fathom.ShardExecutor do
   defp read_verb?(head), do: Enum.any?(@read_verbs, &String.starts_with?(head, &1))
 
   @control_prefixes ~w(begin commit end rollback savepoint release pragma)
+
+  # Expert review 2026-10-20-2027 #1: the transaction-control subset of `@control_prefixes` (no
+  # PRAGMA, whose assignments can be durable). Such a statement changes no row, so it reports
+  # 0 affected rows / no rowid. SQLite's `sqlite3_changes()` / `last_insert_rowid()` keep the
+  # PREVIOUS write's values across it, so before this the wire said "BEGIN changed 3 rows" after
+  # an INSERT of 3, and the statement paid two extra dirty dispatches to read them. (sqld's own
+  # value for BEGIN-after-write could not be verified offline; 0/nil is the only sensible report
+  # for a statement that modifies nothing.)
+  defp txn_control?(head) do
+    Enum.any?(@control_prefixes, &String.starts_with?(head, &1)) and
+      not String.starts_with?(head, "pragma")
+  end
 
   # Header-writing pragma ASSIGNMENTS are durable file mutations that report
   # num_changes == 0 and no columns, so the blanket "pragma is control" rule dropped
@@ -1356,8 +1373,14 @@ defmodule Fathom.ShardExecutor do
     # #6): a connection-local pragma this stream set, or TEMP objects. Checked here, in the stream
     # process, before the handle is handed off; such a handle is closed and the next stream opens
     # fresh, which is exactly the pre-pooling behaviour for that one handle.
-    if connection_pool?() and not opts.template? and not session_mutated? and
-         Connection.temp_schema_empty?(conn) do
+    # One fused probe for the temp schema AND the autocommit flag (expert review 2026-10-20-2027
+    # #18): was a `step` here plus a `transaction_status` in `rollback_if_open/1` below.
+    {temp_empty?, autocommit?} =
+      if connection_pool?() and not opts.template? and not session_mutated?,
+        do: Connection.checkin_probe(conn),
+        else: {false, true}
+
+    if temp_empty? do
       # Stop THIS stream's watchdog, and DETACH (not release) its prepared statements so they travel
       # with the handle to the next stream (perf review 2026-10-14 #10: re-preparing them cost 41 vs
       # 24 us for a three-statement stream). They used to be finalized here because the coordinator
@@ -1391,7 +1414,7 @@ defmodule Fathom.ShardExecutor do
       # that dies with the cast still in its mailbox closes it in terminate
       # (`close_pending_checkins`); the residual is a cast landing in the instant between that drain
       # and the process exiting.
-      case Connection.rollback_if_open(conn) do
+      case if(autocommit?, do: :ok, else: Connection.rollback_if_open(conn)) do
         :ok ->
           Shard.checkin(pid, ref, handle, scope)
           unless Process.alive?(pid), do: Connection.close_pooled(handle)
