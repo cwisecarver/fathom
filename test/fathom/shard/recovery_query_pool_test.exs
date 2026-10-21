@@ -78,6 +78,8 @@ defmodule Fathom.Shard.RecoveryQueryPoolTest do
             packet: 4,
             active: false,
             reuseaddr: true,
+            # Room for a burst of overflow dials (rv6 F2): the default backlog of 5 resets them.
+            backlog: 256,
             ip: {127, 0, 0, 1}
           ])
 
@@ -221,7 +223,12 @@ defmodule Fathom.Shard.RecoveryQueryPoolTest do
       assert accepted_count() == 1
     end
 
-    test "a burst of concurrent opens holds at most pool_size connections per peer" do
+    # This test used to assert `accepted_count() <= 2`: a burst queued behind the pool's slots and
+    # never dialed past them. That queue is what answered a healthy peer `:silent` (expert review
+    # 2026-10-21 rv6 F2), so an ask that finds every slot busy now dials fresh, as the pre-pool code
+    # did. What stays bounded is the POOLED connections, the long-lived ones that hold the
+    # follower's connection cap between waves.
+    test "a burst of concurrent opens is fully answered and keeps at most pool_size slots" do
       start_pool(2)
       {surv, _} = start_follower()
       peer = start_peer(fn _s, _c, _q -> [:answer] end)
@@ -242,10 +249,7 @@ defmodule Fathom.Shard.RecoveryQueryPoolTest do
         |> Enum.map(fn {:ok, r} -> r end)
 
       assert Enum.all?(results, &(&1 == :none))
-      # The fresh-dial code dialed one connection per concurrent ask (21 accepted here when probed
-      # against it on 2026-10-21). That unbounded count
-      # is what shares the follower's 256-connection cap with the shipper links in a failover wave.
-      assert accepted_count() <= 2
+      assert :ets.info(QueryPool.Slots, :size) <= 2
     end
   end
 
@@ -389,6 +393,43 @@ defmodule Fathom.Shard.RecoveryQueryPoolTest do
 
       assert answered_at(1001) == ask(peer.endpoint, "i")
       assert_receive {:peer_saw_close, 1}, 2_000
+    end
+
+    # HEAD-OF-LINE BLOCKING (expert review 2026-10-21 rv6 F2). Asks used to queue behind a busy
+    # slot (`phash2(shard, pool_size)`, one ask at a time), and an ask that waited past its budget
+    # answered `:silent` without touching the network. With a 100 ms peer, 30 concurrent asks on 2
+    # slots need 1.5 s of serial service against a 500 ms budget, so most of them came back silent:
+    # a healthy peer read as gone, which under quorum can refuse an open. A busy slot must never
+    # hold an ask: the ask takes an idle slot or is handed back `:unavailable`, and the caller
+    # dials fresh exactly as the pre-pool code did.
+    test "concurrent asks beyond pool_size never wait behind a busy slot" do
+      start_pool(2)
+      peer = start_peer(fn _s, _c, _q -> [{:sleep, 100}, :answer] end)
+      {_k, host, port} = peer.endpoint
+
+      answers =
+        1..30
+        |> Task.async_stream(
+          fn i ->
+            shard = "hol_#{i}"
+
+            case ask(peer.endpoint, shard, 250, 250) do
+              {:ok, answer} ->
+                answer
+
+              :unavailable ->
+                {:ok, sock} = Recovery.connect_peer(host, port)
+                {answer, _} = Recovery.exchange(sock, shard, 250)
+                :gen_tcp.close(sock)
+                answer
+            end
+          end,
+          max_concurrency: 30,
+          timeout: 5_000
+        )
+        |> Enum.map(fn {:ok, a} -> a end)
+
+      assert Enum.count(answers, &(&1 == :silent)) == 0
     end
 
     test "with the pool off, asks dial fresh exactly as before" do

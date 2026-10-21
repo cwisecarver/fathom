@@ -14,14 +14,22 @@ defmodule Fathom.Shard.Replication.Recovery.QueryPool.Slot do
   def init(endpoint), do: {:ok, %{endpoint: endpoint, sock: nil}}
 
   @impl true
-  def handle_call({:ask, shard_id, timeout_ms, connect_ms, deadline, honor?}, _from, st) do
-    if remaining(deadline) == 0 do
-      # The caller has already given up. Do not spend the network on an answer nobody reads.
-      {:reply, :silent, st, QueryPool.idle_ms()}
-    else
-      {answer, st} = run(st, shard_id, timeout_ms, connect_ms, deadline, honor?)
-      {:reply, answer, st, QueryPool.idle_ms()}
-    end
+  def handle_call({:ask, key, shard_id, timeout_ms, connect_ms, deadline, honor?}, from, st) do
+    {caller, _tag} = from
+
+    {answer, st} =
+      if remaining(deadline) == 0 or not Process.alive?(caller) do
+        # The caller has already given up, or was killed by `Recovery`'s early exit (rv6 F2). Do
+        # not spend the network on an answer nobody reads.
+        {:silent, st}
+      else
+        run(st, shard_id, timeout_ms, connect_ms, deadline, honor?)
+      end
+
+    # Free the slot before replying, so the next ask finds it idle rather than overflowing to a
+    # fresh dial while this reply is in flight.
+    QueryPool.release(key, deadline)
+    {:reply, answer, st, QueryPool.idle_ms()}
   end
 
   @impl true
