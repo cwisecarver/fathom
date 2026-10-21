@@ -127,6 +127,101 @@ defmodule Fathom.Tenants.TombstoneReplicaEraseTest do
     assert replica_files(id) == []
   end
 
+  # LAZY BOOT + BUSY LOCK (expert review 2026-10-21 rv6 F5). The erase hook forgot the replica only
+  # when `state_of/2` returned a row. Since the lazy boot (2026-10-21 #5) a replica on disk is
+  # usually not resident, so `state_of/2` re-derives it; with the shard's lock held elsewhere (a
+  # push or seed) that re-derive answers nil for a tombstoned shard, the hook skipped the forget,
+  # and the deleted tenant's `.db` + `-wal` stayed on disk until the next boot.
+  test "a live delete erases a NON-resident replica while its lock is busy", %{id: id, dir: dir} do
+    put_env!(:replication_forget_lock_wait_ms, 100)
+    {db, wal} = real_replica_bytes!(dir)
+    File.write!(Path.join(dir, id <> ".db"), db)
+    File.write!(Path.join(dir, id <> ".db-wal"), wal)
+
+    start_follower!(dir)
+
+    assert :ets.lookup(Follower.table(Follower), id) == [],
+           "fixture: the row must not be resident"
+
+    test = self()
+
+    holder =
+      spawn_link(fn ->
+        {:ok, tok} = Follower.lock_shard(Follower, id, 1_000)
+        send(test, :held)
+
+        receive do
+          :release -> Follower.unlock_shard(Follower, tok)
+        end
+
+        send(test, :released)
+      end)
+
+    assert_receive :held
+    :ok = Tombstones.put(id)
+    send(holder, :release)
+    assert_receive :released
+
+    assert replica_files(id) == [],
+           "a deleted tenant's replica survived a live delete: #{inspect(replica_files(id))}"
+  end
+
+  # A SEED IN FLIGHT ACROSS THE DELETE (expert review 2026-10-21 rv6 F5). `begin_seed/3` refuses a
+  # tombstoned shard, but a seed that began first holds the shard's lock, so the erase hook's
+  # `forget/2` waits out its lock wait and erases without it, and the install then put the deleted
+  # tenant's replica back on disk.
+  test "a seed that began before the delete is discarded at install", %{id: id, dir: dir} do
+    put_env!(:replication_forget_lock_wait_ms, 50)
+    start_follower!(dir)
+    {db, _wal} = real_replica_bytes!(dir)
+
+    seeds =
+      Follower.begin_seed(Follower, %{}, %Protocol.SeedBegin{
+        shard_id: id,
+        epoch: 1,
+        wal_gen: 0,
+        salt1: 0,
+        wal_offset: 0,
+        db_size: byte_size(db),
+        wal_size: 0,
+        lineage: 1
+      })
+
+    assert Map.has_key?(seeds, id), "fixture: the seed must open before the delete"
+
+    :ok = Tombstones.put(id)
+
+    seeds = Follower.write_chunk(seeds, id, :db, 0, db)
+    assert {{:error, :tombstoned}, %{}} = Follower.finish_seed(Follower, seeds, id)
+    assert Follower.state_of(Follower, id) == nil
+    assert replica_files(id) == [], "the seed re-installed a deleted tenant's replica"
+  end
+
+  defp put_env!(key, value) do
+    prev = Application.get_env(:fathom, key)
+
+    on_exit(fn ->
+      if prev == nil,
+        do: Application.delete_env(:fathom, key),
+        else: Application.put_env(:fathom, key, prev)
+    end)
+
+    Application.put_env(:fathom, key, value)
+  end
+
+  # A real `.db` + committed `-wal` pair, built off to the side.
+  defp real_replica_bytes!(dir) do
+    src = Path.join(dir, "src_#{System.unique_integer([:positive])}.db")
+    {:ok, conn} = Fathom.Shard.Connection.open(src)
+    {:ok, _} = Fathom.Shard.Connection.query(conn, "PRAGMA wal_autocheckpoint=0", [])
+    {:ok, _} = Fathom.Shard.Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
+    {:ok, _} = Fathom.Shard.Connection.query(conn, "INSERT INTO t VALUES (1)", [])
+    bytes = {File.read!(src), File.read!(src <> "-wal")}
+    Fathom.Shard.Connection.close(conn)
+    for s <- ["", "-wal", "-shm"], do: File.rm(src <> s)
+    bytes
+  end
+
   # A shard file whose WAL `Wal.read/1` accepts, so recovery would pick it up if not for the
   # tombstone — otherwise the recovery test passes because the files were unreadable, not because
   # of the guard.

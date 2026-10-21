@@ -1851,7 +1851,19 @@ defmodule Fathom.Shard.Replication.Follower do
         {{:error, :seed_failed}, discard_seed(seeds, shard_id)}
 
       %{db_written: db, db_size: db, wal_written: wal, wal_size: wal} = state ->
-        {install(name, shard_id, state), Map.delete(seeds, shard_id)}
+        # A seed that BEGAN before the tenant was deleted (expert review 2026-10-21 rv6 F5).
+        # `checked_begin/4` refuses a seed for a tombstoned shard, but a seed already streaming when
+        # the delete lands holds the shard's lock, so `Tombstones`' `forget/2` waits out its lock
+        # wait and erases without it, and the install would then put the deleted tenant's replica
+        # back on disk. Re-checked here, under the lock this seed holds: the tombstone is in the
+        # set before the erase runs, so either this install sees it and discards, or the install
+        # finished first and the erase that follows removes it.
+        if Fathom.Tenants.Tombstones.tombstoned?(shard_id) do
+          Logger.info("replication follower discarding a seed of #{shard_id}: tenant is deleted")
+          {{:error, :tombstoned}, discard_seed(seeds, shard_id)}
+        else
+          {install(name, shard_id, state), Map.delete(seeds, shard_id)}
+        end
 
       _short ->
         # Declared sizes not met. The stream ended early — refuse rather than install a truncated

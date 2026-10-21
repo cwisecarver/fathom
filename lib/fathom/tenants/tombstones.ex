@@ -268,13 +268,21 @@ defmodule Fathom.Tenants.Tombstones do
   # still converges at the next refresh. Replicas that exist on disk before this node's Follower
   # has booted are erased by `Follower`'s post-listen housekeeping pass, and refused by its lazy
   # re-derive until that pass reaches them (expert review 2026-10-21 #5);
-  # `Follower.begin_seed/3` refuses to re-seed one.
+  # `Follower.begin_seed/3` refuses to re-seed one, and `Follower.finish_seed/3` refuses to install
+  # one whose seed began before the delete (expert review 2026-10-21 rv6 F5).
+  #
+  # UNCONDITIONAL (expert review 2026-10-21 rv6 F5). This used to forget only when `state_of/2`
+  # returned a row. Since the lazy follower boot (2026-10-21 #5) a replica is usually NOT resident,
+  # and `state_of/2` then re-derives it; when the shard's lock is busy that re-derive answers nil
+  # for a tombstoned shard (it must not serve one), so the forget was skipped and the deleted
+  # tenant's bytes stayed on disk until the next boot. `forget/2` is idempotent and erases files
+  # whether or not a row is resident, and this runs once per newly learned id (`insert_new`).
   defp forget_replica(shard_id) do
     follower = Fathom.Shard.Replication.Follower
 
-    if Process.whereis(follower) && follower.state_of(follower, shard_id) do
+    if Process.whereis(follower) do
       follower.forget(follower, shard_id)
-      Logger.info("tenant #{shard_id} is tombstoned — erased this node's A2 replica of it")
+      Logger.info("tenant #{shard_id} is tombstoned — erased any A2 replica of it on this node")
     end
 
     :ok
