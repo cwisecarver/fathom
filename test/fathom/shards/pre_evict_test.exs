@@ -226,9 +226,14 @@ defmodule Fathom.Shards.PreEvictTest do
       assert {:error, :claimed} = Shards.evict(id, 1_000)
       assert open?(id), "the claimed victim was evicted twice"
 
+      # Asserted on the coordinator's own DOWN, not `open?/1`: `evict/2` answers on that DOWN, and
+      # `Registry` drops the entry later, in its partition process. Under full-suite load the
+      # lookup still saw it (seeds 316529 and 181822 failed `refute open?(id)` here).
+      [{pid, _}] = Registry.lookup(Fathom.ShardRegistry, id)
+      ref = Process.monitor(pid)
       :ok = Lru.release_eviction(id)
       assert :ok = Shards.evict(id, 5_000)
-      refute open?(id)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}
       cleanup([id])
     end
 
