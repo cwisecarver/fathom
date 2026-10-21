@@ -435,6 +435,54 @@ defmodule Fathom.BenchTest do
     assert put > 20 and put < 50_000, "conditional PUT #{put}us outside the band"
   end
 
+  # expert review 2026-10-21 #2. S3Stub had no DELETE, so a lease release / idle drop could not run
+  # against it. It must answer like S3: 204 for a plain delete (existing or not), 412 for an
+  # If-Match mismatch, 404 for If-Match on a missing key, and actually remove the object.
+  test "S3Stub DELETE is S3-shaped (plain, If-Match match / mismatch / missing)" do
+    table = :ets.new(:s3_stub_test, [:set, :public])
+    Fathom.Bench.S3Stub.put_object(table, "/b/k", "body", [{"etag", ~s("e1")}])
+    opts = Fathom.Bench.S3Stub.init(table: table)
+
+    del = fn path, headers ->
+      Enum.reduce(headers, Plug.Test.conn("DELETE", path), fn {k, v}, c ->
+        Plug.Conn.put_req_header(c, k, v)
+      end)
+      |> Fathom.Bench.S3Stub.call(opts)
+    end
+
+    assert del.("/b/k", [{"if-match", ~s("other")}]).status == 412
+    assert :ets.member(table, "/b/k"), "a mismatched If-Match must not delete"
+    assert del.("/b/nope", [{"if-match", ~s("e1")}]).status == 404
+    assert del.("/b/k", [{"if-match", ~s("e1")}]).status == 204
+    refute :ets.member(table, "/b/k")
+    assert del.("/b/k", []).status == 204, "S3 DELETE of a missing key is 204"
+  end
+
+  # expert review 2026-10-21 #2. The cold-open and concurrent-cold-cycle arms against the real S3
+  # client + coordinator over the loopback stub. Each raises if a cycle did not pull a file, the
+  # Finch pool did not carry the requests, or a lease lock survives the drain (DELETE not run).
+  @tag timeout: 300_000
+  test "cold_open_stub and concurrent_cold_cycle run the real S3 path and clean up their env" do
+    before_env =
+      Application.get_all_env(:fathom) |> Keyword.take([:shard_storage, :shard_data_dir])
+
+    us = Fathom.Bench.StorageIO.cold_open_stub(cold_stub_samples: 3)
+    assert is_float(us) and us > 50 and us < 500_000, "cold_open_stub_p50_us #{us} out of band"
+
+    rate =
+      Fathom.Bench.StorageIO.concurrent_cold_cycle(
+        cold_cycle_workers: 4,
+        cold_cycle_per_worker: 2,
+        cold_cycle_trials: 1
+      )
+
+    IO.puts("cold_open_stub_p50_us=#{us} concurrent_cold_cycle_per_s=#{rate}")
+    assert is_float(rate) and rate > 1, "concurrent_cold_cycle_per_s #{rate} out of band"
+
+    assert Application.get_all_env(:fathom) |> Keyword.take([:shard_storage, :shard_data_dir]) ==
+             before_env
+  end
+
   # expert review 2026-10-19 #12. A warm-stream SELECT 1 over the WebSocket path; the metric
   # asserts each reply is [[1]]. Prod ~100-200 us.
   # The full `mix fathom.bench` run crashed in await_upgrade/2 with a CaseClauseError on :unknown

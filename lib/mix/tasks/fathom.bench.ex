@@ -104,7 +104,9 @@ defmodule Mix.Tasks.Fathom.Bench do
     :hrana_ws_sparse,
     :same_shard_stmt,
     :serial_checkout,
-    :hrana_wide
+    :hrana_wide,
+    :cold_open_stub,
+    :concurrent_cold_cycle
   ]
 
   @doc false
@@ -302,6 +304,10 @@ defmodule Mix.Tasks.Fathom.Bench do
        "ops/s  (checkout+checkin, one worker per shard: every checkin a 1->0 edge; watch-only)"},
       {"hrana_wide_rt_us", metrics.hrana_wide_rt_us,
        "\u00b5s   (Hrana round trip, 8-column point SELECT, warm stream; watch-only)"},
+      {"cold_open_stub_p50_us", metrics.cold_open_stub_p50_us,
+       "\u00b5s   (cold open: real Storage.S3 client + Finch + coordinator, loopback stub; watch-only)"},
+      {"concurrent_cold_cycle_per_s", metrics.concurrent_cold_cycle_per_s,
+       "cycles/s (32 workers: cold checkout+checkin+drain vs loopback S3 stub; watch-only)"},
       {"wire_rows_per_s", metrics.wire_rows_per_s,
        "rows/s (result-set encode over the wire, keystone rows)"},
       {"wire_server_rows_per_s", metrics.wire_server_rows_per_s,

@@ -134,7 +134,9 @@ defmodule Fathom.Bench do
     :hrana_ws_sparse,
     :same_shard_stmt,
     :serial_checkout,
-    :hrana_wide
+    :hrana_wide,
+    :cold_open_stub,
+    :concurrent_cold_cycle
   ]
 
   @doc false
@@ -287,7 +289,17 @@ defmodule Fathom.Bench do
       serial_checkout_per_s: run_if(only, :serial_checkout, fn -> serial_checkout(opts) end),
       # WATCH-ONLY (expert review 2026-10-19 #10): an 8-column point read, the per-COLUMN encode
       # cost every other wire metric (one-cell SELECT 1) hides.
-      hrana_wide_rt_us: run_if(only, :hrana_wide, fn -> hrana_wide_rt_us(opts) end)
+      hrana_wide_rt_us: run_if(only, :hrana_wide, fn -> hrana_wide_rt_us(opts) end),
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-21 #2), user-approved. The cold open and the
+      # concurrent cold cycle against the REAL Storage.S3 client + Finch pool + coordinator over a
+      # loopback S3Stub (with DELETE), instead of the Storage.Local double. Each owns its scoped
+      # setup in `Fathom.Bench.StorageIO`, so the shared `setup/1` is unchanged.
+      cold_open_stub_p50_us:
+        run_if(only, :cold_open_stub, fn -> Fathom.Bench.StorageIO.cold_open_stub(opts) end),
+      concurrent_cold_cycle_per_s:
+        run_if(only, :concurrent_cold_cycle, fn ->
+          Fathom.Bench.StorageIO.concurrent_cold_cycle(opts)
+        end)
     }
     |> Map.merge(sparse_ws_metrics(only, opts))
   end

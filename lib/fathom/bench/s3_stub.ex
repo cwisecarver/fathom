@@ -1,13 +1,16 @@
 defmodule Fathom.Bench.S3Stub do
   @moduledoc """
   A loopback S3 stand-in for the storage-IO benches (`Fathom.Bench.StorageIO`): a Plug answering
-  HEAD/GET/PUT on any path from an ETS table, with S3-shaped headers (quoted `etag`, the
+  HEAD/GET/PUT/DELETE on any path from an ETS table, with S3-shaped headers (quoted `etag`, the
   `x-amz-meta-*` user metadata). It is served by a real Bandit listener so requests cross a real
   socket and the real S3 Finch pool, which a `req_plug` double would bypass.
 
   It honours exactly what the S3 client's fences need and nothing more: `If-Match` /
   `If-None-Match: *` on PUT (412 on a mismatch, as S3 answers), a fresh etag per PUT, and
-  `x-amz-meta-*` request headers echoed on HEAD/GET. No auth check, no multipart, no listing.
+  `x-amz-meta-*` request headers echoed on HEAD/GET. DELETE (what `release_lease` and a drop send) is
+  S3-shaped: 204 whether or not the key exists, except that an `If-Match` that does not match the
+  current etag is a 412 (and a missing key under `If-Match` is a 404). No auth check, no multipart,
+  no listing.
   """
   @behaviour Plug
 
@@ -47,6 +50,9 @@ defmodule Fathom.Bench.S3Stub do
       {"PUT", existing} ->
         put(conn, table, existing)
 
+      {"DELETE", existing} ->
+        delete(conn, table, existing)
+
       {m, [{_, body, headers}]} when m in ["GET", "HEAD"] ->
         conn
         |> prepend_resp_headers(headers)
@@ -54,6 +60,27 @@ defmodule Fathom.Bench.S3Stub do
 
       {m, []} when m in ["GET", "HEAD"] ->
         send_resp(conn, 404, "")
+    end
+  end
+
+  defp delete(conn, table, existing) do
+    current = with [{_, _, headers}] <- existing, do: List.keyfind(headers, "etag", 0)
+    current = if is_tuple(current), do: elem(current, 1)
+
+    case get_req_header(conn, "if-match") |> List.first() do
+      nil ->
+        :ets.delete(table, conn.request_path)
+        send_resp(conn, 204, "")
+
+      _ when current == nil ->
+        send_resp(conn, 404, "")
+
+      etag when etag != current ->
+        send_resp(conn, 412, "")
+
+      _ ->
+        :ets.delete(table, conn.request_path)
+        send_resp(conn, 204, "")
     end
   end
 
