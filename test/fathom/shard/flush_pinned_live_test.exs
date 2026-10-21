@@ -173,12 +173,28 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
     assert object_rows(id) == Enum.to_list(1..10)
   end
 
-  test "a non-empty WAL keeps the VACUUM INTO route", ctx do
-    %{id: id, coordinator: coordinator} = ctx
+  # This test used to assert that ANY non-empty WAL keeps the VACUUM route. That pinned the defect
+  # expert review 2026-10-21 #11 fixed: a persistent stream's WAL is never zero-length, so such a
+  # shard never took the cheap route even when fully checkpointed. The route now needs the WAL fully
+  # BACKFILLED (replication off: the flush's PASSIVE runs before the pin to get it there). What still
+  # forces VACUUM is a WAL holding frames the main file lacks; a reader on an older snapshot keeps
+  # them there. `FlushPinnedBackfilledTest` covers the new route.
+  test "a WAL holding un-backfilled frames keeps the VACUUM INTO route", ctx do
+    %{id: id, coordinator: coordinator, path: path} = ctx
     {:ok, conn} = ShardExecutor.open(id)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (a INTEGER)"))
-    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (1)"))
     on_exit(fn -> ShardExecutor.close(conn) end)
+
+    {:ok, reader} = Connection.open(path)
+    :ok = Connection.exec(reader, "BEGIN")
+    {:ok, _} = Connection.query(reader, "SELECT count(*) FROM t", [])
+
+    on_exit(fn ->
+      _ = Connection.rollback_if_open(reader)
+      Connection.close(reader)
+    end)
+
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (1)"))
 
     flush!(coordinator)
 
@@ -218,6 +234,9 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
     assert_received {:route, :pinned_live}
     assert object_rows(id) == Enum.to_list(1..20)
 
+    # The flag off forces the VACUUM route: a live stream's WAL no longer does on its own, since
+    # the pre-pin PASSIVE folds it (expert review 2026-10-21 #11).
+    Application.put_env(:fathom, :flush_pinned_live_upload, false)
     {:ok, conn} = ShardExecutor.open(id)
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (21)"))
     on_exit(fn -> ShardExecutor.close(conn) end)
