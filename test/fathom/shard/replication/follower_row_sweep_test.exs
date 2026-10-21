@@ -212,4 +212,43 @@ defmodule Fathom.Shard.Replication.FollowerRowSweepTest do
 
     assert ordinal == @ordinal + 1
   end
+
+  # Integration review of expert review 2026-10-20-2027 #11. A swept row re-derives epoch 0 (the
+  # epoch is on no disk), which drops the EPOCH fence: any deposed primary's lock epoch is > 0.
+  # Invariant: the LINEAGE fence (above it in `FollowerLog.decide/2`, from the lineage sidecar)
+  # still refuses a deposed owner's push, even a well-formed offset-0 reset that `decide_fresh`
+  # would otherwise accept. Probed by mutation: without the lower-lineage clause this push is acked.
+  test "a swept replica still refuses a deposed (lower-lineage) owner's reset push", ctx do
+    %{name: name, id: id, port: port} = ctx
+    h = plant!(ctx)
+    age!(name, id)
+    assert Follower.sweep_idle_rows(name) == 1
+    refute resident?(name, id)
+
+    salt = rem(h.salt1 + 1, 0x1_0000_0000)
+
+    header =
+      <<0x377F0682::32, 3_007_000::32, 4096::32, h.ckpt_seq + 1::32, salt::32, 0::32, 0::64>>
+
+    zombie = %Protocol.Push{
+      shard_id: id,
+      epoch: 7,
+      wal_gen: h.ckpt_seq + 1,
+      salt1: salt,
+      offset: 0,
+      payload: header,
+      prev_extent: h.commit_extent,
+      wal_ordinal: @ordinal + 1,
+      lineage: @lineage - 1
+    }
+
+    assert {:ok, {:reject, ^id, :stale_epoch, 0}} =
+             send_frame!(port, Protocol.encode_push(zombie))
+
+    # The replica is untouched: same WAL identity, lineage and ordinal, not torn.
+    assert %{epoch: 0, salt1: salt1, lineage: @lineage, wal_ordinal: @ordinal, torn: false} =
+             Follower.state_of(name, id)
+
+    assert salt1 == h.salt1
+  end
 end

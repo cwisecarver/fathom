@@ -2417,6 +2417,23 @@ defmodule Fathom.Shard.Replication.Follower do
   # push, seed or promotion that is about to write the row itself; answer what the files say
   # without inserting it, never a definite "nothing" over a replica that is on disk (the
   # 2026-10-15 #4 bug class).
+  #
+  # WHY THE UNLOCKED BUSY-PATH READ IS HARMLESS (integration review of expert review 2026-10-20-2027
+  # #11; an explicit `:replica_busy` answer was considered and rejected). Only callers OUTSIDE the
+  # lock holder reach it (the holder's own reads are re-entrant): `PromoteOnOpen.replica_state/1`,
+  # `Recovery.local_state/2`, `Promote.ensure_replica/2`, the tombstone presence check. It can see a
+  # push or seed mid-write, but:
+  #   * it can only UNDER-claim. `Wal.read/1`'s commit extent stops at the last commit frame, so
+  #     frames a push has written but not committed are not counted; and a reset caught between
+  #     rewriting the `-wal` and `put_state/3` reads a new salt whose ordinal sidecar (keyed on the
+  #     salt it was written for) is absent, so `wal_ordinal` is 0 and `Promote.fresher?/2` refuses to
+  #     rank it. Nothing transient can rank ABOVE what the replica durably holds;
+  #   * no caller ACTS on it unlocked. Every promotion goes through `Promote.stage/4`, which takes
+  #     this lock and fences with `expect:` the state that was ranked, so a value that moved is
+  #     refused `:replica_changed`; the other readers only test presence or log;
+  #   * a resident row read by the same callers is just as unlocked and just as about to change.
+  # Answering `:replica_busy` instead would widen `state_of/2`'s contract for every call site and,
+  # mapped to `nil` by any of them, reintroduce "no replica" over one on disk.
   defp rederive(name, shard_id) do
     if Fathom.ShardId.valid?(shard_id) do
       case with_shard_lock(name, shard_id, lock_wait_ms(), fn ->
