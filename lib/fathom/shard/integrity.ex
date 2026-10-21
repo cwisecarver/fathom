@@ -88,6 +88,34 @@ defmodule Fathom.Shard.Integrity do
     end
   end
 
+  # `run_quick_check/1` on the MAIN FILE's bytes alone (expert review 2026-10-21 rv6 F3): a
+  # `Connection.open_immutable/1` handle, which reads no WAL frame. For the pinned-live flush, which
+  # uploads the `.db` itself. The pin's own handle is the wrong one to check there: when the WAL is
+  # fully backfilled but the pin's read mark is in the WAL, it reads those pages from the WAL frames,
+  # so a `.db` page that differs from its frame (a torn backfill write, bad media) passes the check
+  # and is uploaded. Only valid while the main file cannot change (the pin freezes it). `prepare` runs
+  # on the handle first (the scan mmap). An open failure is "could not check", not "corrupt", unless
+  # SQLite says the file is not a database.
+  @spec run_quick_check_main_file(Path.t(), (reference() -> term())) :: :ok | {:error, term()}
+  def run_quick_check_main_file(path, prepare \\ fn _ -> :ok end) do
+    if verify_flush?() do
+      case Connection.open_immutable(path) do
+        {:ok, conn} ->
+          try do
+            _ = prepare.(conn)
+            run_quick_check(conn)
+          after
+            Connection.close(conn)
+          end
+
+        {:error, reason} ->
+          verdict({:error, {:quick_check_open_failed, reason}})
+      end
+    else
+      :ok
+    end
+  end
+
   # The same check as `run_quick_check/1` but WITHOUT the `verify_flush?` gate or `verdict/1`
   # classification — it returns the raw `{:quick_check, _}` / `{:quick_check_failed, _}` shapes for
   # the checkpoint-and-verify drop path, which does its own thing with them.

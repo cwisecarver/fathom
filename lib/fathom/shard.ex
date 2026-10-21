@@ -5166,9 +5166,15 @@ defmodule Fathom.Shard do
   #     the `.db`, and the WAL was already fully backfilled; any newer commit would need read-lock 0
   #     exclusively to backfill, which the pin blocks, so the WAL could not have become empty
   #     holding newer data.)
-  #   * THE INTEGRITY GATE RUNS ON THE UPLOADED BYTES. `quick_check` runs on the pin's own handle,
-  #     which reads those same frozen pages, and the pin is held across `Storage.flush`. The S3
-  #     backend's own stat-before/stat-after (`source_unchanged`) and the decode proof still apply.
+  #   * THE INTEGRITY GATE RUNS ON THE UPLOADED BYTES. `quick_check` runs on a separate
+  #     `immutable=1` handle that reads the `.db` alone (`Integrity.run_quick_check_main_file/2`),
+  #     opened and closed while the pin holds those bytes frozen, and the pin is held across
+  #     `Storage.flush`. It used to run on the pin's own handle, which is NOT the same thing once
+  #     the WAL is merely fully backfilled rather than empty (expert review 2026-10-21 rv6 F3): a pin
+  #     whose read mark is in the WAL reads every page the WAL holds from its frame, so a `.db` page
+  #     that differs from its frame passed the check and was uploaded (probe: the pin's
+  #     `quick_check` said ok while the immutable `.db` said malformed). The S3 backend's own
+  #     stat-before/stat-after (`source_unchanged`) and the decode proof still apply.
   #     (`VACUUM INTO` never gave the gate more than this: it already ran on the LIVE file, and
   #     VACUUM rewrites pages, so it was not a check of the temp. Index-content drift is invisible
   #     to `quick_check` on either route, per "WHAT THIS GATE CANNOT SEE".)
@@ -5218,7 +5224,9 @@ defmodule Fathom.Shard do
       result =
         Fathom.Shard.Replication.Session.with_flush_pin(
           state.path,
-          fn pin ->
+          fn _pin ->
+            pin_held_hook(state)
+
             # A mostly-free file takes the VACUUM route, which compacts it (expert review
             # 2026-10-20-2027 #9). Header read under the pin with a folded WAL: the main file
             # holds the pin's whole state, so its counts are current.
@@ -5228,9 +5236,9 @@ defmodule Fathom.Shard do
               with :ok <-
                      Fathom.Shard.ScanGate.with_permit(
                        @scan_permit_wait_ms,
+                       # On the `.db` bytes, not through the pin (rv6 F3, see above).
                        fn ->
-                         apply_scan_mmap(pin)
-                         Integrity.run_quick_check(pin)
+                         Integrity.run_quick_check_main_file(state.path, &apply_scan_mmap/1)
                        end
                      ),
                    :ok <- after_snapshot_hook(state),
@@ -5303,6 +5311,18 @@ defmodule Fathom.Shard do
   # TEST SEAM between the snapshot and the PUT (expert review 2026-10-15 #5): the only way to land a
   # commit deterministically inside the window the stamp's read order is about. One env read per
   # flush, beside a full VACUUM INTO and PUT.
+  # Test seam: runs first thing under the pinned-live route's pin, before the route decision and
+  # the integrity gate (expert review 2026-10-21 rv6 F3's regression test checkpoints and corrupts
+  # the main file here). Unset in production.
+  defp pin_held_hook(state) do
+    case Application.get_env(:fathom, :flush_pin_held_hook) do
+      fun when is_function(fun, 1) -> fun.(state.id)
+      _ -> :ok
+    end
+
+    :ok
+  end
+
   defp after_snapshot_hook(state) do
     case Application.get_env(:fathom, :flush_after_snapshot_hook) do
       fun when is_function(fun, 1) -> fun.(state.id)

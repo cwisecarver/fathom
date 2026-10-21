@@ -101,6 +101,25 @@ defmodule Fathom.Shard.Connection do
 
   defp ensure_dir(dir), do: unless(Fathom.FS.dir?(dir), do: File.mkdir_p!(dir))
 
+  @doc """
+  Open a read-only handle that reads the main database file ONLY: a `file:` URI with
+  `immutable=1` (exqlite builds SQLite with `SQLITE_USE_URI=1`). SQLite then ignores the `-wal` and
+  `-shm` and takes no locks, so every page comes from the `.db` bytes on disk.
+
+  For the pinned-live flush's integrity gate only (expert review 2026-10-21 rv6 F3), where the main
+  file is frozen by a read pin and those bytes are exactly what gets uploaded. Never hand it to
+  anything that must see committed WAL frames, and never use it on a file that can change while it
+  is open: SQLite's answers are undefined then. No authorizer and no extension: fathom's own query,
+  never tenant SQL. Fails (does not create) when the file is absent.
+  """
+  @spec open_immutable(Path.t()) :: {:ok, reference()} | {:error, term()}
+  def open_immutable(path) do
+    # The path part of a `file:` URI is percent-decoded, so escape everything but `/` and the
+    # unreserved set: a `?` or `#` in a directory name must not end the path.
+    uri = "file:" <> URI.encode(path, &(URI.char_unreserved?(&1) or &1 == ?/)) <> "?immutable=1"
+    track_open(Sqlite3.open(uri, mode: :readonly), false, path)
+  end
+
   defp open_handle_ensuring_dir(path, scope, true = _tenant?, dir) do
     case open_handle(path, scope) do
       {:error, _} = err ->
