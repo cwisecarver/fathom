@@ -454,10 +454,13 @@ defmodule Fathom.Shard.Replication.Session do
 
   # A cycle with no caller (the catch-up timer, the covered-idle-close ask): exactly the
   # `handle_call({:commit, wal_path, :no_checkpoint}, ...)` path with no caller deadline (so never
-  # dropped), tagged with its origin.
-  defp internal_cycle(state, origin) do
+  # dropped), tagged with its origin. `deadline` defaults to that path's; the idle-close ask passes
+  # `now` for a single non-blocking round (see `idle_close_verdict/1`).
+  defp internal_cycle(state, origin, deadline \\ nil) do
+    deadline = deadline || commit_deadline(now_ms(), nil)
+
     {:reply, _discarded, state} =
-      run_commit(state.wal_path, :no_checkpoint, commit_deadline(now_ms(), nil), state, origin)
+      run_commit(state.wal_path, :no_checkpoint, deadline, state, origin)
 
     state
   end
@@ -2455,9 +2458,26 @@ defmodule Fathom.Shard.Replication.Session do
   # The covered-idle-close verdict (#7, `request_idle_close/2`). `:ready` when the close-time
   # checkpoint would fold nothing a connected follower lacks: a quorum holds the WAL and no connected
   # follower is owed frames. Otherwise ship first — through the catch-up path, so every ordering rule
-  # of the commit path applies (drain late replies, settle, reconcile, seed) — and judge again on the
-  # header that ship read. Still owed after that (a follower whose push failed): `:wait`; the
-  # coordinator re-asks, and its bound decides when to drain regardless.
+  # of the commit path applies (drain late replies, reconcile, seed) — and judge again on the header
+  # that ship read. Still owed after that: `:wait`, with the catch-up armed; the coordinator re-asks,
+  # and its bound decides when to drain regardless.
+  #
+  # ONE ROUND, NO WAITING (expert review 2026-10-20-2027 #15). The ship used to be a full catch-up
+  # cycle: up to `catchup_ms` (1 s) of rounds with `settle_inflight/3` between them, waiting on a
+  # far-behind or slow follower's acks — inside the Session, ~250 ms after the last checkin, which is
+  # exactly when a bursty tenant (Django CONN_MAX_AGE=0) opens its next connection and commits; that
+  # commit queued behind the whole catch-up. Now the ship runs with a deadline of NOW: one round,
+  # sent fire-and-forget when the quorum already holds (`deliver/7`, `needed == 0`), and nothing
+  # sent if it does not (a refusal, never an ack — no tenant is waiting on this cycle). The bytes a
+  # laggard still needs after that are the re-ask's (each ask is one more non-blocking round) and the
+  # catch-up timer's, off this path.
+  #
+  # Durability: unchanged. The verdict is still computed from a header read AFTER the ask arrived
+  # (the property the coordinator's bounded fallback rests on), and `:ready` still requires
+  # `nothing_owed?/2`: a quorum ACKED the extent and every connected follower was SENT it. A push
+  # sent in this round counts as sent, by the same argument `laggards/2` makes: the reset that
+  # follows the close travels the same shipper behind it, and a push that then fails leaves that
+  # follower short at the reset — re-seeded, never laundered.
   defp idle_close_verdict(%{wal_path: nil} = state), do: {:ready, state}
 
   defp idle_close_verdict(state) do
@@ -2471,10 +2491,13 @@ defmodule Fathom.Shard.Replication.Session do
         if nothing_owed?(state, header) do
           {:ready, state}
         else
-          state = internal_cycle(state, :idle_close)
+          state = internal_cycle(state, :idle_close, now_ms())
 
           header = state.last_header || header
-          {if(nothing_owed?(state, header), do: :ready, else: :wait), state}
+
+          if nothing_owed?(state, header),
+            do: {:ready, state},
+            else: {:wait, arm_catchup(state, [])}
         end
 
       # `:retry`, not `:wait`: nothing was read, so this is not the answer the coordinator's bounded
