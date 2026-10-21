@@ -255,6 +255,85 @@ defmodule Fathom.Shard.NifDispatchTest do
     end
   end
 
+  # expert review 2026-10-20-2027 #18: a pooled stream's CLOSE paid two dirty dispatches for two
+  # facts (temp-schema probe `step` + `rollback_if_open`'s `transaction_status`); they are one
+  # fused cached statement now. The abandoned-transaction rollback must still happen.
+  describe "pooled stream close" do
+    setup do
+      prev = Application.get_env(:fathom, :connection_pool)
+      prev_idle = Application.get_env(:fathom, :shard_idle_ms)
+      Application.put_env(:fathom, :connection_pool, true)
+      Application.put_env(:fathom, :shard_idle_ms, 60_000)
+      shard = "test_nifd_pool_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        for {k, v} <- [connection_pool: prev, shard_idle_ms: prev_idle] do
+          if v == nil,
+            do: Application.delete_env(:fathom, k),
+            else: Application.put_env(:fathom, k, v)
+        end
+
+        for base <- [
+              Path.join(Fathom.Shard.data_dir(), "#{shard}.db"),
+              Path.join(Fathom.Shard.Storage.Local.dir(), "#{shard}.db")
+            ],
+            suffix <- ["", "-wal", "-shm"],
+            do: File.rm(base <> suffix)
+      end)
+
+      {:ok, keep} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(keep, stmt("CREATE TABLE kv (k INTEGER PRIMARY KEY)"))
+      on_exit(fn -> ShardExecutor.close(keep) end)
+      %{shard: shard}
+    end
+
+    test "closing a clean pooled stream is exactly 1 dirty dispatch (was 2)", %{shard: shard} do
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("SELECT 1"))
+
+      {:ok, warm} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(warm, stmt("SELECT 1"))
+      # Warm the fused statement's cache entry on this handle; the steady state is what is pinned.
+      _ = ShardExecutor.close(warm)
+
+      {:ok, again} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(again, stmt("SELECT 1"))
+      {_, total, by_fun} = count(fn -> ShardExecutor.close(again) end)
+      ShardExecutor.close(conn)
+
+      assert {total, by_fun} == {1, %{multi_step: 1}}
+    end
+
+    test "a stream closed mid-BEGIN is still rolled back before pooling", %{shard: shard} do
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1)"))
+      :ok = ShardExecutor.close(conn)
+
+      # The abandoned write was rolled back: nothing is held, and the row is gone.
+      {:ok, other} = ShardExecutor.open(shard)
+
+      assert {:ok, %StmtResult{rows: []}} =
+               ShardExecutor.execute(other, stmt("SELECT k FROM kv"))
+
+      assert {:ok, _} = ShardExecutor.execute(other, stmt("INSERT INTO kv VALUES (2)"))
+      ShardExecutor.close(other)
+    end
+
+    test "the fused probe reports the temp schema and the autocommit flag", %{shard: shard} do
+      {:ok, conn} = ShardExecutor.open(shard)
+      assert {true, true} = Connection.checkin_probe(elem(conn, 2))
+
+      {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
+      assert {true, false} = Connection.checkin_probe(elem(conn, 2))
+      {:ok, _} = ShardExecutor.execute(conn, stmt("ROLLBACK"))
+
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TEMP TABLE t(x)"))
+      assert {false, true} = Connection.checkin_probe(elem(conn, 2))
+      ShardExecutor.close(conn)
+    end
+  end
+
   # Order-of-magnitude ceiling, not an exact latency (other agents load the machine). Measured
   # 2026-10-14: ~5.8 us -> ~2.7 us of NIF work per prepared point SELECT (100k iterations, median of
   # 7 alternating runs); the whole Connection.query is far below the 100 us ceiling either way.

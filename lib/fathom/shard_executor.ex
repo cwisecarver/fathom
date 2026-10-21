@@ -385,6 +385,7 @@ defmodule Fathom.ShardExecutor do
     if ddl?, do: cap_temp(conn)
 
     read? = read_verb?(head)
+
     # Expert review 2026-10-20-2027 #1: a transaction-control statement has no counters of its own;
     # `Connection.query` skips both getters for it (see `txn_control?/1`).
     control? = not dml? and not read? and txn_control?(head)
@@ -1372,8 +1373,14 @@ defmodule Fathom.ShardExecutor do
     # #6): a connection-local pragma this stream set, or TEMP objects. Checked here, in the stream
     # process, before the handle is handed off; such a handle is closed and the next stream opens
     # fresh, which is exactly the pre-pooling behaviour for that one handle.
-    if connection_pool?() and not opts.template? and not session_mutated? and
-         Connection.temp_schema_empty?(conn) do
+    # One fused probe for the temp schema AND the autocommit flag (expert review 2026-10-20-2027
+    # #18): was a `step` here plus a `transaction_status` in `rollback_if_open/1` below.
+    {temp_empty?, autocommit?} =
+      if connection_pool?() and not opts.template? and not session_mutated?,
+        do: Connection.checkin_probe(conn),
+        else: {false, true}
+
+    if temp_empty? do
       # Stop THIS stream's watchdog, and DETACH (not release) its prepared statements so they travel
       # with the handle to the next stream (perf review 2026-10-14 #10: re-preparing them cost 41 vs
       # 24 us for a three-statement stream). They used to be finalized here because the coordinator
@@ -1407,7 +1414,7 @@ defmodule Fathom.ShardExecutor do
       # that dies with the cast still in its mailbox closes it in terminate
       # (`close_pending_checkins`); the residual is a cast landing in the instant between that drain
       # and the process exiting.
-      case Connection.rollback_if_open(conn) do
+      case if(autocommit?, do: :ok, else: Connection.rollback_if_open(conn)) do
         :ok ->
           Shard.checkin(pid, ref, handle, scope)
           unless Process.alive?(pid), do: Connection.close_pooled(handle)

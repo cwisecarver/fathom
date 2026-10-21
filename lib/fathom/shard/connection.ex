@@ -2016,6 +2016,36 @@ defmodule Fathom.Shard.Connection do
     _ -> false
   end
 
+  # Expert review 2026-10-20-2027 #18: the pooled-stream CLOSE used to pay two dirty dispatches
+  # for two facts about the handle — the temp-schema probe (a `step`) and `rollback_if_open/1`'s
+  # `transaction_status`. Both are readable in ONE step of a cached statement: the extension's
+  # `fathom_conn_state()` carries the autocommit flag, and the EXISTS column is the temp probe.
+  # (The reuse-side `transaction_status` in `reset_for_reuse/2` is NOT touched: expert review
+  # 2026-10-17 #31 tried dropping it and one-shot got 12% slower, unexplained.)
+  @checkin_probe_sql "SELECT fathom_conn_state(), EXISTS(SELECT 1 FROM temp.sqlite_schema)"
+
+  @doc """
+  `{temp_schema_empty?, autocommit?}` for a handle about to be pooled, in ONE dirty dispatch when
+  the extension is loaded (expert review 2026-10-20-2027 #18). Same answers as
+  `temp_schema_empty?/1` + `autocommit?/1`, and the same failure direction: a handle whose temp
+  schema cannot be read is not poolable (`false`), an unreadable autocommit flag counts as `true`.
+  Falls back to the two separate calls when the fused statement is unavailable. Like
+  `temp_schema_empty?/1`, it must run BEFORE `detach_statements/1`.
+  """
+  @spec checkin_probe(reference()) :: {boolean(), boolean()}
+  def checkin_probe(conn) do
+    with {:ok, stmt, _cols, _enc, _refresh} <- cached_stmt(conn, @checkin_probe_sql),
+         # One row, so the chunk size is immaterial (`@multi_step_chunk` is defined further down).
+         {:done, [[<<_changes::unsigned-little-64, _rowid::signed-little-64, ac>>, exists]]} <-
+           Sqlite3.multi_step(conn, stmt, 2) do
+      {exists == 0, ac == 1}
+    else
+      _ -> {temp_schema_empty?(conn), autocommit?(conn)}
+    end
+  rescue
+    _ -> {false, true}
+  end
+
   @doc """
   Roll back any transaction left open on `conn`; `:ok` when it is already in autocommit.
 
