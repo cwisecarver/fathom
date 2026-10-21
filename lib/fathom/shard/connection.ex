@@ -1602,6 +1602,15 @@ defmodule Fathom.Shard.Connection do
 
         # Re-put under `canonical`, never the incoming sub-binary: a map that has grown past a
         # flatmap adopts the new key term, which would silently reinstate the pin.
+        #
+        # MEASURED AND DROPPED (expert review 2026-10-21 #27 part i): moving the LRU stamp out of
+        # this SQL-keyed map into a ref-keyed overlay (so a hit does one lookup and no re-put) was
+        # built and A/B'd, 1,145-byte SELECT, min of 25 trials, 4 alternating rounds: 64 entries
+        # 4.62-4.87 us -> 4.23-4.44 us (-0.4 us); 20 entries 3.49 -> 3.50 (no change, the map is
+        # still a flatmap below 33 keys); the residual to the 1-entry hit (3.46 us) is the lookup's
+        # own hash, which only a shorter key removes. 0.4 us is ~0.7% of hrana_ws_rt_us (59 us),
+        # under the panel's 3% bar, and it needed the stamp overlay to ride the pooled carry. Do not
+        # redo it without a workload that holds >32 distinct statements per stream.
         Process.put(
           key,
           {seq + 1, Map.put(cache, canonical, {stmt, seq + 1, gen, bytes, packed})}
@@ -1972,6 +1981,17 @@ defmodule Fathom.Shard.Connection do
   # the post-arm re-check the message protocol needed (2026-08-31 #22) is gone with it. The
   # residual window — the watchdog dying between this check and `start_timer` — self-heals on the
   # next statement, the same class the old re-check also left open.
+  #
+  # MEASURED AND DROPPED (expert review 2026-10-21 #27 part ii): carrying the watchdog with the
+  # pooled handle (park at checkin, `{:retarget, owner}` at adopt) so a stream does not spawn one.
+  # Ceiling: a warm watchdog saves 2.9 us per stream (SELECT 1: 5.22 -> 2.32 us), i.e. 2.9% of
+  # hrana_oneshot_rt_us (101 us) at ZERO cost, under the 3% bar. The cost is not zero: a parked
+  # watchdog idles on a scheduler, and the retarget send wakes it (fire-and-forget send to an idle
+  # process 0.63 / 1.04 / 2.04 us after 1 / 20 / 100 ms gaps, against spawn+stop 1.63 / 3.79 /
+  # 5.33 us), so the real gain is ~1-3 us (1-3%). It would also add a parked-watchdog lifetime
+  # (nothing monitors a parked one, so a coordinator that drops the handle leaks it) and a window
+  # between park and retarget in which owner death must not cancel a statement of the NEXT stream
+  # (the 2026-09-29 #33 class). Not worth that surface for <3%.
   defp ensure_watchdog(conn) do
     key = {__MODULE__, :watchdog, conn}
 
@@ -2313,28 +2333,68 @@ defmodule Fathom.Shard.Connection do
   Introspects a statement WITHOUT running it (the Hrana `describe` request, #34): returns its result
   column names and its bound-parameter count as `%{params: [nil, …], cols: [name, …]}`. Parameters
   are reported positionally (`nil` each — exqlite exposes the count, not the names), which is what a
-  libSQL client needs to know how many values to bind. The prepared statement is always released.
+  libSQL client needs to know how many values to bind.
+
+  GOES THROUGH THE STATEMENT CACHE (expert review 2026-10-21 #16a). The Rust/Python SDKs send one
+  `describe` before every statement, and this used to prepare + `columns` + release a fresh
+  statement each time (3 dirty dispatches, the compiled statement thrown away) while the cache
+  held the same compiled statement. Now a describe hit costs a map lookup + the non-dirty
+  `bind_parameter_count`, and a describe MISS prepares and caches, so the execute that follows
+  hits (and the reverse). The cache owns the statement; nothing is released here.
+
+  Exact-text keys only: `describe("X")` and `execute("X;")` are two entries (parked, #16b — no
+  trailing-`;` aliasing).
+
+  One case needs care: a hit whose `SchemaGen` moved (`refresh?`). `cached_stmt/3` re-prepares and
+  re-stamps the entry with the CURRENT generation, trusting the caller to re-read the columns after
+  the statement steps (which describe never does). Left alone, the next execute would take the
+  ordinary hit path and report the stale pre-DDL column list. So describe re-marks that entry with
+  a generation that never matches (-1): the next execute takes the refresh branch again, and the
+  describe answer is the fresh prepare's columns, exactly as the uncached describe returned.
   """
   @spec describe(reference(), String.t()) ::
           {:ok, %{params: [nil], cols: [String.t()]}} | {:error, term()}
   def describe(conn, sql) do
-    with {:ok, stmt} <- prepare_retrying(conn, sql, nil) do
-      try do
-        cols = with {:ok, c} <- Sqlite3.columns(conn, stmt), do: c, else: (_ -> [])
+    case cached_stmt(conn, sql) do
+      {:ok, stmt, cols, _enc, false} ->
+        {:ok, describe_result(stmt, cols)}
 
-        count =
-          case Sqlite3.bind_parameter_count(stmt) do
-            n when is_integer(n) and n >= 0 -> n
-            _ -> 0
-          end
+      {:ok, stmt, cols, _enc, true} ->
+        mark_stale(conn, sql)
+        {:ok, describe_result(stmt, cols)}
 
-        {:ok, %{params: List.duplicate(nil, count), cols: cols}}
-      after
-        Sqlite3.release(conn, stmt)
-      end
+      {:error, _} = err ->
+        err
     end
   rescue
     e in ArgumentError -> {:error, Exception.message(e)}
+  end
+
+  defp describe_result(stmt, cols) do
+    count =
+      case Sqlite3.bind_parameter_count(stmt) do
+        n when is_integer(n) and n >= 0 -> n
+        _ -> 0
+      end
+
+    %{params: List.duplicate(nil, count), cols: cols}
+  end
+
+  # Re-mark `sql`'s entry with a generation no `SchemaGen.current/0` ever equals, so the next
+  # `cached_stmt/3` hit takes the refresh branch (the column list is re-read after the step).
+  defp mark_stale(conn, sql) do
+    key = {__MODULE__, :stmt_cache, conn}
+
+    case Process.get(key) do
+      {seq, %{^sql => {stmt, stamp, _gen, bytes, packed}} = cache} ->
+        # Re-put under the CANONICAL key, never the caller's sub-binary (see `cached_stmt/3`).
+        {canonical, _cols, _enc} = decoded(conn, stmt, packed, sql)
+        Process.put(key, {seq, Map.put(cache, canonical, {stmt, stamp, -1, bytes, packed})})
+        :ok
+
+      _ ->
+        :ok
+    end
   end
 
   @doc """
