@@ -141,7 +141,9 @@ defmodule Fathom.Shard.ReplicationLagTest do
 
     report = Fleet.lag_report()
     assert report.sessions >= 1 and report.timed_out == 0
-    assert report.answered == report.sessions
+    # Only flagged Sessions are asked (expert review 2026-10-21 #24); a current one is not.
+    assert report.answered == report.queried
+    refute Enum.any?(report.worst, &(&1.shard_id == id))
   end
 
   # Expert review 2026-10-19 #9 (measure only): the commit_stage events carry a bounded
@@ -312,6 +314,8 @@ defmodule Fathom.Shard.ReplicationLagTest do
         {:ok, _} =
           Registry.register(@registry, "hung_#{System.unique_integer([:positive])}", self())
 
+        # The report only asks flagged Sessions (expert review 2026-10-21 #24).
+        LagGauge.mark(self(), true)
         send(parent, :registered)
 
         receive do
@@ -324,11 +328,78 @@ defmodule Fathom.Shard.ReplicationLagTest do
 
     report = Fleet.lag_report(timeout: 100)
     assert report.timed_out >= 1
-    assert report.answered == report.sessions - report.timed_out
+    assert report.answered == report.queried - report.timed_out
+  end
+
+  # Expert review 2026-10-21 #24. SYMPTOM: the Durability page's lag report called EVERY replication
+  # Session every 10 s while a viewer was mounted — 30k shards, 30k calls, each waking a hibernated
+  # Session and queueing behind its commits — to rank the handful that were lagging. INVARIANT: the
+  # report calls only the Sessions flagged in `LagGauge` (a real laggard, #25), while still counting
+  # every registered Session.
+  test "lag_report calls only the Sessions flagged in LagGauge, and still counts them all" do
+    start_supervised!(Fleet)
+    parent = self()
+
+    fake = fn armed? ->
+      pid =
+        spawn(fn ->
+          id = "fake_#{System.unique_integer([:positive])}"
+          {:ok, _} = Registry.register(@registry, id, self())
+          if armed?, do: LagGauge.mark(self(), true)
+          send(parent, {:registered, self()})
+          fake_session_loop(parent, id, armed?)
+        end)
+
+      assert_receive {:registered, ^pid}
+      pid
+    end
+
+    idle = for _ <- 1..1_000, do: fake.(false)
+    armed = for _ <- 1..3, do: fake.(true)
+    on_exit(fn -> for p <- idle ++ armed, do: Process.exit(p, :kill) end)
+
+    report = Fleet.lag_report(timeout: 1_000)
+    calls = drain_lag_calls([])
+
+    assert length(calls) == 3,
+           "lag_report called #{length(calls)} Sessions to find 3 laggards (1,000 idle)"
+
+    assert Enum.sort(calls) == Enum.sort(armed)
+    assert report.sessions == 1_003, "the report stopped counting the Sessions it did not call"
+    assert report.catching_up == 3
+    assert length(report.worst) == 3
+    assert report.timed_out == 0
+  end
+
+  defp fake_session_loop(parent, id, armed?) do
+    receive do
+      {:"$gen_call", from, :lag_info} ->
+        send(parent, {:lag_info_called, self()})
+
+        GenServer.reply(from, %{
+          shard_id: id,
+          catchup_fails: if(armed?, do: 1, else: 0),
+          catching_up?: armed?,
+          inflight_pushes: 0,
+          seeds_in_flight: 0,
+          behind_followers: if(armed?, do: 1, else: 0),
+          unacked_bytes: if(armed?, do: 4096, else: 0)
+        })
+
+        fake_session_loop(parent, id, armed?)
+    end
+  end
+
+  defp drain_lag_calls(acc) do
+    receive do
+      {:lag_info_called, pid} -> drain_lag_calls([pid | acc])
+    after
+      0 -> acc
+    end
   end
 
   test "lag_report with no registry (replication off) is an empty report, not a crash" do
-    assert %{sessions: 0, answered: 0, timed_out: 0, catching_up: 0, worst: []} =
+    assert %{sessions: 0, queried: 0, answered: 0, timed_out: 0, catching_up: 0, worst: []} =
              Fleet.lag_report()
 
     assert Session.lag_info("nope") == nil

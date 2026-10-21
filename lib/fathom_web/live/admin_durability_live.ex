@@ -255,7 +255,7 @@ defmodule FathomWeb.AdminDurabilityLive do
                 id="repl-lag-empty"
                 class="text-sm text-base-content/50"
               >
-                All sessions caught up ({@lag.answered} answered)
+                No session catching up ({@lag.sessions} sessions)
               </div>
               <table :if={@lag && @lag.worst != []} id="repl-lag-table" class="w-full text-sm">
                 <thead class="text-[11px] uppercase tracking-wide text-base-content/50">

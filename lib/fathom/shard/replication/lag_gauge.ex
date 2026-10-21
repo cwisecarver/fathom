@@ -59,6 +59,19 @@ defmodule Fathom.Shard.Replication.LagGauge do
     ArgumentError -> 0
   end
 
+  @doc """
+  The flagged Session pids that are still alive — the set `Fleet.lag_report/1` asks (expert review
+  2026-10-21 #24). Dead rows are left for `count/0` to prune.
+  """
+  @spec flagged() :: [pid()]
+  def flagged do
+    @table
+    |> :ets.tab2list()
+    |> Enum.flat_map(fn {pid} -> if Process.alive?(pid), do: [pid], else: [] end)
+  rescue
+    ArgumentError -> []
+  end
+
   @doc "Poller entry point: emits `[:fathom, :replication, :lag]` with `catching_up_shards`."
   @spec measure() :: :ok
   def measure do
