@@ -123,6 +123,173 @@ defmodule ErrTally do
   end
 end
 
+# --- tail statistics (pure; expert review 2026-10-20-2027 #3) --------------------------------
+# BEGIN TpcStats
+# Why: tpc-fleet reported one p99 per sweep step, so "round-4 p99 +34%" rested on a single run
+# whose tail was one slow cohort, and nothing said WHEN the slow txns happened (the first seconds
+# after a cold herd), WHICH node held them, or how wide the estimate's uncertainty was. A sample
+# is `{start_us, response_us, service_us}`: start is the monotonic µs the txn began (closed loop)
+# or was INTENDED to begin (open loop), response runs from that start to the reply, service from
+# the actual send. Closed loop: response == service.
+defmodule TpcStats do
+  @moduledoc false
+
+  @bucket_base 1.01
+
+  @doc "Linear-interpolated quantile `p` (0..1) of a SORTED tuple; nil when empty."
+  def q(xs, _p) when tuple_size(xs) == 0, do: nil
+  def q(xs, _p) when tuple_size(xs) == 1, do: Float.round(elem(xs, 0) / 1, 1)
+
+  def q(xs, p) do
+    n = tuple_size(xs)
+    rank = p * (n - 1)
+    lo = trunc(rank)
+    hi = min(lo + 1, n - 1)
+    frac = rank - lo
+    Float.round((elem(xs, lo) * (1 - frac) + elem(xs, hi) * frac) / 1, 1)
+  end
+
+  def sorted_tuple(values), do: values |> Enum.sort() |> List.to_tuple()
+
+  @doc """
+  Bootstrap `level` (default 0.95) confidence interval of the `p` quantile of a sorted tuple,
+  from `b` resamples (nil when `b < 1` or the tuple is empty). Exact, not approximate: a
+  resample is `n` uniform draws of INDICES into the sorted original, so only the draws landing
+  in the top few percent of ranks can be the p-quantile — everything below is just a count. That
+  keeps `b` x `n` at one pass of random numbers instead of `b` full sorts (410k txns x 100
+  resamples runs in seconds). IID resampling: it understates the width when txns cluster in time
+  or tenant, so read it beside `windows`, not instead of them.
+  """
+  def boot_ci(xs, p, b, level \\ 0.95, seed \\ {11, 22, 33})
+
+  def boot_ci(xs, _p, b, _level, _seed) when b < 1 or tuple_size(xs) == 0, do: nil
+
+  def boot_ci(xs, p, b, level, seed) do
+    n = tuple_size(xs)
+    prev = :rand.export_seed()
+    :rand.seed(:exsss, seed)
+
+    try do
+      # Ranks that can hold the quantile live above `cut`; anything below only adds to the count.
+      top = max(trunc(n * (1 - p)) * 3 + 8, 16)
+      cut = max(n - top, 0)
+
+      reps =
+        for _ <- 1..b do
+          {below, kept} = draw(n, n, cut, 0, [])
+          kept = Enum.sort(kept)
+          rank = p * (n - 1)
+          lo = trunc(rank)
+          hi = min(lo + 1, n - 1)
+          frac = rank - lo
+
+          if lo >= below do
+            kv = List.to_tuple(kept)
+            vlo = elem(xs, elem(kv, lo - below))
+            vhi = elem(xs, elem(kv, min(hi - below, tuple_size(kv) - 1)))
+            vlo * (1 - frac) + vhi * frac
+          else
+            # The resample's quantile fell below the cut (only possible for tiny n): redo plainly.
+            ys = for _ <- 1..n, do: elem(xs, :rand.uniform(n) - 1)
+            q(sorted_tuple(ys), p)
+          end
+        end
+
+      r = sorted_tuple(reps)
+      alpha = (1 - level) / 2
+      [q(r, alpha), q(r, 1 - alpha)]
+    after
+      if prev != :undefined, do: :rand.seed(prev)
+    end
+  end
+
+  defp draw(0, _n, _cut, below, kept), do: {below, kept}
+
+  defp draw(k, n, cut, below, kept) do
+    i = :rand.uniform(n) - 1
+
+    if i < cut,
+      do: draw(k - 1, n, cut, below + 1, kept),
+      else: draw(k - 1, n, cut, below, [i | kept])
+  end
+
+  @doc """
+  Reduce `samples` to the tail report. `opts`: `:excl_s` (drop txns that started in the first
+  N s of load), `:boot` (bootstrap resamples), `:window_s` (width of the p99 time series).
+  The origin is the EARLIEST txn start, i.e. when load began, not when the driver booted.
+  """
+  def tail(samples, opts \\ []) do
+    excl_us = Keyword.get(opts, :excl_s, 10) * 1_000_000
+    window_us = max(Keyword.get(opts, :window_s, 10), 1) * 1_000_000
+    boot = Keyword.get(opts, :boot, 0)
+
+    case samples do
+      [] ->
+        %{"n" => 0}
+
+      _ ->
+        t0 = samples |> Enum.map(&elem(&1, 0)) |> Enum.min()
+        resp = sorted_tuple(Enum.map(samples, &elem(&1, 1)))
+        svc = sorted_tuple(Enum.map(samples, &elem(&1, 2)))
+        steady = Enum.filter(samples, fn {s, _, _} -> s - t0 >= excl_us end)
+        steady_resp = sorted_tuple(Enum.map(steady, &elem(&1, 1)))
+
+        top5 =
+          samples
+          |> Enum.sort_by(&elem(&1, 1), :desc)
+          |> Enum.take(5)
+          |> Enum.map(fn {s, r, v} ->
+            %{
+              "at_s" => Float.round((s - t0) / 1_000_000, 2),
+              "response_us" => r,
+              "service_us" => v
+            }
+          end)
+
+        windows =
+          samples
+          |> Enum.group_by(fn {s, _, _} -> div(s - t0, window_us) end, &elem(&1, 1))
+          |> Enum.sort()
+          |> Enum.map(fn {w, ls} ->
+            t = sorted_tuple(ls)
+            %{"at_s" => div(w * window_us, 1_000_000), "n" => length(ls), "p99_us" => q(t, 0.99)}
+          end)
+
+        %{
+          "n" => tuple_size(resp),
+          "p50_us" => q(resp, 0.50),
+          "p99_us" => q(resp, 0.99),
+          "p99_ci95_us" => boot_ci(resp, 0.99, boot),
+          "service_p99_us" => q(svc, 0.99),
+          "boot_resamples" => boot,
+          "excl_first_s" => div(excl_us, 1_000_000),
+          "n_excl" => tuple_size(steady_resp),
+          "p99_excl_us" => q(steady_resp, 0.99),
+          "p99_excl_ci95_us" => boot_ci(steady_resp, 0.99, boot),
+          "max_us" => q(resp, 1.0),
+          "slowest" => top5,
+          "windows" => windows
+        }
+    end
+  end
+
+  @doc "Log-bucket index of a latency in µs (1% relative resolution)."
+  def bucket(us), do: round(:math.log(max(us, 1)) / :math.log(@bucket_base))
+
+  @doc "Approximate µs for a bucket index (the inverse of `bucket/1`, within 0.5%)."
+  def unbucket(b), do: Float.round(:math.pow(@bucket_base, b), 1)
+
+  @doc "Sparse `[[bucket, count], ...]` histogram of response latencies, for node-side merging."
+  def hist(samples) do
+    samples
+    |> Enum.frequencies_by(fn {_, r, _} -> bucket(r) end)
+    |> Enum.sort()
+    |> Enum.map(fn {b, c} -> [b, c] end)
+  end
+end
+
+# END TpcStats
+
 defmodule Tpc do
   @moduledoc "TPC workloads + one-BEAM-process-per-client orchestration over Filo.Client."
 
@@ -195,7 +362,12 @@ defmodule Tpc do
 
   # --- TPC-B (pgbench bank txn: 7 statements on a held stream) ---------------------------------
   def mode_tpcb(args) do
-    a = Map.put(args, :per_client, max(1, div(args.txns, args.clients)))
+    # `ready` is the open-loop start barrier (see `await_barrier/1`): every worker bumps it once it
+    # has established (or given up), so the arrival schedule starts with the whole fleet connected.
+    a =
+      args
+      |> Map.put(:per_client, max(1, div(args.txns, args.clients)))
+      |> Map.put(:ready, :atomics.new(1, []))
 
     raw =
       Task.async_stream(0..(a.clients - 1), fn cid -> worker(cid, a) end,
@@ -215,9 +387,10 @@ defmodule Tpc do
     results = for {:ok, r} <- raw, do: r
     crashed = length(raw) - length(results)
 
-    lat = Enum.flat_map(results, fn {l, _span, _e} -> l end)
-    spans = Enum.map(results, fn {_l, span, _e} -> span end)
-    errs = Enum.sum(Enum.map(results, fn {_l, _span, e} -> e end)) + crashed * a.per_client
+    samples = Enum.flat_map(results, fn {_cid, s, _span, _e} -> s end)
+    lat = Enum.map(samples, &elem(&1, 1))
+    spans = Enum.map(results, fn {_cid, _s, span, _e} -> span end)
+    errs = Enum.sum(Enum.map(results, fn {_cid, _s, _span, e} -> e end)) + crashed * a.per_client
 
     window_us =
       case spans do
@@ -265,10 +438,34 @@ defmodule Tpc do
       "errors" => errs,
       "shed_tenants" => crashed,
       "shed_errors" => crashed * a.per_client,
-      "tpcb_tps" => tps
+      "tpcb_tps" => tps,
+      # Open-loop arm: the fleet-wide arrival rate (txn/s) the schedule offered; 0 = closed loop.
+      "open_loop_rate" => a.rate,
+      "tail" => TpcStats.tail(samples, excl_s: a.excl_s, boot: a.boot, window_s: 10)
     }
     |> Map.merge(for {k, v} <- p, into: %{}, do: {"tpcb_#{k}", v})
+    |> maybe_tenant_hist(a, results)
   end
+
+  # Per-tenant response-latency histograms (steady state: after the first `--excl-s` s of load),
+  # so chaos.sh can merge them per NODE once it knows which node holds which tenant shard. Off by
+  # default: it is ~0.5 MB of JSON at 1024 tenants.
+  defp maybe_tenant_hist(out, %{tenant_hist: 1} = a, results) do
+    t0 =
+      results
+      |> Enum.flat_map(fn {_cid, s, _span, _e} -> Enum.map(s, &elem(&1, 0)) end)
+      |> Enum.min(fn -> 0 end)
+
+    hist =
+      for {cid, s, _span, _e} <- results, into: %{} do
+        steady = Enum.filter(s, fn {st, _, _} -> st - t0 >= a.excl_s * 1_000_000 end)
+        {Integer.to_string(cid), TpcStats.hist(steady)}
+      end
+
+    Map.put(out, "tenant_hist", hist)
+  end
+
+  defp maybe_tenant_hist(out, _a, _results), do: out
 
   # --- oneshot-fleet: K concurrent one-shot streams PER tenant shard ---------------------------
   # Every other mode holds ONE long-lived stream per tenant, so a stream opens once and the
@@ -461,7 +658,9 @@ defmodule Tpc do
 
     case establish(a, cid, 8) do
       {:ok, c} ->
-        run_txns(c, a)
+        await_barrier(a)
+        {cid, samples, span, errs} = run_txns(c, a, cid)
+        {cid, samples, span, errs}
 
       :error ->
         # Couldn't connect+seed after retries — on the single-host rig this is CPU starvation (the
@@ -469,7 +668,30 @@ defmodule Tpc do
         # connection mid-seed. Count the whole tenant as errored with a valid span: an honest errs
         # number, not a crashed run.
         t = System.monotonic_time(:microsecond)
-        {[], {t, t}, a.per_client}
+        # Count this worker as ready too, or the open-loop barrier would wait on it forever.
+        bump_ready(a)
+        {cid, [], {t, t}, a.per_client}
+    end
+  end
+
+  # Open-loop start barrier: wait (bounded) until every worker has established or given up, so the
+  # arrival schedule begins with the whole fleet connected instead of ramping in with the herd.
+  # A no-op for the closed-loop arm, which never needed one.
+  defp bump_ready(%{ready: ref}), do: :atomics.add(ref, 1, 1)
+  defp bump_ready(_a), do: :ok
+
+  defp await_barrier(%{rate: rate, ready: ref, clients: n} = a) when rate > 0 do
+    bump_ready(a)
+    deadline = System.monotonic_time(:millisecond) + 180_000
+    wait_ready(ref, n, deadline)
+  end
+
+  defp await_barrier(_a), do: :ok
+
+  defp wait_ready(ref, n, deadline) do
+    if :atomics.get(ref, 1) < n and System.monotonic_time(:millisecond) < deadline do
+      Process.sleep(20)
+      wait_ready(ref, n, deadline)
     end
   end
 
@@ -482,25 +704,45 @@ defmodule Tpc do
   # The shed transactions ARE counted as errors rather than quietly dropped from the denominator —
   # a sweep that reports 3,000 txn/s while having abandoned a third of its work is the kind of
   # suspiciously-good number this project has been burned by before.
-  defp run_txns(c, a) do
+  #
+  # OPEN LOOP (`--rate R`, fleet-wide txn/s): tenant i's k-th txn is INTENDED at
+  # `base + phase + k * (clients / R)` seconds, independent of how long earlier txns took. A late
+  # txn starts immediately and its response time still runs from the INTENDED start, so a stall
+  # shows up as queueing delay in the tail instead of vanishing (coordinated omission - which is
+  # exactly what a closed loop does: it slows its own arrivals when the server slows). `service`
+  # is send-to-reply, so response - service is the queueing the schedule caused.
+  defp run_txns(c, a, cid) do
     t0 = System.monotonic_time(:microsecond)
     deadline = t0 + a.worker_timeout * 1000
+    open? = a.rate > 0
+    interval_us = if open?, do: a.clients / a.rate * 1_000_000, else: 0.0
+    phase_us = if open?, do: :rand.uniform() * interval_us, else: 0.0
 
-    {lat, errs, c, done} =
-      Enum.reduce(1..a.per_client, {[], 0, c, 0}, fn _, {lat, e, c, done} ->
+    {samples, errs, c, done} =
+      Enum.reduce(1..a.per_client, {[], 0, c, 0}, fn k, {acc, e, c, done} ->
+        intended =
+          if open?, do: t0 + trunc(phase_us + (k - 1) * interval_us), else: nil
+
+        if open? do
+          wait = intended - System.monotonic_time(:microsecond)
+          if wait > 1000, do: Process.sleep(div(wait, 1000))
+        end
+
         start = System.monotonic_time(:microsecond)
 
         if start > deadline do
           # Out of time. Stop working, but keep reducing (cheap) so the count stays exact.
-          {lat, e + 1, c, done}
+          {acc, e + 1, c, done}
         else
           try do
             c = tpcb_txn(c, a.accounts)
-            {[System.monotonic_time(:microsecond) - start | lat], e, c, done + 1}
+            finish = System.monotonic_time(:microsecond)
+            origin = intended || start
+            {[{origin, finish - origin, finish - start} | acc], e, c, done + 1}
           rescue
             # Transient: a Hrana-level error (rebalancer flip) OR a stale keepalive the server
             # closed between requests. Real SDKs retry both; reconnect and count as a transient err.
-            _ -> {lat, e + 1, reconnect(c), done}
+            _ -> {acc, e + 1, reconnect(c), done}
           end
         end
       end)
@@ -512,7 +754,7 @@ defmodule Tpc do
     end
 
     Client.close(c)
-    {lat, {t0, t1}, errs}
+    {cid, samples, {t0, t1}, errs}
   end
 
   # `--clients C` = C tenant shards, each its own single-writer file, so there is no intra-shard
@@ -636,7 +878,15 @@ defmodule Tpc do
       # oneshot-fleet: concurrent one-shot workers per tenant shard.
       streams: 2,
       threads: 8,
-      scale: 0.02
+      scale: 0.02,
+      # Tail measurement (expert review 2026-10-20-2027 #3). rate: fleet-wide open-loop arrival
+      # rate in txn/s (0 = closed loop). boot: bootstrap resamples for the p99 CI (0 = none).
+      # excl_s: leading seconds of load excluded from the steady-state p99. tenant_hist: 1 emits
+      # per-tenant latency histograms so chaos.sh can merge them per node.
+      rate: 0,
+      boot: 0,
+      excl_s: 10,
+      tenant_hist: 0
     }
 
     a = parse_opts(rest, defaults)
@@ -656,7 +906,20 @@ defmodule Tpc do
     IO.puts(Jason.encode!(out))
   end
 
-  @ints [:samples, :txns, :clients, :accounts, :threads, :max_w, :worker_timeout, :streams]
+  @ints [
+    :samples,
+    :txns,
+    :clients,
+    :accounts,
+    :threads,
+    :max_w,
+    :worker_timeout,
+    :streams,
+    :rate,
+    :boot,
+    :excl_s,
+    :tenant_hist
+  ]
   @floats [:scale]
 
   defp parse_opts([], acc), do: acc

@@ -72,6 +72,14 @@ defmodule Fathom.Bench do
   # fd-bound long before it is interesting to push. It measures the per-shard SLOPE, not a ceiling.
   @served_n 64
   @served_rows 200
+  # Distinct wide keystone statements primed per served shard (expert review 2026-10-20-2027 #7a).
+  # `served/1` and `served_repl/1` keep priming ONE statement (@served_stmts), so the gated
+  # `served_kb_per_shard` series is unbroken. The statement cache (count-capped at 64, sized in
+  # bytes by nothing) was barely populated by that and the gate was blind to its footprint, so the
+  # NEW watch-only series `served_mix_kb_per_shard` primes @served_mix_stmts: 48 sits inside the
+  # 64 cap on purpose - a realistic warm working set, not eviction churn. NEW SERIES 2026-10-20.
+  @served_stmts 1
+  @served_mix_stmts 48
   @concurrent_shards 64
   @concurrent_ms 1_000
   @recorder_rows 2_000
@@ -103,6 +111,7 @@ defmodule Fathom.Bench do
     :fanout,
     :fanout_gc,
     :served,
+    :served_mix,
     :concurrent,
     :hrana_rt,
     :hrana_open_rt,
@@ -110,6 +119,7 @@ defmodule Fathom.Bench do
     :hrana_pooled,
     :hrana_pooled_pipeline,
     :wire_rows,
+    :wire_server,
     :wire_encode,
     :flush,
     :served_repl,
@@ -151,6 +161,7 @@ defmodule Fathom.Bench do
     # set, or the gate compares two independent runs of a noisy bench and calls the difference a
     # regression (expert review 2026-08-01 #41.5).
     served = run_if(only, :served, fn -> served(opts) end)
+    served_mix = run_if(only, :served_mix, fn -> served_mix(opts) end)
     conc = run_if(only, :concurrent, fn -> concurrent_checkout(opts) end)
     cold = run_if(only, :cold_open, fn -> cold_open_stats(opts) end)
     rt = run_if(only, :hrana_rt, fn -> hrana_rt_stats(opts) end)
@@ -196,6 +207,10 @@ defmodule Fathom.Bench do
       # in the process heap — one combined number would hide that whole class of regression.
       served_kb_per_shard: served && served.total_kb,
       served_binary_kb_per_shard: served && served.binary_kb,
+      # NEW SERIES (expert review 2026-10-20-2027 #7a): the same regime with 48 distinct wide
+      # statements primed per shard, so the statement cache is populated. Watch-only.
+      served_mix_kb_per_shard: served_mix && served_mix.total_kb,
+      served_mix_binary_kb_per_shard: served_mix && served_mix.binary_kb,
       # WATCH-ONLY (perf review 2026-10-14 #17): the SERVED regime with A2 replication ON, which is
       # what prod runs. Every density number above was measured replication OFF. Primary side
       # (coordinator + connection + Session + shippers) and, separately, the FOLLOWER side per
@@ -226,6 +241,8 @@ defmodule Fathom.Bench do
       hrana_pooled_pipeline_rt_us:
         run_if(only, :hrana_pooled_pipeline, fn -> hrana_pooled_pipeline_rt_us(opts) end),
       wire_rows_per_s: run_if(only, :wire_rows, fn -> wire_rows(opts) end),
+      # The SERVER half of wire_rows_per_s (expert review 2026-10-20-2027 #4): no client, no decode.
+      wire_server_rows_per_s: run_if(only, :wire_server, fn -> wire_server_rows(opts) end),
       # The OTHER encoder (#41.7). wire_rows_per_s drives encode_json/1; this drives encode/1,
       # the tagged-map builder Cursor and Protobuf reach, whose own moduledoc says the tagged-map
       # layer "roughly doubled" per-cell cost.
@@ -262,11 +279,6 @@ defmodule Fathom.Bench do
       # WATCH-ONLY (expert review 2026-10-19 #12): the WebSocket round trip, the path django-libsql
       # uses. Every other wire metric is HTTP.
       hrana_ws_rt_us: run_if(only, :hrana_ws, fn -> hrana_ws_rt_us(opts) end),
-      # WATCH-ONLY (expert review 2026-10-20 #25): the same WS round trip but SPARSE (an idle gap
-      # before every request), auth on, prod listener settings. Every other hrana_* metric is a hot
-      # loop; sparse traffic measured ~10x the hot cost.
-      hrana_ws_sparse_rt_us:
-        run_if(only, :hrana_ws_sparse, fn -> hrana_ws_sparse_rt_us(opts) end),
       # HOT-SHARD CONTENTION, watch-only (expert review 2026-10-19 #5). Last for the same reason as
       # the two above: each starts the ShardLoad/ShardLatency/Lru tables in its own scoped setup.
       # Many streams on ONE shard through the executor (the per-statement counter keys), and one
@@ -276,6 +288,23 @@ defmodule Fathom.Bench do
       # WATCH-ONLY (expert review 2026-10-19 #10): an 8-column point read, the per-COLUMN encode
       # cost every other wire metric (one-cell SELECT 1) hides.
       hrana_wide_rt_us: run_if(only, :hrana_wide, fn -> hrana_wide_rt_us(opts) end)
+    }
+    |> Map.merge(sparse_ws_metrics(only, opts))
+  end
+
+  # WATCH-ONLY (expert review 2026-10-20 #25): the same WS round trip but SPARSE (an idle gap
+  # before every request), auth on, prod listener settings. Every other hrana_* metric is a hot
+  # loop; sparse traffic measured ~10x the hot cost. One run yields three keys (expert review
+  # 2026-10-20-2027 #25): the sparse p50, a raw-TCP host calibration after the SAME idle gap, and
+  # their ratio - most of the sparse-vs-hot 6x is the host waking from idle, which the ratio
+  # factors out. Merged last, as the entry used to be positioned.
+  defp sparse_ws_metrics(only, opts) do
+    s = run_if(only, :hrana_ws_sparse, fn -> hrana_ws_sparse_stats(opts) end)
+
+    %{
+      hrana_ws_sparse_rt_us: s && s.p50_us,
+      hrana_ws_sparse_calibration_us: s && s.calib_us,
+      hrana_ws_sparse_ratio: s && s.ratio
     }
   end
 
@@ -1157,8 +1186,16 @@ defmodule Fathom.Bench do
   on the SAME socket, every reply is `[[1]]`, auth was enforced (a missing token is refused and the
   authorize callback ran at `hello`), and the revocation floor stayed a cache hit.
   """
-  @spec hrana_ws_sparse_rt_us(keyword()) :: float() | nil
-  def hrana_ws_sparse_rt_us(opts \\ []) do
+  @spec hrana_ws_sparse_rt_us(keyword()) :: float()
+  def hrana_ws_sparse_rt_us(opts \\ []), do: hrana_ws_sparse_stats(opts).p50_us
+
+  @doc """
+  `hrana_ws_sparse_rt_us` plus its host calibration, from ONE run: `%{p50_us, calib_us, ratio}`.
+  `calib_us` is a raw loopback TCP echo after the same idle gap (`calibration_idle_rt_us/2`) and
+  `ratio` is `p50_us / calib_us` (expert review 2026-10-20-2027 #25).
+  """
+  @spec hrana_ws_sparse_stats(keyword()) :: %{p50_us: float(), calib_us: float(), ratio: float()}
+  def hrana_ws_sparse_stats(opts \\ []) do
     alias Fathom.Bench.HranaClient
     alias Fathom.HranaAuth
     alias Fathom.HranaAuth.Revocations
@@ -1186,6 +1223,14 @@ defmodule Fathom.Bench do
         {:ok, pid} -> pid
         {:error, {:already_started, _}} -> nil
       end
+
+    # Host calibration, same samples x gap, run BEFORE the listener starts (expert review
+    # 2026-10-20-2027 #25). Most of the sparse-vs-hot 6x is the HOST waking from an idle gap (CPU
+    # power state, scheduler wake), which no fathom change can move; the ratio is what a fathom
+    # regression moves. Placed here and not after the loop because dialyzer's opaque
+    # mint_web_socket cascade marks everything after the first HranaClient call unreachable, which
+    # made it report the calibration helpers as never called.
+    calib_us = calibration_idle_rt_us(samples, gap_ms)
 
     calls = :counters.new(1, [])
 
@@ -1245,12 +1290,74 @@ defmodule Fathom.Bench do
         do: raise("hrana_ws_sparse_rt_us: the revocation floor lapsed mid-run")
 
       HranaClient.close(client)
-      p50(us)
+
+      p50_us = p50(us)
+      %{p50_us: p50_us, calib_us: calib_us, ratio: p50_us / max(calib_us, 1.0)}
     after
       HranaClient.stop_listener(sup)
       Fathom.Shards.drain(shard, 5_000)
       if revocations, do: GenServer.stop(revocations)
       Enum.each(keys, &restore_env(&1, Map.fetch!(prev, &1)))
+    end
+  end
+
+  # `hrana_ws_sparse_calibration_us`: median µs of a 1-byte echo over a raw loopback `:gen_tcp`
+  # pair (no Mint, no WebSocket, no auth, no fathom code) after the same idle gap per sample as
+  # `hrana_ws_sparse_rt_us`. It pays the host's idle-wake cost (CPU power state, scheduler wake,
+  # loopback syscalls) and nothing else, so `hrana_ws_sparse_rt_us / this` separates a host that
+  # is slow to wake from fathom work added to the sparse request path. Asserts the gap elapsed
+  # and every echo returned the byte sent.
+  defp calibration_idle_rt_us(samples, gap_ms) do
+    {:ok, lsock} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}, nodelay: true])
+    {:ok, port} = :inet.port(lsock)
+
+    echo =
+      spawn_link(fn ->
+        {:ok, s} = :gen_tcp.accept(lsock)
+        echo_loop(s)
+      end)
+
+    {:ok, c} =
+      :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false, nodelay: true])
+
+    try do
+      :ok = :gen_tcp.send(c, "x")
+      {:ok, "x"} = :gen_tcp.recv(c, 1, 5_000)
+
+      {_done, us} =
+        Enum.reduce(1..samples, {System.monotonic_time(:millisecond), []}, fn _, {done, acc} ->
+          Process.sleep(gap_ms)
+          started = System.monotonic_time(:millisecond)
+
+          unless started - done >= gap_ms,
+            do: raise("calibration_idle_rt_us: idle gap #{started - done} ms < #{gap_ms} ms")
+
+          {t, {:ok, "x"}} =
+            :timer.tc(fn ->
+              :ok = :gen_tcp.send(c, "x")
+              :gen_tcp.recv(c, 1, 5_000)
+            end)
+
+          {System.monotonic_time(:millisecond), [t | acc]}
+        end)
+
+      p50(us)
+    after
+      :gen_tcp.close(c)
+      :gen_tcp.close(lsock)
+      Process.unlink(echo)
+      Process.exit(echo, :kill)
+    end
+  end
+
+  defp echo_loop(s) do
+    case :gen_tcp.recv(s, 1) do
+      {:ok, data} ->
+        :ok = :gen_tcp.send(s, data)
+        echo_loop(s)
+
+      {:error, _} ->
+        :ok
     end
   end
 
@@ -1546,6 +1653,60 @@ defmodule Fathom.Bench do
     end)
   end
 
+  @doc """
+  `wire_server_rows_per_s` - rows/sec the SERVER side alone sustains for the `wire_rows_per_s`
+  workload: an in-process `Fathom.ShardExecutor.execute/2` of `SELECT * FROM ks_scalars` on a
+  keystone, then `Filo.StmtResult.encode(rows: :json)` and the final JSON serialisation (what
+  `Filo.Plug` does with the reply). No listener, no `Filo.Client`, so no client-side decode.
+
+  Why it exists (expert review 2026-10-20-2027 #4): `wire_rows_per_s` times the whole round
+  trip including the bench client's own decode, which a profile put at ~65% of the sample, so a
+  server-side win (or a filo change on the encode path) is diluted ~3x in that metric. This one
+  is the number to judge encode/execute changes by; the old metric is kept unchanged as the
+  end-to-end figure. New series, watch-only until a band is measured.
+
+  PRECONDITION asserted: the execute returned the full keystone and the encoded body is non-empty.
+  """
+  @spec wire_server_rows(keyword()) :: float()
+  def wire_server_rows(opts \\ []) do
+    setup(opts)
+    rows = Keyword.get(opts, :wire_rows, @wire_rows)
+    trials = Keyword.get(opts, :trials, @default_trials)
+    shard = "benchwiresrv"
+    path = Fathom.Shard.db_path(shard)
+    drop_db(path)
+    {:ok, _} = Fathom.Keystone.build!(path, rows: rows)
+    :ok = Fathom.Shard.stamp_local_provenance(shard)
+
+    {:ok, handle} = Fathom.ShardExecutor.open(shard, :trusted)
+
+    try do
+      stmt = %Filo.Stmt{sql: "SELECT * FROM ks_scalars"}
+
+      run = fn ->
+        {:ok, result} = Fathom.ShardExecutor.execute(handle, stmt)
+        body = result |> Filo.StmtResult.encode(rows: :json) |> Jason.encode_to_iodata!()
+        {length(result.rows), IO.iodata_length(body)}
+      end
+
+      {got, bytes} = run.()
+
+      if got != rows or bytes == 0,
+        do: raise("wire_server_rows: expected #{rows} rows, got #{got} - measuring nothing")
+
+      trials
+      |> times(fn _ ->
+        {us, _} = :timer.tc(run)
+        rows / (us / 1_000_000)
+      end)
+      |> median()
+    after
+      Fathom.ShardExecutor.close(handle)
+      Fathom.Shards.drain(shard, 5_000)
+      drop_db(path)
+    end
+  end
+
   # `wire_encode_rows_per_s` — rows/sec through `Filo.Value.encode/1`, the OTHER encoder
   # (expert review 2026-08-01 #41.7).
   #
@@ -1838,6 +1999,7 @@ defmodule Fathom.Bench do
     n = Keyword.get(opts, :served_n, @served_n)
     trials = Keyword.get(opts, :trials, @default_trials)
     rows = Keyword.get(opts, :served_rows, @served_rows)
+    stmts = Keyword.get(opts, :served_stmts, @served_stmts)
 
     results =
       times(trials, fn t ->
@@ -1845,7 +2007,7 @@ defmodule Fathom.Bench do
         before_total = :erlang.memory(:total)
         before_bin = :erlang.memory(:binary)
 
-        handles = Enum.map(1..n, fn i -> open_served_shard(t, i, rows) end)
+        handles = Enum.map(1..n, fn i -> open_served_shard(t, i, rows, stmts) end)
 
         # Assert the precondition rather than trust it (the `flush_p50_us` 2 µs lesson: a metric
         # whose work silently did not happen reports a spectacular number and the gate says OK).
@@ -1868,7 +2030,17 @@ defmodule Fathom.Bench do
     }
   end
 
-  defp open_served_shard(t, i, rows) do
+  @doc """
+  `served_mix_kb_per_shard` / `served_mix_binary_kb_per_shard` - `served/1` with #{@served_mix_stmts}
+  distinct wide keystone statements primed per shard (expert review 2026-10-20-2027 #7a), so the
+  statement cache is populated like a real ORM-driven connection. Measured on the dev build at
+  8 shards: ~160 KiB/shard with one statement vs ~865 KiB/shard with the mix, i.e. the cache is the
+  dominant per-connection cost the single-statement series could not see. Watch-only new series.
+  """
+  @spec served_mix(keyword()) :: %{total_kb: float(), binary_kb: float()}
+  def served_mix(opts \\ []), do: served(Keyword.put_new(opts, :served_stmts, @served_mix_stmts))
+
+  defp open_served_shard(t, i, rows, stmts \\ @served_stmts) do
     id = "bench_served_#{t}_#{i}"
     {:ok, pid, ref, path} = Shards.checkout(id)
     {:ok, _} = Fathom.Keystone.build!(path, rows: rows)
@@ -1884,7 +2056,45 @@ defmodule Fathom.Bench do
     # an empty result had the table merely been empty.)
     if got == [], do: raise("served bench read 0 rows — the page/statement caches are cold")
 
+    prime_wide_statements(conn, stmts)
+
     {id, pid, ref, conn}
+  end
+
+  # Primes `n` DISTINCT wide statements (all 29 `ks_scalars` columns, rotated per statement, over
+  # three predicate shapes ORMs emit: point, range + ORDER BY, filtered range), the way a Django
+  # model's many queries populate a connection's statement cache. The cache is keyed by SQL text,
+  # so each statement is textually distinct; each is parameterised, as real traffic is. Asserts
+  # every statement returned rows and that the cache actually holds them afterwards: a bench whose
+  # cache did not fill would report the old single-statement regime under a new name.
+  defp prime_wide_statements(_conn, n) when n <= 1, do: :ok
+
+  defp prime_wide_statements(conn, n) do
+    {:ok, %{rows: info}} = Connection.query(conn, "PRAGMA table_info(ks_scalars)", [])
+    cols = Enum.map(info, fn [_cid, name | _] -> name end)
+    width = length(cols)
+
+    shapes = [
+      {"WHERE id = ?", [1]},
+      {"WHERE id > ? ORDER BY id LIMIT 10", [1]},
+      {"WHERE c_integer IS NOT NULL AND id >= ? ORDER BY id DESC LIMIT 5", [1]}
+    ]
+
+    for k <- 0..(n - 1) do
+      {tail, args} = Enum.at(shapes, rem(k, length(shapes)))
+      {a, b} = Enum.split(cols, rem(k, width))
+      sql = "SELECT " <> Enum.join(b ++ a, ", ") <> " FROM ks_scalars " <> tail
+      {:ok, %{rows: got}} = Connection.query(conn, sql, args)
+      if got == [], do: raise("served bench: primed statement #{k} returned no rows")
+    end
+
+    # Connection keeps its statement cache in the calling process's dictionary, keyed by conn.
+    {_seq, cache} = Process.get({Connection, :stmt_cache, conn}, {0, %{}})
+
+    if map_size(cache) < n,
+      do: raise("served bench: statement cache holds #{map_size(cache)}/#{n} - measuring nothing")
+
+    :ok
   end
 
   # --- the SERVED regime with replication ON ---------------------------------

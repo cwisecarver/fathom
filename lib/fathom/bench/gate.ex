@@ -106,6 +106,12 @@ defmodule Fathom.Bench.Gate do
     # ON, primary side, and the follower VM per replica. No band has been measured yet, so neither
     # can gate; promote them once a few runs establish one.
     {:served_repl_kb_per_shard, :higher_worse, :watch},
+    # NEW SERIES (expert review 2026-10-20-2027 #7a): the served regime with 48 distinct wide
+    # statements primed per shard, so the statement cache is populated. The single-statement
+    # `served_kb_per_shard` above is deliberately left as it was (its series is unbroken); these
+    # are watch-only until a band exists.
+    {:served_mix_kb_per_shard, :higher_worse, :watch},
+    {:served_mix_binary_kb_per_shard, :higher_worse, :watch},
     {:follower_kb_per_shard, :higher_worse, :watch},
     # CONTENTION, gated from 2026-08-03 (#41.4). Every other gated metric is single-threaded, so
     # the concurrency-tuned machinery (write_concurrency on the ETS
@@ -126,6 +132,10 @@ defmodule Fathom.Bench.Gate do
     # the one that would have caught it.
     {:hrana_rt_us, :higher_worse},
     {:wire_rows_per_s, :lower_worse},
+    # The server half of the above, no client decode (expert review 2026-10-20-2027 #4): the bench
+    # client's decode is ~65% of wire_rows_per_s, so a server win is diluted ~3x there. New series,
+    # watch-only until a band is measured.
+    {:wire_server_rows_per_s, :lower_worse, :watch},
     # The OTHER encoder, gated from 2026-08-03 (#41.7). `Filo.Value` has TWO encoders and the
     # gate only ran one: `wire_rows_per_s` drives `encode_json/1`, while `encode/1` — the
     # tagged-map builder whose own moduledoc says that layer "roughly doubled" per-cell cost — is
@@ -183,6 +193,11 @@ defmodule Fathom.Bench.Gate do
     # The same WS round trip after an idle gap, auth on, prod listener settings (expert review
     # 2026-10-20 #25). The only gated metric that is not a hot loop. Watch-only until a band exists.
     {:hrana_ws_sparse_rt_us, :higher_worse, :watch},
+    # Host calibration for the sparse metric (expert review 2026-10-20-2027 #25): a raw-TCP echo
+    # after the same idle gap, and sparse/calibration. A host power-state swing moves the first two
+    # together and leaves the ratio alone; fathom work on the sparse path moves only the ratio.
+    {:hrana_ws_sparse_calibration_us, :higher_worse, :watch},
+    {:hrana_ws_sparse_ratio, :higher_worse, :watch},
     # An 8-column point read (expert review 2026-10-19 #10): the per-column encode cost the
     # one-cell SELECT 1 metrics cannot see. Watch-only until a band is measured.
     {:hrana_wide_rt_us, :higher_worse, :watch},

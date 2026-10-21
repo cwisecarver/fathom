@@ -114,6 +114,31 @@ redefined. Entries before this date keep `copy_rows_per_s` and are never compare
 after it (a metric absent from the parent is skipped, not treated as flat). Rename again on any
 future harness change to this bench.
 
+**New watch-only series, 2026-10-20 (expert review 2026-10-20-2027 #3/#4/#7a/#25).** No existing
+metric was redefined, so no rename and no break in a gated series; each key below is absent from
+older `perf_history` lines (skipped, not flat) until `benchmark.sh` records it, and is listed in
+`gate_test`'s `@not_yet_in_history` until then.
+
+| Metric | What it isolates |
+|---|---|
+| `wire_server_rows_per_s` | The server half of `wire_rows_per_s`: in-process `ShardExecutor.execute` + `StmtResult.encode(rows: :json)` + JSON, no listener and no `Filo.Client`. The old metric is ~65-70% bench-client decode (dev build: 139k vs 41k rows/s), so a server or filo encode win is diluted ~3x there. Judge encode/execute changes by this one. |
+| `served_mix_kb_per_shard`, `served_mix_binary_kb_per_shard` | `served_kb_per_shard` with 48 distinct wide statements (29 columns, 3 predicate shapes) primed per shard instead of one. The single-statement series is deliberately unchanged: it left the statement cache nearly empty, so density numbers were blind to it (dev build, 8 shards: ~60-160 KiB/shard single vs ~670-865 KiB/shard mixed). Baseline for the byte-bounded statement cache (#7b). |
+| `hrana_ws_sparse_calibration_us`, `hrana_ws_sparse_ratio` | A raw loopback-TCP echo after the same idle gap per sample, and `hrana_ws_sparse_rt_us` / that. Most of the sparse-vs-hot 6x is the host waking from idle; a host power-state swing moves the sparse number and the calibration together and leaves the ratio alone. Read the ratio, not the raw sparse µs. |
+
+**Tail measurement on the rig (`chaos.sh tpc-tail`, expert review 2026-10-20-2027 #3).** `tpc-fleet`
+reports one closed-loop p99 per step, which cannot say how wide the estimate is, when the slow
+transactions happened, or which node held them. `tpc_driver.exs tpcb` now records every txn as
+`{start, response, service}` and emits a `tail` object: p99 with a bootstrap 95% CI (`--boot`,
+IID resampling, so read it beside the windows), p99 excluding the first `--excl-s` s of load, the
+p99-by-10 s-window series, the five slowest txns and when they started, and (`--tenant-hist 1`)
+per-tenant latency histograms that `chaos.sh` merges per node. `--rate R` makes the run OPEN loop:
+arrivals follow a fixed schedule independent of completions and response time runs from the
+INTENDED start, so a stall appears as queueing delay instead of vanishing (a closed loop slows its
+own arrivals when the server stalls). `tpc-tail` runs 3 closed then 3 open (default 70% of the
+closed median) runs; the spread across the 3 runs of one arm is the noise floor to beat. The A2
+commit / commit_stage / commit_total histograms are printed one series per line, fleet-summed over
+the run, so the `collect` stage is no longer truncated.
+
 The `host` **and `mix_env`** fields pin the comparison topology: the
 gate compares only same-host, same-env baselines, so a macOS number never gates a
 Linux number and a dev run (file-I/O-bound, ~3x slower than prod) can never serve
