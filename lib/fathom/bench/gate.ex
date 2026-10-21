@@ -112,6 +112,9 @@ defmodule Fathom.Bench.Gate do
     # are watch-only until a band exists.
     {:served_mix_kb_per_shard, :higher_worse, :watch},
     {:served_mix_binary_kb_per_shard, :higher_worse, :watch},
+    # Django-sized wide schema (expert review 2026-10-21 #18a). Watch-only, new series.
+    {:served_django_kb_per_shard, :higher_worse, :watch},
+    {:served_django_binary_kb_per_shard, :higher_worse, :watch},
     {:follower_kb_per_shard, :higher_worse, :watch},
     # The replication Session's own memory (expert review 2026-10-21 #29). Watch-only, new series.
     {:repl_session_kb_per_shard, :higher_worse, :watch},

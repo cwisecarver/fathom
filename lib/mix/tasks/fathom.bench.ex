@@ -108,7 +108,8 @@ defmodule Mix.Tasks.Fathom.Bench do
     :cold_open_stub,
     :concurrent_cold_cycle,
     :hrana_sdk_write,
-    :hrana_sdk_read
+    :hrana_sdk_read,
+    :served_django
   ]
 
   @doc false
@@ -254,6 +255,10 @@ defmodule Mix.Tasks.Fathom.Bench do
        "KiB/shard (served, :erlang.memory(:binary) only)"},
       {"served_mix_kb_per_shard", metrics.served_mix_kb_per_shard,
        "KiB/shard (SERVED with 48 distinct wide statements primed: the statement-cache regime; watch-only)"},
+      {"served_django_kb_per_shard", metrics.served_django_kb_per_shard,
+       "KiB/shard (SERVED on a Django-sized 45-table/~100-index schema; watch-only)"},
+      {"served_django_binary_kb_per_shard", metrics.served_django_binary_kb_per_shard,
+       "KiB/shard (:binary share of the Django-sized served regime; watch-only)"},
       {"served_mix_binary_kb_per_shard", metrics.served_mix_binary_kb_per_shard,
        "KiB/shard (served mix, :erlang.memory(:binary) only; watch-only)"},
       {"served_repl_kb_per_shard", metrics.served_repl_kb_per_shard,

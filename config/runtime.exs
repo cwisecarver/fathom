@@ -243,7 +243,12 @@ end
 #
 # PROD DEFAULT 8 GiB, chosen to err generous: the heaviest measured regime, `served-data`
 # (docs/reviews/fleet-density-2026-07-10.md: 10k held data-bearing streams/node at ~640 KiB each
-# vs ~220 KiB without data), puts at most ~420 KiB × 10k ≈ 4 GiB/node in SQLite's heap, so 8 GiB
+# vs ~220 KiB without data), puts at most ~420 KiB × 10k ≈ 4 GiB/node in SQLite's heap. CAVEAT
+# (expert review 2026-10-21 #18): that ~420 KiB was measured on the 6-table keystone schema. Each
+# connection holds its own schema copy, and a Django-sized schema (45 tables / 114 indexes) measured
+# ~250 KiB per served connection vs ~187 KiB keystone (`served_django_kb_per_shard`, +34%; SQLite-only
+# probe: 60 tables/120 idx = +68%), so re-derive this for a schema-heavy fleet: 10k × (420 + ~65) ≈
+# 4.6 GiB for the Django case, still inside the 8 GiB default but with less than 2× headroom. So 8 GiB
 # leaves 2× headroom over everything we have measured while cutting the 60 GB worst-case tail
 # (2 MiB × 30k streams) by ~7×. A fixed number rather than a fraction of system RAM on purpose: in
 # a container `memsup` reports the HOST's memory, not the cgroup limit, so a derived default would

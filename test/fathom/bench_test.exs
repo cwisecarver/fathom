@@ -511,6 +511,23 @@ defmodule Fathom.BenchTest do
     assert is_float(total)
   end
 
+  # expert review 2026-10-21 #18a. The Django-sized fixture really is wide (the arm itself raises
+  # under 40 tables / 80 indexes), and a connection holding it costs clearly more than the 6-table
+  # keystone one: every density number and PoolBudget's sizing assumed the keystone.
+  test "the Django-sized schema fixture is wide and the served_django arm runs on it" do
+    path = Path.join(System.tmp_dir!(), "django_schema_#{System.unique_integer([:positive])}.db")
+    on_exit(fn -> Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1)) end)
+    counts = Fathom.Bench.DjangoSchema.build!(path)
+    IO.puts("django schema: #{inspect(counts)}")
+    assert counts.tables >= 40 and counts.indexes >= 80
+
+    # The memory ordering (django ~250 vs keystone ~187 KiB, +34%) is NOT asserted here: inside the
+    # full test VM the allocator delta swung to 338 vs 354 KiB (the keystone read heavier), so it
+    # would be a flake. It is measured standalone by `mix fathom.bench --only served,served_django`.
+    d = Fathom.Bench.served_django(served_n: 4, trials: 1)
+    assert is_float(d.total_kb) and d.total_kb > 20 and d.total_kb < 5_000
+  end
+
   # expert review 2026-10-19 #12. A warm-stream SELECT 1 over the WebSocket path; the metric
   # asserts each reply is [[1]]. Prod ~100-200 us.
   # The full `mix fathom.bench` run crashed in await_upgrade/2 with a CaseClauseError on :unknown

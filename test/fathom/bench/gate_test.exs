@@ -20,7 +20,9 @@ defmodule Fathom.Bench.GateTest do
     :concurrent_cold_cycle_per_s,
     :hrana_sdk_write_rt_us,
     :hrana_sdk_read_rt_us,
-    :repl_session_kb_per_shard
+    :repl_session_kb_per_shard,
+    :served_django_kb_per_shard,
+    :served_django_binary_kb_per_shard
   ]
 
   # Lives here, not in bench_test.exs, because that whole module is @moduletag :bench and excluded

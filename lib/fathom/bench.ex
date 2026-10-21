@@ -138,7 +138,8 @@ defmodule Fathom.Bench do
     :cold_open_stub,
     :concurrent_cold_cycle,
     :hrana_sdk_write,
-    :hrana_sdk_read
+    :hrana_sdk_read,
+    :served_django
   ]
 
   @doc false
@@ -166,6 +167,7 @@ defmodule Fathom.Bench do
     # regression (expert review 2026-08-01 #41.5).
     served = run_if(only, :served, fn -> served(opts) end)
     served_mix = run_if(only, :served_mix, fn -> served_mix(opts) end)
+    served_django = run_if(only, :served_django, fn -> served_django(opts) end)
     conc = run_if(only, :concurrent, fn -> concurrent_checkout(opts) end)
     cold = run_if(only, :cold_open, fn -> cold_open_stats(opts) end)
     rt = run_if(only, :hrana_rt, fn -> hrana_rt_stats(opts) end)
@@ -215,6 +217,10 @@ defmodule Fathom.Bench do
       # statements primed per shard, so the statement cache is populated. Watch-only.
       served_mix_kb_per_shard: served_mix && served_mix.total_kb,
       served_mix_binary_kb_per_shard: served_mix && served_mix.binary_kb,
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-21 #18a): the served regime on a Django-sized
+      # 45-table / ~100-index schema; the keystone series above is unchanged.
+      served_django_kb_per_shard: served_django && served_django.total_kb,
+      served_django_binary_kb_per_shard: served_django && served_django.binary_kb,
       # WATCH-ONLY (perf review 2026-10-14 #17): the SERVED regime with A2 replication ON, which is
       # what prod runs. Every density number above was measured replication OFF. Primary side
       # (coordinator + connection + Session + shippers) and, separately, the FOLLOWER side per
@@ -2260,6 +2266,7 @@ defmodule Fathom.Bench do
     trials = Keyword.get(opts, :trials, @default_trials)
     rows = Keyword.get(opts, :served_rows, @served_rows)
     stmts = Keyword.get(opts, :served_stmts, @served_stmts)
+    schema = Keyword.get(opts, :served_schema, :keystone)
 
     results =
       times(trials, fn t ->
@@ -2267,7 +2274,7 @@ defmodule Fathom.Bench do
         before_total = :erlang.memory(:total)
         before_bin = :erlang.memory(:binary)
 
-        handles = Enum.map(1..n, fn i -> open_served_shard(t, i, rows, stmts) end)
+        handles = Enum.map(1..n, fn i -> open_served_shard(t, i, rows, stmts, schema) end)
 
         # Assert the precondition rather than trust it (the `flush_p50_us` 2 µs lesson: a metric
         # whose work silently did not happen reports a spectacular number and the gate says OK).
@@ -2300,7 +2307,47 @@ defmodule Fathom.Bench do
   @spec served_mix(keyword()) :: %{total_kb: float(), binary_kb: float()}
   def served_mix(opts \\ []), do: served(Keyword.put_new(opts, :served_stmts, @served_mix_stmts))
 
-  defp open_served_shard(t, i, rows, stmts \\ @served_stmts) do
+  @doc """
+  `served_django_kb_per_shard` / `served_django_binary_kb_per_shard` - `served/1` with a
+  Django-sized WIDE schema (`Fathom.Bench.DjangoSchema`: 45 tables / ~100 indexes, the 12 contrib
+  tables plus generated app models) instead of the 6-table keystone (expert review 2026-10-21
+  #18a). Each SQLite connection parses and holds its own copy of the schema, so per-connection
+  memory grows with the tenant's schema, and every other density number (and `PoolBudget`'s sizing)
+  was measured on the keystone. Watch-only new series, beside the gated keystone one.
+
+  Preconditions: the fixture really has >= 40 tables and >= 80 indexes, and the held connection's
+  first query returned rows.
+  """
+  @spec served_django(keyword()) :: %{total_kb: float(), binary_kb: float()}
+  def served_django(opts \\ []), do: served(Keyword.put(opts, :served_schema, :django))
+
+  defp open_served_shard(t, i, rows, stmts \\ @served_stmts, schema \\ :keystone)
+
+  defp open_served_shard(t, i, _rows, _stmts, :django) do
+    id = "bench_served_django_#{t}_#{i}"
+    {:ok, pid, ref, path} = Shards.checkout(id)
+    %{tables: tables, indexes: indexes} = Fathom.Bench.DjangoSchema.build!(path)
+
+    if tables < 40 or indexes < 80,
+      do:
+        raise(
+          "served_django: fixture has #{tables} tables / #{indexes} indexes - not Django-sized"
+        )
+
+    {:ok, conn} = Connection.open(path)
+
+    {:ok, %{rows: got}} =
+      Connection.query(
+        conn,
+        "SELECT * FROM #{Fathom.Bench.DjangoSchema.probe_table()} LIMIT 50",
+        []
+      )
+
+    if got == [], do: raise("served_django read 0 rows - the page/statement caches are cold")
+    {id, pid, ref, conn}
+  end
+
+  defp open_served_shard(t, i, rows, stmts, :keystone) do
     id = "bench_served_#{t}_#{i}"
     {:ok, pid, ref, path} = Shards.checkout(id)
     {:ok, _} = Fathom.Keystone.build!(path, rows: rows)
