@@ -12,7 +12,9 @@ defmodule Fathom.Directory.Recorder do
     * `record/2` is a lock-free ETS write (microseconds, no Postgres, no GenServer
       mailbox) — and, for a touch from the coordinator that wrote the buffered row less
       than a second ago, only a read (expert review 2026-10-19 #5). A shard hit 1000×/s
-      collapses to one buffered row.
+      collapses to one buffered row. Once a touch is WRITTEN, a same-coordinator touch is also
+      only a read until the directory's 30 s write guard would admit another (expert review
+      2026-10-21 #19), so a continuously busy shard ships one row per window, not one per second.
     * a periodic flush (default 1s) drains the buffer and batch-upserts every
       touched shard in one chunked `Repo.insert_all` (see
       `Fathom.Directory.record_batch/1`).
@@ -36,8 +38,16 @@ defmodule Fathom.Directory.Recorder do
   # review 2026-10-19 #5). Deleted when the touch is drained; a missing or stale row only costs a
   # touch its coalescing, never its stamp.
   @owner_table Module.concat(__MODULE__, Owners)
+  # `{shard_id, coordinator_pid, quiet_until_us}`: the touch this coordinator last got WRITTEN, and
+  # the node-clock instant before which the directory's write guard would reject another (expert
+  # review 2026-10-21 #19). Set only from what the database returned (see `mark_quiet/3`), deleted by
+  # `record_flush/1` and before a buffered flush is drained, swept once expired.
+  @quiet_table Module.concat(__MODULE__, Quiet)
   # A touch within this window of a buffered one from the same coordinator only reads (`record/2`).
   @coalesce_us 1_000_000
+  # How often the expired rows of `@quiet_table` are swept. An expired row is dead weight only: it
+  # never suppresses anything.
+  @quiet_sweep_ms 10_000
   @default_flush_ms 1_000
 
   @doc false
@@ -81,6 +91,15 @@ defmodule Fathom.Directory.Recorder do
     #
     # Inside one incarnation, between flushes, `last_active_at` may trail by up to `@coalesce_us`,
     # far finer than the 30 s write granularity downstream. `coordinator: nil` never coalesces.
+    #
+    # QUIET WINDOW (expert review 2026-10-21 #19). With nothing buffered, a touch is also only a
+    # read when the same coordinator's last WRITTEN touch left the directory guard rejecting
+    # re-touches until a later instant (`@quiet_table`). Before this, a shard checked out
+    # continuously (the HTTP Hrana path: one checkout per stream) shipped a row every second and
+    # the guard threw away 29 of every 30 (probe: 1000 busy shards, 983 rows/s shipped, 2000
+    # written in 60 s). The same two edges hold: the window is keyed by coordinator (cutover), is
+    # never set when the stored stamp is at or before `last_flushed_at`/`cutover_at`, and is
+    # ignored while a flush row is buffered and deleted by `record_flush/1` (flush).
     if coalesced?(shard_id, coordinator, now) do
       :ok
     else
@@ -100,8 +119,20 @@ defmodule Fathom.Directory.Recorder do
         :ets.lookup(@owner_table, shard_id) == [{shard_id, coordinator}] and
           not :ets.member(@flush_table, shard_id)
 
+      [] ->
+        quiet?(shard_id, coordinator, now)
+
       _ ->
         false
+    end
+  end
+
+  # Only with NOTHING buffered: a buffered touch is written whatever this says, and its write sets
+  # the next window.
+  defp quiet?(shard_id, coordinator, now) do
+    case :ets.lookup(@quiet_table, shard_id) do
+      [{_, ^coordinator, until}] when now < until -> not :ets.member(@flush_table, shard_id)
+      _ -> false
     end
   end
 
@@ -142,6 +173,12 @@ defmodule Fathom.Directory.Recorder do
   """
   @spec record_flush(String.t()) :: :ok
   def record_flush(shard_id) do
+    # The flush edge (expert review 2026-10-21 #19): the first touch after this flush must land, so
+    # end the quiet window. BEFORE the flush row goes in: a touch between the two then finds
+    # neither and buffers. A window a concurrent drain sets after this delete is harmless, since
+    # the buffered flush row disables it and `take_pair/2` deletes it before taking that row.
+    :ets.delete(@quiet_table, shard_id)
+
     # `System.os_time`, for the same reason as `record/1` above: `last_flushed_at` is compared
     # against `last_active_at` to compute each tenant's loss window, so it must be on the same
     # clock or the window is off by the skew — in the direction that UNDER-reports loss.
@@ -211,6 +248,14 @@ defmodule Fathom.Directory.Recorder do
       read_concurrency: true
     ])
 
+    :ets.new(@quiet_table, [
+      :set,
+      :public,
+      :named_table,
+      write_concurrency: true,
+      read_concurrency: true
+    ])
+
     :ets.new(@meta_table, [:set, :public, :named_table])
     note_flush_ok()
 
@@ -222,7 +267,7 @@ defmodule Fathom.Directory.Recorder do
       )
 
     schedule(flush_ms)
-    {:ok, %{flush_ms: flush_ms}}
+    {:ok, %{flush_ms: flush_ms, swept_ms: System.monotonic_time(:millisecond)}}
   end
 
   @impl true
@@ -238,7 +283,30 @@ defmodule Fathom.Directory.Recorder do
   def handle_info(:flush, state) do
     do_flush()
     schedule(state.flush_ms)
-    {:noreply, state}
+    {:noreply, maybe_sweep_quiet(state)}
+  end
+
+  # Bounds `@quiet_table` to shards written in about the last granularity plus `@quiet_sweep_ms`
+  # (expert review 2026-10-21 #19). A stopped coordinator's row is never matched again, so it only
+  # waits here for its expiry.
+  defp maybe_sweep_quiet(state) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    if now_ms - state.swept_ms >= @quiet_sweep_ms do
+      _ = sweep_quiet(node_clock_us())
+      %{state | swept_ms: now_ms}
+    else
+      state
+    end
+  end
+
+  @doc false
+  # Deletes the expired quiet windows and returns how many. Public for the sweep test.
+  @spec sweep_quiet(integer()) :: non_neg_integer()
+  def sweep_quiet(now_us) do
+    :ets.select_delete(@quiet_table, [{{:_, :_, :"$1"}, [{:"=<", :"$1", now_us}], [true]}])
+  rescue
+    ArgumentError -> 0
   end
 
   @impl true
@@ -367,7 +435,7 @@ defmodule Fathom.Directory.Recorder do
           flush_joint(deadline, offset, 0) +
             flush_table(
               @table,
-              &Directory.record_batch/1,
+              &Directory.record_batch_with_quiet/1,
               [:fathom, :directory, :flush],
               deadline,
               offset
@@ -419,13 +487,17 @@ defmodule Fathom.Directory.Recorder do
       acc
     else
       case drain_chunk(table) do
-        [] ->
+        {[], _owners} ->
           acc
 
-        rows ->
+        {rows, owners} ->
           case flush_rows(table, rows, upsert, event, offset) do
-            {:ok, n} -> flush_chunks(table, upsert, event, acc + n, deadline, offset)
-            :failed -> acc
+            {:ok, n, quiet} ->
+              mark_quiet(quiet, owners, offset)
+              flush_chunks(table, upsert, event, acc + n, deadline, offset)
+
+            :failed ->
+              acc
           end
       end
     end
@@ -445,11 +517,11 @@ defmodule Fathom.Directory.Recorder do
       acc
     else
       case take_joint(@drain_chunk) do
-        {[], []} ->
+        {[], [], _owners} ->
           acc
 
-        {both, only} ->
-          case write_joint(both, offset) do
+        {both, only, owners} ->
+          case write_joint(both, offset, owners) do
             {:ok, n} ->
               case write_flush_only(only, offset) do
                 {:ok, m} -> flush_joint(deadline, offset, acc + n + m)
@@ -473,49 +545,88 @@ defmodule Fathom.Directory.Recorder do
   # a touch in that gap finds no touch row and buffers its own.
   defp take_joint(limit) do
     case :ets.select(@flush_table, [{{:"$1", :_}, [], [:"$1"]}], limit) do
-      {ids, _cont} -> Enum.reduce(ids, {[], []}, &take_pair/2)
-      :"$end_of_table" -> {[], []}
+      {ids, _cont} -> Enum.reduce(ids, {[], [], %{}}, &take_pair/2)
+      :"$end_of_table" -> {[], [], %{}}
     end
   rescue
-    ArgumentError -> {[], []}
+    ArgumentError -> {[], [], %{}}
   end
 
-  defp take_pair(id, {both, only}) do
-    touch = take_touch(id)
+  defp take_pair(id, {both, only, owners}) do
+    {touch, owner} = take_touch(id)
+    # End the quiet window BEFORE the flush row leaves the buffer (expert review 2026-10-21 #19),
+    # for the same reason the touch is taken first: once the row is gone nothing else disables the
+    # window, and a touch in that gap would be dropped although it is the first after the flush.
+    # The joint write sets a fresh window only if the stored stamp ends up past the flush.
+    :ets.delete(@quiet_table, id)
+    owners = if owner, do: Map.put(owners, id, owner), else: owners
 
     case {:ets.take(@flush_table, id), touch} do
       {[{^id, flushed_us}], [{^id, touched_us}]} ->
-        {[{id, flushed_us, touched_us} | both], only}
+        {[{id, flushed_us, touched_us} | both], only, owners}
 
       {[{^id, _} = row], []} ->
-        {both, [row | only]}
+        {both, [row | only], owners}
 
       # The flush row went between the select and the take (only a drain takes it, so this is a
       # concurrent shutdown drain): hand the touch back for the touch-only pass.
       {[], taken} ->
         Enum.each(taken, &:ets.insert_new(@table, &1))
-        {both, only}
+        {both, only, owners}
     end
   end
 
-  # Takes a buffered touch and its coalescing owner. Deleting the owner AFTER the take can only
-  # cost a racing touch its coalescing (it then inserts), never lose a stamp.
+  # Takes a buffered touch and its coalescing owner, and returns both. Taking the owner AFTER the
+  # touch can only cost a racing touch its coalescing (it then inserts), never lose a stamp. A racing
+  # touch from a NEW coordinator can make this return the new owner with the old stamp; the quiet
+  # window set from that is keyed to the new coordinator, whose own touch is still buffered and is
+  # written on the next tick regardless.
   defp take_touch(id) do
-    taken = :ets.take(@table, id)
-    if taken != [], do: :ets.delete(@owner_table, id)
-    taken
+    case :ets.take(@table, id) do
+      [] ->
+        {[], nil}
+
+      taken ->
+        case :ets.take(@owner_table, id) do
+          [{^id, owner}] -> {taken, owner}
+          [] -> {taken, nil}
+        end
+    end
   end
 
-  defp write_joint([], _offset), do: {:ok, 0}
+  # Records the windows the directory returned for the touches it just wrote (expert review
+  # 2026-10-21 #19), keyed by the coordinator whose touch was written. A `nil` coordinator never
+  # coalesces, so it gets no window. The stamps come back on the Postgres clock; `offset` (the one
+  # this flush rebased with) turns them back into the node clock `record/2` compares against. A
+  # later flush's offset can differ by its query latency, so the window can be off by that much
+  # (milliseconds) against the guard in either direction.
+  defp mark_quiet([], _owners, _offset), do: :ok
 
-  defp write_joint(both, offset) do
+  defp mark_quiet(quiet, owners, offset) do
+    Enum.each(quiet, fn {id, until} ->
+      case Map.fetch(owners, id) do
+        {:ok, owner} ->
+          :ets.insert(@quiet_table, {id, owner, DateTime.to_unix(until, :microsecond) - offset})
+
+        :error ->
+          :ok
+      end
+    end)
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp write_joint([], _offset, _owners), do: {:ok, 0}
+
+  defp write_joint(both, offset, owners) do
     entries =
       Enum.map(both, fn {id, flushed_us, touched_us} ->
         {id, to_datetime(flushed_us, offset), to_datetime(touched_us, offset)}
       end)
 
     try do
-      n = Directory.record_flush_and_touch_batch(entries)
+      {n, quiet} = Directory.record_flush_and_touch_batch_with_quiet(entries)
+      mark_quiet(quiet, owners, offset)
 
       if n > 0 do
         :telemetry.execute([:fathom, :directory, :flush_recorded], %{count: n}, %{})
@@ -546,13 +657,16 @@ defmodule Fathom.Directory.Recorder do
   defp write_flush_only([], _offset), do: {:ok, 0}
 
   defp write_flush_only(rows, offset) do
-    flush_rows(
-      @flush_table,
-      rows,
-      &Directory.record_flush_batch/1,
-      [:fathom, :directory, :flush_recorded],
-      offset
-    )
+    case flush_rows(
+           @flush_table,
+           rows,
+           &{Directory.record_flush_batch(&1), []},
+           [:fathom, :directory, :flush_recorded],
+           offset
+         ) do
+      {:ok, n, _quiet} -> {:ok, n}
+      :failed -> :failed
+    end
   end
 
   # The same rebase `flush_rows/5` applies: once per distinct shard, on the Postgres clock.
@@ -573,7 +687,7 @@ defmodule Fathom.Directory.Recorder do
           # convert here — once per distinct shard per flush — rebased onto the Postgres clock
           # (#8, see do_flush/2). `restore/2` re-buffers the RAW node stamps, so a retried row
           # is rebased with the retry's fresh offset, never twice.
-          n =
+          {n, quiet} =
             upsert.(
               Enum.map(rows, fn {id, us} ->
                 {id, DateTime.from_unix!(us + offset, :microsecond)}
@@ -582,7 +696,7 @@ defmodule Fathom.Directory.Recorder do
 
           if n > 0, do: :telemetry.execute(event, %{count: n}, %{})
           note_flush_ok()
-          {:ok, n}
+          {:ok, n, quiet}
         rescue
           e ->
             Logger.warning("Directory.Recorder flush failed: #{inspect(e)}")
@@ -621,12 +735,21 @@ defmodule Fathom.Directory.Recorder do
   defp drain_chunk(table) do
     case :ets.select(table, [{{:"$1", :_}, [], [:"$1"]}], @drain_chunk) do
       # Only the touch buffer is drained here (the flush buffer goes through `take_joint/1`), so
-      # every take also drops the touch's coalescing owner.
-      {ids, _cont} -> Enum.flat_map(ids, &take_touch/1)
-      :"$end_of_table" -> []
+      # every take also takes the touch's coalescing owner, which keys its quiet window (#19).
+      {ids, _cont} ->
+        Enum.reduce(ids, {[], %{}}, fn id, {rows, owners} ->
+          case take_touch(id) do
+            {[], _} -> {rows, owners}
+            {taken, nil} -> {taken ++ rows, owners}
+            {taken, owner} -> {taken ++ rows, Map.put(owners, id, owner)}
+          end
+        end)
+
+      :"$end_of_table" ->
+        {[], %{}}
     end
   rescue
     # Table gone (teardown).
-    ArgumentError -> []
+    ArgumentError -> {[], %{}}
   end
 end
