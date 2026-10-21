@@ -284,6 +284,86 @@ defmodule Fathom.Shard.ReplicationWriterTest do
     Task.shutdown(seeder, :brutal_kill)
   end
 
+  # EXPERT REVIEW 2026-10-20-2027 #14. `handle_call({:seed_chunk, …})` sent the chunk with a
+  # synchronous `Writer.send_now/2`, so the SHIPPER — the link's only ack reader — blocked for the
+  # chunk's whole wire time, and every other shard's ack on the link sat unread behind a seed: the
+  # 2026-08-26 #19 hazard (first test above), back on the seed path. The invariant: while a seed
+  # chunk's send is stalled, an ack for another shard is still delivered — and the seeder still
+  # waits (its call does not return) until its chunk is on the wire.
+  test "an ack for another shard is processed while a seed chunk's send is stalled (#14)" do
+    {peer, port} = deaf_peer!()
+
+    name = :"writer_seed_ack_#{System.unique_integer([:positive])}"
+    shipper = start_supervised!({Shipper, name: name, id: name, host: ~c"127.0.0.1", port: port})
+    assert Shipper.connected?(shipper)
+    assert_receive {:deaf_accepted, ^peer}, 2_000
+    sock = :sys.get_state(shipper).sock
+
+    # A push for "b" holds a waiter, so its ack has somewhere to land.
+    Shipper.push(shipper, push("b", "small"))
+
+    chunk = :binary.copy(<<0x5E>>, @payload_bytes)
+
+    seeder =
+      Task.async(fn ->
+        Shipper.seed_begin(shipper, seed_begin("seedme"))
+        for seq <- 0..23, do: Shipper.seed_chunk(shipper, "seedme", :db, seq, chunk)
+      end)
+
+    await_stall!(sock, 200)
+    flush_rejects()
+
+    # Still the one-chunk-in-flight bound (#6): the seeder is waiting on the wire.
+    assert Task.yield(seeder, 100) == nil, "the seeder finished while the link was stalled"
+
+    send(peer, {:reply, IO.iodata_to_binary(Protocol.encode_ack("b", 5))})
+
+    # Unfixed: the shipper is blocked inside the chunk's send and never decodes this.
+    assert_receive {:repl_reply, ^name, {:ack, "b", 5}}, 1_000, ":blocked_ack_behind_seed_chunk"
+
+    send(peer, :close)
+    Task.shutdown(seeder, :brutal_kill)
+  end
+
+  # A seed chunk queued in a writer that dies (the link dropped) is answered by `drop/2`, not left
+  # to the seeder's 60 s call timeout (#14: the answer now comes from the writer's report).
+  test "a stalled seed chunk is answered with an error when the link drops (#14)" do
+    {peer, port} = deaf_peer!()
+
+    name = :"writer_seed_drop_#{System.unique_integer([:positive])}"
+    shipper = start_supervised!({Shipper, name: name, id: name, host: ~c"127.0.0.1", port: port})
+    assert Shipper.connected?(shipper)
+    assert_receive {:deaf_accepted, ^peer}, 2_000
+    sock = :sys.get_state(shipper).sock
+    chunk = :binary.copy(<<0x5E>>, @payload_bytes)
+
+    seeder =
+      Task.async(fn ->
+        Shipper.seed_begin(shipper, seed_begin("seeddrop"))
+        Enum.map(0..23, fn seq -> Shipper.seed_chunk(shipper, "seeddrop", :db, seq, chunk) end)
+      end)
+
+    await_stall!(sock, 200)
+    send(peer, :close)
+
+    results = Task.await(seeder, 15_000)
+    assert Enum.any?(results, &match?({:error, _}, &1)), "no chunk saw the link drop"
+    refute Enum.any?(results, &match?({:error, {:seed_chunk, _}}, &1)), "a chunk call timed out"
+  end
+
+  defp seed_begin(shard_id) do
+    %SeedBegin{
+      shard_id: shard_id,
+      epoch: 1,
+      wal_gen: 1,
+      salt1: 0,
+      wal_offset: 0,
+      db_size: 24 * @payload_bytes,
+      wal_size: 0,
+      lineage: 0
+    }
+  end
+
   # RIG 2026-10-03: hundreds of `gen_of(nil)` crashes per 1024-tenant run. A seed whose
   # `seed_begin` the shipper refused (`:already_in_flight` — a push for the shard was awaiting its
   # reply) still sent its chunks and then `seed_abort`; the follower answered the abort, and since

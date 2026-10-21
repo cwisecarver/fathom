@@ -569,6 +569,128 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     end
   end
 
+  # The UNLINK+RECREATE variant of #9 (expert review 2026-10-20-2027 #16). The pre-send recheck now
+  # reads the held `-shm` wal-index instead of stat'ing the path, so a recreate between the round's
+  # header read and its recheck is no longer seen by the recheck: the held fds still point at the
+  # OLD, unlinked inodes. That is safe only because SQLite unlinks them in the last connection's
+  # close AFTER checkpointing every frame, and nothing writes them again — so the round ships a
+  # frozen generation's committed bytes under that generation's own header, never a splice, and the
+  # next commit's stat sees the new inode and resets. This pins the outcome: the commit succeeds,
+  # no replica goes torn, and after the next commit a quorum holds every row of both generations.
+  test "#9 (unlink+recreate): a WAL recreated inside a push round never ships a splice", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    names = for {n, _} <- followers, do: n
+    enable!(for({_, p} <- followers, do: p), timeout: 3_000, catchup: 0)
+
+    {:ok, coordinator, ref, path} = Shards.checkout(id)
+    on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
+    wal = path <> "-wal"
+
+    # The shard's only SQLite connection lives in its own process: `Connection` caches prepared
+    # statements in the OWNER's dictionary, and a close from any other process is a deferred
+    # `sqlite3_close_v2` that skips the last-close checkpoint and unlink — the very event this test
+    # needs to land inside the Session's round.
+    owner = sql_owner!(path)
+    sql!(owner, "CREATE TABLE t (a INTEGER)")
+    assert :ok = Session.commit(id, wal, coordinator)
+    await_seeds_landed!(session!(id))
+
+    for i <- 1..5, do: sql!(owner, "INSERT INTO t VALUES (#{i})")
+    assert :ok = Session.commit(id, wal, coordinator)
+    for i <- 6..8, do: sql!(owner, "INSERT INTO t VALUES (#{i})")
+
+    inode_before = File.stat!(wal).inode
+    fired = :counters.new(1, [])
+
+    # Fires ONCE, inside the Session, after the round read its payloads and before the recheck:
+    # close the shard's only connection (SQLite checkpoints and unlinks -wal and -shm), then reopen
+    # and write, which creates a NEW -wal/-shm pair.
+    Application.put_env(:fathom, :replication_build_hook, fn ->
+      if :counters.get(fired, 1) == 0 do
+        :counters.add(fired, 1, 1)
+        :ok = call_owner(owner, :reopen)
+        refute File.exists?(wal) and File.stat!(wal).inode == inode_before
+        sql!(owner, "INSERT INTO t VALUES (100)")
+      end
+    end)
+
+    on_exit(fn -> Application.delete_env(:fathom, :replication_build_hook) end)
+
+    assert :ok = Session.commit(id, wal, coordinator)
+    assert :counters.get(fired, 1) == 1, "PRECONDITION: the recreate hook never ran"
+
+    assert File.stat!(wal).inode != inode_before,
+           "PRECONDITION: the hook did not recreate the WAL"
+
+    # The next commit stats the path, sees the new inode, and ships the new generation.
+    sql!(owner, "INSERT INTO t VALUES (101)")
+    assert :ok = Session.commit(id, wal, coordinator)
+
+    for n <- names do
+      refute match?(%{torn: true}, Follower.state_of(n, id)), "#{n} went torn across the recreate"
+    end
+
+    {:ok, %{commit_extent: extent}} = Fathom.Shard.Replication.Wal.read(wal)
+    expected = binary_part(File.read!(wal), 0, extent)
+
+    holding =
+      Enum.filter(names, fn n -> File.read(Follower.wal_path(n, id)) == {:ok, expected} end)
+
+    assert length(holding) >= 2, "only #{length(holding)} followers hold the new generation"
+
+    for n <- holding do
+      assert follower_rows(n, id) == 10,
+             "#{n} holds the new WAL but not every row of both generations"
+    end
+  end
+
+  defp sql_owner!(path) do
+    test = self()
+
+    pid =
+      spawn_link(fn ->
+        {:ok, conn} = Connection.open(path)
+        send(test, {:owner_ready, self()})
+        sql_owner_loop(path, conn)
+      end)
+
+    assert_receive {:owner_ready, ^pid}, 5_000
+    on_exit(fn -> if Process.alive?(pid), do: call_owner(pid, :stop) end)
+    pid
+  end
+
+  defp sql_owner_loop(path, conn) do
+    receive do
+      {from, ref, {:sql, sql}} ->
+        send(from, {ref, Connection.query(conn, sql, [])})
+        sql_owner_loop(path, conn)
+
+      {from, ref, :reopen} ->
+        :ok = Connection.close(conn)
+        {:ok, conn} = Connection.open(path)
+        send(from, {ref, :ok})
+        sql_owner_loop(path, conn)
+
+      {from, ref, :stop} ->
+        Connection.close(conn)
+        send(from, {ref, :ok})
+    end
+  end
+
+  defp call_owner(pid, msg) do
+    ref = make_ref()
+    send(pid, {self(), ref, msg})
+
+    receive do
+      {^ref, reply} -> reply
+    after
+      5_000 -> flunk("the SQL owner did not answer #{inspect(msg)}")
+    end
+  end
+
+  defp sql!(owner, sql), do: {:ok, _} = call_owner(owner, {:sql, sql})
+
   defp await_seeds_landed!(session, timeout \\ 5_000) do
     deadline = System.monotonic_time(:millisecond) + timeout
 

@@ -273,7 +273,7 @@ defmodule Fathom.Shard.Replication.WalIndexTest do
       end
     end
 
-    test "a warm replicated commit's read shape is 5 raw file calls (was 6)", %{dir: dir} do
+    test "a warm replicated commit's read shape is 4 raw file calls (was 5)", %{dir: dir} do
       {db, wal} = open_db!(dir)
       exec!(db, "INSERT INTO t VALUES (0, NULL)")
 
@@ -291,8 +291,43 @@ defmodule Fathom.Shard.Replication.WalIndexTest do
           h
         end)
 
-      assert length(calls) == 5,
-             "expected stat, index pread, payload pread, stat, header pread; saw #{inspect(calls)}"
+      # Expert review 2026-10-20-2027 #16: the recheck reads the held index, not stat + WAL header.
+      # Previously asserted 5 (stat, index pread, payload pread, stat, header pread).
+      assert calls == [:read_file_info, :pread, :pread, :pread],
+             "expected stat, index pread, payload pread, index pread; saw #{inspect(calls)}"
+    end
+
+    # The index recheck must still refuse a round whose WAL restarted in place after its header
+    # read: a restart publishes new salts in the index before rewriting the WAL header, so the
+    # recheck's index read misses the cursor and it falls back to the stat + header read, which
+    # reports the new generation.
+    test "the index recheck reports an in-place restart since read_held", %{dir: dir} do
+      {db, wal} = open_db!(dir)
+      commit_rows!(db, 5)
+      {:ok, before, h} = Wal.read_held(nil, wal)
+      assert h.shm != nil, "fixture: no -shm fd held, so the index path is not under test"
+
+      exec!(db, "PRAGMA wal_checkpoint(PASSIVE)")
+      exec!(db, "INSERT INTO t VALUES (-1, NULL)")
+
+      assert {:ok, after_, h} = Wal.recheck_held(h, wal)
+      assert after_.salt1 != before.salt1, "the recheck missed an in-place WAL restart"
+      Wal.close_held(h)
+    end
+
+    test "the index recheck reports the cursor's identity while the generation is unchanged", %{
+      dir: dir
+    } do
+      {db, wal} = open_db!(dir)
+      commit_rows!(db, 2)
+      {:ok, before, h} = Wal.read_held(nil, wal)
+      # More commits in the SAME generation do not move the identity.
+      commit_rows!(db, 2)
+      assert {:ok, after_, h} = Wal.recheck_held(h, wal)
+      assert after_ == %{ckpt_seq: before.ckpt_seq, salt1: before.salt1}
+      assert {:ok, ref} = Wal.read(wal)
+      assert {ref.ckpt_seq, ref.salt1} == {after_.ckpt_seq, after_.salt1}
+      Wal.close_held(h)
     end
 
     # The read must happen in a process the test traces (a process cannot trace itself), and that

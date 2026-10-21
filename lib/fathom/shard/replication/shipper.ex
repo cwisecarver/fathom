@@ -50,14 +50,30 @@ defmodule Fathom.Shard.Replication.Shipper do
 
   @connect_timeout 5_000
 
-  # Above `Writer`'s own 30 s `send_now` bound, so the writer's answer always arrives first.
+  # Well above the socket's `send_timeout` (5 s): a chunk's send either returns or fails the link,
+  # and either way the writer's `{:sent, …}` or `drop/2` answers first (expert review
+  # 2026-10-20-2027 #14). This is now also the only bound on a writer wedged past `send_timeout`
+  # for a seed: the shipper no longer waits on the send itself, so it is not wedged with it.
   @seed_chunk_call_ms 60_000
   @reconnect_backoff_ms 500
   # How long the very first connect may hold the process before going asynchronous (see
   # `handle_continue/2`).
   @initial_connect_wait_ms 250
 
-  defstruct [:host, :port, :sock, :writer, :writer_budget, :id, :name, :connecting, waiters: %{}]
+  # `chunk_calls`: seed-chunk calls handed to the writer and not yet answered (#14,
+  # `handle_call({:seed_chunk, …})`), so `drop/2` can answer any the dead writer never will.
+  defstruct [
+    :host,
+    :port,
+    :sock,
+    :writer,
+    :writer_budget,
+    :id,
+    :name,
+    :connecting,
+    waiters: %{},
+    chunk_calls: MapSet.new()
+  ]
 
   # ------------------------------------------------------------------------------------------
   # api
@@ -237,14 +253,25 @@ defmodule Fathom.Shard.Replication.Shipper do
   def handle_call({:seed_chunk, _shard_id, _frame}, _from, %{sock: nil} = state),
     do: {:reply, {:error, :disconnected}, state}
 
-  def handle_call({:seed_chunk, shard_id, frame}, {pid, _}, state) do
-    if seed_owner?(state, shard_id, pid) do
-      case Writer.send_now(state.writer, seed_frame(shard_id, frame)) do
-        :ok -> {:reply, :ok, state}
-        {:error, reason} -> {:reply, {:error, reason}, drop(state, reason)}
-      end
-    else
-      {:reply, {:error, :not_seeding}, state}
+  # THE SEND RUNS IN THE WRITER, NOT HERE (expert review 2026-10-20-2027 #14). This used to
+  # `Writer.send_now/2` inline, blocking this process — the link's ONLY ack reader — for the
+  # chunk's whole wire time, so every other shard's ack on the link sat unread behind a seed (the
+  # 2026-08-26 #19 hazard, back on the seed path; 4 MiB is ~34 ms at 1 Gbit). Now the chunk is
+  # handed to the writer with the caller's `from`, the writer reports `{:sent, …}` after the send,
+  # and `handle_info/2` answers the seeder. Same semantics for the seeder: its call returns after
+  # the send, so the one-chunk-in-flight bound (2026-10-01 #6) holds; frames leave in the order
+  # they reach the writer; a failure still answers `{:error, reason}` and drops the link.
+  def handle_call({:seed_chunk, shard_id, frame}, {pid, _} = from, state) do
+    cond do
+      not seed_owner?(state, shard_id, pid) ->
+        {:reply, {:error, :not_seeding}, state}
+
+      state.writer == nil ->
+        {:reply, {:error, :no_writer}, drop(state, :no_writer)}
+
+      true ->
+        Writer.frame_reply(state.writer, seed_frame(shard_id, frame), from)
+        {:noreply, %{state | chunk_calls: MapSet.put(state.chunk_calls, from)}}
     end
   end
 
@@ -362,14 +389,11 @@ defmodule Fathom.Shard.Replication.Shipper do
       send(from, {:repl_reply, state.id, {:reject, s.shard_id, :already_in_flight, 0}})
       {:noreply, state}
     else
-      case Writer.send_now(state.writer, Protocol.encode_seed_begin(s)) do
-        :ok ->
-          {:noreply, %{state | waiters: Map.put(state.waiters, s.shard_id, from)}}
-
-        {:error, reason} ->
-          send(from, {:repl_reply, state.id, {:reject, s.shard_id, :disconnected, 0}})
-          {:noreply, drop(state, reason)}
-      end
+      # Queued, not sent inline (#14): the waiter is claimed first, so a failed send reaches the
+      # seeder exactly once, as the `:disconnected` that `drop/2` sends every waiter — the same one
+      # reject the inline failure branch used to send.
+      Writer.frame(state.writer, Protocol.encode_seed_begin(s), nil, 0)
+      {:noreply, %{state | waiters: Map.put(state.waiters, s.shard_id, from)}}
     end
   end
 
@@ -393,10 +417,9 @@ defmodule Fathom.Shard.Replication.Shipper do
 
   def handle_cast({:seed_frame, shard_id, frame, from}, state) do
     if seed_owner?(state, shard_id, from) do
-      case Writer.send_now(state.writer, seed_frame(shard_id, frame)) do
-        :ok -> {:noreply, state}
-        {:error, reason} -> {:noreply, drop(state, reason)}
-      end
+      # Queued (#14); a failure drops the link via the writer's `{:send_failed, …}`, as before.
+      Writer.frame(state.writer, seed_frame(shard_id, frame), nil, 0)
+      {:noreply, state}
     else
       not_seeding(state, shard_id, frame, from)
       {:noreply, state}
@@ -458,6 +481,17 @@ defmodule Fathom.Shard.Replication.Shipper do
   # cannot tear down the socket that replaced it.
   def handle_info({:send_failed, writer, reason}, %{writer: writer} = state),
     do: {:noreply, drop(state, reason)}
+
+  # A seed chunk's send finished in the writer (#14): answer the seeder's call. Only a call still
+  # pending — one `drop/2` already answered (the link died first) is not answered twice.
+  def handle_info({:sent, _writer, from, result}, state) do
+    if MapSet.member?(state.chunk_calls, from) do
+      GenServer.reply(from, result)
+      {:noreply, %{state | chunk_calls: MapSet.delete(state.chunk_calls, from)}}
+    else
+      {:noreply, state}
+    end
+  end
 
   def handle_info(:reconnect, state), do: {:noreply, start_connect(state)}
 
@@ -706,12 +740,16 @@ defmodule Fathom.Shard.Replication.Shipper do
       send(from, {:repl_reply, state.id, {:reject, shard, :disconnected, 0}})
     end
 
+    # Seed-chunk calls the dead writer will never report (#14). `:disconnected` is what a chunk
+    # sent on this now-socketless link answers anyway.
+    for from <- state.chunk_calls, do: GenServer.reply(from, {:error, :disconnected})
+
     if reason != :closed do
       Logger.warning("shipper connection lost: #{inspect(reason)}")
     end
 
     Process.send_after(self(), :reconnect, @reconnect_backoff_ms)
-    %{state | sock: nil, writer: nil, writer_budget: nil, waiters: %{}}
+    %{state | sock: nil, writer: nil, writer_budget: nil, waiters: %{}, chunk_calls: MapSet.new()}
   end
 
   # ONE EVENT PER REFUSED PUSH, tagged by REASON only.
