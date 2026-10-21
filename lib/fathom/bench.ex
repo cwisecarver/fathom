@@ -2091,8 +2091,18 @@ defmodule Fathom.Bench do
     # Connection keeps its statement cache in the calling process's dictionary, keyed by conn.
     {_seq, cache} = Process.get({Connection, :stmt_cache, conn}, {0, %{}})
 
-    if map_size(cache) < n,
-      do: raise("served bench: statement cache holds #{map_size(cache)}/#{n} - measuring nothing")
+    # Full means every primed statement is held, OR the byte budget (expert review 2026-10-20-2027
+    # #7b) is what stopped it: an evicting cache sits within one wide entry (~19 KiB) of the budget.
+    # Either way the series measures a cache at its steady-state cap.
+    held = cache |> Map.values() |> Enum.map(&elem(&1, 3)) |> Enum.sum()
+    budget = Application.get_env(:fathom, :stmt_cache_bytes, 256 * 1024)
+    at_budget? = is_integer(budget) and budget > 0 and held >= budget - 32 * 1024
+
+    if map_size(cache) < n and not at_budget?,
+      do:
+        raise(
+          "served bench: statement cache holds #{map_size(cache)}/#{n} (#{held} B) - measuring nothing"
+        )
 
     :ok
   end
