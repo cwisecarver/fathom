@@ -458,9 +458,13 @@ defmodule Fathom.BenchTest do
   # raises when any fails, so a number coming back means those held. Prod ~150-400 us.
   test "hrana_ws_sparse_rt_us measures a sparse, authenticated WS round trip" do
     prev = Application.get_env(:fathom, :hrana_auth)
-    us = Fathom.Bench.hrana_ws_sparse_rt_us(hrana_sparse_samples: 3, hrana_sparse_gap_ms: 30)
-    IO.puts("hrana_ws_sparse_rt_us: #{inspect(us)}")
+    stats = Fathom.Bench.hrana_ws_sparse_stats(hrana_sparse_samples: 3, hrana_sparse_gap_ms: 30)
+    us = stats.p50_us
+    IO.puts("hrana_ws_sparse: #{inspect(stats)}")
     assert is_float(us)
+    # #25 (2026-10-20-2027): the host calibration ran and the ratio is its quotient.
+    assert stats.calib_us > 0
+    assert_in_delta stats.ratio, us / stats.calib_us, 0.001
 
     assert us > 10 and us < 50_000,
            "sparse WS round trip #{us}us outside the order-of-magnitude band"
@@ -482,6 +486,26 @@ defmodule Fathom.BenchTest do
     assert {:ok, c, %{rows: [[1]]}} = HranaClient.execute(c, "SELECT 1")
     HranaClient.close(c)
     Fathom.Shards.drain("prodlistenerprobe", 5_000)
+  end
+
+  # expert review 2026-10-20-2027 #7a. The served bench primes a realistic statement mix; the
+  # priming asserts the cache filled, and the mix must cost MORE per shard than the old single
+  # statement, or it is not exercising the cache it exists to see.
+  test "served primes a wide statement mix that costs more than a single statement" do
+    one = Fathom.Bench.served(served_n: 8, trials: 1)
+    mix = Fathom.Bench.served_mix(served_n: 8, trials: 1)
+    IO.puts("served total_kb single=#{one.total_kb} mix=#{mix.total_kb}")
+    assert mix.total_kb > one.total_kb
+  end
+
+  # expert review 2026-10-20-2027 #4. The server half of wire_rows: no client, so it must read
+  # FASTER than the end-to-end metric over the same keystone (the client decode is ~65% of that).
+  test "wire_server_rows_per_s measures the server alone, faster than the end-to-end metric" do
+    server = Fathom.Bench.wire_server_rows(wire_rows: 2_000, trials: 3)
+    e2e = Fathom.Bench.wire_rows(wire_rows: 2_000, trials: 3)
+    IO.puts("wire_server_rows_per_s: #{inspect(server)}  wire_rows_per_s: #{inspect(e2e)}")
+    assert server > 1_000
+    assert server > e2e, "server-only #{server} rows/s is not above end-to-end #{e2e} rows/s"
   end
 
   # expert review 2026-10-19 #10. An 8-column point read over HTTP; the metric asserts every

@@ -61,6 +61,12 @@
 #   ./chaos.sh tpc-fleet [tenants_csv per_client accounts]  multi-tenant TPC-B THROUGHPUT across the
 #                                 fleet: sweep the tenant count (one single-writer shard each), read
 #                                 aggregate txn/s + the per-node load split — the throughput-across-nodes run
+#   TPC_NET=container TPC_DRIVER=elixir ./chaos.sh tpc-tail [tenants per_client accounts runs]  TAIL
+#                                 measurement (expert review 2026-10-20-2027 #3): `runs` (default 3)
+#                                 CLOSED-loop runs, then `runs` OPEN-loop runs at TPC_OPEN_FRAC (0.7) of
+#                                 the closed-loop median txn/s (or TPC_OPEN_RATE=<txn/s>); per run p99
+#                                 with a bootstrap CI, p99 excluding the first TPC_EXCL_S (10) s, the
+#                                 p99-by-10s-window series, per-node p99, and the A2 commit histograms
 #   TPC_NET=container ./chaos.sh tpcc-fleet [tenants_csv per_client scale]  the TPC-C analog: sweep the
 #                                 tenant count with a 1-warehouse TPC-C per tenant; aggregate tpmC +
 #                                 per-node split (elixir driver only)
@@ -2156,6 +2162,7 @@ cmd_tpc_fleet() {
   done
 
   tpc_prewarm
+  local hist_before; hist_before=$(mktemp); repl_hist_dump "$hist_before"
 
   # The cross-LB warm-read floor every statement of every txn pays (context for the per-txn numbers).
   local rtt; rtt=$(tpc_run rtt --domain "$DOMAIN" --shard rttprobe --samples 200 2>/dev/null | jq -r '.rtt_p50_us // 0')
@@ -2178,8 +2185,11 @@ cmd_tpc_fleet() {
     # LINEARLY with N. Leaving the driver's 300 s default in place at 2048 would shed workers that
     # were making perfectly good progress, and the run would be measuring the timeout rather than
     # the fleet. Override with TPC_WORKER_TIMEOUT (ms).
+    # --boot/--excl-s/--tenant-hist: tail statistics (CI, p99 past the warm-up, per-node p99), see
+    # tpc_tail_lines. They add driver CPU after the run, not during it.
     json=$(tpc_run tpcb --domain "$DOMAIN" --shard "tfleet$c" \
       --worker-timeout "${TPC_WORKER_TIMEOUT:-300000}" \
+      --boot "${TPC_BOOT:-100}" --excl-s "${TPC_EXCL_S:-10}" --tenant-hist 1 \
       --txns "$txns" --clients "$c" --accounts "$accounts" 2>/dev/null)
     tps=$(printf '%s' "$json" | jq -r '.tpcb_tps // 0')
     p50=$(printf '%s' "$json" | jq -r '.tpcb_p50_us // 0')
@@ -2194,6 +2204,7 @@ cmd_tpc_fleet() {
     # WHAT the errors were. The driver tallies them by reason, but this sweep discarded its stderr
     # and printed only the count, so a 7x error jump on 2026-10-03 could not be attributed.
     printf "  err reasons: %s\n" "$(printf '%s' "$json" | jq -c '.err_reasons // {}')"
+    tpc_tail_lines "$json" "tfleet${c}_"
   done
 
   # Per-node distribution: how many tenant shards each node held + total query load it absorbed.
@@ -2218,9 +2229,191 @@ cmd_tpc_fleet() {
   echo "          12-vCPU VM; on N separate machines the partitioned work is ~N× (the 'millions' angle)."
   rm -f "$dist"
 
+  local hist_after; hist_after=$(mktemp); repl_hist_dump "$hist_after"
+  repl_hist_report "$hist_before" "$hist_after"
+  rm -f "$hist_before" "$hist_after"
+
   for n in "${NODES[@]}"; do
     rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, true); Application.put_env(:fathom, :shard_idle_ms, 20_000)' >/dev/null
   done
+}
+
+# -- tpc-tail helpers + arm (expert review 2026-10-20-2027 #3, #5) ------------------------------------
+# repl_hist_dump <file>: the fleet-summed A2 commit / commit_stage / commit_total Prometheus series,
+# one "series value" per line (every le bucket its own line - the old ad-hoc scrape truncated the
+# `collect` stage and only 92 of 80k samples were visible). Cumulative since boot, so the report
+# diffs two dumps. Series carry whatever tags telemetry.ex defines (outcome, stage, reset, and the
+# `mode` tag once team A2a's lands) - nothing here hard-codes them.
+repl_hist_dump() {
+  local out=$1 n tmp; tmp=$(mktemp)
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Fathom.Telemetry.scrape() |> IO.iodata_to_binary() |> String.split("\n") |> Enum.filter(&String.starts_with?(&1, "fathom_replication_commit")) |> Enum.reject(&String.starts_with?(&1, "#")) |> Enum.each(&IO.puts/1)' >> "$tmp"
+  done
+  awk '
+    NF >= 2 { i = match($0, / [^ ]+$/); k = substr($0, 1, i - 1); s[k] += substr($0, i + 1) }
+    END { for (k in s) printf "%s %.10g\n", k, s[k] }
+  ' "$tmp" | sort > "$out"
+  rm -f "$tmp"
+}
+
+# repl_hist_report <before> <after>: every series' delta on its OWN line, then one summary line per
+# histogram group (count, mean ms, p50/p99 as bucket upper bounds). Series keys contain no spaces.
+repl_hist_report() {
+  local before=$1 after=$2
+  echo ""
+  echo "  --- A2 commit histograms, fleet-summed over this run (one series per line) ---"
+  awk '
+    function strip_le(l) { gsub(/le="[^"]*",?/, "", l); gsub(/,\}/, "}", l); gsub(/\{,/, "{", l); return l }
+    function num(s) { return (s == "+Inf") ? 1e300 : s + 0 }
+    FNR == NR { b[$1] = $2; next }
+    {
+      d = $2 - b[$1]
+      printf "  %s %.10g\n", $1, d
+      name = $1; labels = ""
+      p = index(name, "{")
+      if (p > 0) { labels = substr(name, p); name = substr(name, 1, p - 1) }
+      if (name ~ /_bucket$/) {
+        base = substr(name, 1, length(name) - 7)
+        le = labels; sub(/.*le="/, "", le); sub(/".*/, "", le)
+        g = base strip_le(labels)
+        n = ++nle[g]; lev[g, n] = num(le); lec[g, n] = d; lestr[g, n] = le
+        if (!(g in seen)) { seen[g] = 1; order[++ng] = g }
+      } else if (name ~ /_sum$/) { sumv[substr(name, 1, length(name) - 4) strip_le(labels)] = d }
+      else if (name ~ /_count$/) { cnt[substr(name, 1, length(name) - 6) strip_le(labels)] = d }
+    }
+    END {
+      print ""
+      print "  --- per group: count, mean ms, p50/p99 (bucket upper bound, ms) ---"
+      for (gi = 1; gi <= ng; gi++) {
+        g = order[gi]; m = nle[g]
+        # insertion sort of this group buckets by upper bound
+        for (i = 2; i <= m; i++) {
+          v = lev[g, i]; c = lec[g, i]; s = lestr[g, i]; j = i - 1
+          while (j >= 1 && lev[g, j] > v) { lev[g, j + 1] = lev[g, j]; lec[g, j + 1] = lec[g, j]; lestr[g, j + 1] = lestr[g, j]; j-- }
+          lev[g, j + 1] = v; lec[g, j + 1] = c; lestr[g, j + 1] = s
+        }
+        total = lec[g, m]; p50 = "-"; p99 = "-"
+        for (i = 1; i <= m; i++) {
+          if (p50 == "-" && lec[g, i] >= 0.5 * total) p50 = lestr[g, i]
+          if (p99 == "-" && lec[g, i] >= 0.99 * total) p99 = lestr[g, i]
+        }
+        mean = (cnt[g] > 0) ? sumv[g] / cnt[g] : 0
+        printf "  %s n=%d mean=%.2f p50<=%s p99<=%s\n", g, total, mean, p50, p99
+      }
+    }
+  ' "$before" "$after"
+}
+
+# tpc_node_ids <prefix>: the cids of the tenant shards <prefix>* that a node currently holds, one per
+# line, per node: prints "node cid" lines. A driver tenant `cid` is shard `<prefix><cid>`.
+tpc_node_cids() {
+  local prefix=$1 n
+  for n in "${NODES[@]}"; do
+    rpc "$n" "Fathom.ShardLoad.snapshot() |> Enum.filter(fn m -> String.starts_with?(m.shard_id, \"$prefix\") end) |> Enum.each(fn m -> IO.puts(String.replace_prefix(m.shard_id, \"$prefix\", \"\")) end)" \
+      | awk -v n="$n" 'NF { print n, $1 }'
+  done
+}
+
+# tpc_tail_lines <json> <shard_prefix>: the tail report for ONE driver run, printed as indented
+# lines: p99 with its bootstrap CI, p99 past the warm-up, service-time p99 (differs from response
+# only in the open-loop arm), the slowest txns and WHEN they started, the p99-by-window series, and
+# per-node p99 (steady state, merged from the per-tenant histograms once we know which node holds
+# which tenant).
+tpc_tail_lines() {
+  local json=$1 prefix=$2
+  printf '%s' "$json" | jq -r '
+    def ms: if . == null then "-" else (. / 100 | round / 10 | tostring) end;
+    .tail as $t |
+    if ($t.n // 0) == 0 then "  tail: no samples" else
+    "  tail: n=\($t.n) p99=\($t.p99_us | ms) ms CI95=[\($t.p99_ci95_us[0]? | ms), \($t.p99_ci95_us[1]? | ms)]" +
+    "  excl first \($t.excl_first_s)s (n=\($t.n_excl)): p99=\($t.p99_excl_us | ms) ms CI95=[\($t.p99_excl_ci95_us[0]? | ms), \($t.p99_excl_ci95_us[1]? | ms)]" +
+    "  service p99=\($t.service_p99_us | ms) ms" +
+    "\n  slowest: " + ([$t.slowest[] | "\(.response_us | ms) ms @\(.at_s)s"] | join(", ")) +
+    "\n  p99 by window (ms, 10 s each): " + ([$t.windows[] | "\(.at_s)s=\(.p99_us | ms)"] | join(" "))
+    end'
+  # Per-node steady-state p99. Needs the per-tenant histograms (--tenant-hist 1) and the node map.
+  if printf '%s' "$json" | jq -e '.tenant_hist != null' >/dev/null 2>&1; then
+    local map n ids
+    map=$(tpc_node_cids "$prefix")
+    local line=""
+    for n in "${NODES[@]}"; do
+      ids=$(printf '%s\n' "$map" | awk -v n="$n" '$1 == n { print $2 }' | jq -R . | jq -s -c .)
+      line="$line $(printf '%s' "$json" | jq -r --arg node "$n" --argjson ids "$ids" '
+        .tenant_hist as $h
+        | [ $ids[] | ($h[.] // [])[] ] | group_by(.[0]) | map({b: .[0][0], c: (map(.[1]) | add)}) | sort_by(.b) as $bk
+        | ($bk | map(.c) | add // 0) as $tot
+        | if $tot == 0 then "\($node)=- (0)" else
+            ($tot * 0.99) as $target
+            | (reduce $bk[] as $x ({cum: 0, hit: null}; .cum += $x.c | if .hit == null and .cum >= $target then .hit = $x.b else . end) | .hit) as $b
+            | "\($node)=\((pow(1.01; $b) / 100 | round) / 10) ms (\($tot))"
+          end')"
+    done
+    echo "  per-node steady-state p99 (txns):$line"
+  fi
+}
+
+# cmd_tpc_tail [tenants per_client accounts runs]: the repeated, tail-focused sibling of tpc-fleet.
+#   1. `runs` CLOSED-loop runs at one tenant count (each its own shard namespace, so no re-seeding):
+#      what tpc-fleet measures, but repeated, with the full tail report per run.
+#   2. `runs` OPEN-loop runs at a fixed fleet-wide arrival rate: TPC_OPEN_FRAC (0.7) x the closed-loop
+#      median txn/s, or TPC_OPEN_RATE (txn/s) to pin it. A closed loop slows its own arrivals when
+#      the server stalls (coordinated omission); the open loop does not, so its p99 includes the
+#      queueing a real client population would see. Response time is measured from the INTENDED start.
+# The round-4 "p99 +34%" came from one closed-loop run; the falsifier from the review is that two more
+# base runs reach 700-800 ms. Read the per-run spread before comparing arms: p99 across runs of one arm
+# is the noise floor, and a difference inside it is not a finding.
+cmd_tpc_tail() {
+  local tenants=${1:-256} per_client=${2:-400} accounts=${3:-1000} runs=${4:-3}
+  local frac=${TPC_OPEN_FRAC:-0.7} ncount=${#NODES[@]}
+  echo "tpc-tail: $tenants tenants x $per_client txns, $runs closed-loop + $runs open-loop runs across $ncount nodes" >&2
+
+  local n
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, false); Application.put_env(:fathom, :shard_idle_ms, 900_000); Fathom.ShardLoad.reset()' >/dev/null
+  done
+  tpc_prewarm
+  local hist_before; hist_before=$(mktemp); repl_hist_dump "$hist_before"
+
+  local txns=$(( per_client * tenants )) tps_list="" k json tps arm rate
+  for arm in closed open; do
+    if [ "$arm" = open ]; then
+      rate=${TPC_OPEN_RATE:-$(printf '%s\n' $tps_list | sort -n | awk -v f="$frac" '{ v[NR] = $1 } END { if (NR) printf "%d", v[int((NR + 1) / 2)] * f }')}
+      if [ -z "$rate" ] || [ "$rate" -le 0 ]; then echo "  tpc-tail: no closed-loop capacity to derive the open-loop rate from" >&2; break; fi
+      echo ""
+      echo "  === OPEN loop: fixed arrival rate $rate txn/s fleet-wide (TPC_OPEN_FRAC=$frac of closed-loop median) ==="
+    else
+      echo ""
+      echo "  === CLOSED loop: $tenants tenants, each issues its next txn when the last returns ==="
+    fi
+    printf "  %-12s %9s %9s %6s %5s\n" run "txn/s" "p50 ms" errs shed
+    for k in $(seq 1 "$runs"); do
+      json=$(tpc_run tpcb --domain "$DOMAIN" --shard "ttail${arm}${k}x" \
+        --worker-timeout "${TPC_WORKER_TIMEOUT:-300000}" \
+        --boot "${TPC_BOOT:-100}" --excl-s "${TPC_EXCL_S:-10}" --tenant-hist 1 \
+        $( [ "$arm" = open ] && echo "--rate $rate" ) \
+        --txns "$txns" --clients "$tenants" --accounts "$accounts" 2>/dev/null)
+      tps=$(printf '%s' "$json" | jq -r '.tpcb_tps // 0')
+      printf "  %-12s %9s %9s %6s %5s\n" "$arm#$k" "$tps" \
+        "$(printf '%s' "$json" | jq -r '(.tail.p50_us // 0) / 1000 | . * 100 | round / 100')" \
+        "$(printf '%s' "$json" | jq -r '.errors // 0')" "$(printf '%s' "$json" | jq -r '.shed_tenants // 0')"
+      tpc_tail_lines "$json" "ttail${arm}${k}x_"
+      printf "  summary-line %s#%s p99_excl_ms=%s p99_ms=%s\n" "$arm" "$k" \
+        "$(printf '%s' "$json" | jq -r '(.tail.p99_excl_us // 0) / 1000 | . * 10 | round / 10')" \
+        "$(printf '%s' "$json" | jq -r '(.tail.p99_us // 0) / 1000 | . * 10 | round / 10')"
+      [ "$arm" = closed ] && tps_list="$tps_list $tps"
+    done
+  done
+
+  local hist_after; hist_after=$(mktemp); repl_hist_dump "$hist_after"
+  repl_hist_report "$hist_before" "$hist_after"
+  rm -f "$hist_before" "$hist_after"
+
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, true); Application.put_env(:fathom, :shard_idle_ms, 20_000)' >/dev/null
+  done
+  echo ""
+  echo "  Read: compare p99_excl_ms ACROSS the $runs runs of an arm first - that spread is the noise floor."
+  echo "  Open-loop p99 > closed-loop p99 at the same code means the closed loop was hiding queueing."
 }
 
 # -- pool-fleet: the connection pool under K concurrent one-shot streams per shard -------------------
@@ -3114,6 +3307,7 @@ case "${1:-}" in
   served-data) shift; cmd_served_data "$@" ;;
   latency-cost) shift; cmd_latency_cost "$@" ;;
   tpc-fleet)   shift; cmd_tpc_fleet "$@" ;;
+  tpc-tail)    shift; cmd_tpc_tail "$@" ;;
   tpcc-fleet)  shift; cmd_tpcc_fleet "$@" ;;
   pool-fleet)  shift; cmd_pool_fleet "$@" ;;
   pool-gap)    shift; cmd_pool_gap "$@" ;;
