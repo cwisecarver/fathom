@@ -1280,6 +1280,7 @@ defmodule Fathom.Shards do
 
         with {:ok, _pid} = ok <- start(shard_id) do
           Fathom.Shards.KnownShards.put(shard_id)
+          maybe_pre_evict()
           ok
         end
     end
@@ -1550,6 +1551,119 @@ defmodule Fathom.Shards do
 
   defp evict_budget_ms,
     do: Application.get_env(:fathom, :evict_budget_ms, @default_evict_budget_ms)
+
+  # THE LOW-WATERMARK PRE-EVICTOR (perf review 2026-10-21 #14, user decision: headroom 1% of the
+  # cap, minimum 16). At the cap, every admitted cold open used to pay a victim's WHOLE drop inline
+  # — drain, `terminate/2`, the lock release (an S3 conditional DELETE round trip), plus a PUT when
+  # the victim was dirty — before its own cold open began. A node sized from its fd budget sits at
+  # the cap by design, so that was every reopen. Now, when an admission leaves the node within
+  # `headroom` of the cap, one background task drops LRU idle shards until it is back below
+  # `cap - headroom`, and admissions find a free slot.
+  #
+  # It reuses the inline path's machinery unchanged, so its safety is the inline path's: candidates
+  # come from `Lru.lru_order/1` (busy shards filtered), clean before dirty (`prefer_clean/1`), and
+  # `evict/2` is the atomic evict-if-idle — a shard holding a connection answers `:busy` and is left
+  # alone, and a dirty one flushes in its `terminate/2` before it drops. The inline eviction stays as
+  # the fallback for a burst that outruns the evictor. The trade (the user's): idle tenants are
+  # dropped slightly before strictly necessary, so they pay their cold reopen a little sooner.
+  #
+  # Single-flight by a registered name, not a flag: the name dies with the task, so a crash cannot
+  # leave the evictor "running" forever. Off for a cap too small to hold the headroom twice over
+  # (tests and dev use caps of 1-2; pre-evicting there would empty the node), and with
+  # `:pre_evict_headroom` set to 0.
+  @pre_evict_name Fathom.Shards.PreEvictor
+  @pre_evict_min_headroom 16
+  # Each background eviction may wait this long for its victim's terminate (a dirty victim's flush).
+  # Nothing waits on the evictor, so it is drain's safety net rather than the 2 s admission budget.
+  @pre_evict_budget_ms 30_000
+  # Victims drained at once per pass: each is an independent coordinator stop (its own DELETE), so a
+  # burst of admissions is not refilled one round trip at a time.
+  @pre_evict_concurrency 8
+
+  @doc false
+  # The headroom for a cap: `:pre_evict_headroom` (an integer, 0 = off), or `:auto` (the default) =
+  # 1% of the cap, at least 16. 0 when the cap cannot hold twice the headroom. Public for the test.
+  @spec pre_evict_headroom(pos_integer()) :: non_neg_integer()
+  def pre_evict_headroom(cap) do
+    headroom =
+      case Application.get_env(:fathom, :pre_evict_headroom, :auto) do
+        :auto -> max(div(cap, 100), @pre_evict_min_headroom)
+        n when is_integer(n) and n >= 0 -> n
+      end
+
+    if headroom > 0 and cap > 2 * headroom, do: headroom, else: 0
+  end
+
+  # Called after an admitted open: one config read, one O(1) `Registry.count`, one `whereis`.
+  defp maybe_pre_evict do
+    with cap when is_integer(cap) <- max_open_shards(),
+         true <- Fathom.Shards.Lru.enabled?(),
+         headroom when headroom > 0 <- pre_evict_headroom(cap),
+         true <- open_count() >= cap - headroom,
+         nil <- Process.whereis(@pre_evict_name) do
+      _ =
+        Task.Supervisor.start_child(Fathom.TaskSupervisor, fn ->
+          pre_evict(cap - headroom)
+        end)
+    end
+
+    :ok
+  catch
+    # The task supervisor is down (shutdown): the inline fallback still admits correctly.
+    :exit, _ -> :ok
+  end
+
+  defp pre_evict(low) do
+    # A racing kick lost the name: the winner is already evicting.
+    if register_pre_evictor(), do: pre_evict_pass(low)
+  end
+
+  defp register_pre_evictor do
+    Process.register(self(), @pre_evict_name)
+  rescue
+    ArgumentError -> false
+  end
+
+  # Evict until the node is below `low`. Each pass takes up to `excess` candidates; a pass that
+  # frees nothing (every candidate busy, or an empty Lru) ends the run — the next admission
+  # re-kicks, so there is no spin.
+  defp pre_evict_pass(low) do
+    excess = open_count() - low + 1
+
+    with true <- excess > 0,
+         [_ | _] = victims <-
+           Fathom.Shards.Lru.lru_order(@max_evict_probes)
+           |> Enum.filter(&shard_open?/1)
+           |> prefer_clean()
+           |> Enum.take(excess),
+         freed when freed > 0 <- pre_evict_batch(victims) do
+      pre_evict_pass(low)
+    else
+      _ -> :ok
+    end
+  end
+
+  defp pre_evict_batch(victims) do
+    Fathom.TaskSupervisor
+    |> Task.Supervisor.async_stream_nolink(victims, &pre_evict_one/1,
+      max_concurrency: @pre_evict_concurrency,
+      timeout: @pre_evict_budget_ms + @evict_probe_grace_ms + 1_000,
+      on_timeout: :kill_task,
+      ordered: false
+    )
+    |> Enum.count(&match?({:ok, true}, &1))
+  end
+
+  defp pre_evict_one(shard_id) do
+    case evict(shard_id, @pre_evict_budget_ms) do
+      :ok ->
+        :telemetry.execute([:fathom, :shards, :pre_evicted], %{count: 1}, %{shard_id: shard_id})
+        true
+
+      _ ->
+        false
+    end
+  end
 
   # Is this shard currently open on this node? Filters stale Lru rows (a coordinator that
   # already stopped without its `forget` having landed) so we don't count a no-op
