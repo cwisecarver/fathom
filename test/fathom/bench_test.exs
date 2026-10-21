@@ -497,6 +497,20 @@ defmodule Fathom.BenchTest do
     assert Application.get_env(:fathom, :connection_pool) == prev
   end
 
+  # expert review 2026-10-21 #29. served_repl's total_kb includes the arm's own CREATE TABLE + INSERT
+  # (~+41-45 KiB), so a Session growing 2x was invisible in it. session_kb is the Session process
+  # alone: a few KiB (panel measured 4.7-5.9), far below total_kb.
+  test "served_repl reports the replication Session's own memory, separate from total_kb" do
+    %{total_kb: total, session_kb: session} =
+      Fathom.Bench.served_repl(served_repl_n: 4, trials: 1)
+
+    IO.puts("served_repl: total_kb=#{total} session_kb=#{session}")
+    assert is_float(session) and session > 1.0 and session < 100.0
+
+    # total_kb at n=4, one trial is a noisy allocator delta (seen 43-435 KiB), so it is only printed.
+    assert is_float(total)
+  end
+
   # expert review 2026-10-19 #12. A warm-stream SELECT 1 over the WebSocket path; the metric
   # asserts each reply is [[1]]. Prod ~100-200 us.
   # The full `mix fathom.bench` run crashed in await_upgrade/2 with a CaseClauseError on :unknown

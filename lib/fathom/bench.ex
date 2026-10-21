@@ -221,6 +221,9 @@ defmodule Fathom.Bench do
       # replica, measured in a peer VM. See `served_repl/1`.
       served_repl_kb_per_shard: repl && repl.total_kb,
       follower_kb_per_shard: repl && repl.follower_kb,
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-21 #29): the replication Session's own memory
+      # per shard (Process.info), the number `served_repl_kb_per_shard` cannot isolate.
+      repl_session_kb_per_shard: repl && repl.session_kb,
       # CONTENTION (#41.4). Every other metric here is serial, so a change that serialises the
       # ETS counters, the LRU, or the coordinator GenServer.call left all of them flat.
       concurrent_checkout_per_s: conc && conc.spread_per_s,
@@ -2378,8 +2381,15 @@ defmodule Fathom.Bench do
   live connection that has run a query AND has been replicated to a quorum, and reports per shard:
 
     * `total_kb` — BEAM memory delta of THIS VM (coordinator + connection + the per-shard `Session`
-      + the shippers' bookkeeping). Compare it with `served_kb_per_shard`; the difference is what
-      replication costs the primary.
+      + the shippers' bookkeeping). **Do NOT read `total_kb - served_kb_per_shard` as the cost of
+      replication** (that sentence used to be here; expert review 2026-10-21 #29): the arm also
+      runs its own CREATE TABLE + INSERT, which costs ~+41-45 KiB of SQLite write-path memory, and
+      the first commit's seed checkpoint frees ~25-39 KiB again, so the delta is mostly write noise
+      and a 2x Session growth would vanish in it. `total_kb` is a "served + replicating + written"
+      density figure and nothing more.
+    * `session_kb` (`repl_session_kb_per_shard`) — the replication `Session` process alone
+      (`Process.info` memory plus its refc binaries) per shard. Deterministic; this is the number
+      that attributes replication memory (~5 KiB per shard measured by `repl_mem.exs`).
     * `follower_kb` — BEAM memory delta of the FOLLOWER VM, per shard per replica. The followers
       live in a separate `:peer` VM so their memory is not folded into the primary's number
       (in-process loopback followers would be counted in `total_kb` and could not be split out).
@@ -2403,7 +2413,11 @@ defmodule Fathom.Bench do
   report the OFF number under a new name: replication is on, every shipper is connected, one
   `Session` exists per shard, and every shard's replica is present on every follower.
   """
-  @spec served_repl(keyword()) :: %{total_kb: float(), follower_kb: float()}
+  @spec served_repl(keyword()) :: %{
+          total_kb: float(),
+          follower_kb: float(),
+          session_kb: float()
+        }
   def served_repl(opts \\ []) do
     n = Keyword.get(opts, :served_repl_n, @served_repl_n)
     trials = Keyword.get(opts, :trials, @default_trials)
@@ -2414,7 +2428,8 @@ defmodule Fathom.Bench do
 
       %{
         total_kb: results |> Enum.map(&elem(&1, 0)) |> median(),
-        follower_kb: results |> Enum.map(&elem(&1, 1)) |> median()
+        follower_kb: results |> Enum.map(&elem(&1, 1)) |> median(),
+        session_kb: results |> Enum.map(&elem(&1, 2)) |> median()
       }
     end)
   end
@@ -2571,6 +2586,7 @@ defmodule Fathom.Bench do
     collect_all()
     local = :erlang.memory(:total) - before_local
     remote = peer_call(peer, __MODULE__, :peer_memory_total, []) - before_remote
+    session_kb = session_bytes!(ids) / n / 1024
 
     Enum.each(handles, fn {id, _pid, _ref, _conn} = h ->
       Session.stop(id)
@@ -2578,7 +2594,33 @@ defmodule Fathom.Bench do
       for name <- names, do: peer_call(peer, Follower, :forget, [name, id])
     end)
 
-    {local / n / 1024, remote / n / length(names) / 1024}
+    {local / n / 1024, remote / n / length(names) / 1024, session_kb}
+  end
+
+  # Σ over the shards' replication Sessions of `Process.info(:memory)` (heap, stack, mailbox) plus
+  # the refc binaries each holds (`Process.info(:binary)` sizes). Deterministic and needs no
+  # allocator delta, unlike `served_repl`'s `total_kb`, which also contains the arm's own
+  # CREATE TABLE + INSERT (expert review 2026-10-21 #29: Session ~5 KiB of a ~246 KiB total, so a
+  # 2x Session growth was invisible in it). Raises on a missing Session or a zero size.
+  defp session_bytes!(ids) do
+    bytes =
+      Enum.map(ids, fn id ->
+        case Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id) do
+          [{pid, _}] ->
+            {:memory, mem} = Process.info(pid, :memory)
+            {:binary, bins} = Process.info(pid, :binary)
+            mem + (bins |> Enum.map(&elem(&1, 1)) |> Enum.sum())
+
+          other ->
+            raise "served_repl: no replication Session for #{id} (#{inspect(other)}) - " <>
+                    "repl_session_kb_per_shard would measure nothing"
+        end
+      end)
+
+    if Enum.any?(bytes, &(&1 <= 0)),
+      do: raise("served_repl: a replication Session reported 0 bytes - measuring nothing")
+
+    Enum.sum(bytes)
   end
 
   defp open_repl_shard(t, i, rows) do

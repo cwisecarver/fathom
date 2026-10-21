@@ -113,6 +113,8 @@ defmodule Fathom.Bench.Gate do
     {:served_mix_kb_per_shard, :higher_worse, :watch},
     {:served_mix_binary_kb_per_shard, :higher_worse, :watch},
     {:follower_kb_per_shard, :higher_worse, :watch},
+    # The replication Session's own memory (expert review 2026-10-21 #29). Watch-only, new series.
+    {:repl_session_kb_per_shard, :higher_worse, :watch},
     # CONTENTION, gated from 2026-08-03 (#41.4). Every other gated metric is single-threaded, so
     # the concurrency-tuned machinery (write_concurrency on the ETS
     # counters, the Lru CA-tree, +SDio, the per-shard coordinator GenServer.call) had no gate at
