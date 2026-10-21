@@ -508,6 +508,17 @@ defmodule Fathom.Shard do
       )
 
     if reaped > 0, do: Logger.info("shard #{shard_id}: reaped #{reaped} orphaned pull temp(s)")
+
+    # A clean copy retained by an earlier drop (expert review 2026-10-20-2027 #22) is CLAIMED before
+    # anything below looks at the file, so the retention reaper cannot evict it mid-open. One stat
+    # when there is no marker. Nothing is held yet, so a failed claim just stops.
+    case Fathom.Shard.Retained.claim(shard_id, path) do
+      :ok -> open_coordinator_claimed(state, shard_id, path, open_started)
+      {:error, reason} -> {:stop, {:shutdown, reason}, state}
+    end
+  end
+
+  defp open_coordinator_claimed(state, shard_id, path, open_started) do
     # Force a full-sweep GC on this LONG-LIVED coordinator after the memory-heavy init
     # (GenServer setup + lease acquire + pull). :erlang.garbage_collect/0 also SHRINKS the
     # heap back from its init high-water mark, which would otherwise sit resident until the
@@ -877,6 +888,11 @@ defmodule Fathom.Shard do
          {head, prefetch} = await_open_head(head_task),
          {verdict, etag1} when verdict in [:ok, :repulled] <-
            revalidate_takeover(shard_id, path, lease, etag0, warm?, head) do
+      # A claimed retained copy (expert review 2026-10-20-2027 #22) is warm only in the sense that
+      # it skipped the pull: it equals the stored object, so for the promote decision and the dirty
+      # seed it is a COLD open — no un-flushed local writes to protect, and re-flushing it on the
+      # next drop would spend a full PUT on unchanged bytes. The marker goes now, before serving.
+      local_writes? = warm? and not Fathom.Shard.Retained.settle_claim!(path)
       # NOT a `with` clause, and returning a bare etag rather than `{:ok, etag}`. Both are for the
       # same measured reason: `handle_continue/2` garbage-collects this coordinator early to shrink
       # its init high-water mark, so ANY allocation after that point stays resident for the shard's
@@ -907,7 +923,7 @@ defmodule Fathom.Shard do
           lease,
           etag1,
           lineage,
-          warm? and verdict == :ok,
+          local_writes? and verdict == :ok,
           head,
           prefetch
         )
@@ -1034,7 +1050,7 @@ defmodule Fathom.Shard do
         # then leaves a stale generation ⇒ dirty (the safe direction), never a fresh
         # generation legitimizing a dead table's watermark (expert review #11).
         counter_gen: WriteCounter.generation(),
-        flushed_through: init_flushed_through(shard_id, warm?),
+        flushed_through: init_flushed_through(shard_id, local_writes?),
         flush_timer: nil,
         # Was `flush_timer` armed at the SLOW (clean-poll) cadence? Read by the `:became_dirty`
         # handler to tell "this shard is loafing and a write should speed it up" from "a flush is
@@ -2672,6 +2688,11 @@ defmodule Fathom.Shard do
   # load row so a stopped shard never leaks a counter.
   def terminate(_reason, state) do
     close_pool(state)
+
+    # A pre-open stop that had claimed a retained clean copy puts it back under the budget
+    # (expert review 2026-10-20-2027 #22). Only pre-open: a built state never holds the claim.
+    if not Map.has_key?(state, :conns),
+      do: Fathom.Shard.Retained.restore_claim(state.id, db_path(state.id))
 
     # A flush_now caller pending when the coordinator is force-stopped (a pre-open failure) gets an
     # explicit error, not a swallowed exit → false :ok (expert review 2026-07-18 #4). settle_waiters
@@ -4339,7 +4360,14 @@ defmodule Fathom.Shard do
     :ok
   end
 
-  defp drop_local_unless_serving(state), do: drop_local(state.path)
+  # Every caller of this clause has just made the object durable and equal to the local file (a
+  # clean drop, or a stamped drop flush), with no connection open — the one state in which the
+  # local copy may be RETAINED for the next open instead of deleted (expert review 2026-10-20-2027
+  # #22). Off unless `:shard_retain_local_bytes` is set; then `Retained` decides.
+  defp drop_local_unless_serving(state) do
+    _ = Fathom.Shard.Retained.retain_or_drop(state.id, state.path, &drop_local/1)
+    :ok
+  end
 
   defp drop_local(path), do: Enum.each(["", "-wal", "-shm", ".etag"], &File.rm(path <> &1))
 

@@ -467,6 +467,13 @@ if ms = System.get_env("SHARD_IDLE_MS") do
   config :fathom, :shard_idle_ms, String.to_integer(ms)
 end
 
+# Expert review 2026-10-20-2027 #22: the node disk budget (bytes) for keeping a shard's local `.db`
+# after a clean durable drop, so the next open here is warm instead of a full pull. Default 0 = OFF
+# until the rig measures it (`Fathom.Shard.Retained`).
+if bytes = System.get_env("SHARD_RETAIN_LOCAL_BYTES") do
+  config :fathom, :shard_retain_local_bytes, String.to_integer(bytes)
+end
+
 # Perf review 2026-10-14 #4: how long an idle shard keeps its pooled SQLite handle after its last
 # stream closes (default 250 ms), so a serial client's next request reuses it. 0 = drain on close.
 if ms = System.get_env("POOL_DRAIN_GRACE_MS") do

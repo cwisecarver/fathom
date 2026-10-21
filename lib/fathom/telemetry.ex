@@ -140,6 +140,24 @@ defmodule Fathom.Telemetry do
         ],
         description: "Time from an idle drop to the shard's next cold open, ms"
       ),
+      # Local retention after a clean durable drop (expert review 2026-10-20-2027 #22). Untagged
+      # beyond the bounded discard reason — never the shard id.
+      counter("fathom.shard.retained.discarded.count",
+        event_name: [:fathom, :shard, :retained, :discarded],
+        tags: [:reason],
+        description:
+          "Retained clean copies deleted on reopen because the stored lineage moved on (another node wrote) — the copy is pulled instead. A high rate relative to warm opens means retention is mostly paying disk for shards that come back elsewhere"
+      ),
+      counter("fathom.shard.retained.evicted.count",
+        event_name: [:fathom, :shard, :retained, :evicted],
+        description:
+          "Retained clean copies evicted (LRU by bytes) to stay under :shard_retain_local_bytes"
+      ),
+      sum("fathom.shard.retained.evicted.bytes",
+        event_name: [:fathom, :shard, :retained, :evicted],
+        measurement: :bytes,
+        description: "Bytes of retained clean copies evicted under the node retention budget"
+      ),
       # Pooled-handle reuse rate (expert review 2026-10-01 perf #19/#24). Tagged by result only
       # (:hit | :miss), never by shard.
       counter("fathom.shard.pool_take.count",

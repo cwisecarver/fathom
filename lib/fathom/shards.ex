@@ -718,7 +718,9 @@ defmodule Fathom.Shards do
     end
   end
 
-  defp kept_local_copy?(shard_id), do: File.exists?(Fathom.Shard.db_path(shard_id))
+  # A clean-retained copy (expert review 2026-10-20-2027 #22) is not a kept copy: the object holds it.
+  defp kept_local_copy?(shard_id),
+    do: Fathom.Shard.Retained.unflushed_local?(Fathom.Shard.db_path(shard_id))
 
   @doc """
   Node-level graceful drain (expert review #28): the ordered voluntary alternative to funnelling
@@ -1035,7 +1037,7 @@ defmodule Fathom.Shards do
       # a copy we could not make durable.
       {:ok, []} ->
         cond do
-          File.exists?(Fathom.Shard.db_path(shard_id)) -> flush_kept_local(shard_id)
+          kept_local_copy?(shard_id) -> flush_kept_local(shard_id)
           remote? -> Fathom.Shards.RemoteFlush.flush(shard_id)
           true -> :ok
         end
@@ -1089,7 +1091,7 @@ defmodule Fathom.Shards do
   # failed), or a fresh coordinator has already warm-opened it — either way this call did not make
   # it durable, and the error is retryable (the retry finds the running coordinator and flushes it).
   defp stopped_clean(shard_id) do
-    if File.exists?(Fathom.Shard.db_path(shard_id)),
+    if kept_local_copy?(shard_id),
       do: {:error, :unflushed_local_copy},
       else: :ok
   end
