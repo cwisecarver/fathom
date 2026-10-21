@@ -140,6 +140,16 @@ defmodule Fathom.Telemetry do
         ],
         description: "Time from an idle drop to the shard's next cold open, ms"
       ),
+      # The pre-PUT intent write + fsync that gates every S3 flush PUT's first byte (expert review
+      # 2026-10-20-2027 #21). Decides whether overlapping it with the body upload is worth building.
+      distribution("fathom.shard.flush.pre_put.duration",
+        event_name: [:fathom, :shard, :flush, :pre_put],
+        measurement: :duration,
+        unit: {:native, :millisecond},
+        reporter_options: [buckets: [0.25, 0.5, 1, 2, 5, 10, 25, 50, 100]],
+        description:
+          "Time the pre-PUT intent (sidecar pwrite + fsync + ownership recheck) holds an S3 flush PUT, ms. p50 under 1 ms means overlapping it with the body is not worth building"
+      ),
       # Local retention after a clean durable drop (expert review 2026-10-20-2027 #22). Untagged
       # beyond the bounded discard reason — never the shard id.
       counter("fathom.shard.retained.discarded.count",

@@ -586,7 +586,19 @@ defmodule Fathom.Shard.Storage.S3 do
         :ok
 
       fun ->
-        case fun.(md5_hex) do
+        # How long the pre-PUT intent (sidecar pwrite + fsync, plus the ownership recheck) holds
+        # the PUT's first byte (expert review 2026-10-20-2027 #21). Measure-first: the panel's
+        # overlap-the-fsync-with-the-body restructure is built only if the Linux rig shows p50 > 1 ms.
+        started = System.monotonic_time()
+        result = fun.(md5_hex)
+
+        :telemetry.execute(
+          [:fathom, :shard, :flush, :pre_put],
+          %{duration: System.monotonic_time() - started},
+          %{}
+        )
+
+        case result do
           :ok ->
             :ok
 
