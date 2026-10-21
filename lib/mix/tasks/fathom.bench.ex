@@ -109,7 +109,10 @@ defmodule Mix.Tasks.Fathom.Bench do
     :concurrent_cold_cycle,
     :hrana_sdk_write,
     :hrana_sdk_read,
-    :served_django
+    :served_django,
+    :flush_vacuum,
+    :drop_flush,
+    :flush_stub
   ]
 
   @doc false
@@ -283,6 +286,12 @@ defmodule Mix.Tasks.Fathom.Bench do
       {"hrana_pooled_pipeline_rt_us", metrics.hrana_pooled_pipeline_rt_us,
        "\u00b5s   (serial 5-statement one-shot: pool hit + statement-cache hits)"},
       {"flush_p50_us", metrics.flush_p50_us, "\u00b5s   (one durability flush, local storage)"},
+      {"flush_vacuum_p50_us", metrics.flush_vacuum_p50_us,
+       "µs   (one flush on the VACUUM INTO route, local storage; watch-only)"},
+      {"drop_flush_p50_us", metrics.drop_flush_p50_us,
+       "µs   (idle-drop flush: Shards.drain of a dirty shard, checkpoint route; watch-only)"},
+      {"flush_stub_p50_us", metrics.flush_stub_p50_us,
+       "µs   (VACUUM-route flush via real Storage.S3 + codec, loopback stub; watch-only)"},
       {"hrana_write_rt_us", metrics.hrana_write_rt_us,
        "\u00b5s   (INSERT RETURNING over Hrana, A2 replication ON, quorum ship asserted)"},
       {"hrana_open_auth_rt_us", metrics.hrana_open_auth_rt_us,

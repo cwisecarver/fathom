@@ -139,7 +139,10 @@ defmodule Fathom.Bench do
     :concurrent_cold_cycle,
     :hrana_sdk_write,
     :hrana_sdk_read,
-    :served_django
+    :served_django,
+    :flush_vacuum,
+    :drop_flush,
+    :flush_stub
   ]
 
   @doc false
@@ -263,6 +266,12 @@ defmodule Fathom.Bench do
       # The write path. Before this, NOTHING in the harness executed a line of the durability
       # flush — setup/1 sets :shard_flush_interval_ms to 0 (#41.3).
       flush_p50_us: run_if(only, :flush, fn -> flush_p50(opts) end),
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-21 r7 #2): the other flush routes prod runs.
+      # `flush_p50_us` above is the pinned-live route only. Each asserts its own route.
+      flush_vacuum_p50_us: run_if(only, :flush_vacuum, fn -> flush_vacuum_p50(opts) end),
+      drop_flush_p50_us: run_if(only, :drop_flush, fn -> drop_flush_p50(opts) end),
+      flush_stub_p50_us:
+        run_if(only, :flush_stub, fn -> Fathom.Bench.StorageIO.flush_stub(opts) end),
       # Placed AFTER every density metric on purpose: these two start helpers in their own scoped
       # setup (the dirty-flag tables, a Revocations server) that would change what a later
       # fanout/served reading measures. Keep them last, like flush_p50_us.
@@ -1834,8 +1843,14 @@ defmodule Fathom.Bench do
   (expert review 2026-08-01 #41.3).
 
   Runs against `Storage.Local` over a keystone-sized shard, so it is S3-free and stays in the
-  default gate. Drives `flush_now/1`, which is the same fence → `VACUUM INTO` → conditional
-  PUT path the periodic timer takes.
+  default gate. Drives `flush_now/1`, the same entry the periodic timer takes.
+
+  **Which route it measures (r7 #2).** Since 04c387c8 the shard has no WAL between trials
+  (Keystone `build!` ends with TRUNCATE + close and the trials only bump the write counter), so
+  every trial takes the PINNED-LIVE route (`quick_check` + a live-file upload under a read pin),
+  NOT `VACUUM INTO`. The trials assert that via `[:fathom, :shard, :flush, :route]`. The VACUUM
+  route is `flush_vacuum_p50_us`, the drop flush `drop_flush_p50_us`, and the codec route
+  `flush_stub_p50_us`. Series name kept for continuity.
   """
   # No `| nil`, unlike the wire metrics: those return nil when the listener or client cannot start
   # (the metric is skipped, never faked), but this one is S3-free and local — there is nothing for
@@ -1847,6 +1862,7 @@ defmodule Fathom.Bench do
 
     setup(opts)
     setup_write_path()
+    routes = Fathom.Bench.StorageIO.attach_routes()
 
     try do
       {:ok, pid, ref, path} = Shards.checkout(id)
@@ -1869,12 +1885,113 @@ defmodule Fathom.Bench do
           t
         end
 
+      # The route this series is documented to measure (r7 #2): a regression that moved these
+      # trials onto another route would otherwise change the series silently.
+      taken = Fathom.Bench.StorageIO.take_routes(routes)
+
+      unless taken == List.duplicate({:flush, :pinned_live}, trials),
+        do:
+          raise(
+            "flush_p50_us expected #{trials} x {:flush, :pinned_live} routes, got #{inspect(taken)}"
+          )
+
+      Fathom.Shard.checkin(pid, ref)
+      Shards.drain(id, 5_000)
+      p50(us)
+    after
+      Fathom.Bench.StorageIO.detach_routes(routes)
+      Shards.drain(id, 5_000)
+      drop_db(Fathom.Shard.db_path(id))
+    end
+  end
+
+  @doc """
+  `flush_vacuum_p50_us` - median wall time of one durability flush on the `VACUUM INTO` route
+  (`quick_check` + `VACUUM INTO` a temp + upload), `Storage.Local` (expert review 2026-10-21 r7 #2).
+  `flush_p50_us` runs the pinned-live route; this is the route a write-active replicated shard
+  takes in prod. A reader transaction is held for the run so the WAL is never fully backfilled, and
+  one small write is committed before every trial. WATCH-ONLY (new series).
+
+  Preconditions (raises otherwise): the shard is dirty before every flush and every flush reports
+  the `:vacuum` route.
+  """
+  @spec flush_vacuum_p50(keyword()) :: float()
+  def flush_vacuum_p50(opts \\ []) do
+    trials = Keyword.get(opts, :trials, @default_trials)
+    id = "benchflushvac"
+
+    setup(opts)
+    setup_write_path()
+
+    try do
+      {pid, ref, path} =
+        Fathom.Bench.StorageIO.open_flush_shard(id, Keyword.get(opts, :flush_rows, 2_000))
+
+      us =
+        Fathom.Bench.StorageIO.vacuum_route_flush_us(id, pid, path, trials, "flush_vacuum_p50_us")
+
       Fathom.Shard.checkin(pid, ref)
       Shards.drain(id, 5_000)
       p50(us)
     after
       Shards.drain(id, 5_000)
       drop_db(Fathom.Shard.db_path(id))
+    end
+  end
+
+  @doc """
+  `drop_flush_p50_us` - median wall time of `Shards.drain/2` on a dirty, fully checked-in shard:
+  the idle-drop durability flush (`checkpoint_and_verify` TRUNCATE + `quick_check` + live-file
+  upload), prod's main durability producer because `SHARD_IDLE_MS` is shorter than the flush
+  interval (expert review 2026-10-21 r7 #2). Includes the coordinator stop and file drop, which is
+  what an idle drop costs. Each trial uses a fresh shard (a drop consumes it); the Keystone build
+  is untimed. WATCH-ONLY (new series).
+
+  Preconditions (raises otherwise): the shard is dirty before the drain and each drain reports the
+  `:checkpoint` drop route.
+  """
+  @spec drop_flush_p50(keyword()) :: float()
+  def drop_flush_p50(opts \\ []) do
+    trials = Keyword.get(opts, :trials, @default_trials)
+    rows = Keyword.get(opts, :flush_rows, 2_000)
+
+    setup(opts)
+    setup_write_path()
+    routes = Fathom.Bench.StorageIO.attach_routes()
+    ids = for i <- 1..trials, do: "benchdropflush#{i}"
+
+    try do
+      us =
+        for id <- ids do
+          {pid, ref, _path} = Fathom.Bench.StorageIO.open_flush_shard(id, rows)
+          Fathom.Shard.WriteCounter.bump(id)
+
+          unless Fathom.Shard.dirty?(pid),
+            do: raise("drop_flush_p50_us is measuring nothing: the shard is not dirty")
+
+          Fathom.Shard.checkin(pid, ref)
+          _ = :sys.get_state(pid)
+          {t, res} = :timer.tc(fn -> Shards.drain(id, 10_000) end)
+          if res != :ok, do: raise("drop_flush_p50_us: drain returned #{inspect(res)}")
+          t
+        end
+
+      taken = Fathom.Bench.StorageIO.take_routes(routes)
+
+      unless Enum.count(taken, &(&1 == {:drop_flush, :checkpoint})) == trials,
+        do:
+          raise(
+            "drop_flush_p50_us expected #{trials} x {:drop_flush, :checkpoint}, got #{inspect(taken)}"
+          )
+
+      p50(us)
+    after
+      Fathom.Bench.StorageIO.detach_routes(routes)
+
+      for id <- ids do
+        Shards.drain(id, 5_000)
+        drop_db(Fathom.Shard.db_path(id))
+      end
     end
   end
 

@@ -367,6 +367,146 @@ defmodule Fathom.Bench.StorageIO do
     end)
   end
 
+  # ---------------------------------------------------------------------------------------------
+  # Flush-route arms (expert review 2026-10-21 r7 #2 / panel 3 #3). `flush_p50_us` alone measures
+  # the pinned-live route; these measure the VACUUM INTO route, the drop flush, and the VACUUM
+  # route through the real `Storage.S3` client + codec. The route is read from the existing
+  # `[:fathom, :shard, :flush, :route]` / `[:fathom, :shard, :drop_flush, :route]` counters, so a
+  # trial that took a different route raises instead of reporting the wrong series.
+  # ---------------------------------------------------------------------------------------------
+
+  @doc false
+  # Attaches a handler on the two route events that mails `{ref, kind, route}` to the caller.
+  @spec attach_routes() :: reference()
+  def attach_routes do
+    # `mix fathom.bench` does not boot the app; the handler table lives in the telemetry app.
+    {:ok, _} = Application.ensure_all_started(:telemetry)
+    ref = make_ref()
+    parent = self()
+
+    :telemetry.attach_many(
+      {__MODULE__, :routes, ref},
+      [[:fathom, :shard, :flush, :route], [:fathom, :shard, :drop_flush, :route]],
+      fn [:fathom, :shard, kind, :route], _m, %{route: route}, _ ->
+        send(parent, {ref, kind, route})
+      end,
+      nil
+    )
+
+    ref
+  end
+
+  @doc false
+  @spec detach_routes(reference()) :: :ok
+  def detach_routes(ref) do
+    :telemetry.detach({__MODULE__, :routes, ref})
+    :ok
+  end
+
+  @doc false
+  # Drains the mailbox of route messages, oldest first, as `[{kind, route}]`.
+  @spec take_routes(reference()) :: [{:flush | :drop_flush, atom()}]
+  def take_routes(ref) do
+    receive do
+      {^ref, kind, route} -> [{kind, route} | take_routes(ref)]
+    after
+      0 -> []
+    end
+  end
+
+  @doc false
+  # Builds a Keystone shard behind `id` through the coordinator and returns what a flush trial
+  # needs. The caller owns draining it.
+  @spec open_flush_shard(String.t(), pos_integer()) :: {pid(), reference(), Path.t()}
+  def open_flush_shard(id, rows) do
+    {:ok, pid, ref, path} = Shards.checkout(id)
+    {:ok, _} = Fathom.Keystone.build!(path, rows: rows)
+    :ok = Fathom.Shard.stamp_local_provenance(id)
+    {pid, ref, path}
+  end
+
+  @doc false
+  # `trials` timed `flush_now/1` calls on the VACUUM INTO route (µs each). A reader holds an open
+  # read transaction on the shard for the whole run, so the WAL can never be fully backfilled
+  # (the replication-ON prod shape: a write-active shard almost never is), and one small write is
+  # committed before every trial so the WAL is live. Preconditions, raised on: the shard is dirty
+  # before the flush, and the ONLY route reported by every flush is `:vacuum`.
+  @spec vacuum_route_flush_us(String.t(), pid(), Path.t(), pos_integer(), String.t()) ::
+          [non_neg_integer()]
+  def vacuum_route_flush_us(id, pid, path, trials, metric) do
+    {:ok, reader} = Connection.open(path)
+    {:ok, writer} = Connection.open(path)
+    :ok = Connection.exec(writer, "CREATE TABLE IF NOT EXISTS bench_flush_w (v INTEGER)")
+    :ok = Connection.exec(reader, "BEGIN")
+    {:ok, _} = Connection.query(reader, "SELECT count(*) FROM sqlite_master", [])
+    ref = attach_routes()
+
+    try do
+      one = fn ->
+        :ok = Connection.exec(writer, "INSERT INTO bench_flush_w VALUES (1)")
+        Fathom.Shard.WriteCounter.bump(id)
+
+        unless Fathom.Shard.dirty?(pid),
+          do: raise("#{metric} is measuring nothing: the shard is not dirty before flush_now/1")
+
+        {t, res} = :timer.tc(fn -> Fathom.Shard.flush_now(pid) end)
+        if res != :ok, do: raise("#{metric}: flush_now returned #{inspect(res)}")
+        t
+      end
+
+      # Untimed warm-up flush.
+      one.()
+      _ = take_routes(ref)
+      us = for _ <- 1..trials, do: one.()
+      routes = take_routes(ref)
+
+      if routes != List.duplicate({:flush, :vacuum}, trials),
+        do:
+          raise(
+            "#{metric}: expected #{trials} x {:flush, :vacuum} routes, got #{inspect(routes)}; " <>
+              "this is not measuring the VACUUM INTO route"
+          )
+
+      us
+    after
+      detach_routes(ref)
+      Connection.exec(reader, "ROLLBACK")
+      Connection.close(reader)
+      Connection.close(writer)
+    end
+  end
+
+  @doc """
+  `flush_stub_p50_us` - median µs of one durability flush on the VACUUM INTO route through the REAL
+  `Storage.S3` client, the codec (zstd + MD5 passes + decode proof) and the Finch pool, against a
+  loopback `S3Stub` (expert review 2026-10-21 r7 #2). `flush_p50_us` runs `Storage.Local`, where
+  the codec (~65% of a VACUUM-route flush's CPU) does not run. Loopback: the S3 PROTOCOL and codec
+  cost, not a network RTT. WATCH-ONLY (new series).
+
+  Preconditions (raises otherwise): every flush took the `:vacuum` route, the shard was dirty, and
+  the S3 Finch pool carried at least one request per flush.
+  """
+  @spec flush_stub(keyword()) :: float()
+  def flush_stub(opts \\ []) do
+    trials = Keyword.get(opts, :trials, 5)
+    rows = Keyword.get(opts, :flush_rows, 2_000)
+
+    with_stub_shards(fn stub ->
+      id = stub_id("flush")
+      {pid, ref, path} = open_flush_shard(id, rows)
+      before = :counters.get(stub.counter, 1)
+
+      try do
+        us = vacuum_route_flush_us(id, pid, path, trials, "flush_stub_p50_us")
+        assert_finch_used!(stub, before + trials)
+        median(us)
+      after
+        Fathom.Shard.checkin(pid, ref)
+        Shards.drain(id, 5_000)
+      end
+    end)
+  end
+
   defp open_query(id) do
     {:ok, pid, ref, path} = Shards.checkout(id)
     {:ok, conn} = Connection.open(path)
