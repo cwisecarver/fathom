@@ -134,7 +134,12 @@ defmodule Fathom.Bench do
     :hrana_ws_sparse,
     :same_shard_stmt,
     :serial_checkout,
-    :hrana_wide
+    :hrana_wide,
+    :cold_open_stub,
+    :concurrent_cold_cycle,
+    :hrana_sdk_write,
+    :hrana_sdk_read,
+    :served_django
   ]
 
   @doc false
@@ -162,6 +167,7 @@ defmodule Fathom.Bench do
     # regression (expert review 2026-08-01 #41.5).
     served = run_if(only, :served, fn -> served(opts) end)
     served_mix = run_if(only, :served_mix, fn -> served_mix(opts) end)
+    served_django = run_if(only, :served_django, fn -> served_django(opts) end)
     conc = run_if(only, :concurrent, fn -> concurrent_checkout(opts) end)
     cold = run_if(only, :cold_open, fn -> cold_open_stats(opts) end)
     rt = run_if(only, :hrana_rt, fn -> hrana_rt_stats(opts) end)
@@ -211,12 +217,19 @@ defmodule Fathom.Bench do
       # statements primed per shard, so the statement cache is populated. Watch-only.
       served_mix_kb_per_shard: served_mix && served_mix.total_kb,
       served_mix_binary_kb_per_shard: served_mix && served_mix.binary_kb,
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-21 #18a): the served regime on a Django-sized
+      # 45-table / ~100-index schema; the keystone series above is unchanged.
+      served_django_kb_per_shard: served_django && served_django.total_kb,
+      served_django_binary_kb_per_shard: served_django && served_django.binary_kb,
       # WATCH-ONLY (perf review 2026-10-14 #17): the SERVED regime with A2 replication ON, which is
       # what prod runs. Every density number above was measured replication OFF. Primary side
       # (coordinator + connection + Session + shippers) and, separately, the FOLLOWER side per
       # replica, measured in a peer VM. See `served_repl/1`.
       served_repl_kb_per_shard: repl && repl.total_kb,
       follower_kb_per_shard: repl && repl.follower_kb,
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-21 #29): the replication Session's own memory
+      # per shard (Process.info), the number `served_repl_kb_per_shard` cannot isolate.
+      repl_session_kb_per_shard: repl && repl.session_kb,
       # CONTENTION (#41.4). Every other metric here is serial, so a change that serialises the
       # ETS counters, the LRU, or the coordinator GenServer.call left all of them flat.
       concurrent_checkout_per_s: conc && conc.spread_per_s,
@@ -287,7 +300,21 @@ defmodule Fathom.Bench do
       serial_checkout_per_s: run_if(only, :serial_checkout, fn -> serial_checkout(opts) end),
       # WATCH-ONLY (expert review 2026-10-19 #10): an 8-column point read, the per-COLUMN encode
       # cost every other wire metric (one-cell SELECT 1) hides.
-      hrana_wide_rt_us: run_if(only, :hrana_wide, fn -> hrana_wide_rt_us(opts) end)
+      hrana_wide_rt_us: run_if(only, :hrana_wide, fn -> hrana_wide_rt_us(opts) end),
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-21 #2), user-approved. The cold open and the
+      # concurrent cold cycle against the REAL Storage.S3 client + Finch pool + coordinator over a
+      # loopback S3Stub (with DELETE), instead of the Storage.Local double. Each owns its scoped
+      # setup in `Fathom.Bench.StorageIO`, so the shared `setup/1` is unchanged.
+      cold_open_stub_p50_us:
+        run_if(only, :cold_open_stub, fn -> Fathom.Bench.StorageIO.cold_open_stub(opts) end),
+      concurrent_cold_cycle_per_s:
+        run_if(only, :concurrent_cold_cycle, fn ->
+          Fathom.Bench.StorageIO.concurrent_cold_cycle(opts)
+        end),
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-21 #3): the libSQL Rust SDK's request shape
+      # (describe before every statement, batch + get_autocommit + close, reads via /v3/cursor).
+      hrana_sdk_write_rt_us: run_if(only, :hrana_sdk_write, fn -> hrana_sdk_rt(opts, :write) end),
+      hrana_sdk_read_rt_us: run_if(only, :hrana_sdk_read, fn -> hrana_sdk_rt(opts, :read) end)
     }
     |> Map.merge(sparse_ws_metrics(only, opts))
   end
@@ -1116,6 +1143,245 @@ defmodule Fathom.Bench do
 
       p50(us)
     end)
+  end
+
+  @doc """
+  `hrana_sdk_write_rt_us` / `hrana_sdk_read_rt_us` - median round trip of a statement sent EXACTLY as
+  the libSQL Rust SDK over HTTP (`libsql-experimental` 0.0.55, libsql crate 0.9.10) sends it, replayed
+  from a capture against `Filo.Plug` (expert review 2026-10-21 #3; fixtures: panel 2 `p2/probe_out3.log`).
+  No other metric sends this shape, and it is unlike `hrana_oneshot_rt_us`: the SDK describes the
+  statement first, and the describe pipeline carries no `close`, so the inline-oneshot fast path never
+  applies.
+
+    * WRITE (`hrana_sdk_write_rt_us`): two HTTP round trips on a fresh stream -
+      `POST /v3/pipeline [describe]` (no baton, opens a stream), then
+      `POST /v3/pipeline [batch(1 step, condition null), get_autocommit, close]` on the returned baton.
+      The describe text lacks the trailing `;` that the executed text carries, as the SDK sends it.
+    * READ (`hrana_sdk_read_rt_us`): a HELD stream; per statement `[describe]` then `POST /v3/cursor`
+      (a chunked NDJSON body) with a one-step batch.
+
+  Real Bandit + `Filo.Plug` listener with the connection pool forced on (as prod) and the
+  `Filo.Client` Mint transport; the cursor request is sent through the client's own transport because
+  `Filo.Client` has no cursor sugar. WATCH-ONLY, new series. Compare `hrana_sdk_write_rt_us` with
+  `hrana_oneshot_rt_us`: if it is ~2x and a later describe-cache change moves it by less than the
+  noise band, the SDK path is RTT-bound and that change is hygiene.
+
+  Preconditions (raises otherwise): the describe was served (`describe` response with the right
+  parameter count), the batch step had no condition and no step error, the write affected exactly one
+  row / the read returned its row in a `row` cursor entry, `get_autocommit` and `close` returned ok,
+  the pool served at least half the write streams from a pooled handle, and no stream is left live.
+  """
+  @spec hrana_sdk_write_rt_us(keyword()) :: float() | nil
+  def hrana_sdk_write_rt_us(opts \\ []), do: hrana_sdk_rt(opts, :write)
+
+  @doc "The READ half of `hrana_sdk_write_rt_us/1`: describe + `/v3/cursor` on a held stream."
+  @spec hrana_sdk_read_rt_us(keyword()) :: float() | nil
+  def hrana_sdk_read_rt_us(opts \\ []), do: hrana_sdk_rt(opts, :read)
+
+  @sdk_insert "INSERT INTO sdk_kv VALUES (?, ?)"
+  @sdk_select "SELECT v FROM sdk_kv WHERE k = ?"
+
+  defp hrana_sdk_rt(opts, mode) do
+    samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
+    label = "hrana_sdk_#{mode}_rt_us"
+    prev_pool = Application.get_env(:fathom, :connection_pool)
+    Application.put_env(:fathom, :connection_pool, true)
+    hits = :counters.new(2, [])
+    handler = "bench-sdk-#{mode}-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :pool_take],
+      fn _event, _m, %{result: result}, _ ->
+        :counters.add(hits, if(result == :hit, do: 1, else: 2), 1)
+      end,
+      nil
+    )
+
+    try do
+      with_wire(
+        opts,
+        "benchsdk#{mode}",
+        fn client ->
+          {:ok, _, client} =
+            Filo.Client.execute(
+              client,
+              "CREATE TABLE IF NOT EXISTS sdk_kv (k INTEGER PRIMARY KEY, v TEXT)"
+            )
+
+          {:ok, _, client} =
+            Filo.Client.execute(client, "INSERT OR REPLACE INTO sdk_kv VALUES (1, 'one')")
+
+          {:ok, _, client} = Filo.Client.pipeline(client, [%{"type" => "close"}])
+          client = %{client | baton: nil}
+
+          p50(sdk_samples(mode, client, samples, label, hits))
+        end,
+        [],
+        version: "v3"
+      )
+    after
+      :telemetry.detach(handler)
+
+      if is_nil(prev_pool),
+        do: Application.delete_env(:fathom, :connection_pool),
+        else: Application.put_env(:fathom, :connection_pool, prev_pool)
+    end
+  end
+
+  defp sdk_samples(:write, client, samples, label, hits) do
+    # Warm: opens the shard and puts a handle in the pool. Never timed.
+    {_, parts, client} = sdk_write(client, 2_000_000)
+    sdk_check_write!(parts, label)
+    :counters.put(hits, 1, 0)
+    :counters.put(hits, 2, 0)
+
+    {_client, us} =
+      Enum.reduce(1..samples, {client, []}, fn i, {c, acc} ->
+        {t, parts, c} = sdk_write(c, 2_000_000 + i)
+        sdk_check_write!(parts, label)
+        {c, [t | acc]}
+      end)
+
+    hit = :counters.get(hits, 1)
+
+    unless hit * 2 >= samples,
+      do:
+        raise(
+          "#{label} got #{hit} pool hits in #{samples} samples; the SDK stream is not " <>
+            "reusing a pooled handle, so this is not the prod regime"
+        )
+
+    sdk_assert_no_live_streams!(label)
+    us
+  end
+
+  defp sdk_samples(:read, client, samples, label, _hits) do
+    # The SDK holds one stream open for its reads: a describe opens it, the cursor keeps it.
+    {_, parts, client} = sdk_read(client)
+    sdk_check_read!(parts, label)
+
+    {client, us} =
+      Enum.reduce(1..samples, {client, []}, fn _, {c, acc} ->
+        {t, parts, c} = sdk_read(c)
+        sdk_check_read!(parts, label)
+        {c, [t | acc]}
+      end)
+
+    {:ok, [%{"type" => "ok"}], _} = Filo.Client.pipeline(client, [%{"type" => "close"}])
+    sdk_assert_no_live_streams!(label)
+    us
+  end
+
+  # One SDK write: describe on a fresh stream, then batch + get_autocommit + close on its baton.
+  # Returns the timed span (both round trips) and the raw replies for the precondition checks,
+  # which run OUTSIDE the timed window.
+  defp sdk_write(c, key) do
+    c = %{c | baton: nil}
+
+    {t, {d, b}} =
+      :timer.tc(fn ->
+        {:ok, d, c1} = Filo.Client.pipeline(c, [sdk_describe(@sdk_insert)])
+
+        {:ok, b, _} =
+          Filo.Client.pipeline(c1, [
+            sdk_batch(@sdk_insert <> ";", [key, "x"]),
+            %{"type" => "get_autocommit"},
+            %{"type" => "close"}
+          ])
+
+        {d, b}
+      end)
+
+    {t, {d, b}, c}
+  end
+
+  # One SDK read on the held stream: describe, then /v3/cursor.
+  defp sdk_read(c) do
+    {t, {d, raw, c2}} =
+      :timer.tc(fn ->
+        {:ok, d, c1} = Filo.Client.pipeline(c, [sdk_describe(@sdk_select)])
+        {raw, c2} = sdk_cursor(c1, sdk_batch(@sdk_select <> ";", [1], false))
+        {d, raw, c2}
+      end)
+
+    {t, {d, raw}, c2}
+  end
+
+  defp sdk_describe(sql),
+    do: %{"type" => "describe", "sql" => sql, "sql_id" => nil, "replication_index" => nil}
+
+  # The exact step the SDK sends: `condition: null`, `want_rows: true`, args typed. With
+  # `wrap? = true` it is a pipeline `batch` request, else the bare batch the cursor endpoint takes.
+  defp sdk_batch(sql, args, wrap? \\ true) do
+    batch = %{
+      "steps" => [
+        %{
+          "condition" => nil,
+          "stmt" => %{
+            "sql" => sql,
+            "sql_id" => nil,
+            "args" => Enum.map(args, &Filo.Value.encode/1),
+            "named_args" => [],
+            "want_rows" => true,
+            "replication_index" => nil
+          }
+        }
+      ],
+      "replication_index" => nil
+    }
+
+    if wrap?, do: %{"type" => "batch", "batch" => batch}, else: batch
+  end
+
+  # `Filo.Client` has no cursor sugar, so the request goes through its own transport. The response
+  # is NDJSON: line 1 `{"baton": ..., "base_url": null}`, then step_begin / row / step_end entries.
+  defp sdk_cursor(c, batch) do
+    body = Jason.encode_to_iodata!(%{"baton" => c.baton, "batch" => batch})
+    headers = [{"host", c.authority} | c.headers]
+
+    {:ok, %{status: 200, body: raw}, state} =
+      c.transport.request(c.transport_state, "POST", "/v3/cursor", headers, body)
+
+    [first | _] = String.split(raw, "\n", parts: 2)
+    {raw, %{c | transport_state: state, baton: Jason.decode!(first)["baton"]}}
+  end
+
+  defp sdk_check_write!({d, b}, label) do
+    with [%{"type" => "ok", "response" => %{"type" => "describe", "result" => dr}}] <- d,
+         2 <- length(dr["params"] || []),
+         [
+           %{"type" => "ok", "response" => %{"type" => "batch", "result" => br}},
+           %{
+             "type" => "ok",
+             "response" => %{"type" => "get_autocommit", "is_autocommit" => true}
+           },
+           %{"type" => "ok", "response" => %{"type" => "close"}}
+         ] <- b,
+         [nil] <- br["step_errors"],
+         [%{"affected_row_count" => 1}] <- br["step_results"] do
+      :ok
+    else
+      other ->
+        raise "#{label}: the SDK write shape was not served as expected (#{inspect({d, b})}; #{inspect(other)})"
+    end
+  end
+
+  defp sdk_check_read!({d, raw}, label) do
+    served? =
+      match?([%{"type" => "ok", "response" => %{"type" => "describe"}}], d) and
+        String.contains?(raw, ~s("type":"row")) and String.contains?(raw, "step_end")
+
+    unless served?,
+      do: raise("#{label}: describe or the /v3/cursor row was not served (#{inspect({d, raw})})")
+
+    :ok
+  end
+
+  defp sdk_assert_no_live_streams!(label) do
+    live = Registry.count(Module.concat(Fathom.Bench.WireStreams, Registry))
+    unless live <= 1, do: raise("#{label} left #{live} live streams; it is not closing them")
+    :ok
   end
 
   @doc """
@@ -2000,6 +2266,7 @@ defmodule Fathom.Bench do
     trials = Keyword.get(opts, :trials, @default_trials)
     rows = Keyword.get(opts, :served_rows, @served_rows)
     stmts = Keyword.get(opts, :served_stmts, @served_stmts)
+    schema = Keyword.get(opts, :served_schema, :keystone)
 
     results =
       times(trials, fn t ->
@@ -2007,7 +2274,7 @@ defmodule Fathom.Bench do
         before_total = :erlang.memory(:total)
         before_bin = :erlang.memory(:binary)
 
-        handles = Enum.map(1..n, fn i -> open_served_shard(t, i, rows, stmts) end)
+        handles = Enum.map(1..n, fn i -> open_served_shard(t, i, rows, stmts, schema) end)
 
         # Assert the precondition rather than trust it (the `flush_p50_us` 2 µs lesson: a metric
         # whose work silently did not happen reports a spectacular number and the gate says OK).
@@ -2040,7 +2307,47 @@ defmodule Fathom.Bench do
   @spec served_mix(keyword()) :: %{total_kb: float(), binary_kb: float()}
   def served_mix(opts \\ []), do: served(Keyword.put_new(opts, :served_stmts, @served_mix_stmts))
 
-  defp open_served_shard(t, i, rows, stmts \\ @served_stmts) do
+  @doc """
+  `served_django_kb_per_shard` / `served_django_binary_kb_per_shard` - `served/1` with a
+  Django-sized WIDE schema (`Fathom.Bench.DjangoSchema`: 45 tables / ~100 indexes, the 12 contrib
+  tables plus generated app models) instead of the 6-table keystone (expert review 2026-10-21
+  #18a). Each SQLite connection parses and holds its own copy of the schema, so per-connection
+  memory grows with the tenant's schema, and every other density number (and `PoolBudget`'s sizing)
+  was measured on the keystone. Watch-only new series, beside the gated keystone one.
+
+  Preconditions: the fixture really has >= 40 tables and >= 80 indexes, and the held connection's
+  first query returned rows.
+  """
+  @spec served_django(keyword()) :: %{total_kb: float(), binary_kb: float()}
+  def served_django(opts \\ []), do: served(Keyword.put(opts, :served_schema, :django))
+
+  defp open_served_shard(t, i, rows, stmts \\ @served_stmts, schema \\ :keystone)
+
+  defp open_served_shard(t, i, _rows, _stmts, :django) do
+    id = "bench_served_django_#{t}_#{i}"
+    {:ok, pid, ref, path} = Shards.checkout(id)
+    %{tables: tables, indexes: indexes} = Fathom.Bench.DjangoSchema.build!(path)
+
+    if tables < 40 or indexes < 80,
+      do:
+        raise(
+          "served_django: fixture has #{tables} tables / #{indexes} indexes - not Django-sized"
+        )
+
+    {:ok, conn} = Connection.open(path)
+
+    {:ok, %{rows: got}} =
+      Connection.query(
+        conn,
+        "SELECT * FROM #{Fathom.Bench.DjangoSchema.probe_table()} LIMIT 50",
+        []
+      )
+
+    if got == [], do: raise("served_django read 0 rows - the page/statement caches are cold")
+    {id, pid, ref, conn}
+  end
+
+  defp open_served_shard(t, i, rows, stmts, :keystone) do
     id = "bench_served_#{t}_#{i}"
     {:ok, pid, ref, path} = Shards.checkout(id)
     {:ok, _} = Fathom.Keystone.build!(path, rows: rows)
@@ -2121,8 +2428,15 @@ defmodule Fathom.Bench do
   live connection that has run a query AND has been replicated to a quorum, and reports per shard:
 
     * `total_kb` — BEAM memory delta of THIS VM (coordinator + connection + the per-shard `Session`
-      + the shippers' bookkeeping). Compare it with `served_kb_per_shard`; the difference is what
-      replication costs the primary.
+      + the shippers' bookkeeping). **Do NOT read `total_kb - served_kb_per_shard` as the cost of
+      replication** (that sentence used to be here; expert review 2026-10-21 #29): the arm also
+      runs its own CREATE TABLE + INSERT, which costs ~+41-45 KiB of SQLite write-path memory, and
+      the first commit's seed checkpoint frees ~25-39 KiB again, so the delta is mostly write noise
+      and a 2x Session growth would vanish in it. `total_kb` is a "served + replicating + written"
+      density figure and nothing more.
+    * `session_kb` (`repl_session_kb_per_shard`) — the replication `Session` process alone
+      (`Process.info` memory plus its refc binaries) per shard. Deterministic; this is the number
+      that attributes replication memory (~5 KiB per shard measured by `repl_mem.exs`).
     * `follower_kb` — BEAM memory delta of the FOLLOWER VM, per shard per replica. The followers
       live in a separate `:peer` VM so their memory is not folded into the primary's number
       (in-process loopback followers would be counted in `total_kb` and could not be split out).
@@ -2146,7 +2460,11 @@ defmodule Fathom.Bench do
   report the OFF number under a new name: replication is on, every shipper is connected, one
   `Session` exists per shard, and every shard's replica is present on every follower.
   """
-  @spec served_repl(keyword()) :: %{total_kb: float(), follower_kb: float()}
+  @spec served_repl(keyword()) :: %{
+          total_kb: float(),
+          follower_kb: float(),
+          session_kb: float()
+        }
   def served_repl(opts \\ []) do
     n = Keyword.get(opts, :served_repl_n, @served_repl_n)
     trials = Keyword.get(opts, :trials, @default_trials)
@@ -2157,7 +2475,8 @@ defmodule Fathom.Bench do
 
       %{
         total_kb: results |> Enum.map(&elem(&1, 0)) |> median(),
-        follower_kb: results |> Enum.map(&elem(&1, 1)) |> median()
+        follower_kb: results |> Enum.map(&elem(&1, 1)) |> median(),
+        session_kb: results |> Enum.map(&elem(&1, 2)) |> median()
       }
     end)
   end
@@ -2314,6 +2633,7 @@ defmodule Fathom.Bench do
     collect_all()
     local = :erlang.memory(:total) - before_local
     remote = peer_call(peer, __MODULE__, :peer_memory_total, []) - before_remote
+    session_kb = session_bytes!(ids) / n / 1024
 
     Enum.each(handles, fn {id, _pid, _ref, _conn} = h ->
       Session.stop(id)
@@ -2321,7 +2641,33 @@ defmodule Fathom.Bench do
       for name <- names, do: peer_call(peer, Follower, :forget, [name, id])
     end)
 
-    {local / n / 1024, remote / n / length(names) / 1024}
+    {local / n / 1024, remote / n / length(names) / 1024, session_kb}
+  end
+
+  # Σ over the shards' replication Sessions of `Process.info(:memory)` (heap, stack, mailbox) plus
+  # the refc binaries each holds (`Process.info(:binary)` sizes). Deterministic and needs no
+  # allocator delta, unlike `served_repl`'s `total_kb`, which also contains the arm's own
+  # CREATE TABLE + INSERT (expert review 2026-10-21 #29: Session ~5 KiB of a ~246 KiB total, so a
+  # 2x Session growth was invisible in it). Raises on a missing Session or a zero size.
+  defp session_bytes!(ids) do
+    bytes =
+      Enum.map(ids, fn id ->
+        case Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id) do
+          [{pid, _}] ->
+            {:memory, mem} = Process.info(pid, :memory)
+            {:binary, bins} = Process.info(pid, :binary)
+            mem + (bins |> Enum.map(&elem(&1, 1)) |> Enum.sum())
+
+          other ->
+            raise "served_repl: no replication Session for #{id} (#{inspect(other)}) - " <>
+                    "repl_session_kb_per_shard would measure nothing"
+        end
+      end)
+
+    if Enum.any?(bytes, &(&1 <= 0)),
+      do: raise("served_repl: a replication Session reported 0 bytes - measuring nothing")
+
+    Enum.sum(bytes)
   end
 
   defp open_repl_shard(t, i, rows) do

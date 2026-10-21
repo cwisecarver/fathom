@@ -2265,7 +2265,9 @@ repl_hist_report() {
   awk '
     function strip_le(l) { gsub(/le="[^"]*",?/, "", l); gsub(/,\}/, "}", l); gsub(/\{,/, "{", l); return l }
     function num(s) { return (s == "+Inf") ? 1e300 : s + 0 }
-    FNR == NR { b[$1] = $2; next }
+    # Key on the FILE, not FNR == NR: with an empty before-dump (every fresh fleet) FNR == NR stays
+    # true through the whole after-file and swallowed every line (expert review 2026-10-21 #1).
+    FILENAME == ARGV[1] { b[$1] = $2; next }
     {
       d = $2 - b[$1]
       printf "  %s %.10g\n", $1, d

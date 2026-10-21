@@ -6,7 +6,20 @@ defmodule Fathom.Shard.PoolBudget do
   scope), but nothing bounded them per NODE. With the pool drain grace (#4) an idle shard keeps its
   last stream's handle for `drain_grace_ms` after the stream closes, so residency grows with the
   rate of distinct shards served: about (shards touched in the last grace window, plus busy shards)
-  x up to 2 handles x ~150-170 KB each. This counts them and caps them.
+  x up to 2 handles x the per-handle cost. This counts them and caps them.
+
+  ## The budget is a COUNT, and a handle's size depends on the tenant's schema
+
+  (user decision 2026-10-21, expert review 2026-10-21 #18: keep a count, correct the sizing.) Every
+  SQLite connection parses and holds its OWN copy of the schema (shared cache is off). Measured per
+  held connection with `served_kb_per_shard` / `served_django_kb_per_shard`: ~187 KiB on the 6-table
+  keystone every earlier density number used, ~250 KiB on a Django-sized schema (45 tables / 114
+  indexes, +34%); a SQLite-only probe read 156 KiB for 1 table, 212 for 30 tables / 60 indexes and
+  278 for 60 / 120. On top come up to 256 KiB of statement cache (`:stmt_cache_bytes`) and up to
+  2 MiB of page cache once the handle has served queries. So the default 8,192 is about 1.5 GiB
+  (keystone, empty caches), 2.0 GiB (Django, empty caches), 4 GiB (Django, full statement caches),
+  and more with warm page caches (bounded node-wide by the soft heap limit) - not a fixed 1.4 GB.
+  Size the count for the fleet's schema.
 
   ## What happens at the cap
 

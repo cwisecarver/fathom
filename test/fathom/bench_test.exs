@@ -435,6 +435,99 @@ defmodule Fathom.BenchTest do
     assert put > 20 and put < 50_000, "conditional PUT #{put}us outside the band"
   end
 
+  # expert review 2026-10-21 #2. S3Stub had no DELETE, so a lease release / idle drop could not run
+  # against it. It must answer like S3: 204 for a plain delete (existing or not), 412 for an
+  # If-Match mismatch, 404 for If-Match on a missing key, and actually remove the object.
+  test "S3Stub DELETE is S3-shaped (plain, If-Match match / mismatch / missing)" do
+    table = :ets.new(:s3_stub_test, [:set, :public])
+    Fathom.Bench.S3Stub.put_object(table, "/b/k", "body", [{"etag", ~s("e1")}])
+    opts = Fathom.Bench.S3Stub.init(table: table)
+
+    del = fn path, headers ->
+      Enum.reduce(headers, Plug.Test.conn("DELETE", path), fn {k, v}, c ->
+        Plug.Conn.put_req_header(c, k, v)
+      end)
+      |> Fathom.Bench.S3Stub.call(opts)
+    end
+
+    assert del.("/b/k", [{"if-match", ~s("other")}]).status == 412
+    assert :ets.member(table, "/b/k"), "a mismatched If-Match must not delete"
+    assert del.("/b/nope", [{"if-match", ~s("e1")}]).status == 404
+    assert del.("/b/k", [{"if-match", ~s("e1")}]).status == 204
+    refute :ets.member(table, "/b/k")
+    assert del.("/b/k", []).status == 204, "S3 DELETE of a missing key is 204"
+  end
+
+  # expert review 2026-10-21 #2. The cold-open and concurrent-cold-cycle arms against the real S3
+  # client + coordinator over the loopback stub. Each raises if a cycle did not pull a file, the
+  # Finch pool did not carry the requests, or a lease lock survives the drain (DELETE not run).
+  @tag timeout: 300_000
+  test "cold_open_stub and concurrent_cold_cycle run the real S3 path and clean up their env" do
+    before_env =
+      Application.get_all_env(:fathom) |> Keyword.take([:shard_storage, :shard_data_dir])
+
+    us = Fathom.Bench.StorageIO.cold_open_stub(cold_stub_samples: 3)
+    assert is_float(us) and us > 50 and us < 500_000, "cold_open_stub_p50_us #{us} out of band"
+
+    rate =
+      Fathom.Bench.StorageIO.concurrent_cold_cycle(
+        cold_cycle_workers: 4,
+        cold_cycle_per_worker: 2,
+        cold_cycle_trials: 1
+      )
+
+    IO.puts("cold_open_stub_p50_us=#{us} concurrent_cold_cycle_per_s=#{rate}")
+    assert is_float(rate) and rate > 1, "concurrent_cold_cycle_per_s #{rate} out of band"
+
+    assert Application.get_all_env(:fathom) |> Keyword.take([:shard_storage, :shard_data_dir]) ==
+             before_env
+  end
+
+  # expert review 2026-10-21 #3. The libSQL Rust SDK request shape (describe, then batch +
+  # get_autocommit + close; reads via /v3/cursor). The arms raise if the describe, the
+  # condition-less batch step, the cursor row or the pooled-handle reuse did not happen, and must
+  # restore the connection_pool env they force on.
+  test "hrana_sdk_write/read run the SDK shape and restore the pool env" do
+    prev = Application.get_env(:fathom, :connection_pool)
+    w = Fathom.Bench.hrana_sdk_write_rt_us(hrana_rt_samples: 20)
+    r = Fathom.Bench.hrana_sdk_read_rt_us(hrana_rt_samples: 20)
+    IO.puts("hrana_sdk_write_rt_us=#{w} hrana_sdk_read_rt_us=#{r}")
+    assert is_float(w) and w > 20 and w < 100_000
+    assert is_float(r) and r > 20 and r < 100_000
+    assert Application.get_env(:fathom, :connection_pool) == prev
+  end
+
+  # expert review 2026-10-21 #29. served_repl's total_kb includes the arm's own CREATE TABLE + INSERT
+  # (~+41-45 KiB), so a Session growing 2x was invisible in it. session_kb is the Session process
+  # alone: a few KiB (panel measured 4.7-5.9), far below total_kb.
+  test "served_repl reports the replication Session's own memory, separate from total_kb" do
+    %{total_kb: total, session_kb: session} =
+      Fathom.Bench.served_repl(served_repl_n: 4, trials: 1)
+
+    IO.puts("served_repl: total_kb=#{total} session_kb=#{session}")
+    assert is_float(session) and session > 1.0 and session < 100.0
+
+    # total_kb at n=4, one trial is a noisy allocator delta (seen 43-435 KiB), so it is only printed.
+    assert is_float(total)
+  end
+
+  # expert review 2026-10-21 #18a. The Django-sized fixture really is wide (the arm itself raises
+  # under 40 tables / 80 indexes), and a connection holding it costs clearly more than the 6-table
+  # keystone one: every density number and PoolBudget's sizing assumed the keystone.
+  test "the Django-sized schema fixture is wide and the served_django arm runs on it" do
+    path = Path.join(System.tmp_dir!(), "django_schema_#{System.unique_integer([:positive])}.db")
+    on_exit(fn -> Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1)) end)
+    counts = Fathom.Bench.DjangoSchema.build!(path)
+    IO.puts("django schema: #{inspect(counts)}")
+    assert counts.tables >= 40 and counts.indexes >= 80
+
+    # The memory ordering (django ~250 vs keystone ~187 KiB, +34%) is NOT asserted here: inside the
+    # full test VM the allocator delta swung to 338 vs 354 KiB (the keystone read heavier), so it
+    # would be a flake. It is measured standalone by `mix fathom.bench --only served,served_django`.
+    d = Fathom.Bench.served_django(served_n: 4, trials: 1)
+    assert is_float(d.total_kb) and d.total_kb > 20 and d.total_kb < 5_000
+  end
+
   # expert review 2026-10-19 #12. A warm-stream SELECT 1 over the WebSocket path; the metric
   # asserts each reply is [[1]]. Prod ~100-200 us.
   # The full `mix fathom.bench` run crashed in await_upgrade/2 with a CaseClauseError on :unknown

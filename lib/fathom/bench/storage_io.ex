@@ -20,8 +20,11 @@ defmodule Fathom.Bench.StorageIO do
 
   alias Exqlite.Sqlite3
   alias Fathom.Bench.S3Stub
+  alias Fathom.Shard.Connection
+  alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.Codec
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Shards
 
   @fixture_rows 160_000
   @min_plain_bytes 10_000_000
@@ -30,6 +33,10 @@ defmodule Fathom.Bench.StorageIO do
   @pull_trials 5
   @s3_head_samples 300
   @s3_put_samples 100
+  @cold_stub_samples 50
+  @cold_cycle_workers 32
+  @cold_cycle_per_worker 4
+  @cold_cycle_trials 3
   @s3_bucket "benchbucket"
   @s3_prefix "s3io/"
 
@@ -255,6 +262,208 @@ defmodule Fathom.Bench.StorageIO do
     after
       stop_s3(stub)
       File.rm_rf(dir)
+    end
+  end
+
+  @doc """
+  `cold_open_stub_p50_us` - median µs of the same cold open `cold_open_p50_us` times
+  (`Shards.checkout/1` + connection open + first query), but with the REAL `Storage.S3` backend, the
+  real S3 Finch pool and a loopback `S3Stub` instead of the `Storage.Local` double (expert review
+  2026-10-21 #2). The Local double is ~2/3 of the Local cold-open checkout and is partly double-only
+  (JSON lock files under `:global.trans`, `File.cp` metadata calls), so a coordinator-side
+  regression has to exceed ~60% of coordinator cost to trip `cold_open_p50_us`. This arm runs the
+  lease PUT and the pull over a real socket (the lease-release DELETE runs in the untimed
+  teardown). Loopback, so the S3 PROTOCOL cost, not a network RTT. WATCH-ONLY (new series; do not
+  compare with `cold_open_p50_us`).
+
+  Preconditions (raises otherwise): every sample left a pulled, non-empty local file, the S3 Finch
+  pool carried at least the pull's requests, and after the run every lease was released by a
+  DELETE (no `.lock` object remains).
+  """
+  @spec cold_open_stub(keyword()) :: float()
+  def cold_open_stub(opts \\ []) do
+    n = Keyword.get(opts, :cold_stub_samples, @cold_stub_samples)
+
+    with_stub_shards(fn stub ->
+      cycle = fn id ->
+        seed_stub_shard(id)
+        {us, {pid, ref, conn, path}} = :timer.tc(fn -> open_query(id) end)
+        assert_pulled!("cold_open_stub_p50_us", path)
+        Connection.close(conn)
+        Fathom.Shard.checkin(pid, ref)
+        Shards.drain(id)
+        us
+      end
+
+      # Untimed warm-up: module/NIF load and the first Finch connection.
+      cycle.(stub_id("warm"))
+
+      samples = for i <- 1..n, do: cycle.(stub_id("cold#{i}"))
+
+      # warm-up + n cycles, each at least a seed PUT + a lease PUT + the pull through the pool.
+      assert_finch_used!(stub, 2 * (n + 1))
+      assert_no_locks!(stub, "cold_open_stub_p50_us")
+      median(samples)
+    end)
+  end
+
+  @doc """
+  `concurrent_cold_cycle_per_s` - cold checkout -> checkin -> drain cycles per second with
+  #{@cold_cycle_workers} workers each cycling distinct shards, against the same real-S3-client +
+  loopback-stub topology as `cold_open_stub/1` (expert review 2026-10-21 #2). Every other
+  cold-open metric is serial, so nothing node-wide (the file server, the Finch pool, the Registry,
+  the DynamicSupervisor) could show. Median of #{@cold_cycle_trials} trials after one untimed
+  trial; seeding is untimed. WATCH-ONLY (new series).
+
+  Preconditions: each cycle's checkout returned a non-empty local file (checked with a RAW file
+  call, so the check itself does not load `file_server_2`), the Finch pool carried at least the
+  pulls and releases, and no `.lock` object remains (every drain released by DELETE).
+  """
+  @spec concurrent_cold_cycle(keyword()) :: float()
+  def concurrent_cold_cycle(opts \\ []) do
+    workers = Keyword.get(opts, :cold_cycle_workers, @cold_cycle_workers)
+    per = Keyword.get(opts, :cold_cycle_per_worker, @cold_cycle_per_worker)
+    trials = Keyword.get(opts, :cold_cycle_trials, @cold_cycle_trials)
+
+    with_stub_shards(fn stub ->
+      run_trial = fn t ->
+        batches =
+          for w <- 1..workers do
+            for c <- 1..per, do: stub_id("cc#{t}_#{w}_#{c}")
+          end
+
+        Enum.each(List.flatten(batches), &seed_stub_shard/1)
+
+        {us, _} =
+          :timer.tc(fn ->
+            batches
+            |> Task.async_stream(&cycle_all/1,
+              max_concurrency: workers,
+              ordered: false,
+              timeout: 120_000
+            )
+            |> Enum.each(fn {:ok, :ok} -> :ok end)
+          end)
+
+        workers * per / (us / 1_000_000)
+      end
+
+      # Untimed trial 0: warms the pool's connections and the code paths.
+      run_trial.(0)
+      rates = for t <- 1..trials, do: run_trial.(t)
+
+      assert_finch_used!(stub, 2 * workers * per * (trials + 1))
+      assert_no_locks!(stub, "concurrent_cold_cycle_per_s")
+      median(rates)
+    end)
+  end
+
+  defp cycle_all(ids) do
+    Enum.each(ids, fn id ->
+      {:ok, pid, ref, path} = Shards.checkout(id)
+      assert_pulled!("concurrent_cold_cycle_per_s", path)
+      Fathom.Shard.checkin(pid, ref)
+      Shards.drain(id)
+    end)
+  end
+
+  defp open_query(id) do
+    {:ok, pid, ref, path} = Shards.checkout(id)
+    {:ok, conn} = Connection.open(path)
+    {:ok, _} = Connection.query(conn, "SELECT 1", [])
+    {pid, ref, conn, path}
+  end
+
+  # A RAW file call goes straight to the prim_file NIF instead of through `file_server_2`, so the
+  # precondition check does not add load to the very server the concurrent arm exists to expose.
+  defp assert_pulled!(metric, path) do
+    case :file.read_file_info(String.to_charlist(path), [:raw]) do
+      {:ok, info} when elem(info, 1) > 0 ->
+        :ok
+
+      other ->
+        raise "#{metric}: the checkout did not leave a pulled, non-empty file at #{path} " <>
+                "(#{inspect(other)}); this would measure a cycle that never pulled"
+    end
+  end
+
+  defp assert_no_locks!(%{table: table}, metric) do
+    locks = for [k] <- :ets.match(table, {:"$1", :_, :_}), String.ends_with?(k, ".lock"), do: k
+
+    if locks != [],
+      do:
+        raise(
+          "#{metric}: #{length(locks)} lease lock object(s) remain in the stub; the release " <>
+            "DELETE did not run, so the drain path is not what this metric measures"
+        ),
+      else: :ok
+  end
+
+  defp stub_id(suffix), do: "stubcold-#{System.unique_integer([:positive])}-#{suffix}"
+
+  # Creates a tiny shard locally and flushes it to the stub through the production flush path
+  # (`Storage.flush/2` -> S3 PUT with the md5 metadata), then drops the local copy so the next
+  # checkout is a genuine cold pull.
+  defp seed_stub_shard(id) do
+    data = Application.fetch_env!(:fathom, :shard_data_dir)
+    tmp = Path.join(data, "#{id}.seed")
+    {:ok, conn} = Connection.open(tmp)
+    Connection.exec(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    Connection.exec(conn, "INSERT INTO t DEFAULT VALUES")
+    Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+    Connection.close(conn)
+    :ok = Storage.flush(id, tmp)
+    Enum.each(["", "-wal", "-shm"], &File.rm(tmp <> &1))
+  end
+
+  # Runs `fun.(stub)` with `Storage.S3` pointed at a loopback stub AND the shard data path pointed
+  # at a scratch dir, with the same hot-path knobs `Fathom.Bench.setup/1` turns off, then restores
+  # every env key. Starts the registries/supervisors a checkout needs if no earlier metric did.
+  # Owns its setup so the shared `Fathom.Bench.setup/1` (and every series that reads it) is
+  # unchanged.
+  defp with_stub_shards(fun) do
+    keys = [
+      :shard_data_dir,
+      :shard_storage,
+      :shard_flush_interval_ms,
+      :directory_touch,
+      :lazy_migrate
+    ]
+
+    prev = for k <- keys, do: {k, Application.fetch_env(:fathom, k)}
+    dir = Path.join(tmp_dir(), "stubshards_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    stub = start_s3()
+
+    try do
+      Application.put_env(:fathom, :shard_data_dir, dir)
+      Application.put_env(:fathom, :shard_storage, Storage.S3)
+      Application.put_env(:fathom, :shard_flush_interval_ms, 0)
+      Application.put_env(:fathom, :directory_touch, false)
+      Application.put_env(:fathom, :lazy_migrate, false)
+      ensure_started(Registry, keys: :unique, name: Fathom.ShardRegistry)
+      ensure_started(DynamicSupervisor, name: Fathom.ShardSupervisor, strategy: :one_for_one)
+      ensure_started(Fathom.ShardLoad, [])
+      ensure_started(Fathom.ShardLatency, [])
+      fun.(stub)
+    after
+      stop_s3(stub)
+
+      for {k, v} <- prev do
+        case v do
+          {:ok, val} -> Application.put_env(:fathom, k, val)
+          :error -> Application.delete_env(:fathom, k)
+        end
+      end
+
+      File.rm_rf(dir)
+    end
+  end
+
+  defp ensure_started(mod, opts) do
+    case mod.start_link(opts) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
     end
   end
 

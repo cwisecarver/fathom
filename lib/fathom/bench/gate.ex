@@ -112,7 +112,12 @@ defmodule Fathom.Bench.Gate do
     # are watch-only until a band exists.
     {:served_mix_kb_per_shard, :higher_worse, :watch},
     {:served_mix_binary_kb_per_shard, :higher_worse, :watch},
+    # Django-sized wide schema (expert review 2026-10-21 #18a). Watch-only, new series.
+    {:served_django_kb_per_shard, :higher_worse, :watch},
+    {:served_django_binary_kb_per_shard, :higher_worse, :watch},
     {:follower_kb_per_shard, :higher_worse, :watch},
+    # The replication Session's own memory (expert review 2026-10-21 #29). Watch-only, new series.
+    {:repl_session_kb_per_shard, :higher_worse, :watch},
     # CONTENTION, gated from 2026-08-03 (#41.4). Every other gated metric is single-threaded, so
     # the concurrency-tuned machinery (write_concurrency on the ETS
     # counters, the Lru CA-tree, +SDio, the per-shard coordinator GenServer.call) had no gate at
@@ -201,6 +206,13 @@ defmodule Fathom.Bench.Gate do
     # An 8-column point read (expert review 2026-10-19 #10): the per-column encode cost the
     # one-cell SELECT 1 metrics cannot see. Watch-only until a band is measured.
     {:hrana_wide_rt_us, :higher_worse, :watch},
+    # NEW SERIES (expert review 2026-10-21 #2): cold open and 32-worker cold cycle through the real
+    # Storage.S3 client against a loopback stub. Watch-only until a band is measured.
+    {:cold_open_stub_p50_us, :higher_worse, :watch},
+    {:concurrent_cold_cycle_per_s, :lower_worse, :watch},
+    # The libSQL Rust SDK request shape over HTTP (expert review 2026-10-21 #3). Watch-only.
+    {:hrana_sdk_write_rt_us, :higher_worse, :watch},
+    {:hrana_sdk_read_rt_us, :higher_worse, :watch},
     # THE TAIL, gated from 2026-08-03 (expert review #41.5). Every metric above is a p50, and
     # `delta/4` is a pure ratio — which AGENTS.md forbids in as many words ("Assert an absolute
     # floor, not only a ratio… The ratio holds while throughput collapses"). A change that leaves
