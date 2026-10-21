@@ -109,7 +109,11 @@ defmodule Fathom.Telemetry.FastHistogramTest do
 
     assert MapSet.new(Map.keys(commit_stage_sets)) ==
              MapSet.new(
-               for s <- [:build, :collect], r <- [true, false], do: %{stage: s, reset: r}
+               for s <- [:build, :collect],
+                   r <- [true, false],
+                   k <- [true, false],
+                   m <- [:tenant, :catch_up, :idle_close],
+                   do: %{stage: s, reset: r, skipped: k, mode: m}
              )
 
     for o <- [:ok, :held, :unavailable, :at_capacity, :novel_rate_limited, :error],
@@ -118,7 +122,7 @@ defmodule Fathom.Telemetry.FastHistogramTest do
     :telemetry.execute(
       [:fathom, :replication, :commit_stage],
       %{duration: ms(1)},
-      %{stage: :build, reset: true}
+      %{stage: :build, reset: true, skipped: false, mode: :tenant}
     )
 
     assert :persistent_term.get(checkout_key) == checkout_sets
@@ -136,6 +140,21 @@ defmodule Fathom.Telemetry.FastHistogramTest do
              "fathom_replication_commit_stage_duration",
              "stage"
            ) == ["build"]
+  end
+
+  # Integration of expert review 2026-10-20-2027 #5 and #26. Symptom: #26 hand-copied the label
+  # maps while #5 added `mode`/`skipped` tags, so no pre-created set matched a real sample and the
+  # runtime persistent_term put came back for every series. Invariant: each hot metric's
+  # pre-created sets carry EXACTLY the metric's current tags, and there is at least one, so a tag
+  # added without a domain in FastHistogram fails here instead of silently disabling #26.
+  test "every hot metric pre-creates label sets keyed by exactly its current tags" do
+    for m <- hot_metrics(), m.tags != [] do
+      sets = FastHistogram.known_label_sets(m)
+      assert sets != [], "#{inspect(m.name)} has a tag with no known domain: #{inspect(m.tags)}"
+
+      for labels <- sets,
+          do: assert(MapSet.new(Map.keys(labels)) == MapSet.new(m.tags), inspect(m.name))
+    end
   end
 
   test "a value exactly on a bound lands in that bucket (le is inclusive)" do

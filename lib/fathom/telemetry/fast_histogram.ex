@@ -43,24 +43,59 @@ defmodule Fathom.Telemetry.FastHistogram do
 
   # Every label set these metrics can emit, created at init (expert review 2026-10-20-2027 #26).
   # Creating a series at runtime is a `:persistent_term.put` on an EXISTING key, which forces a
-  # node-wide literal GC scan, so a first-seen outcome used to pay it on the request path. Each set
-  # below is the closed set the emitter produces (checkout: `checkout_outcome/1` in shards.ex;
-  # commit/commit_total: `commit_outcome/1` in session.ex; commit_stage: `stage` x `reset` in
-  # session.ex). A label set NOT listed here still works, it just takes the runtime path once.
+  # node-wide literal GC scan, so a first-seen outcome used to pay it on the request path.
+  #
+  # The sets are DERIVED: the cartesian product, over the metric's own `tags` (from
+  # `Fathom.Telemetry.metrics/0`), of each tag's closed value domain below. The first version
+  # hand-copied the label maps and went stale the same day: `mode` was added to
+  # `replication.commit` and `skipped` + `mode` to `commit_stage`, so none of the pre-created
+  # maps matched a real sample and every series took the runtime put again (expert review
+  # 2026-10-20-2027 integration). Deriving from the tags means a NEW tag cannot silently stale
+  # the sets: a metric with a tag that has no domain here just pre-creates nothing (every set
+  # takes the runtime path once, as before #26). Domains: checkout `outcome` is
+  # `checkout_outcome/1` in shards.ex; commit/commit_total `outcome` is `commit_outcome/1` in
+  # session.ex; `mode` is Session's `cycle`; `stage`/`reset`/`skipped` are `stage_duration/5`.
   # render/1 skips zero-count series, so pre-creating a set does not change the exposition text.
-  @label_sets %{
-    [:fathom, :shards, :checkout, :stop, :duration] =>
-      for(
-        o <- [:ok, :held, :unavailable, :at_capacity, :novel_rate_limited, :error],
-        do: %{outcome: o}
-      ),
-    [:fathom, :replication, :commit, :duration] =>
-      for(o <- [:ok, :no_quorum, :timeout, :other], do: %{outcome: o}),
-    [:fathom, :replication, :commit_total, :duration] =>
-      for(o <- [:ok, :no_quorum, :timeout, :other], do: %{outcome: o}),
-    [:fathom, :replication, :commit_stage, :duration] =>
-      for(s <- [:build, :collect], r <- [true, false], do: %{stage: s, reset: r})
+  @commit_outcomes [:ok, :no_quorum, :timeout, :other]
+  @tag_domains %{
+    [:fathom, :shards, :checkout, :stop, :duration] => %{
+      outcome: [:ok, :held, :unavailable, :at_capacity, :novel_rate_limited, :error]
+    },
+    [:fathom, :replication, :commit, :duration] => %{
+      outcome: @commit_outcomes,
+      mode: [:tenant, :catch_up, :idle_close]
+    },
+    [:fathom, :replication, :commit_total, :duration] => %{outcome: @commit_outcomes},
+    [:fathom, :replication, :commit_stage, :duration] => %{
+      stage: [:build, :collect],
+      reset: [true, false],
+      skipped: [true, false],
+      mode: [:tenant, :catch_up, :idle_close]
+    }
   }
+
+  @doc """
+  The label sets pre-created at init for `metric`: every combination of its tags' known values,
+  or `[]` when a tag has no known domain (or the metric has no tags).
+  """
+  @spec known_label_sets(Distribution.t()) :: [map()]
+  def known_label_sets(%Distribution{name: name, tags: tags}) do
+    domains = Map.get(@tag_domains, name, %{})
+
+    cond do
+      tags == [] -> []
+      Enum.all?(tags, &Map.has_key?(domains, &1)) -> product(tags, domains)
+      true -> []
+    end
+  end
+
+  defp product([], _domains), do: [%{}]
+
+  defp product([tag | rest], domains) do
+    for v <- Map.fetch!(domains, tag),
+        labels <- product(rest, domains),
+        do: Map.put(labels, tag, v)
+  end
 
   @doc "True for the metrics this module records instead of `TelemetryMetricsPrometheus.Core`."
   @spec handles?(Telemetry.Metrics.t()) :: boolean()
@@ -116,7 +151,7 @@ defmodule Fathom.Telemetry.FastHistogram do
         size = length(buckets) + 2
 
         series =
-          for labels <- Map.get(@label_sets, m.name, []),
+          for labels <- known_label_sets(m),
               into: %{},
               do: {labels, :counters.new(size, [:write_concurrency])}
 
