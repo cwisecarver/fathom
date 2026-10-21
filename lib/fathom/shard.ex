@@ -4117,17 +4117,26 @@ defmodule Fathom.Shard do
     # the flush, while a merely-busy checkpoint must fall back to the snapshot path.
     case checkpoint_and_verify(state.path) do
       :ok ->
-        # The WAL has just been folded into the database, so the object holds everything through
-        # the end of `pre`'s generation — see flush_position/2 for why that is claimed as gen + 1.
-        state.id
-        |> Storage.flush(
-          state.path,
-          state.etag,
-          Position.flush_position(state, pre),
-          Position.lineage_arg(state),
-          flush_intent_opts(state.path)
-        )
-        |> guard_pre_touch(state)
+        if compaction_worthwhile?(state.path) do
+          # Mostly-free file (expert review 2026-10-20-2027 #9): a raw upload ships every freelist
+          # page (measured 7.6x bigger object at 90% free) and keeps deleted rows in the object.
+          # The checkpoint folded the WAL, so the header counts are current. The VACUUM route
+          # compacts; it takes `pre` because the checkpoint already unlinked `-wal`.
+          emit_drop_route(state, :snapshot_compact)
+          snapshot_and_upload(state, pre)
+        else
+          # The WAL has just been folded into the database, so the object holds everything through
+          # the end of `pre`'s generation — see flush_position/2 for why that is claimed as gen + 1.
+          state.id
+          |> Storage.flush(
+            state.path,
+            state.etag,
+            Position.flush_position(state, pre),
+            Position.lineage_arg(state),
+            flush_intent_opts(state.path)
+          )
+          |> guard_pre_touch(state)
+        end
 
       # Integrity failed (expert review 2026-07-14 #4). The checkpoint-then-raw-upload fast path
       # uploads the bytes as-is, so a locally corrupted db (disk/fs/memory fault, exqlite/OS bug)
@@ -4277,6 +4286,17 @@ defmodule Fathom.Shard do
   # This connection keeps synchronous=FULL: #11's relaxation is scoped to the snapshot connection,
   # and a checkpoint at synchronous=OFF can corrupt the main database on power loss.
   defp checkpoint_and_verify(path) do
+    # SCAN PERMIT (expert review 2026-10-20-2027 #10): the TRUNCATE checkpoint and the full
+    # `quick_check` each hold a dirty-IO thread, and an idle wave / rolling deploy drops many shards
+    # at once outside the ScanGate that bounds the periodic flush's scans. Wait at most a quarter of
+    # `settle_yield_ms/0` (the enclosing `bounded_upload_for_drop/1` budget) and then scan anyway:
+    # never fail the drop-flush because the gate was busy.
+    Fathom.Shard.ScanGate.with_permit(div(settle_yield_ms(), 4), fn ->
+      checkpoint_and_verify_unpermitted(path)
+    end)
+  end
+
+  defp checkpoint_and_verify_unpermitted(path) do
     case Connection.open(path) do
       {:ok, conn} ->
         Connection.set_busy_timeout(conn, 1000)
@@ -4969,7 +4989,7 @@ defmodule Fathom.Shard do
   # `Position.snapshot_position/2`: the position as of `pre`, read BEFORE the snapshot, so the stamp
   # under-claims and never over-claims (expert review 2026-10-15 #5, user decision Q3 = A).
 
-  defp snapshot_and_upload(state) do
+  defp snapshot_and_upload(state, pre_override \\ nil) do
     temp = "#{state.path}.snap.#{System.unique_integer([:positive])}"
 
     # THE POSITION THE STAMP CLAIMS, read BEFORE the snapshot (expert review 2026-10-15 #5, user
@@ -4982,7 +5002,10 @@ defmodule Fathom.Shard do
     # not the frame walk, which can count a commit-frame header whose page is not yet written
     # (stale-tail slot) and so over-claim the object. PRIMARY, SQLite-written WAL only; promote.ex
     # and follower.ex read fathom-written WALs and must stay on the walk.
-    pre = Fathom.Shard.Replication.Wal.read(state.path <> "-wal", index: true)
+    # `pre_override` (expert review 2026-10-20-2027 #9): the compaction reroute from
+    # `checkpoint_then_upload/2` arrives AFTER its TRUNCATE checkpoint unlinked `-wal`, so re-reading
+    # here would stamp {epoch, 0, 0} (the 2026-08-20 #4 bug); it passes the `pre` it captured first.
+    pre = pre_override || Fathom.Shard.Replication.Wal.read(state.path <> "-wal", index: true)
 
     try do
       # Integrity BEFORE the snapshot: quarantine_corrupt!/2 renames the live path, so checking
@@ -5077,7 +5100,9 @@ defmodule Fathom.Shard do
     if Application.get_env(:fathom, :flush_pinned_live_upload, true) and wal_empty?(wal) do
       result =
         Fathom.Shard.Replication.Session.with_flush_pin(state.path, fn pin ->
-          if wal_empty?(wal) do
+          # A mostly-free file takes the VACUUM route, which compacts it (expert review
+          # 2026-10-20-2027 #9). Header read under the pin with an empty WAL: counts are current.
+          if wal_empty?(wal) and not compaction_worthwhile?(state.path) do
             emit_flush_route(state, :pinned_live)
 
             with :ok <-
@@ -5100,6 +5125,24 @@ defmodule Fathom.Shard do
       if result == :skipped, do: :fallback, else: result
     else
       :fallback
+    end
+  end
+
+  # Is the file mostly freelist pages, so that a VACUUM-compacted object is much smaller than the live
+  # file (expert review 2026-10-20-2027 #9)? Header-only read, no open. Defaults: free pages above
+  # 25% of the page count AND above 1 MiB free; `:flush_compact_min_free_ratio` /
+  # `:flush_compact_min_free_bytes` tune it, and a ratio of 1.0+ disables it. An unreadable header
+  # answers false (keep the existing route; the integrity gate reports real damage).
+  defp compaction_worthwhile?(path) do
+    ratio = Application.get_env(:fathom, :flush_compact_min_free_ratio, 0.25)
+    min_bytes = Application.get_env(:fathom, :flush_compact_min_free_bytes, 1_048_576)
+
+    case Fathom.Shard.SqliteHeader.free_pages(path) do
+      {:ok, %{page_count: count, freelist: free, page_size: ps}} when count > 0 ->
+        free / count > ratio and free * ps > min_bytes
+
+      _ ->
+        false
     end
   end
 

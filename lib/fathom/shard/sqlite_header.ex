@@ -32,4 +32,30 @@ defmodule Fathom.Shard.SqliteHeader do
       {:error, reason} -> {:error, reason}
     end
   end
+
+  @doc """
+  Page size, page count and freelist page total from the header (offsets 16, 28 and 36;
+  expert review 2026-10-20-2027 #9). The page count is only authoritative when the file is not
+  ahead of its WAL, so callers must read it with an empty/folded WAL (the drop route after a
+  TRUNCATE checkpoint, the pinned-live route under its empty-WAL check).
+  """
+  @spec free_pages(Path.t()) ::
+          {:ok,
+           %{page_size: pos_integer(), page_count: non_neg_integer(), freelist: non_neg_integer()}}
+          | {:error, term()}
+  def free_pages(path) do
+    case File.open(path, [:read, :binary], fn io -> :file.pread(io, 0, 40) end) do
+      {:ok,
+       {:ok,
+        <<"SQLite format 3\0", ps::big-16, _::binary-size(10), count::big-32, _::binary-size(4),
+          free::big-32>>}} ->
+        {:ok, %{page_size: if(ps == 1, do: 65_536, else: ps), page_count: count, freelist: free}}
+
+      {:ok, other} ->
+        {:error, {:free_pages_unreadable, other}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 end
