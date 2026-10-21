@@ -137,7 +137,8 @@ defmodule Fathom.Shard.Replication.WalSync do
   # consumed an EIO from this WAL fails with SQLITE_IOERR, and that is the other half of the cover.
 
   @typedoc "The Session's held sync fd and the WAL inode it was opened on, or nil."
-  @type held :: %{fd: pid(), inode: non_neg_integer()} | nil
+  @type held :: held_fd() | nil
+  @type held_fd :: %{fd: pid(), inode: non_neg_integer()}
 
   @doc """
   The held sync fd for the `-wal` at `wal_path` as it is NOW, opening one if none is held or the
@@ -181,7 +182,7 @@ defmodule Fathom.Shard.Replication.WalSync do
   `fdatasync` through the held fd. Runs in the round's sync task. The `:replication_wal_sync_fun`
   test seam, when set, replaces the syscall exactly as it does in `sync/1`.
   """
-  @spec sync_held(Path.t(), %{fd: pid()}) :: :ok | {:error, {:open | :datasync, term()}}
+  @spec sync_held(Path.t(), held_fd()) :: :ok | {:error, {:open | :datasync, term()}}
   def sync_held(wal_path, %{fd: fd}) do
     case Application.get_env(:fathom, :replication_wal_sync_fun) do
       fun when is_function(fun, 1) -> fun.(wal_path)
