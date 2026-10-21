@@ -266,7 +266,8 @@ defmodule Fathom.Tenants.Tombstones do
   # This is the one place every node learns of a delete — the NOTIFY, the periodic refresh, and the
   # deleting node's own `put/1` all funnel through `insert/3` — so a node that missed the NOTIFY
   # still converges at the next refresh. Replicas that exist on disk before this node's Follower
-  # has booted are handled by `Follower`'s recovery, which skips and deletes tombstoned shards;
+  # has booted are erased by `Follower`'s post-listen housekeeping pass, and refused by its lazy
+  # re-derive until that pass reaches them (expert review 2026-10-21 #5);
   # `Follower.begin_seed/3` refuses to re-seed one.
   defp forget_replica(shard_id) do
     follower = Fathom.Shard.Replication.Follower

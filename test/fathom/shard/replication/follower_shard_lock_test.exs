@@ -211,7 +211,10 @@ defmodule Fathom.Shard.Replication.FollowerShardLockTest do
     an_hour_ago = System.os_time(:second) - 3_600
     for p <- [stale, legacy], do: File.touch!(p, an_hour_ago)
 
-    start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
+    pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
+    # The reap runs after the listener, in `handle_continue(:boot_housekeeping)` (expert review
+    # 2026-10-21 #5); syncing on the GenServer waits it out.
+    _ = :sys.get_state(pid)
 
     refute File.exists?(stale), "a dead seed's temp survived the follower start"
     refute File.exists?(legacy), "a pre-upgrade fixed-name temp survived the follower start"

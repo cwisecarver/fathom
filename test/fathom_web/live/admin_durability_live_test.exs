@@ -129,6 +129,7 @@ defmodule FathomWeb.AdminDurabilityLiveTest do
 
     lag = %{
       sessions: 5,
+      queried: 5,
       answered: 4,
       timed_out: 1,
       catching_up: 1,
@@ -161,11 +162,13 @@ defmodule FathomWeb.AdminDurabilityLiveTest do
     refute has_element?(view, "#repl-lag-empty")
   end
 
-  test "enabled but nothing lagging says all sessions caught up", %{conn: conn} do
+  # The report asks only flagged Sessions (expert review 2026-10-21 #24), so with nothing lagging it
+  # asked none; the line counts the registered Sessions instead of the (zero) answers.
+  test "enabled but nothing lagging says no session is catching up", %{conn: conn} do
     {:ok, view, _} = conn |> auth() |> live("/admin/durability")
     render_async(view)
 
-    lag = %{sessions: 3, answered: 3, timed_out: 0, catching_up: 0, worst: []}
+    lag = %{sessions: 3, queried: 0, answered: 0, timed_out: 0, catching_up: 0, worst: []}
 
     send(
       view.pid,
@@ -174,7 +177,7 @@ defmodule FathomWeb.AdminDurabilityLiveTest do
 
     render(view)
 
-    assert has_element?(view, "#repl-lag-empty", "All sessions caught up (3 answered)")
+    assert has_element?(view, "#repl-lag-empty", "No session catching up (3 sessions)")
     refute has_element?(view, "#repl-lag-table")
     refute has_element?(view, "#repl-lag-partial")
   end

@@ -189,14 +189,23 @@ defmodule Fathom.Shard.Replication.Fleet do
   @doc """
   On-demand replication lag across this node's Sessions (admin observability 2026-10-15 P2).
 
-  Fans out over the Session registry with `Task.async_stream` and a REAL per-session `:timeout`
-  (default 1 s; `:max_concurrency` 16). A Session that does not answer in time is counted in
-  `timed_out` and excluded from the ranking, never a crash. `worst` is the top 20 by unacked bytes,
-  then catch-up backoff depth; only Sessions with something to report (behind, catching up or
-  backing off) qualify. Not for the hot path: a render/UI-cached caller only.
+  Asks only the Sessions flagged in `LagGauge` — those with a catch-up armed for REAL lag (expert
+  review 2026-10-21 #24, #25) — with `Task.async_stream` and a REAL per-session `:timeout`
+  (default 1 s; `:max_concurrency` 16). It used to ask every registered Session, which at 30k
+  replicating shards was 30k calls per 10 s refresh, each waking a hibernated Session and queueing
+  behind its commits, to rank the few that were behind. An unflagged Session is current or only has
+  fresh in-flight pushes, which is not what this report is for; a follower that is disconnected
+  shows in `connection_status/0`, and its Sessions are flagged by their `:disconnected` rejects.
+
+  `sessions` is every registered Session (not called); `queried` the flagged ones asked; one that
+  does not answer in time is counted in `timed_out` and excluded from the ranking, never a crash.
+  `worst` is the top 20 by unacked bytes, then catch-up backoff depth; only Sessions with something
+  to report (behind, catching up or backing off) qualify. Not for the hot path: a render/UI-cached
+  caller only.
   """
   @spec lag_report(keyword()) :: %{
           sessions: non_neg_integer(),
+          queried: non_neg_integer(),
           answered: non_neg_integer(),
           timed_out: non_neg_integer(),
           catching_up: non_neg_integer(),
@@ -205,17 +214,21 @@ defmodule Fathom.Shard.Replication.Fleet do
   def lag_report(opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 1_000)
 
-    # Registry.select's middle slot is the registered PROCESS pid (the value slot holds the
-    # coordinator pid), which is what lag_info wants.
-    sessions =
+    {total, flagged} =
       try do
-        Registry.select(@registry, [{{:_, :"$1", :_}, [], [:"$1"]}])
+        # Only pids that are registered Sessions: a flag row is keyed by pid and nothing else
+        # validates it.
+        {Registry.count(@registry),
+         Enum.filter(
+           Fathom.Shard.Replication.LagGauge.flagged(),
+           &(Registry.keys(@registry, &1) != [])
+         )}
       rescue
-        ArgumentError -> []
+        ArgumentError -> {0, []}
       end
 
     infos =
-      sessions
+      flagged
       |> Task.async_stream(&Fathom.Shard.Replication.Session.lag_info(&1, timeout),
         timeout: timeout + 500,
         on_timeout: :kill_task,
@@ -234,9 +247,10 @@ defmodule Fathom.Shard.Replication.Fleet do
       |> Enum.take(20)
 
     %{
-      sessions: length(sessions),
+      sessions: total,
+      queried: length(flagged),
       answered: length(infos),
-      timed_out: length(sessions) - length(infos),
+      timed_out: length(flagged) - length(infos),
       catching_up: Enum.count(infos, & &1.catching_up?),
       worst: worst
     }

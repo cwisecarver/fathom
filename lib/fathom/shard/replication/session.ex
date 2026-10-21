@@ -371,6 +371,10 @@ defmodule Fathom.Shard.Replication.Session do
        # counts commit cycles (observability and tests). Whether a fired timer runs a cycle is
        # decided from follower positions, not from this count — see `handle_info(:catch_up, ...)`.
        catchup_ref: nil,
+       # Whether the armed catch-up is for REAL lag (expert review 2026-10-21 #25) — the thing
+       # `LagGauge` and the `:catchup` event count. False for a timer armed only as a safety net
+       # behind fresh in-flight pushes, which every N > Q commit leaves at reply. See `arm_if_short/1`.
+       catchup_lag: false,
        commits: 0,
        # Consecutive catch-up rounds that were ALSO refused. Drives the backoff in
        # `retry_delay_ms/2`; reset by any commit that comes back with no rejects.
@@ -785,7 +789,7 @@ defmodule Fathom.Shard.Replication.Session do
     %{
       shard_id: state.shard_id,
       catchup_fails: state.catchup_fails,
-      catching_up?: state.catchup_ref != nil,
+      catching_up?: state.catchup_lag,
       inflight_pushes: map_size(state.inflight),
       seeds_in_flight: map_size(state.seeding),
       behind_followers: behind,
@@ -1050,11 +1054,26 @@ defmodule Fathom.Shard.Replication.Session do
   # #5(a)); those are the next live call's to ship, exactly as before — the timer was never armed for
   # them. The old `catchup_at` refresh existed only to stop the count-based rule from dropping a
   # timer that was still needed; with no count rule there is nothing to strand.
+  #
+  # LAG ACCOUNTING (expert review 2026-10-21 #25). Arms are usually QUIET now (`arm_if_short/1`), so
+  # the fired timer is where lag is judged. A `:pending` fire whose in-flight push has outlived a
+  # catch-up interval is real lag: mark it (`escalate/1`). A `:short` fire — a follower still behind
+  # with nothing in flight an interval after the arm — is marked for the cycle; that cycle's own
+  # re-arm (loud while `catchup_lag`) keeps the mark if the follower is still behind, and the mark is
+  # cleared here when the cycle left nothing armed, so it never outlives its timer.
   def handle_info(:catch_up, state) do
     case catch_up_need(state) do
-      :none -> {:noreply, clear_catchup(state)}
-      :pending -> {:noreply, rearm_catchup(state)}
-      :short -> {:noreply, internal_cycle(clear_catchup(state), :catch_up)}
+      :none ->
+        {:noreply, clear_catchup(state)}
+
+      :pending ->
+        state = if lagging?(state), do: escalate(state), else: state
+        {:noreply, rearm_catchup(state)}
+
+      :short ->
+        LagGauge.mark(self(), true)
+        state = internal_cycle(%{state | catchup_ref: nil, catchup_lag: true}, :catch_up)
+        {:noreply, if(state.catchup_ref == nil, do: clear_catchup(state), else: state)}
     end
   end
 
@@ -3674,7 +3693,10 @@ defmodule Fathom.Shard.Replication.Session do
   # laggard stranded: `commits=6 catchup_at=2 ref=nil`). The fired timer now decides from follower
   # positions (`catch_up_need/1`, expert review 2026-10-20-2027 #6), so there is no count to keep
   # fresh and no way to strand a laggard by skipping.
-  defp arm_catchup(%{catchup_ref: ref} = state, _rejects) when ref != nil, do: state
+  #
+  # `arm_catchup/2` is the LOUD arm — real lag: it marks `LagGauge` and emits the `:catchup` event.
+  # An already-armed QUIET timer (`arm_quiet/1`) is escalated in place (expert review 2026-10-21 #25).
+  defp arm_catchup(%{catchup_ref: ref} = state, _rejects) when ref != nil, do: escalate(state)
 
   defp arm_catchup(state, rejects) do
     case retry_delay_ms(state.catchup_fails, rejects) do
@@ -3687,9 +3709,52 @@ defmodule Fathom.Shard.Replication.Session do
 
         LagGauge.mark(self(), true)
 
-        %{state | catchup_ref: Process.send_after(self(), :catch_up, ms)}
+        %{state | catchup_ref: Process.send_after(self(), :catch_up, ms), catchup_lag: true}
     end
   end
+
+  # The SAFETY-NET arm (expert review 2026-10-21 #25): followers whose only shortfall is a fresh
+  # in-flight push. With N > Q every commit replies at the Q-th ack and leaves N-Q of those, so
+  # this is the steady state of a healthy shard, not lag. The timer is still armed — a reply that
+  # never comes must age into a retry, exactly as before — but nothing is marked or emitted unless
+  # the fired timer (or a later arm) finds the shortfall has lasted a catch-up interval.
+  defp arm_quiet(%{catchup_ref: ref} = state) when ref != nil, do: state
+
+  defp arm_quiet(state) do
+    case retry_delay_ms(state.catchup_fails, []) do
+      0 -> state
+      ms -> %{state | catchup_ref: Process.send_after(self(), :catch_up, ms)}
+    end
+  end
+
+  # A quiet timer turned out to cover real lag: count it, once.
+  defp escalate(%{catchup_lag: true} = state), do: state
+
+  defp escalate(state) do
+    :telemetry.execute([:fathom, :replication, :catchup], %{fails: state.catchup_fails}, %{})
+    LagGauge.mark(self(), true)
+    %{state | catchup_lag: true}
+  end
+
+  # Lag that can be judged AT ARM TIME: a follower that is not current and whose outstanding push
+  # has gone unanswered for at least one catch-up interval (a healthy follower acks in milliseconds).
+  # A follower that is merely short with nothing in flight is NOT judged here: on a busy N > Q shard
+  # that is routine — our own shipper refused this round's push `:already_in_flight` behind the
+  # previous one (measured: 95/100 healthy N=4/Q=2 commits marked when this counted it). It is
+  # judged by the fired timer instead, which marks a follower still `:short` an interval later.
+  # Nothing read yet: lag, the conservative answer.
+  defp lagging?(%{seen: [{gen, salt, extent} | _]} = state) do
+    now = now_ms()
+    stale_after = catchup_ms()
+
+    Enum.any?(shippers(), fn s ->
+      not Map.has_key?(state.seeding, s) and not holds?(state, s, gen, salt, extent) and
+        Map.has_key?(state.inflight, s) and
+        now - Map.get(state.inflight_at, s, now) >= stale_after
+    end)
+  end
+
+  defp lagging?(_state), do: true
 
   # A fired timer whose only short followers have a push in flight: wait one more interval for
   # their replies (`handle_info(:catch_up, ...)`). Not a new arm — no `:catchup` event, the gauge
@@ -3733,7 +3798,7 @@ defmodule Fathom.Shard.Replication.Session do
   # it too; a Session killed without terminate is pruned by the gauge's liveness check.
   defp clear_catchup(state) do
     LagGauge.mark(self(), false)
-    %{state | catchup_ref: nil}
+    %{state | catchup_ref: nil, catchup_lag: false}
   end
 
   # A CLEAN commit is the only thing that clears the failure count. Not tidiness: without it a
@@ -3741,21 +3806,46 @@ defmodule Fathom.Shard.Replication.Session do
   # a whole flush interval to be made good instead of the 1 s the retry was tuned for.
   defp arm_if_rejected(state, []), do: %{state | catchup_fails: 0}
 
-  defp arm_if_rejected(state, rejects),
-    do: arm_catchup(%{state | catchup_fails: state.catchup_fails + 1}, rejects)
+  # A round whose only "rejects" are followers skipped `:already_in_flight` is the N > Q steady state
+  # on a busy shard (the previous commit's straggler has not acked yet), not lag: arm quietly unless
+  # `lagging?/1` says that push has been out a whole interval (expert review 2026-10-21 #25;
+  # measured 45/100 healthy N=4/Q=2 commits marked through this path once `arm_if_short/1` alone
+  # was fixed). The backoff count moves as before. Any other reject is a real failure: loud.
+  defp arm_if_rejected(state, rejects) do
+    state = %{state | catchup_fails: state.catchup_fails + 1}
+
+    if state.catchup_lag or lagging?(state) or
+         not Enum.all?(rejects, &match?({_, :already_in_flight, _}, &1)),
+       do: arm_catchup(state, rejects),
+       else: arm_quiet(state)
+  end
 
   # Arm the catch-up when a connected follower is behind the newest extent this Session has read
   # (expert review 2026-10-20 #3). The commit loop used to keep every follower current itself, at
   # the cost of every commit waiting on the slowest; it now stops at the quorum, so this is what
   # keeps the rest converging. A follower being seeded is left to its seed. Not a failure: the
   # backoff count is untouched, and an already-armed timer is only refreshed.
-  defp arm_if_short(%{seen: [{gen, salt, extent} | _]} = state) do
-    short? =
-      Enum.any?(shippers(), fn s ->
-        not Map.has_key?(state.seeding, s) and not holds?(state, s, gen, salt, extent)
-      end)
+  #
+  # LOUD ONLY FOR REAL LAG (expert review 2026-10-21 #25). This used to arm the loud catch-up for any
+  # follower not yet acked, and with N > Q the commit replies at the Q-th ack, so N-Q pushes are
+  # always still in flight here: every commit of every active shard marked `LagGauge` and emitted
+  # `:catchup` (measured: 100/100 healthy loopback commits at N=4/Q=2), so the operator gauge read
+  # "every active shard is lagging" and hid a real laggard. Now the same timer is armed QUIETLY
+  # unless `lagging?/1` sees a push unanswered for a whole catch-up interval; the fired timer marks
+  # what is still behind then. Once a Session is marked (`catchup_lag`) it re-arms loud until every
+  # follower is current, so a real laggard does not flicker off between rounds. Durability
+  # unchanged: the catch-up never gates an ack, and the timer is armed in exactly the cases it was
+  # before (`catch_up_need/1` is `:none` exactly when no follower is short).
+  defp arm_if_short(%{seen: [_ | _]} = state) do
+    case catch_up_need(state) do
+      :none ->
+        state
 
-    if short?, do: arm_catchup(state, []), else: state
+      _pending_or_short ->
+        if state.catchup_lag or lagging?(state),
+          do: arm_catchup(state, []),
+          else: arm_quiet(state)
+    end
   end
 
   defp arm_if_short(state), do: state
