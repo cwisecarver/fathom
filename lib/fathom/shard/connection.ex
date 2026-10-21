@@ -1602,6 +1602,15 @@ defmodule Fathom.Shard.Connection do
 
         # Re-put under `canonical`, never the incoming sub-binary: a map that has grown past a
         # flatmap adopts the new key term, which would silently reinstate the pin.
+        #
+        # MEASURED AND DROPPED (expert review 2026-10-21 #27 part i): moving the LRU stamp out of
+        # this SQL-keyed map into a ref-keyed overlay (so a hit does one lookup and no re-put) was
+        # built and A/B'd, 1,145-byte SELECT, min of 25 trials, 4 alternating rounds: 64 entries
+        # 4.62-4.87 us -> 4.23-4.44 us (-0.4 us); 20 entries 3.49 -> 3.50 (no change, the map is
+        # still a flatmap below 33 keys); the residual to the 1-entry hit (3.46 us) is the lookup's
+        # own hash, which only a shorter key removes. 0.4 us is ~0.7% of hrana_ws_rt_us (59 us),
+        # under the panel's 3% bar, and it needed the stamp overlay to ride the pooled carry. Do not
+        # redo it without a workload that holds >32 distinct statements per stream.
         Process.put(
           key,
           {seq + 1, Map.put(cache, canonical, {stmt, seq + 1, gen, bytes, packed})}
@@ -1961,6 +1970,17 @@ defmodule Fathom.Shard.Connection do
   # the post-arm re-check the message protocol needed (2026-08-31 #22) is gone with it. The
   # residual window — the watchdog dying between this check and `start_timer` — self-heals on the
   # next statement, the same class the old re-check also left open.
+  #
+  # MEASURED AND DROPPED (expert review 2026-10-21 #27 part ii): carrying the watchdog with the
+  # pooled handle (park at checkin, `{:retarget, owner}` at adopt) so a stream does not spawn one.
+  # Ceiling: a warm watchdog saves 2.9 us per stream (SELECT 1: 5.22 -> 2.32 us), i.e. 2.9% of
+  # hrana_oneshot_rt_us (101 us) at ZERO cost, under the 3% bar. The cost is not zero: a parked
+  # watchdog idles on a scheduler, and the retarget send wakes it (fire-and-forget send to an idle
+  # process 0.63 / 1.04 / 2.04 us after 1 / 20 / 100 ms gaps, against spawn+stop 1.63 / 3.79 /
+  # 5.33 us), so the real gain is ~1-3 us (1-3%). It would also add a parked-watchdog lifetime
+  # (nothing monitors a parked one, so a coordinator that drops the handle leaks it) and a window
+  # between park and retarget in which owner death must not cancel a statement of the NEXT stream
+  # (the 2026-09-29 #33 class). Not worth that surface for <3%.
   defp ensure_watchdog(conn) do
     key = {__MODULE__, :watchdog, conn}
 
