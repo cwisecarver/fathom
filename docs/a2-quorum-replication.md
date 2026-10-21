@@ -94,7 +94,15 @@ Two things it costs, both deliberate, which is why it is a **separate gate** rat
   store only when this node actually holds a replica, and is kept bit-for-bit for that reason);
 - one round trip to each peer, **concurrent** so it is one round trip and not N, bounded by
   `REPLICATION_RECOVERY_TIMEOUT_MS`. A node already holding the freshest copy short-circuits before
-  opening a socket.
+  opening a socket. Since 2026-10-21 (expert review #9) the ask runs on a small persistent
+  per-peer connection pool (`Recovery.QueryPool`, `REPLICATION_RECOVERY_POOL_SIZE`, default 4)
+  instead of a fresh dial per ask. A fresh dial cost 3 round trips (connect, nonce hello, query)
+  and left one TIME_WAIT socket per ask. On this Mac, ~14k fresh asks in ~3 s ran the ephemeral
+  ports out (`eaddrnotavail`), even though `netstat` listed no TIME_WAIT sockets. Each pooled
+  connection is owned by one slot process that runs the handshake and every frame on it, so the
+  nonce binding and frame authentication are unchanged. A slot runs one ask at a time and closes
+  the socket on any unclean exchange, so a reply can only ever answer the ask that sent it. Pulls
+  still dial their own connection.
 
 **The new frames were added at `@version 2` rather than bumping to 3**, which reverses the reasoning
 the salt1 change used. They are purely additive, and the two options are not symmetric: a bump makes
