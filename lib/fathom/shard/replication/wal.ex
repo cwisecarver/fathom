@@ -789,6 +789,57 @@ defmodule Fathom.Shard.Replication.Wal do
 
   defp parse_index(_), do: :none
 
+  # `WalCkptInfo` follows the two header copies: `nBackfill` is its first u32 (native order), at 96.
+  @backfill_offset 2 * @index_hdr_bytes
+
+  @doc """
+  Whether the PRIMARY WAL at `wal_path` is FULLY BACKFILLED per its `-shm` wal-index:
+  `nBackfill == mxFrame`, i.e. every committed frame is already in the main database file (expert
+  review 2026-10-21 #11). `false` whenever that cannot be established (no `-shm`, a short or
+  uninitialised index, a header still mid-publish after retries, or two reads that disagree).
+
+  Read twice; both reads must be byte-identical. One pread is one memcpy with no ordering promise,
+  so a `nBackfill` copied while a checkpointer stores it could in principle tear into a value it
+  never held; requiring the same 100 bytes twice in a row rules that out.
+
+  **Correct only for a SQLite-written primary `-wal`** (the same caveat as `read(path, index:
+  true)`), and only meaningful to the caller holding a read transaction on the database: see
+  `Fathom.Shard`'s pinned-live flush route for why "fully backfilled, read under a pin" means the
+  main file is frozen at exactly the pin's state.
+  """
+  @spec fully_backfilled?(Path.t()) :: boolean()
+  def fully_backfilled?(wal_path) do
+    with true <- String.ends_with?(wal_path, "-wal"),
+         {:ok, shm} <- :file.open(shm_path(wal_path), [:read, :raw, :binary]) do
+      try do
+        backfilled_read(shm, @index_attempts)
+      after
+        :file.close(shm)
+      end
+    else
+      _ -> false
+    end
+  end
+
+  defp backfilled_read(_fd, 0), do: false
+
+  defp backfilled_read(fd, n) do
+    with {:ok, first} <- :file.pread(fd, 0, @backfill_offset + 4),
+         {:ok, ^first} <- :file.pread(fd, 0, @backfill_offset + 4),
+         <<a::binary-size(@index_hdr_bytes), b::binary-size(@index_hdr_bytes),
+           backfill::32-native>>
+         when a == b <- first do
+      match?({:ok, %{mx: ^backfill}}, parse_index(a))
+    else
+      # A shm shorter than the read (SQLite truncates it while the first connection rebuilds it).
+      {:ok, short} when byte_size(short) < @backfill_offset + 4 -> false
+      :eof -> false
+      {:error, _} -> false
+      # Copies differ, or the two reads differ: a writer or checkpointer is mid-store. Retry.
+      _ -> backfilled_read(fd, n - 1)
+    end
+  end
+
   # `szPage` is a u16, so 65536 is stored as 1: `(sz & 0xfe00) + ((sz & 1) << 16)` in SQLite.
   defp decode_page(sz), do: Bitwise.band(sz, 0xFE00) + Bitwise.bsl(Bitwise.band(sz, 1), 16)
 

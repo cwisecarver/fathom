@@ -5178,41 +5178,91 @@ defmodule Fathom.Shard do
   #     progress for that long; on a shard that was idle a moment ago that only delays WAL
   #     truncation. The upload is the live file's size, not its VACUUMed size (free pages included).
   #
-  # `:fallback` (the VACUUM route) when disabled, the WAL is non-empty at either check, or the pin
-  # cannot be opened. Disable with `config :fathom, :flush_pinned_live_upload, false`.
+  # A FULLY BACKFILLED WAL COUNTS AS FOLDED (expert review 2026-10-21 #11). The route used to need
+  # an absent/zero-length `-wal`, which a shard holding a stream open never has (a completed
+  # checkpoint leaves the file at its length; it is reused in place), so every periodic flush of
+  # such a shard ran the full VACUUM INTO. The real precondition is "no committed frame outside the
+  # main file", i.e. `nBackfill == mxFrame` in the `-shm` (`Wal.fully_backfilled?/1`), read UNDER
+  # the pin. Why that read freezes the main file at exactly the pin's state:
+  #
+  #   * The pin holds read-lock 0 or a read mark `m` (SQLite's `walTryBeginRead`). Read-lock 0 is
+  #     granted only when the WAL was fully backfilled at BEGIN, and backfill needs read-lock 0
+  #     EXCLUSIVELY, so the main file is frozen at the pin's state whatever we read afterwards.
+  #   * With mark `m`, a checkpointer caps its backfill at `m` (it cannot take the pin's read-lock
+  #     to advance the mark) and cannot restart the log (that needs every read-lock 1..N), so
+  #     within one generation `nBackfill <= m <= mxFrame`, all three non-decreasing. Reading
+  #     `nBackfill == mxFrame` at any instant after BEGIN therefore means `nBackfill == m`: every
+  #     page of the pin's snapshot is already in the `.db`, and nothing past `m` can be written to
+  #     it while the pin is held. Anything else is `:fallback`.
+  #   * `pre` was read before the pin, so the pin's state (and the main file's) includes it; the
+  #     stamp still under-claims.
+  #
+  # WHO GETS THERE (user decision 2026-10-21: no NEW checkpoint on replicated shards):
+  #   * Replication OFF: the flush's existing PASSIVE (it ran after the VACUUM) runs on the pin's
+  #     handle BEFORE the pin, so a shard with no long reader is fully backfilled and takes this
+  #     route. Skipped when the WAL is already folded, so the idle-folded case is unchanged. On a
+  #     fallback the VACUUM route still runs its post-snapshot PASSIVE, as before.
+  #   * Replication ON: no checkpoint here. The route applies only when a Session/threshold or
+  #     covered checkpoint has already backfilled the whole WAL; the pre-pin read just avoids
+  #     opening a pin that would fall back.
+  #
+  # `:fallback` (the VACUUM route) when disabled, the WAL holds frames not in the main file at
+  # either check, or the pin cannot be opened. Disable with
+  # `config :fathom, :flush_pinned_live_upload, false`.
   defp pinned_live_upload(state, pre) do
     wal = state.path <> "-wal"
+    replicated? = Fathom.Shard.Replication.Session.enabled?()
 
-    if Application.get_env(:fathom, :flush_pinned_live_upload, true) and wal_empty?(wal) do
+    if Application.get_env(:fathom, :flush_pinned_live_upload, true) and
+         (not replicated? or wal_folded?(wal)) do
       result =
-        Fathom.Shard.Replication.Session.with_flush_pin(state.path, fn pin ->
-          # A mostly-free file takes the VACUUM route, which compacts it (expert review
-          # 2026-10-20-2027 #9). Header read under the pin with an empty WAL: counts are current.
-          if wal_empty?(wal) and not compaction_worthwhile?(state.path) do
-            emit_flush_route(state, :pinned_live)
+        Fathom.Shard.Replication.Session.with_flush_pin(
+          state.path,
+          fn pin ->
+            # A mostly-free file takes the VACUUM route, which compacts it (expert review
+            # 2026-10-20-2027 #9). Header read under the pin with a folded WAL: the main file
+            # holds the pin's whole state, so its counts are current.
+            if wal_folded?(wal) and not compaction_worthwhile?(state.path) do
+              emit_flush_route(state, :pinned_live)
 
-            with :ok <-
-                   Fathom.Shard.ScanGate.with_permit(
-                     @scan_permit_wait_ms,
-                     fn ->
-                       apply_scan_mmap(pin)
-                       Integrity.run_quick_check(pin)
-                     end
-                   ),
-                 :ok <- after_snapshot_hook(state),
-                 :ok <- recheck_before_put(state) do
-              upload_flush_object(state, state.path, pre)
+              with :ok <-
+                     Fathom.Shard.ScanGate.with_permit(
+                       @scan_permit_wait_ms,
+                       fn ->
+                         apply_scan_mmap(pin)
+                         Integrity.run_quick_check(pin)
+                       end
+                     ),
+                   :ok <- after_snapshot_hook(state),
+                   :ok <- recheck_before_put(state) do
+                upload_flush_object(state, state.path, pre)
+              end
+            else
+              :fallback
             end
-          else
-            :fallback
-          end
-        end)
+          end,
+          before_pin: if(not replicated?, do: &checkpoint_unless_folded(&1, wal))
+        )
 
       if result == :skipped, do: :fallback, else: result
     else
       :fallback
     end
   end
+
+  # Replication OFF only (see `pinned_live_upload/2`): the flush's PASSIVE, ahead of the pin.
+  defp checkpoint_unless_folded(conn, wal) do
+    unless wal_folded?(wal),
+      do: Fathom.Shard.Replication.Session.checkpoint_before_pin(conn)
+
+    :ok
+  end
+
+  # No committed frame outside the main file: an absent/zero-length `-wal`, or one whose `-shm`
+  # reports it fully backfilled (expert review 2026-10-21 #11). Meaningful as a route decision only
+  # when read under the pin (see `pinned_live_upload/2`); before it, it is only a filter.
+  defp wal_folded?(wal),
+    do: wal_empty?(wal) or Fathom.Shard.Replication.Wal.fully_backfilled?(wal)
 
   # Is the file mostly freelist pages, so that a VACUUM-compacted object is much smaller than the live
   # file (expert review 2026-10-20-2027 #9)? Header-only read, no open. Defaults: free pages above

@@ -1998,6 +1998,28 @@ defmodule Fathom.Shard.Replication.Session do
     result
   end
 
+  @doc """
+  The REPLICATION-OFF flush PASSIVE, run BEFORE the pinned-live route takes its pin rather than
+  after a `VACUUM INTO` (expert review 2026-10-21 #11). Counted like `checkpoint_after_snapshot/3`
+  (`replicated: false`).
+
+  Never call it for a replicated shard: under A2 a flush checkpoint is pinned and quorum-gated
+  (`checkpoint_after_snapshot/3`), and the user decision of 2026-10-21 is that the replicated flush
+  gains NO new checkpoint (each one is a WAL-generation reset the followers pay for).
+  """
+  @spec checkpoint_before_pin(reference()) :: {:ok, map()} | {:error, term()}
+  def checkpoint_before_pin(conn) do
+    {result, outcome} = passive(conn)
+
+    :telemetry.execute(
+      [:fathom, :shard, :flush_checkpoint],
+      %{count: 1},
+      %{result: outcome, replicated: false}
+    )
+
+    result
+  end
+
   defp passive(conn) do
     case Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", []) do
       {:ok, %{rows: [[1 | _] | _]}} = r -> {r, :busy}
@@ -2110,12 +2132,17 @@ defmodule Fathom.Shard.Replication.Session do
   the flush's old snapshot connection did. A `:ro` handle leaves a zero-length `-wal` and a stale
   `-shm` behind (`PoolGraceTest` pins the unlink).
   """
-  @spec with_flush_pin(Path.t(), (reference() -> result)) :: result | :skipped
+  @spec with_flush_pin(Path.t(), (reference() -> result), keyword()) :: result | :skipped
         when result: var
-  def with_flush_pin(db_path, fun) when is_function(fun, 1) do
+  def with_flush_pin(db_path, fun, opts \\ []) when is_function(fun, 1) do
     with {:ok, _} <- Fathom.FS.stat(db_path),
          {:ok, pin} <- Connection.open(db_path) do
       try do
+        # `:before_pin` runs on this handle BEFORE its read transaction begins (expert review
+        # 2026-10-21 #11: the replication-off flush's PASSIVE, moved ahead of the pin so the pin
+        # can find the WAL fully backfilled).
+        if before = opts[:before_pin], do: before.(pin)
+
         case pin_snapshot(pin) do
           :ok -> fun.(pin)
           {:error, _} -> :skipped
