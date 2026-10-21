@@ -138,14 +138,15 @@ defmodule Fathom.Shard.Fork do
       # The first-ever flush of a born-here shard has the same lag: sidecar "-", object now ours.
       case adopt_own_put(shard_id, path) do
         :fork -> quarantine!(shard_id, path, :orphaned) == :ok
-        _adopted_or_keep -> false
+        :keep -> unverified(shard_id, path)
+        :adopted -> false
       end
     end
   end
 
   def resolve(:match, _shard_id, _path, _lease), do: false
   def resolve(:absent, _shard_id, _path, _lease), do: false
-  def resolve(:unreachable, _shard_id, _path, _lease), do: false
+  def resolve(:unreachable, shard_id, path, _lease), do: unverified(shard_id, path)
 
   def resolve(:corrupt, shard_id, path, _lease),
     do: quarantine!(shard_id, path, :corrupt_sidecar) == :ok
@@ -165,10 +166,27 @@ defmodule Fathom.Shard.Fork do
     else
       case adopt_own_put(shard_id, path) do
         :adopted -> false
-        :keep -> false
+        :keep -> unverified(shard_id, path)
         :fork -> quarantine!(shard_id, path, :diverged) == :ok
       end
     end
+  end
+
+  # An UNVERIFIABLE verdict (the evidence HEAD failed or timed out, or `adopt_own_put/2`'s HEAD did).
+  # For an ordinary warm copy the fail-safe is to keep it: it may hold acked writes the store lacks,
+  # and the flush is fenced on its provenance etag, so a forked flush 412s instead of clobbering.
+  #
+  # A claimed CLEAN-RETAINED copy (expert review 2026-10-20-2027 #22) is the opposite case: by
+  # construction it holds NOTHING the store lacks, so keeping it buys no durability and costs
+  # correctness. Another node can take the shard, flush E2 and release while this node keeps E1;
+  # the reopen here is then a fresh create (no takeover), and serving E1 on an unreachable verdict
+  # is stale reads plus first-cycle writes fenced on E1 that 412 into the self-fence (integration
+  # review of #22, 2026-10-20). So a retained copy is discarded on every unverifiable verdict and the
+  # open pulls; if the store is unreachable for the pull too, the open fails retryably.
+  defp unverified(shard_id, path) do
+    if Fathom.Shard.Retained.claimed?(path),
+      do: quarantine!(shard_id, path, :unverifiable) == :ok,
+      else: false
   end
 
   defp own_touch?(lease, sidecar, store),

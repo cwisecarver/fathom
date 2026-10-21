@@ -194,6 +194,110 @@ defmodule Fathom.Shard.RetainedTest do
     end
   end
 
+  # Integration review of expert review 2026-10-20-2027 #22. Symptom: this node retains E1; another
+  # node takes the shard, writes, flushes E2 and releases; the reopen here is a fresh create (no
+  # takeover) and the store HEADs fail. The ordinary warm fail-safe ("unreachable: keep it, fenced
+  # on its provenance") then served the retained E1 — stale reads, and writes fenced on E1 that
+  # 412 into the self-fence. Invariant: a claimed clean-retained copy is NEVER served on an
+  # unverifiable verdict; it is discarded and pulled, and when the pull fails too the open fails.
+  #
+  # Staged on ONE node like the moved-lineage test above: set the E1 copy aside, advance the store
+  # to E2 through a normal open + drop, put E1 back. `:faulty_object_etag` makes this shard's
+  # object_etag/object_head answer an error tuple (a real S3 timeout's shape).
+  defp stage_moved_lineage!(id, path) do
+    write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('old')"])
+    drop!(id)
+    assert_retained!(path)
+
+    stash = Path.join(System.tmp_dir!(), "#{id}_stash")
+    File.mkdir_p!(stash)
+    on_exit(fn -> File.rm_rf(stash) end)
+    files = [path, path <> ".etag", Retained.marker(path)]
+    for f <- files, do: :ok = File.rename(f, Path.join(stash, Path.basename(f)))
+
+    write!(id, ["INSERT INTO t VALUES ('new')"])
+    drop!(id)
+    for f <- Path.wildcard(path <> "*"), do: File.rm(f)
+    for f <- files, do: :ok = File.rename(Path.join(stash, Path.basename(f)), f)
+
+    assert {:ok, sidecar} = Provenance.read(path)
+    assert {:ok, store} = Storage.object_etag(id)
+    assert sidecar != store, "fixture: the restored copy still matches the store"
+    {sidecar, store}
+  end
+
+  defp faulty_storage!(id, etag_fault) do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Application.put_env(:fathom, :faulty_object_etag, {id, etag_fault})
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_object_etag)
+      Application.delete_env(:fathom, :storage_fault)
+      restore_env(:shard_storage, prev_storage)
+    end)
+  end
+
+  defp assert_opened_mode!(id, mode) do
+    {:ok, pid} = Shards.ensure(id)
+    assert_mode!(pid, mode)
+  end
+
+  for mode <- @modes do
+    test "[#{mode}] a retained copy is never served when the fork-evidence HEAD is unreachable",
+         %{id: id, path: path} do
+      set_mode!(unquote(mode))
+      stage_moved_lineage!(id, path)
+      faulty_storage!(id, {:error, :timeout})
+      assert {:error, :timeout} = Storage.object_etag(id), "fixture: the fault did not take"
+
+      assert rows!(id) == [["new"], ["old"]],
+             "the unverified retained copy (E1) was served instead of the stored lineage (E2)"
+
+      assert_opened_mode!(id, unquote(mode))
+      assert Path.wildcard(path <> ".forked.*") == []
+    end
+
+    test "[#{mode}] a retained copy is never served when only the post-lease HEAD fails",
+         %{id: id, path: path} do
+      set_mode!(unquote(mode))
+      {sidecar, _store} = stage_moved_lineage!(id, path)
+
+      # The pre-lease evidence HEAD reads the copy's own etag (as if the peer's flush + release
+      # landed in the gap before our acquire, the #19 window); every later read times out.
+      reads = :counters.new(1, [])
+
+      faulty_storage!(id, fn ->
+        :counters.add(reads, 1, 1)
+        if :counters.get(reads, 1) == 1, do: {:ok, sidecar}, else: {:error, :timeout}
+      end)
+
+      assert rows!(id) == [["new"], ["old"]],
+             "the unverified retained copy (E1) was served on a failed post-lease check"
+
+      assert :counters.get(reads, 1) >= 2, "fixture: the post-lease check never read the etag"
+      assert_opened_mode!(id, unquote(mode))
+    end
+
+    test "[#{mode}] a retained copy with an unreachable store fails the open instead of serving",
+         %{id: id, path: path} do
+      set_mode!(unquote(mode))
+      stage_moved_lineage!(id, path)
+      faulty_storage!(id, {:error, :timeout})
+      Application.put_env(:fathom, :storage_fault, :pull)
+
+      assert {:error, _} = ShardExecutor.open(id),
+             "an open served a retained copy it could not verify against the store"
+
+      Application.delete_env(:fathom, :storage_fault)
+      Application.delete_env(:fathom, :faulty_object_etag)
+
+      # Retryable: once the store answers, the next open serves the stored lineage.
+      assert rows!(id) == [["new"], ["old"]]
+      assert_opened_mode!(id, unquote(mode))
+    end
+  end
+
   # --- Retained in isolation (no coordinator) ---
 
   defp fixture!(dir_id, bytes) do

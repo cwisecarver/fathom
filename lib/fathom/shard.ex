@@ -1462,9 +1462,16 @@ defmodule Fathom.Shard do
         end
 
       # Unreachable store: keep availability, fenced by the provenance etag — a
-      # genuinely-forked flush 412s rather than clobbers.
-      {:error, _unreachable} ->
-        {:ok, etag}
+      # genuinely-forked flush 412s rather than clobbers. NOT for a claimed clean-retained copy
+      # (expert review 2026-10-20-2027 #22): it holds nothing the store lacks, so there is no
+      # availability to protect, only a possibly-stale lineage to serve. Discard and pull; a pull
+      # that fails too fails the open retryably. Same rule as `Fork.resolve/4`'s `unverified/2`.
+      {:error, reason} ->
+        cond do
+          not Fathom.Shard.Retained.claimed?(path) -> {:ok, etag}
+          Fork.quarantine!(shard_id, path, :unverifiable) == :ok -> repull(shard_id, path)
+          true -> {:error, {:revalidate_failed, reason}}
+        end
     end
   end
 

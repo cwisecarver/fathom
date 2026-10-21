@@ -317,10 +317,22 @@ defmodule Fathom.Test.FaultyStorage do
 
     # `:object_head` fails the read outright: the store-unreadable case behind a `:unknown` lineage
     # and an uncomputable takeover claim (expert review 2026-10-12 #21).
-    case if(fault() == :object_head,
-           do: {:error, :s3_unreachable},
-           else: Local.object_head(shard_id)
-         ) do
+    head =
+      case object_etag_fault(shard_id) do
+        :pass ->
+          if(fault() == :object_head,
+            do: {:error, :s3_unreachable},
+            else: Local.object_head(shard_id)
+          )
+
+        {:error, _} = error ->
+          error
+
+        _ ->
+          Local.object_head(shard_id)
+      end
+
+    case head do
       {:ok, head} when is_map(head) ->
         cond do
           fault() == :object_head_moves and bump_head_reads() > 1 ->
@@ -356,11 +368,30 @@ defmodule Fathom.Test.FaultyStorage do
   # tuple takes the open's ordinary failure path, which already released. The un-covered class was
   # an EXCEPTION (a `Req.TransportError` raised out of a HEAD under load), which skipped the
   # release entirely and stranded the lock. See the guard in `Fathom.Shard.handle_continue/2`.
+  #
+  # `:faulty_object_etag` is the RETURN-VALUE fault mode (integration review of expert review
+  # 2026-10-20-2027 #22): `{shard_id, result}` makes `object_etag/1` (and `object_head/1`) for THAT
+  # shard answer `result` (e.g. `{:error, :timeout}`) instead of reading the store; `{shard_id, fun}`
+  # calls the 0-arity `fun` per read, and `:pass` from it delegates to the store. The raising hook
+  # above cannot express "the HEAD came back as an error tuple", which is what the open's fail-safe
+  # branches see from a real S3 timeout.
   @impl true
   def object_etag(shard_id) do
     # Handed the shard id (a 1-arity hook) so a test can act on ITS shard only; 0-arity still works.
     run_before(:object_etag, shard_id)
-    Local.object_etag(shard_id)
+
+    case object_etag_fault(shard_id) do
+      :pass -> Local.object_etag(shard_id)
+      result -> result
+    end
+  end
+
+  defp object_etag_fault(shard_id) do
+    case Application.get_env(:fathom, :faulty_object_etag) do
+      {^shard_id, fun} when is_function(fun, 0) -> fun.()
+      {^shard_id, result} -> result
+      _ -> :pass
+    end
   end
 
   # Mirrors S3's conditional release: If-Match the etag WE last wrote. A mismatch is a 412,
