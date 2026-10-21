@@ -4145,6 +4145,10 @@ defmodule Fathom.Shard do
     # the flush, while a merely-busy checkpoint must fall back to the snapshot path.
     case checkpoint_and_verify(state.path) do
       :ok ->
+        # The free-page check runs AFTER the checkpoint, never before: in WAL mode the header's
+        # page/freelist counts can be stale until the WAL is folded in, so a pre-checkpoint read
+        # could pick the raw-upload route for a file that is mostly free (expert review
+        # 2026-10-20-2027 #9).
         if compaction_worthwhile?(state.path) do
           # Mostly-free file (expert review 2026-10-20-2027 #9): a raw upload ships every freelist
           # page (measured 7.6x bigger object at 90% free) and keeps deleted rows in the object.

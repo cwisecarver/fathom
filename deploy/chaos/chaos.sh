@@ -3101,7 +3101,7 @@ commits = fn ->
   Fathom.Telemetry.scrape()
   |> IO.iodata_to_binary()
   |> String.split("\n")
-  |> Enum.filter(&(String.starts_with?(&1, "fathom_replication_commit_duration_count") and String.contains?(&1, ~s(outcome="ok"))))
+  |> Enum.filter(&(String.starts_with?(&1, "fathom_replication_commit_duration_count") and String.contains?(&1, ~s(outcome="ok")) and String.contains?(&1, ~s(mode="tenant"))))
   |> Enum.map(fn l -> l |> String.split(" ") |> List.last() |> String.trim() |> String.to_integer() end)
   |> Enum.sum()
 end

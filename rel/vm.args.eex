@@ -21,8 +21,8 @@
 ##   * PRAGMA synchronous=FULL fsyncs the WAL inside multi_step, so a commit pins a thread for the
 ##     fsync duration (~0.1 ms local NVMe, ~0.5-1 ms on cloud block storage).
 ##   * A contended write parks in the busy handler for up to the busy timeout.
-## A read query costs >=4 dirty-IO dispatches, so at the measured ~27k q/s/node that is ~135k
-## dirty-IO jobs/s across (by default) ten threads.
+## A read on a cached handle costs exactly 1 dirty-IO dispatch (expert review 2026-10-20-2027), so
+## at the measured ~27k q/s/node that is ~27k dirty-IO jobs/s across (by default) ten threads.
 ##
 ## MEASURED 2026-07-25 (docs/reviews/vm-args-ab-2026-07-25.md) — and the hypothesis above did NOT
 ## hold. Two passes, second in reverse order, tpc-fleet at 256/512/1024 tenants on the chaos rig:

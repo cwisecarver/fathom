@@ -444,7 +444,8 @@ defmodule Fathom.Telemetry do
         unit: {:native, :millisecond},
         tags: [:outcome],
         reporter_options: [buckets: [0.5, 1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000]],
-        description: "Shard checkout latency by outcome (ok / held / unavailable / error)"
+        description:
+          "Shard checkout latency by outcome (ok / held / unavailable / at_capacity / novel_rate_limited / error). The full outcome set is `checkout_outcome/1` in shards.ex"
       ),
       last_value("fathom.shards.active",
         event_name: [:fathom, :shards],
