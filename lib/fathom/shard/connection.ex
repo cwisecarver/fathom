@@ -1596,6 +1596,32 @@ defmodule Fathom.Shard.Connection do
     watchdog_loop(conn, flags, mon)
   end
 
+  # The fire handler, split out so a test can interleave the owner's disarm between the generation
+  # check (R1) and the fired mark (W) through `before_mark` (expert review 2026-10-20-2027 #19). The
+  # hook is a no-op in production.
+  @doc false
+  @spec handle_fire(reference(), :atomics.atomics_ref(), integer(), reference(), (-> any())) ::
+          :ok
+  def handle_fire(conn, flags, gen, mon, before_mark \\ fn -> :ok end) do
+    if :atomics.get(flags, @gen_slot) == gen do
+      before_mark.()
+
+      # Mark BEFORE cancelling (expert review 2026-08-01 #46): the cancel is what lets the
+      # statement return, so the owner's read of the mark afterwards cannot miss it.
+      :atomics.put(flags, @fired_slot, gen)
+
+      # Expert review 2026-10-20-2027 #19: re-read the generation AFTER the mark (R2). The owner
+      # disarms (bumps the generation) and THEN reads the mark; the watchdog marks and THEN
+      # re-reads the generation. Atomics are sequentially consistent, so either the owner sees
+      # the mark (and `stop_watchdog/1` waits for this process) or this re-read sees the
+      # disarm and no cancel is issued. That is what lets `stop_watchdog/1` skip the
+      # synchronous wait for a watchdog whose mark it has not seen.
+      if :atomics.get(flags, @gen_slot) == gen, do: await_disarm(conn, flags, gen, mon)
+    end
+
+    :ok
+  end
+
   # Runs only when a deadline timer fires (or on `:stop` / owner death): between fires it sits in
   # `receive` and is never woken by a healthy statement.
   defp watchdog_loop(conn, flags, mon) do
@@ -1609,19 +1635,7 @@ defmodule Fathom.Shard.Connection do
         # non-dirty NIF that deliberately avoids the connection mutex, so it cannot block behind
         # the running query. A spurious late cancel is a no-op: exqlite resets `cancelled` at the
         # top of every subsequent db op.
-        if :atomics.get(flags, @gen_slot) == gen do
-          # Mark BEFORE cancelling (expert review 2026-08-01 #46): the cancel is what lets the
-          # statement return, so the owner's read of the mark afterwards cannot miss it.
-          :atomics.put(flags, @fired_slot, gen)
-
-          # Expert review 2026-10-20-2027 #19: re-read the generation AFTER the mark. The owner
-          # disarms (bumps the generation) and THEN reads the mark; the watchdog marks and THEN
-          # re-reads the generation. Atomics are sequentially consistent, so either the owner sees
-          # the mark (and `stop_watchdog/1` waits for this process) or this re-read sees the
-          # disarm and no cancel is issued. That is what lets `stop_watchdog/1` skip the
-          # synchronous wait for a watchdog whose mark it has not seen.
-          if :atomics.get(flags, @gen_slot) == gen, do: await_disarm(conn, flags, gen, mon)
-        end
+        handle_fire(conn, flags, gen, mon)
 
         watchdog_loop(conn, flags, mon)
 
@@ -1711,6 +1725,11 @@ defmodule Fathom.Shard.Connection do
   # its disarm. So the common pooled checkin sends `:stop` and moves on instead of a monitor +
   # message + DOWN round trip (measured 15 us after a 20 ms gap vs 8 us spawn + async kill). The
   # `Process.delete` below still drops the handle's entry, so the next stream spawns a fresh one.
+  #
+  # The unfired async path ALSO relies on ERTS per-pair signal ordering: `:stop` is sent by the owner
+  # before the owner can die, so it reaches the watchdog BEFORE the owner's DOWN, and `owner_down/1`
+  # (which cancels) therefore cannot run against the next stream's handle. A selective `receive` in
+  # `watchdog_loop/3` that took the DOWN ahead of `:stop` would break that.
   defp stop_watchdog(conn) do
     case Process.delete({__MODULE__, :watchdog, conn}) do
       nil ->
