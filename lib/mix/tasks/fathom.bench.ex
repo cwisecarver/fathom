@@ -112,7 +112,9 @@ defmodule Mix.Tasks.Fathom.Bench do
     :served_django,
     :flush_vacuum,
     :drop_flush,
-    :flush_stub
+    :flush_stub,
+    :hrana_django,
+    :served_pooled
   ]
 
   @doc false
@@ -292,6 +294,10 @@ defmodule Mix.Tasks.Fathom.Bench do
        "µs   (idle-drop flush: Shards.drain of a dirty shard, checkpoint route; watch-only)"},
       {"flush_stub_p50_us", metrics.flush_stub_p50_us,
        "µs   (VACUUM-route flush via real Storage.S3 + codec, loopback stub; watch-only)"},
+      {"hrana_django_request_rt_us", metrics.hrana_django_request_rt_us,
+       "µs   (Django request on a POOLED handle: PRAGMA foreign_keys + 29-col SELECT + 3-way join; watch-only)"},
+      {"served_pooled_kb_per_shard", metrics.served_pooled_kb_per_shard,
+       "KiB/shard (SERVED with a pooled idle handle checked in and reused per shard; watch-only)"},
       {"hrana_write_rt_us", metrics.hrana_write_rt_us,
        "\u00b5s   (INSERT RETURNING over Hrana, A2 replication ON, quorum ship asserted)"},
       {"hrana_open_auth_rt_us", metrics.hrana_open_auth_rt_us,

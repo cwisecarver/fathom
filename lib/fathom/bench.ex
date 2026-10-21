@@ -142,7 +142,9 @@ defmodule Fathom.Bench do
     :served_django,
     :flush_vacuum,
     :drop_flush,
-    :flush_stub
+    :flush_stub,
+    :hrana_django,
+    :served_pooled
   ]
 
   @doc false
@@ -224,6 +226,10 @@ defmodule Fathom.Bench do
       # 45-table / ~100-index schema; the keystone series above is unchanged.
       served_django_kb_per_shard: served_django && served_django.total_kb,
       served_django_binary_kb_per_shard: served_django && served_django.binary_kb,
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-21 r7 #1): the served regime with a pooled
+      # idle handle that has been checked in and reused per shard (the checkin probe, the carried
+      # statement cache), which no raw-connection density arm reaches.
+      served_pooled_kb_per_shard: run_if(only, :served_pooled, fn -> served_pooled(opts) end),
       # WATCH-ONLY (perf review 2026-10-14 #17): the SERVED regime with A2 replication ON, which is
       # what prod runs. Every density number above was measured replication OFF. Primary side
       # (coordinator + connection + Session + shippers) and, separately, the FOLLOWER side per
@@ -256,6 +262,11 @@ defmodule Fathom.Bench do
       # hit through the drain grace AND statement-cache hits, both asserted. Watch-only.
       hrana_pooled_pipeline_rt_us:
         run_if(only, :hrana_pooled_pipeline, fn -> hrana_pooled_pipeline_rt_us(opts) end),
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-21 r7 #1): Django's request shape (per-
+      # connection PRAGMA foreign_keys = ON, then a 29-column SELECT and a 3-way join) on a pooled
+      # reused handle; the PRAGMA expires every carried cached statement.
+      hrana_django_request_rt_us:
+        run_if(only, :hrana_django, fn -> hrana_django_request_rt(opts) end),
       wire_rows_per_s: run_if(only, :wire_rows, fn -> wire_rows(opts) end),
       # The SERVER half of wire_rows_per_s (expert review 2026-10-20-2027 #4): no client, no decode.
       wire_server_rows_per_s: run_if(only, :wire_server, fn -> wire_server_rows(opts) end),
@@ -2437,6 +2448,223 @@ defmodule Fathom.Bench do
   """
   @spec served_django(keyword()) :: %{total_kb: float(), binary_kb: float()}
   def served_django(opts \\ []), do: served(Keyword.put(opts, :served_schema, :django))
+
+  @doc """
+  `served_pooled_kb_per_shard` - BEAM memory (KiB) per shard when each shard holds one live stream
+  AND one pooled IDLE handle that has been checked in and reused (expert review 2026-10-21 r7 #1,
+  panel 2 #6). `served_kb_per_shard` holds raw connections that never go through the pool, so the
+  checkin probe (r7 #14: it opens every connection's TEMP database), the carried statement cache and
+  the pool's own bookkeeping are invisible to every density arm.
+
+  Per shard: a keeper stream runs the `served` query (so the pool is not drained when the others
+  close); a second stream runs it and closes (a pool MISS, the handle is pooled), a third runs it and
+  closes (a pool HIT: reuse, `reset_for_reuse`, adopted statements; pooled again). Memory is read
+  with the keeper still open, so the delta is coordinator + keeper handle + one pooled idle handle.
+  Compare with `served_kb_per_shard` (coordinator + one held handle); the difference is roughly the
+  pooled handle. The pool's idle-shrink (`shrink_memory`) has not run yet when this reads.
+
+  Preconditions (raises otherwise): every shard's third stream was a pool HIT, every query returned
+  rows, and the pool really is on. WATCH-ONLY (new series).
+  """
+  @spec served_pooled(keyword()) :: float()
+  def served_pooled(opts \\ []) do
+    setup(opts)
+    n = Keyword.get(opts, :served_n, @served_n)
+    trials = Keyword.get(opts, :trials, @default_trials)
+    rows = Keyword.get(opts, :served_rows, @served_rows)
+    prev_pool = Application.get_env(:fathom, :connection_pool)
+    Application.put_env(:fathom, :connection_pool, true)
+    hits = :counters.new(2, [])
+    handler = "bench-served-pooled-#{System.unique_integer([:positive])}"
+    {:ok, _} = Application.ensure_all_started(:telemetry)
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :pool_take],
+      fn _event, _m, %{result: result}, _ ->
+        :counters.add(hits, if(result == :hit, do: 1, else: 2), 1)
+      end,
+      nil
+    )
+
+    try do
+      times(trials, fn t ->
+        ids = for i <- 1..n, do: "bench_servedpool_#{t}_#{i}"
+
+        for id <- ids do
+          path = Fathom.Shard.db_path(id)
+          drop_db(path)
+          {:ok, _} = Fathom.Keystone.build!(path, rows: rows)
+          :ok = Fathom.Shard.stamp_local_provenance(id)
+        end
+
+        collect_all()
+        :counters.put(hits, 1, 0)
+        :counters.put(hits, 2, 0)
+        before_total = :erlang.memory(:total)
+
+        keepers =
+          for id <- ids do
+            {:ok, keeper} = ShardExecutor.open(id)
+            pooled_served_query!(keeper)
+
+            for _ <- 1..2 do
+              {:ok, h} = ShardExecutor.open(id)
+              pooled_served_query!(h)
+              :ok = ShardExecutor.close(h)
+            end
+
+            keeper
+          end
+
+        # Per shard the keeper and the first cycled stream MISS (the pool is empty), the second
+        # cycled stream HITS the handle the first one pooled: n hits, 2n misses.
+        hit = :counters.get(hits, 1)
+
+        unless hit >= n,
+          do:
+            raise(
+              "served_pooled_kb_per_shard got #{hit} pool hits for #{n} shards " <>
+                "(#{:counters.get(hits, 2)} misses); it is not measuring reused pooled handles"
+            )
+
+        collect_all()
+        used = :erlang.memory(:total) - before_total
+        Enum.each(keepers, &ShardExecutor.close/1)
+
+        for id <- ids do
+          Shards.drain(id, 5_000)
+          drop_db(Fathom.Shard.db_path(id))
+        end
+
+        used / n / 1024
+      end)
+      |> median()
+    after
+      :telemetry.detach(handler)
+      restore_env(:connection_pool, prev_pool)
+    end
+  end
+
+  @doc """
+  `hrana_django_request_rt_us` - median round trip of one Django-shaped request on a POOLED reused
+  handle (expert review 2026-10-21 r7 #1, panel 2 #6): a one-shot stream `[execute PRAGMA
+  foreign_keys = ON, execute <29-column point SELECT>, execute <36-column 3-way join>, close]`.
+  Default Django (`CONN_MAX_AGE=0` over django-libsql) sends that per-connection pragma first, and
+  SQLite expires EVERY prepared statement on the connection for any flag-pragma assignment
+  (`OP_Expire`, even when the value does not change), so each carried cached statement is
+  re-prepared inside its first step on the dirty-IO thread; no dispatch counter can see it
+  (`fathom_stmt_reprepares` can). `hrana_pooled_open_rt_us` runs `SELECT 1` and never reaches it.
+  The fixture is `Fathom.Bench.DjangoSchema` with its `wide: true` 29-column table.
+
+  A background stream stays open so every timed stream's open is a pool hit. Preconditions (raises
+  otherwise): pool hits are at least half the samples, and every reply is `ok` with the wide
+  SELECT returning its row with 29 columns and the join returning 36. WATCH-ONLY (new series).
+  The `INSERT ... RETURNING` into an FK table from the panel is NOT in this arm: a wire write
+  raises in the prod-compiled bench (replication configured on, no Session registry), and
+  `hrana_write_rt_us` / `hrana_sdk_write_rt_us` own the write shape.
+  """
+  @spec hrana_django_request_rt_us(keyword()) :: float() | nil
+  def hrana_django_request_rt_us(opts \\ []), do: hrana_django_request_rt(opts)
+
+  defp hrana_django_request_rt(opts) do
+    alias Fathom.Bench.DjangoSchema
+    samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
+    id_arg = [%{"type" => "integer", "value" => "1"}]
+
+    requests = [
+      %{"type" => "execute", "stmt" => %{"sql" => "PRAGMA foreign_keys = ON", "args" => []}},
+      %{
+        "type" => "execute",
+        "stmt" => %{"sql" => DjangoSchema.wide_select_sql(), "args" => id_arg}
+      },
+      %{"type" => "execute", "stmt" => %{"sql" => DjangoSchema.join_sql(), "args" => id_arg}},
+      %{"type" => "close"}
+    ]
+
+    prev_pool = Application.get_env(:fathom, :connection_pool)
+    Application.put_env(:fathom, :connection_pool, true)
+    hits = :counters.new(2, [])
+    handler = "bench-django-#{System.unique_integer([:positive])}"
+    {:ok, _} = Application.ensure_all_started(:telemetry)
+    setup_write_path()
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :pool_take],
+      fn _event, _m, %{result: result}, _ ->
+        :counters.add(hits, if(result == :hit, do: 1, else: 2), 1)
+      end,
+      nil
+    )
+
+    try do
+      with_wire(opts, "benchdjango", fn client ->
+        path = Fathom.Shard.db_path("benchdjango")
+        drop_db(path)
+        _ = DjangoSchema.build!(path, wide: true, rows: 50)
+        :ok = Fathom.Shard.stamp_local_provenance("benchdjango")
+
+        {:ok, _, held} = Filo.Client.execute(%{client | baton: nil}, "SELECT 1")
+        held_baton = held.baton
+
+        # Warm: one request puts a handle in the pool (and the statements in its cache).
+        {:ok, warm, client} = Filo.Client.pipeline(%{held | baton: nil}, requests)
+        django_replies!(warm)
+        :counters.put(hits, 1, 0)
+        :counters.put(hits, 2, 0)
+
+        {client, us} =
+          Enum.reduce(1..samples, {client, []}, fn _, {c, acc} ->
+            c = %{c | baton: nil}
+            {t, result} = :timer.tc(fn -> Filo.Client.pipeline(c, requests) end)
+            {:ok, replies, c} = result
+            django_replies!(replies)
+            {c, [t | acc]}
+          end)
+
+        {:ok, _, _} = Filo.Client.pipeline(%{client | baton: held_baton}, [%{"type" => "close"}])
+
+        hit = :counters.get(hits, 1)
+
+        unless hit * 2 >= samples,
+          do:
+            raise(
+              "hrana_django_request_rt_us got #{hit} pool hits in #{samples} samples " <>
+                "(#{:counters.get(hits, 2)} misses); it is not measuring the pooled-reuse path"
+            )
+
+        p50(us)
+      end)
+    after
+      :telemetry.detach(handler)
+      restore_env(:connection_pool, prev_pool)
+    end
+  end
+
+  defp django_replies!([
+         %{"type" => "ok"},
+         %{"type" => "ok", "response" => %{"result" => %{"cols" => wide, "rows" => [_]}}},
+         %{"type" => "ok", "response" => %{"result" => %{"cols" => join, "rows" => [_ | _]}}},
+         %{"type" => "ok"}
+       ])
+       when length(wide) == 29 and length(join) == 36,
+       do: :ok
+
+  defp django_replies!(other),
+    do:
+      raise(
+        "hrana_django_request_rt_us: unexpected replies (pragma served, 29-col row, 36-col " <>
+          "join row expected): #{inspect(other, limit: 8, printable_limit: 120)}"
+      )
+
+  defp pooled_served_query!(handle) do
+    {:ok, %Filo.StmtResult{rows: rows}} =
+      ShardExecutor.execute(handle, %Filo.Stmt{sql: "SELECT * FROM ks_scalars LIMIT 50", args: []})
+
+    if rows == [], do: raise("served_pooled read 0 rows - the page/statement caches are cold")
+    :ok
+  end
 
   defp open_served_shard(t, i, rows, stmts \\ @served_stmts, schema \\ :keystone)
 

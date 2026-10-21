@@ -623,6 +623,18 @@ defmodule Fathom.BenchTest do
     end
   end
 
+  # r7 #1. Both arms assert their own preconditions (pool hits, reply shapes) inside the harness and
+  # raise, so a number here means the pooled-reuse path really ran.
+  test "the Django pooled request and pooled-density arms report plausible numbers" do
+    us = Fathom.Bench.hrana_django_request_rt_us(hrana_rt_samples: 10)
+    assert is_float(us), "the listener/client did not come up - this measured nothing"
+    assert us > 50 and us < 200_000, "django request #{us}us outside the order-of-magnitude band"
+
+    kb = Fathom.Bench.served_pooled(served_n: 4, trials: 1, served_rows: 50)
+    assert is_float(kb)
+    assert kb > 20 and kb < 10_000, "served_pooled #{kb} KiB/shard outside the plausibility band"
+  end
+
   # r7 #2 discrimination: `flush_p50_us` is documented as the pinned-live route and asserts it. With
   # the pinned route disabled the same trials take the VACUUM route, and the arm must RAISE rather
   # than silently change series. (Measured 2026-10-21: the 5 trials reported 5 x :vacuum.)
