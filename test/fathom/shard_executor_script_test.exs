@@ -21,7 +21,14 @@ defmodule Fathom.ShardExecutorScriptTest do
     root = Path.join(System.tmp_dir!(), "scriptt_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
 
-    keys = [:replication_enabled, :replication_followers, :replication_quorum]
+    keys = [
+      :replication_enabled,
+      :replication_followers,
+      :replication_quorum,
+      :replication_deferred_wal_sync,
+      :replication_wal_sync_fun
+    ]
+
     prev = for k <- keys, do: {k, Application.get_env(:fathom, k)}
 
     on_exit(fn ->
@@ -109,6 +116,78 @@ defmodule Fathom.ShardExecutorScriptTest do
       assert :ok = ShardExecutor.execute_sequence(conn, "BEGIN; INSERT INTO t VALUES (1, 'a');")
       {:ok, _} = run(conn, "COMMIT")
       assert await_quorum(f, id), "the COMMIT closing a script's transaction was acked unshipped"
+    end
+
+    # Expert review 2026-10-21 rv6 F4. The ship decision read SQLite's autocommit flag only at
+    # the END of the script, so a script that COMMITTED a write and then opened a transaction
+    # (`INSERT ...; BEGIN;`) was acked with no quorum ship. The later ROLLBACK is not a commit
+    # boundary, so nothing ever shipped it: an acked write no follower held. Checked with NO wait:
+    # the invariant is "on a quorum when acked", not "eventually".
+    test "a script that commits and then opens a transaction ships before the ack", %{
+      id: id,
+      followers: f
+    } do
+      conn = open!(id, f)
+
+      assert :ok = ShardExecutor.execute_sequence(conn, "INSERT INTO t VALUES (1, 'a'); BEGIN;")
+
+      assert quorum_holds?(f, id),
+             "a committed script write was acked while no follower quorum held its frames"
+
+      {:ok, _} = run(conn, "ROLLBACK")
+    end
+
+    # The F4 fix ships while the script's transaction is still OPEN and holding the write lock.
+    # That is safe only because the Session ships the COMMITTED extent, never frames an open
+    # transaction spilled to the WAL. Pinned here: a transaction big enough to spill its cache
+    # writes uncommitted frames past the commit, the script still returns (no deadlock against
+    # the open writer), and no follower received those frames.
+    test "a script ending in an open, spilled transaction ships only committed frames", %{
+      id: id,
+      followers: f
+    } do
+      conn = open!(id, f)
+
+      sql =
+        "INSERT INTO t VALUES (1, 'a'); BEGIN; " <>
+          "WITH RECURSIVE n(i) AS (SELECT 2 UNION ALL SELECT i + 1 FROM n WHERE i < 3000) " <>
+          "INSERT INTO t SELECT i, hex(randomblob(2000)) FROM n;"
+
+      assert :ok = ShardExecutor.execute_sequence(conn, sql)
+
+      primary = File.stat!(Shard.db_path(id) <> "-wal").size
+      shipped = for {n, _} <- f, {:ok, st} <- [File.stat(Follower.wal_path(n, id))], do: st.size
+      assert length(shipped) >= 2, "no quorum received the committed INSERT"
+      # A precondition, or the test measures nothing: the open transaction DID spill.
+      assert primary > Enum.max(shipped) + 1_000_000,
+             "the open transaction did not spill frames into the WAL"
+
+      {:ok, _} = run(conn, "ROLLBACK")
+    end
+
+    # Same bug, deferred-sync handle (rv6 F4): the commit ran at synchronous=NORMAL and was acked
+    # without the fdatasync the mode promises. A failing sync must turn the ack into a 503.
+    test "a deferred-sync script that ends in BEGIN is not acked without its fdatasync", %{
+      id: id,
+      followers: f
+    } do
+      Application.put_env(:fathom, :replication_deferred_wal_sync, true)
+      conn = open!(id, f)
+      test = self()
+
+      Application.put_env(:fathom, :replication_wal_sync_fun, fn p ->
+        send(test, {:sync, p})
+        {:error, {:datasync, :eio}}
+      end)
+
+      capture_log(fn ->
+        assert {:error, %Error{code: "FILO_WAL_SYNC_FAILED", status: 503}} =
+                 ShardExecutor.execute_sequence(conn, "INSERT INTO t VALUES (1, 'a'); BEGIN;"),
+               "a NORMAL-mode script commit was acked with no fdatasync"
+      end)
+
+      assert_received {:sync, _}
+      {:ok, _} = run(conn, "ROLLBACK")
     end
 
     test "heartbeat mode with an unconfirmed owner refuses the script ack", %{

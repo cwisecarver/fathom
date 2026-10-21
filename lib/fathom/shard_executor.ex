@@ -1173,11 +1173,22 @@ defmodule Fathom.ShardExecutor do
         # QUORUM SHIP + OWNERSHIP GATE (expert review 2026-10-12 #4). A script used to be acked as
         # soon as it was locally committed: it never reached `Session.commit`, so with A2 on it was
         # neither shipped to a follower quorum nor gated by `ack_if_owned` (a zombie owner acked it).
-        # A script is presumed to write (`wrote? = true`). If it left a transaction open
-        # (`autocommit?` false) `ships_now?/3` declines and the COMMIT ships it, because
-        # `mark_txn_write` above recorded the write; a script that committed ships here. Same error
-        # mapping as `execute/2`: the local commit already happened, the client asked for a
-        # quorum-durable write and did not get one, so it gets the 503.
+        # A script is presumed to write (`wrote? = true`). Same error mapping as `execute/2`: the
+        # local commit already happened, the client asked for a quorum-durable write and did not
+        # get one, so it gets the 503.
+        #
+        # SHIPPED WHATEVER THE FINAL AUTOCOMMIT STATE (expert review 2026-10-21 rv6 F4). This used
+        # to pass `nil`, so `ships_now?/4` read SQLite's flag AFTER the whole script and declined
+        # whenever the script ENDED inside a transaction. But the end state says nothing about
+        # the middle: `INSERT ...; BEGIN;` commits the INSERT and then opens a transaction, and was
+        # acked with no quorum ship and, on a deferred-sync handle, no fdatasync. A later ROLLBACK
+        # is not a commit boundary, so nothing ever covered it. Shipping here is safe while a
+        # transaction is open: the Session ships only the COMMITTED extent (the wal-index
+        # `mxFrame`, which SQLite publishes only at a commit, or the walk's last commit frame), it
+        # reads the files directly and takes no SQLite lock, and its checkpoint is PASSIVE behind a
+        # read pin. A script that committed nothing ships nothing new and costs one round, which
+        # is fine for a migration-rare request. `mark_txn_write` above still makes the COMMIT that
+        # closes an open transaction ship its frames.
         case maybe_replicate(
                shard_id,
                pid,
@@ -1185,7 +1196,7 @@ defmodule Fathom.ShardExecutor do
                sql,
                true,
                Session.enabled?(),
-               nil,
+               true,
                deferred_sync?(opts)
              ) do
           :ok -> :ok
