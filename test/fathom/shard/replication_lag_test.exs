@@ -196,11 +196,9 @@ defmodule Fathom.Shard.ReplicationLagTest do
 
     assert is_boolean(skipped)
 
-    # Fire the catch-up as the timer would on a quiet shard (`commits == catchup_at`).
+    # A cycle in the catch-up's shape (`:no_checkpoint`, no caller deadline).
     [{session, _}] = Registry.lookup(@registry, id)
-    :sys.replace_state(session, fn s -> %{s | catchup_at: s.commits} end)
-    send(session, :catch_up)
-    _ = :sys.get_state(session)
+    _ = GenServer.call(session, {:commit, path <> "-wal", :no_checkpoint})
 
     assert_receive {:tel, [:fathom, :replication, :commit], _, %{mode: :catch_up}}
     refute_receive {:tel, [:fathom, :replication, :commit], _, %{mode: :tenant}}, 50

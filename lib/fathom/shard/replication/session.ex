@@ -349,11 +349,10 @@ defmodule Fathom.Shard.Replication.Session do
        # #6): lets a missed-quorum commit skip waiting for a seed that cannot land in time.
        seed_rate: nil,
        # Deferred-retry bookkeeping. `catchup_ref` is the armed timer (nil when none); `commits`
-       # counts commit cycles and `catchup_at` records the count at arm time, so the retry can tell
-       # a QUIET shard from a busy one. See `handle_info(:catch_up, ...)`.
+       # counts commit cycles (observability and tests). Whether a fired timer runs a cycle is
+       # decided from follower positions, not from this count — see `handle_info(:catch_up, ...)`.
        catchup_ref: nil,
        commits: 0,
-       catchup_at: 0,
        # Consecutive catch-up rounds that were ALSO refused. Drives the backoff in
        # `retry_delay_ms/2`; reset by any commit that comes back with no rejects.
        catchup_fails: 0,
@@ -814,16 +813,42 @@ defmodule Fathom.Shard.Replication.Session do
   def handle_info(:catch_up, %{wal_path: nil} = state),
     do: {:noreply, clear_catchup(state)}
 
-  def handle_info(:catch_up, %{commits: n, catchup_at: n} = state) do
-    {:noreply, internal_cycle(clear_catchup(state), :catch_up)}
-  end
-
+  # WHETHER A FIRED TIMER RUNS A CYCLE IS DECIDED IN MEMORY (expert review 2026-10-20-2027 #6/#17).
+  #
+  # It used to run whenever no commit had landed since the timer was (re)armed, `commits ==
+  # catchup_at`, on the theory that a commit re-plans for every follower. Since the commit stops at
+  # its quorum (2026-10-20 #3) every commit leaves its non-quorum straggler's ack unread at reply,
+  # so `arm_if_short/1` armed or REFRESHED the timer on nearly every commit, the refresh kept
+  # `catchup_at == commits`, and the timer fired on BUSY shards about once per `catchup_ms`: a full
+  # cycle (dirty-IO header read, plan, ownership gate) that planned nothing, because by then the
+  # straggler's ack had landed. Measured at prod settings (catchup 1000 ms, 3 followers Q=2,
+  # loopback): +15% Session cycles at 3 commits/s — the rig's per-tenant rate — +4% at 20/s.
+  #
+  # Now the timer reads the follower positions it already holds against the newest extent this
+  # Session has read (`catch_up_need/1`):
+  #
+  #   * `:none` — every connected, non-seeding follower has ACKED that extent: a cycle would plan
+  #     `:nothing` for all of them. Clear the timer, read nothing.
+  #   * `:pending` — the only followers not current have a push in flight (fresh, within
+  #     `timeout()`): their replies are already on the way and land in `handle_info/2`; a cycle now
+  #     would skip them `:already_in_flight` and, as a catch-up, sit in `settle_inflight/3` waiting
+  #     for those same replies with tenant commits queued behind it. Re-arm, read nothing. A reply that
+  #     never comes ages past `timeout()` and the follower then counts as short.
+  #   * `:short` — some follower is behind and free to push to: run the cycle, as before.
+  #
+  # Durability: the catch-up never gates an ack (a tenant's ack rests on `quorum_holds?/2` inside its
+  # own cycle), so this only changes WHEN a non-quorum follower is brought current, never what a
+  # tenant was told. The one thing a header read could see that `seen` cannot is frames committed
+  # after this Session's last read whose commit call has not run (queued, or dropped as expired,
+  # #5(a)); those are the next live call's to ship, exactly as before — the timer was never armed for
+  # them. The old `catchup_at` refresh existed only to stop the count-based rule from dropping a
+  # timer that was still needed; with no count rule there is nothing to strand.
   def handle_info(:catch_up, state) do
-    # A commit landed while this was pending, and a commit already re-plans for EVERY follower, so
-    # the laggard has been re-shipped. Drop the timer rather than duplicate that work: if that commit
-    # refused a follower too, its own reject arms a fresh one. This is what keeps the retry free on a
-    # busy shard — the first attempt fired regardless, and that alone cost 15% throughput.
-    {:noreply, clear_catchup(state)}
+    case catch_up_need(state) do
+      :none -> {:noreply, clear_catchup(state)}
+      :pending -> {:noreply, rearm_catchup(state)}
+      :short -> {:noreply, internal_cycle(clear_catchup(state), :catch_up)}
+    end
   end
 
   def handle_info({:DOWN, _ref, :process, coordinator, _reason}, %{coordinator: coordinator} = s) do
@@ -1313,9 +1338,7 @@ defmodule Fathom.Shard.Replication.Session do
           {s, if(Map.has_key?(state.seeding, s), do: :seeding, else: :already_in_flight)}
         end)
 
-      t_build = System.monotonic_time()
-      built = build_pushes(state, wal_path, epoch, header, sendable)
-      stage_duration(:build, t_build, reset_round?(sendable), skipped != [], state.cycle)
+      built = build_round(state, wal_path, epoch, header, sendable, skipped)
 
       case built do
         {:ok, pushes, state} ->
@@ -1334,6 +1357,22 @@ defmodule Fathom.Shard.Replication.Session do
           read_failed(state, reason)
       end
     end
+  end
+
+  # A ROUND THAT SENDS NOTHING READS NOTHING (expert review 2026-10-20-2027 #17). With every planned
+  # follower skipped (in flight or seeding), `build_pushes/5` still paid the header re-check (a
+  # dirty-IO stat + pread) and resolved an ordinal, to build zero pushes. The re-check exists to
+  # keep mis-stamped BYTES off the wire (`stable?/3`); with no bytes it guards nothing. The round's
+  # verdict is unchanged: `deliver/7` counts the current followers (their recorded ACKED positions
+  # against this round's inode-validated header) and the skipped ones as refusals, exactly as it did
+  # when handed the empty push list.
+  defp build_round(state, _wal_path, _epoch, _header, [], _skipped), do: {:ok, [], state}
+
+  defp build_round(state, wal_path, epoch, header, sendable, skipped) do
+    t_build = System.monotonic_time()
+    built = build_pushes(state, wal_path, epoch, header, sendable)
+    stage_duration(:build, t_build, reset_round?(sendable), skipped != [], state.cycle)
+    built
   end
 
   defp in_flight?(state, shipper, now) do
@@ -3338,20 +3377,16 @@ defmodule Fathom.Shard.Replication.Session do
   defp max_push_bytes,
     do: Application.get_env(:fathom, :replication_max_push_bytes, 1024 * 1024)
 
-  # Armed only when a reject was actually seen, and only one timer at a time, so a shard whose
+  # Armed only when a follower was left behind, and only one timer at a time, so a shard whose
   # followers all ack never arms one and pays nothing.
   #
-  # A reject arriving while a timer is ALREADY armed refreshes `catchup_at` rather than being
-  # ignored, and that is load-bearing rather than tidy. The timer means "retry shortly after the
-  # MOST RECENT reject"; `catchup_at` is the commit count as of that reject. Leaving it stale was a
-  # real bug: armed at commit 2, four more commits each refused the laggard and each was swallowed
-  # by this guard, so when the timer finally fired it compared 6 against 2, took the "a commit
-  # landed, skip" branch, and DROPPED itself. The shard then went quiet with nothing armed and the
-  # laggard stayed behind — the exact strand this retry exists to prevent, reintroduced by the
-  # guard meant to keep it cheap. Caught by instrumenting the failure (`commits=6 catchup_at=2
-  # ref=nil`) rather than by reading.
-  defp arm_catchup(%{catchup_ref: ref} = state, _rejects) when ref != nil,
-    do: %{state | catchup_at: state.commits}
+  # An already-armed timer is left alone. It used to REFRESH a `catchup_at` commit count, because
+  # the fired timer skipped itself when a commit had landed since; a stale count once dropped a
+  # timer that was still needed (armed at commit 2, fired at commit 6, skipped, shard went quiet,
+  # laggard stranded: `commits=6 catchup_at=2 ref=nil`). The fired timer now decides from follower
+  # positions (`catch_up_need/1`, expert review 2026-10-20-2027 #6), so there is no count to keep
+  # fresh and no way to strand a laggard by skipping.
+  defp arm_catchup(%{catchup_ref: ref} = state, _rejects) when ref != nil, do: state
 
   defp arm_catchup(state, rejects) do
     case retry_delay_ms(state.catchup_fails, rejects) do
@@ -3364,13 +3399,46 @@ defmodule Fathom.Shard.Replication.Session do
 
         LagGauge.mark(self(), true)
 
-        %{
-          state
-          | catchup_ref: Process.send_after(self(), :catch_up, ms),
-            catchup_at: state.commits
-        }
+        %{state | catchup_ref: Process.send_after(self(), :catch_up, ms)}
     end
   end
+
+  # A fired timer whose only short followers have a push in flight: wait one more interval for
+  # their replies (`handle_info(:catch_up, ...)`). Not a new arm — no `:catchup` event, the gauge
+  # flag is already set — and not a failure, so the backoff depth is untouched.
+  defp rearm_catchup(state) do
+    case retry_delay_ms(state.catchup_fails, []) do
+      0 -> clear_catchup(state)
+      ms -> %{state | catchup_ref: Process.send_after(self(), :catch_up, ms)}
+    end
+  end
+
+  # `:none | :pending | :short` — see `handle_info(:catch_up, ...)`. Judged against the newest
+  # extent this Session has read, with the same per-follower test as `arm_if_short/1`. Nothing read
+  # yet (`seen == []`): `:short`, so the cycle reads, as it always did.
+  @doc false
+  @spec catch_up_need(map()) :: :none | :pending | :short
+  def catch_up_need(%{seen: [{gen, salt, extent} | _]} = state) do
+    now = System.monotonic_time(:millisecond)
+
+    Enum.reduce_while(shippers(), :none, fn s, acc ->
+      cond do
+        Map.has_key?(state.seeding, s) -> {:cont, acc}
+        holds?(state, s, gen, salt, extent) -> {:cont, acc}
+        in_flight?(state, s, now) -> {:cont, :pending}
+        true -> {:halt, :short}
+      end
+    end)
+  end
+
+  def catch_up_need(_state), do: :short
+
+  defp holds?(state, shipper, gen, salt, extent),
+    do:
+      match?(
+        %{wal_gen: ^gen, salt1: ^salt, offset: o} when is_integer(o) and o >= extent,
+        Map.get(state.followers, shipper)
+      )
 
   # Every place that disarms the catch-up timer goes through here so the node-level gauge flag
   # (`LagGauge`, expert review 2026-10-17 #2) cannot drift from `catchup_ref`. `terminate/2` clears
@@ -3396,11 +3464,7 @@ defmodule Fathom.Shard.Replication.Session do
   defp arm_if_short(%{seen: [{gen, salt, extent} | _]} = state) do
     short? =
       Enum.any?(shippers(), fn s ->
-        not Map.has_key?(state.seeding, s) and
-          not match?(
-            %{wal_gen: ^gen, salt1: ^salt, offset: o} when is_integer(o) and o >= extent,
-            Map.get(state.followers, s)
-          )
+        not Map.has_key?(state.seeding, s) and not holds?(state, s, gen, salt, extent)
       end)
 
     if short?, do: arm_catchup(state, []), else: state
