@@ -965,6 +965,19 @@ if ms = env_int.("REPLICATION_RECOVERY_TIMEOUT_MS") do
   config :fathom, :replication_recovery_timeout_ms, ms
 end
 
+# Persistent connections for that ask (expert review 2026-10-21 #9): up to this many per peer,
+# each authenticated once and closed after REPLICATION_RECOVERY_POOL_IDLE_MS unused. Default 4 and
+# 30000 ms. 0 turns the pool off, and every ask dials a fresh connection, the pre-pool behaviour.
+# Each follower sees at most pool_size x (nodes - 1) of these, inside its
+# :replication_max_connections cap (256).
+if n = env_nonneg_int.("REPLICATION_RECOVERY_POOL_SIZE") do
+  config :fathom, :replication_recovery_pool_size, n
+end
+
+if ms = env_int.("REPLICATION_RECOVERY_POOL_IDLE_MS") do
+  config :fathom, :replication_recovery_pool_idle_ms, ms
+end
+
 # Budget for transferring a winning peer's replica. Default 60000 ms. This one is a whole tenant
 # database over the network, so it is sized like a seed rather than like a query.
 if ms = env_int.("REPLICATION_RECOVERY_PULL_TIMEOUT_MS") do

@@ -82,7 +82,7 @@ defmodule Fathom.Shard.Replication.Recovery do
   require Logger
 
   alias Fathom.Shard.Replication.{Fleet, Follower, FollowerLog, Promote, Protocol}
-  alias Fathom.Shard.Replication.Recovery.UnderQuorum
+  alias Fathom.Shard.Replication.Recovery.{QueryPool, UnderQuorum}
 
   @connect_timeout 2_000
   @query_timeout_ms 2_000
@@ -843,24 +843,36 @@ defmodule Fathom.Shard.Replication.Recovery do
   defp early_exit(needed, local, opts) when needed > 1, do: {needed, local, opts}
   defp early_exit(_needed, _local, _opts), do: nil
 
-  defp ask_one({_key, host, port} = endpoint, shard_id, timeout_ms, honor_unreachable?) do
+  # POOLED (expert review 2026-10-21 #9, user decision: a per-peer query-connection pool, not the
+  # Shipper link). `QueryPool` keeps a few authenticated connections per peer and runs one ask at a
+  # time on each, so a cold open no longer pays connect + hello + close per peer. When the pool is
+  # not running or turned off, this dials a fresh connection exactly as it always did.
+  defp ask_one(endpoint, shard_id, timeout_ms, honor_unreachable?) do
     if honor_unreachable? and unreachable?(endpoint) do
       {endpoint, :silent}
     else
-      case connect(host, port) do
-        {:ok, sock} ->
-          reachable(endpoint)
-
-          try do
-            {endpoint, query(sock, shard_id, timeout_ms)}
-          after
-            :gen_tcp.close(sock)
-          end
-
-        {:error, reason} ->
-          note_unreachable(endpoint, reason)
-          {endpoint, :silent}
+      case QueryPool.ask(endpoint, shard_id, timeout_ms, @connect_timeout, honor_unreachable?) do
+        {:ok, answer} -> {endpoint, answer}
+        :unavailable -> {endpoint, ask_fresh(endpoint, shard_id, timeout_ms)}
       end
+    end
+  end
+
+  defp ask_fresh({_key, host, port} = endpoint, shard_id, timeout_ms) do
+    case connect(host, port) do
+      {:ok, sock} ->
+        reachable(endpoint)
+
+        try do
+          {answer, _fate} = exchange(sock, shard_id, timeout_ms)
+          answer
+        after
+          :gen_tcp.close(sock)
+        end
+
+      {:error, reason} ->
+        note_unreachable(endpoint, reason)
+        :silent
     end
   end
 
@@ -937,7 +949,10 @@ defmodule Fathom.Shard.Replication.Recovery do
     :ets.select_delete(@unreachable_table, [{{:_, :"$1"}, [{:<, :"$1", now}], [true]}])
   end
 
-  defp reachable(endpoint) do
+  @doc false
+  # A connect succeeded: clear the unreachable mark. Public for `QueryPool`'s slots.
+  @spec reachable(endpoint()) :: true
+  def reachable(endpoint) do
     :ets.delete(@unreachable_table, endpoint)
   rescue
     ArgumentError -> true
@@ -946,19 +961,39 @@ defmodule Fathom.Shard.Replication.Recovery do
   defp unreachable_ms,
     do: Application.get_env(:fathom, :replication_recovery_unreachable_ms, 10_000)
 
-  defp query(sock, shard_id, timeout_ms) do
-    with :ok <- :gen_tcp.send(sock, Protocol.encode_position_query(shard_id)),
-         {:ok, bytes} <- :gen_tcp.recv(sock, 0, timeout_ms),
-         {:ok, {:position, ^shard_id, pos}} when pos != :torn <- Protocol.decode(bytes) do
-      {:answered, pos}
+  @doc false
+  # One position query on an open connection: the answer, and whether the socket may carry another
+  # ask (`QueryPool`, expert review 2026-10-21 #9).
+  #
+  #   * `:keep` — a well-formed, verified reply for THIS shard was read, so nothing of this exchange
+  #     is left on the socket.
+  #   * `:dead` — the socket was closed or reset before any reply arrived. On a REUSED socket that
+  #     is a peer restart, and the pool redials once. Nothing was read, so nothing can be mismatched.
+  #   * `:close` — anything else: a timeout (a reply may still be in flight, and it must never be read
+  #     as the next ask's answer), or a reply that failed to decode or verify or named another shard.
+  #
+  # The answer is the same as it always was. A TORN replica answers `{:position, id, :torn}` (expert
+  # review 2026-10-13 #5): it may hold the acked tail while hiding it, so it is neither a definite
+  # "nothing" nor an offer. Silent is exactly that: counted toward neither `answered` nor `offers`.
+  # Silent also covers a peer one deploy behind, which answers `{:error, :malformed}` and closes (see
+  # the note in `Protocol` on why these frames were added without bumping the version), and a reply
+  # naming a DIFFERENT shard, which is refused rather than trusted.
+  @spec exchange(:gen_tcp.socket(), String.t(), non_neg_integer()) ::
+          {{:answered, position() | nil} | :silent, :keep | :dead | :close}
+  def exchange(sock, shard_id, timeout_ms) do
+    with {:send, :ok} <- {:send, :gen_tcp.send(sock, Protocol.encode_position_query(shard_id))},
+         {:recv, {:ok, bytes}} <- {:recv, :gen_tcp.recv(sock, 0, timeout_ms)} do
+      case Protocol.decode(bytes) do
+        {:ok, {:position, ^shard_id, :torn}} -> {:silent, :keep}
+        {:ok, {:position, ^shard_id, pos}} -> {{:answered, pos}, :keep}
+        _ -> {:silent, :close}
+      end
     else
-      # A TORN replica answers `{:position, id, :torn}` (expert review 2026-10-13 #5): it may hold
-      # the acked tail while hiding it, so it is neither a definite "nothing" nor an offer. Silent
-      # is exactly that: counted toward neither `answered` nor `offers`.
-      # Includes a peer one deploy behind, which answers `{:error, :malformed}` and closes: see the
-      # note in `Protocol` on why these frames were added without bumping the version. It also
-      # includes a reply naming a DIFFERENT shard, which is refused rather than trusted.
-      _ -> :silent
+      {_step, {:error, reason}} when reason in [:closed, :econnreset, :enotconn, :epipe] ->
+        {:silent, :dead}
+
+      _ ->
+        {:silent, :close}
     end
   end
 
@@ -1083,18 +1118,28 @@ defmodule Fathom.Shard.Replication.Recovery do
   # -- helpers ---------------------------------------------------------------------------------
 
   # Connect, then run the #17 handshake before any frame is exchanged (a no-op with
-  # `REPLICATION_CONN_NONCE` off). Each query/pull runs in its own process and dials its own
-  # connection, so the binding the handshake leaves in the process dictionary is exactly this one.
+  # `REPLICATION_CONN_NONCE` off). The handshake leaves the connection's binding in the process
+  # dictionary of the CALLING process, so the caller must be the one process that encodes and
+  # decodes this connection's frames: a pull's task, a fresh ask's task, or a `QueryPool` slot.
   #
-  # A per-peer reused query connection was considered and NOT built (perf review 2026-10-01
-  # #3(d)). Measured 2026-10-05 on loopback with the nonce handshake: fresh dial + handshake +
-  # position query p50 227 µs / p99 431 µs vs 56 / 136 µs on a held socket, i.e. ~0.17 ms of local
-  # work plus ~2 peer RTTs (connect, the follower's hello) per replicating cold open, with peers
-  # queried in parallel. In-region that is well under the open's S3 round trips (tens of ms), and
-  # a pooled socket breaks the one-connection-per-process assumption the handshake binding relies
-  # on. The large cost here was a blackholed peer, which the unreachable cache handles (#3(c)).
+  # A per-peer reused query connection was first considered and NOT built (perf review 2026-10-01
+  # #3(d)): the measured cost (227 vs 56 µs p50 on loopback, 2026-10-05) looked small next to the
+  # open's S3 round trips, and a socket shared between processes would have broken the binding's
+  # one-connection-per-process rule. Round 6 (expert review 2026-10-21 #9) re-weighed it on the
+  # connection churn rather than the latency: one TIME_WAIT per ask per peer, and one follower-cap
+  # slot per concurrent ask in a failover wave. The user chose a pool. The pool keeps the binding
+  # rule by giving each connection to one slot process that dials it and runs every frame on it
+  # (`QueryPool`).
+  @doc false
+  # Dial + handshake, with the fixed connect bound. Public for the benchmark probe and tests that
+  # exercise the fresh path directly; `QueryPool`'s slots call `dial_peer/3` and the handshake
+  # themselves, because they must tell a dial timeout from a handshake timeout (see `Slot`).
+  @spec connect_peer(String.t() | charlist(), :inet.port_number()) ::
+          {:ok, :gen_tcp.socket()} | {:error, term()}
+  def connect_peer(host, port), do: connect(host, port)
+
   defp connect(host, port) do
-    with {:ok, sock} <- dial(host, port) do
+    with {:ok, sock} <- dial_peer(host, port, @connect_timeout) do
       case Protocol.handshake_connect(sock, Protocol.handshake_timeout_ms()) do
         :ok ->
           {:ok, sock}
@@ -1106,7 +1151,11 @@ defmodule Fathom.Shard.Replication.Recovery do
     end
   end
 
-  defp dial(host, port) do
+  @doc false
+  # The TCP dial alone, bounded by `connect_timeout`. Public for `QueryPool`'s slots.
+  @spec dial_peer(String.t() | charlist(), :inet.port_number(), non_neg_integer()) ::
+          {:ok, :gen_tcp.socket()} | {:error, term()}
+  def dial_peer(host, port, connect_timeout) do
     charlist = if is_binary(host), do: String.to_charlist(host), else: host
 
     :gen_tcp.connect(
@@ -1121,7 +1170,7 @@ defmodule Fathom.Shard.Replication.Recovery do
         active: false,
         nodelay: true
       ],
-      @connect_timeout
+      connect_timeout
     )
   end
 

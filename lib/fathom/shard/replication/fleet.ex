@@ -295,6 +295,9 @@ defmodule Fathom.Shard.Replication.Fleet do
         # session cleanup scan ~5x slower in the review's measurement. Unmeasured on this branch.
         {Registry, keys: :unique, name: @registry, partitions: System.schedulers_online()},
         {DynamicSupervisor, name: @sessions, strategy: :one_for_one},
+        # Pooled connections for survivor selection's position ask (expert review 2026-10-21 #9).
+        # Absent, `Recovery` dials a fresh connection per ask, so its order here does not matter.
+        Fathom.Shard.Replication.Recovery.QueryPool,
         # Node-wide cap on concurrent seeds (expert review 2026-10-01 #6). Before the sessions
         # can seed, i.e. before Membership starts the shippers.
         Fathom.Shard.Replication.SeedGate,
