@@ -4644,6 +4644,14 @@ defmodule Fathom.Shard do
 
   defp stamp_on_open(state, _head, _promoted?), do: state
 
+  # `:infinity` IS DELIBERATE (perf review 2026-10-21 #6, probed and kept). Every step inside the
+  # head task carries its own bound (Req's timeouts on the HEAD, the ask's connect/query timeouts,
+  # the peer pull's deadline), so the wait ends; its worst case (~85 s) can outlast the first
+  # caller's 75 s `checkout_timeout`, and that caller then gets `:timeout` — a RETRYABLE 503 since
+  # expert review 2026-10-12 #13, not a 500 — while this open completes with its recovery decision
+  # and serves the retry. A tighter bound here would kill a peer pull that is carrying quorum-acked
+  # writes the object lacks: the retry restarts the same pull (a livelock on a large shard), or a
+  # `:none` serves the object without the recovered tail. `OpenHeadOverrunTest` pins the outcome.
   defp await_open_head(nil), do: {nil, nil}
   defp await_open_head(task), do: Task.await(task, :infinity)
 
