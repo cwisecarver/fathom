@@ -385,8 +385,9 @@ defmodule Fathom.Shard.Replication.Follower do
   @doc """
   Current replication state for a shard, or nil if it was never seeded.
 
-  A row the idle sweep dropped (`sweep_idle_rows/1`) is re-derived from the replica's files here,
-  exactly as boot recovery derives it, so no caller can tell a swept replica from a resident one.
+  A row that is not resident — never derived since this follower started (rows are derived on
+  first use, not at boot), or dropped by the idle sweep (`sweep_idle_rows/1`) — is derived from
+  the replica's files here, so no caller can tell it from a resident one.
   """
   @spec state_of(atom(), String.t()) :: FollowerLog.t() | nil
   def state_of(name \\ __MODULE__, shard_id) do
@@ -588,9 +589,15 @@ defmodule Fathom.Shard.Replication.Follower do
       Keyword.get(opts, :coordinator_registry)
     )
 
-    reap_stale_seed_temps(dir)
+    # NO EAGER RECOVERY HERE (expert review 2026-10-21 #5). `init/1` used to derive a row for every
+    # replica on disk before returning, ~150-300 µs each (8,000 replicas = 1.2-2.1 s), and since
+    # `Fleet` sits in the data plane ahead of `Edge`, that held up this node's Hrana and /health
+    # listeners as well as this one. Rows are now derived on first use (`state_of/2` ->
+    # `rederive/2`, the same `derive_state/3` the eager pass ran), and the two housekeeping passes
+    # that need a directory listing (stale seed temps, tombstoned replicas) run in
+    # `handle_continue(:boot_housekeeping)`, after the listen socket exists. See "ROWS ARE DERIVED
+    # ON FIRST USE" above `recover_shard/3` for why that is equivalent.
     schedule_seed_temp_reap()
-    recover(tab, name, dir)
     schedule_row_sweep()
 
     # `ip:` is a security control, not tuning. This socket takes raw WAL frames for a tenant's
@@ -633,6 +640,17 @@ defmodule Fathom.Shard.Replication.Follower do
   @impl true
   def handle_continue(:accept, state) do
     spawn_link(fn -> accept_loop(state.lsock, state.name) end)
+    {:noreply, state, {:continue, :boot_housekeeping}}
+  end
+
+  # After the listener: a directory listing, no per-replica derive. Runs in this GenServer, which
+  # nothing on the push/ask/promote path waits on (they use the ETS tables directly), so it delays
+  # only `port/1` and the timers. Tests sync on it with `:sys.get_state/1`.
+  def handle_continue(:boot_housekeeping, state) do
+    dir = dir(state.name)
+    entries = list_dir(dir)
+    reap_stale_seed_temps(dir, entries)
+    erase_tombstoned_replicas(state.name, entries)
     {:noreply, state}
   end
 
@@ -659,7 +677,8 @@ defmodule Fathom.Shard.Replication.Follower do
   # seed, so a worker killed in `close_connection/1` leaves files nothing replaces; the boot reaper
   # alone let them accumulate for the life of the node. Same age gate, run on a timer.
   def handle_info(:reap_seed_temps, state) do
-    reap_stale_seed_temps(dir(state.name))
+    dir = dir(state.name)
+    reap_stale_seed_temps(dir, list_dir(dir))
     schedule_seed_temp_reap()
     {:noreply, state}
   end
@@ -1940,8 +1959,12 @@ defmodule Fathom.Shard.Replication.Follower do
         [{^shard_id, %{torn: t} = prev}] ->
           {t, Map.get(prev, :lineage, 0), {Map.get(prev, :wal_ordinal, 0), prev.salt1}}
 
+        # No resident row: rows are derived on first use (expert review 2026-10-21 #5), so a write
+        # can land on a replica whose row was never derived (a lineage-0 seed install) or was swept.
+        # The sidecars on disk are what the row would have said; assuming "untorn, lineage 0" left a
+        # stale torn marker behind an untorn install. `nil` ordinal always rewrites that sidecar.
         _ ->
-          {false, 0, nil}
+          {File.exists?(torn_path(name, shard_id)), recovered_lineage(name, shard_id), nil}
       end
 
     # Marker BEFORE the ETS row, so a crash between the two leaves the SAFE state: the marker
@@ -2160,28 +2183,49 @@ defmodule Fathom.Shard.Replication.Follower do
   # dead. Matches the pre-unique `<shard>.db.seeding` name too, so an upgrade does not strand those.
   @stale_seed_temp_s 15 * 60
 
-  defp reap_stale_seed_temps(dir) do
+  defp reap_stale_seed_temps(dir, entries) do
     cutoff =
       System.os_time(:second) -
         Application.get_env(:fathom, :replication_stale_seed_temp_s, @stale_seed_temp_s)
 
+    reaped =
+      entries
+      |> Enum.filter(&String.contains?(&1, @seeding_marker))
+      |> Enum.map(&Path.join(dir, &1))
+      |> Enum.count(fn path ->
+        match?({:ok, %{mtime: m}} when m < cutoff, File.stat(path, time: :posix)) and
+          File.rm(path) == :ok
+      end)
+
+    if reaped > 0,
+      do: Logger.info("replication follower reaped #{reaped} stale seed temp(s) in #{dir}")
+  end
+
+  defp list_dir(dir) do
     case File.ls(dir) do
-      {:ok, entries} ->
-        reaped =
-          entries
-          |> Enum.filter(&String.contains?(&1, @seeding_marker))
-          |> Enum.map(&Path.join(dir, &1))
-          |> Enum.count(fn path ->
-            match?({:ok, %{mtime: m}} when m < cutoff, File.stat(path, time: :posix)) and
-              File.rm(path) == :ok
-          end)
-
-        if reaped > 0,
-          do: Logger.info("replication follower reaped #{reaped} stale seed temp(s) in #{dir}")
-
-      {:error, _} ->
-        :ok
+      {:ok, entries} -> entries
+      {:error, _} -> []
     end
+  end
+
+  # ERASE REPLICAS OF TENANTS DELETED WHILE THIS NODE WAS DOWN (expert review 2026-09-29 #5; moved
+  # out of `init/1` by expert review 2026-10-21 #5). `Tombstones`' erase hook fires only for ids it
+  # learns while this follower runs, so a replica of a tenant deleted before boot is erased here,
+  # after the listener is up. Until this pass reaches it the bytes are still on disk, but they are
+  # never SERVED: every read of a replica goes through `state_of/2`, whose lazy re-derive checks the
+  # same tombstone set on both the locked and the busy path (`rederive/2`), and a seed for a
+  # tombstoned shard is refused in `checked_begin/4`. User decision 2026-10-21: this window is
+  # acceptable for the GDPR erase. One ETS read per `.db`; no file is opened for a live replica.
+  defp erase_tombstoned_replicas(name, entries) do
+    erased =
+      entries
+      |> Enum.filter(&String.ends_with?(&1, ".db"))
+      |> Enum.map(&String.replace_suffix(&1, ".db", ""))
+      |> Enum.filter(&Fathom.Tenants.Tombstones.tombstoned?/1)
+      |> Enum.count(fn shard_id -> forget(name, shard_id) == :ok end)
+
+    if erased > 0,
+      do: Logger.info("replication follower erased #{erased} replica(s) of deleted tenant(s)")
   end
 
   # Returns the iodata to send back. All the judgement is in FollowerLog; this only performs it.
@@ -2224,7 +2268,7 @@ defmodule Fathom.Shard.Replication.Follower do
       Protocol.encode_reject(push.shard_id, :internal, 0)
   end
 
-  # REBUILD THE PER-SHARD STATE FROM THE FILES ON BOOT.
+  # REBUILD THE PER-SHARD STATE FROM THE FILES — ON FIRST USE, NOT AT BOOT.
   #
   # This table is ETS, so it dies with the process while the replicas on disk do not. A restarted
   # node therefore held a full copy of every shard it followed and did not know it: `state_of/2`
@@ -2232,6 +2276,36 @@ defmodule Fathom.Shard.Replication.Follower do
   # DATABASE per shard, and `Promote` — which checks `state_of/2` first — would not promote from
   # bytes sitting right there. At any real follower count that is a re-seed storm after every
   # deploy.
+  #
+  # ROWS ARE DERIVED ON FIRST USE (expert review 2026-10-21 #5). This used to run for every replica
+  # inside `init/1` (`recover/3`), O(replicas) of file I/O before the listener — and, through the
+  # application's start order, before Hrana and /health — existed. Since the idle sweep
+  # (2026-10-20-2027 #11) `state_of/2` re-derives a missing row under the shard's lock through this
+  # same function, so the boot pass is gone. Why a row derived at first use equals the one the boot
+  # pass would have inserted:
+  #   * SAME FUNCTION, SAME FILES. `rederive_locked/2` calls `recover_shard/3`, which is all the
+  #     boot pass called. The replica's files are written only by this follower's own workers under
+  #     the shard lock. A push, a promotion fence and an ordinal note read the row through
+  #     `state_of/2` — so through this derive — before their first write; a seed install replaces
+  #     the whole replica (and a seed stating a lineage reads the row first, for the fence); the
+  #     rest are `forget/2` (removes everything, the row included) and the seed temp reaper (temps
+  #     only). Between boot and first use, the files a derive reads do not move.
+  #   * LINEAGE FENCE: `recovered_lineage/2` reads the sidecar in both cases; the fence in
+  #     `FollowerLog.decide/2` and `stale_lineage_seed?/2` sees the same number.
+  #   * TORN TAIL: `Wal.read/1`'s `commit_extent` (2026-09-29 #26) and the torn marker are read by
+  #     `derive_state/3` in both cases.
+  #   * ASK / PROMOTE ANSWERS: the position query, `replica_offer/2`, `Recovery.local_state/2`,
+  #     `PromoteOnOpen.replica_state/1` and `Promote` all read through `state_of/2`; none reads the
+  #     table directly. A busy lock answers the unlocked derive (see `rederive/2`), which can only
+  #     under-claim, and which also refuses a tombstoned shard.
+  #   * `put_state/3` on a row that is not resident reads the previous torn/lineage from the
+  #     sidecars, not from defaults, so a write that lands before any derive (a lineage-0 seed
+  #     install) still clears a stale torn marker exactly as it did over a boot-derived row.
+  #   * EPOCH: 0 in both cases (below).
+  # What is NOT the same: `replica_shard_ids/1` (the rebalancer's warm set) lists only resident
+  # rows, so after a restart it starts empty and refills as pushes and asks arrive — the trade the
+  # sweep already accepted (user decision 2026-10-21). And a tombstoned replica's bytes stay on disk
+  # until `erase_tombstoned_replicas/2` reaches them after listen, refused meanwhile.
   #
   # THE FILES ARE THE SOURCE OF TRUTH, deliberately, rather than a sidecar counter. Frames are
   # applied with `:file.write` in APPEND mode, so a persisted offset that lagged the file by even
@@ -2249,23 +2323,6 @@ defmodule Fathom.Shard.Replication.Follower do
   #
   # A shard whose WAL cannot be read is simply not recovered: it stays unknown and gets a normal
   # seed. Skipping is always safe here; claiming bytes we cannot verify is not.
-  defp recover(tab, name, dir) do
-    recovered =
-      dir
-      |> File.ls()
-      |> case do
-        {:ok, entries} -> entries
-        {:error, _} -> []
-      end
-      |> Enum.filter(&String.ends_with?(&1, ".db"))
-      |> Enum.map(&String.replace_suffix(&1, ".db", ""))
-      |> Enum.count(fn shard_id -> recover_shard(tab, name, shard_id) end)
-
-    if recovered > 0 do
-      Logger.info("replication follower recovered #{recovered} shard(s) from #{dir}")
-    end
-  end
-
   defp recover_shard(tab, name, shard_id) do
     if Fathom.Tenants.Tombstones.tombstoned?(shard_id) do
       # A replica of a DELETED tenant (expert review 2026-09-29 #5): the delete happened while this
@@ -2300,7 +2357,8 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   # What the replica's files say, or nil when they say nothing (no readable WAL, or no `.db`).
-  # Shared by boot recovery and the lazy re-derive of a swept row, so the two can never disagree.
+  # The one derive: first use after a restart, the re-derive of a swept row, and the sweep's own
+  # equivalence check all call it, so they can never disagree.
   # `log?` false for the sweep's equivalence check, which runs every round on a row it keeps.
   defp derive_state(name, shard_id, log? \\ true) do
     with {:ok, header} <- Wal.read(wal_path(name, shard_id)),
@@ -2323,7 +2381,7 @@ defmodule Fathom.Shard.Replication.Follower do
   # ~800 MB at ten million, nearly all for replicas nobody pushes to.
   # A row untouched (no `put_state/3`) for `:replication_row_idle_ms` (default 10 x
   # `:shard_idle_ms`) is dropped, and `state_of/2` re-derives it from the files on the next use,
-  # through the same `derive_state/2` boot recovery uses.
+  # through the same `derive_state/3` a restarted follower uses on first use.
   #
   # WHY DROPPING IT LOSES NOTHING. Every field of the row is either durable beside the replica or
   # recovered in the safe direction, which is what already makes a follower restart (every deploy)
@@ -2439,9 +2497,17 @@ defmodule Fathom.Shard.Replication.Follower do
       case with_shard_lock(name, shard_id, lock_wait_ms(), fn ->
              rederive_locked(name, shard_id)
            end) do
-        {:error, :replica_busy} -> derive_state(name, shard_id)
-        {:error, :no_replica} -> nil
-        state -> state
+        # The tombstone check `recover_shard/3` makes on the locked path, made here too (expert
+        # review 2026-10-21 #5): with no boot pass, a deleted tenant's replica can still be on disk
+        # when this runs, and it must be refused, not served, until `forget/2` erases it.
+        {:error, :replica_busy} ->
+          unless Fathom.Tenants.Tombstones.tombstoned?(shard_id), do: derive_state(name, shard_id)
+
+        {:error, :no_replica} ->
+          nil
+
+        state ->
+          state
       end
     end
   end
