@@ -46,6 +46,11 @@ defmodule Fathom.Shards.Lru do
   # cold-end-first by lru_order/1. The @table stamp is the authority; an order key whose stamp
   # no longer matches is stale and lazily deleted during the walk.
   @order_table __MODULE__.Order
+  # `{shard_id, owner_pid}`: an eviction in progress (expert review 2026-10-21 rv6 F10). The inline
+  # admission path and the background pre-evictor can pick the SAME victim; both used to count its
+  # one freed slot, so an admission could land one shard over the soft cap. A claim held by a dead
+  # process is free, so a probe killed mid-eviction cannot pin a shard as unevictable.
+  @evicting_table __MODULE__.Evicting
 
   # The authority on whether a shard is actually OPEN. `lru_order/1` consults it because the ETS
   # rows here are released only from `Fathom.Shard.terminate/2` — see `ghost?/1`.
@@ -303,11 +308,67 @@ defmodule Fathom.Shards.Lru do
 
   defp open?(id), do: Registry.lookup(@registry, id) != []
 
+  @doc """
+  Whether `shard_id`'s recency stamp is younger than `ms` (expert review 2026-10-21 rv6 F10). Stamps
+  are coarsened to one second (`touch/1`), so this reads "used within about `ms` + 1 s". False for a
+  shard with no stamp.
+  """
+  @spec touched_within?(String.t(), non_neg_integer()) :: boolean()
+  def touched_within?(shard_id, ms) do
+    case :ets.lookup(@table, shard_id) do
+      [{^shard_id, stamp}] ->
+        System.monotonic_time() - stamp < System.convert_time_unit(ms, :millisecond, :native)
+
+      [] ->
+        false
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  @doc """
+  Claim `shard_id` for eviction by the calling process (expert review 2026-10-21 rv6 F10). False
+  when a LIVE process already holds the claim; a claim whose owner died is taken over.
+  """
+  @spec claim_eviction(String.t()) :: boolean()
+  def claim_eviction(shard_id) do
+    me = self()
+
+    :ets.insert_new(@evicting_table, {shard_id, me}) or
+      case :ets.lookup(@evicting_table, shard_id) do
+        [{^shard_id, ^me}] ->
+          true
+
+        [{^shard_id, owner}] ->
+          # Take a dead owner's claim, compare-and-swap so two takers cannot both win it.
+          not Process.alive?(owner) and
+            :ets.select_replace(@evicting_table, [
+              {{shard_id, owner}, [], [{{{:const, shard_id}, me}}]}
+            ]) == 1
+
+        [] ->
+          :ets.insert_new(@evicting_table, {shard_id, me})
+      end
+  rescue
+    # No table (Lru not running): nothing to coordinate with.
+    ArgumentError -> true
+  end
+
+  @doc "Release the calling process's eviction claim on `shard_id`."
+  @spec release_eviction(String.t()) :: :ok
+  def release_eviction(shard_id) do
+    :ets.delete_object(@evicting_table, {shard_id, self()})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
   @doc false
   def reset do
     :ets.delete_all_objects(@table)
     :ets.delete_all_objects(@busy_table)
     :ets.delete_all_objects(@order_table)
+    :ets.delete_all_objects(@evicting_table)
   end
 
   @impl true
@@ -317,6 +378,7 @@ defmodule Fathom.Shards.Lru do
     opts = [:set, :public, :named_table, write_concurrency: true, read_concurrency: true]
     :ets.new(@table, opts)
     :ets.new(@busy_table, opts)
+    :ets.new(@evicting_table, opts)
 
     :ets.new(@order_table, [
       :ordered_set,

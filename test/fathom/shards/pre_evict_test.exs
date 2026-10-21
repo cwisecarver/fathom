@@ -28,7 +28,13 @@ defmodule Fathom.Shards.PreEvictTest do
   @moduletag :capture_log
   @modes [:legacy, :heartbeat]
 
-  @env [:max_open_shards, :pre_evict_headroom, :shard_idle_ms, :evict_idle_at_capacity]
+  @env [
+    :max_open_shards,
+    :pre_evict_headroom,
+    :pre_evict_min_idle_ms,
+    :shard_idle_ms,
+    :evict_idle_at_capacity
+  ]
 
   setup do
     prev = Map.new(@env, &{&1, Application.get_env(:fathom, &1)})
@@ -113,6 +119,13 @@ defmodule Fathom.Shards.PreEvictTest do
 
   defp open?(id), do: Registry.lookup(Fathom.ShardRegistry, id) != []
 
+  defp wait(ms) do
+    receive do
+    after
+      ms -> :ok
+    end
+  end
+
   defp cleanup(ids) do
     Application.put_env(:fathom, :max_open_shards, :infinity)
     Enum.each(ids, &Shards.stop/1)
@@ -144,7 +157,16 @@ defmodule Fathom.Shards.PreEvictTest do
 
         # 30 dirty idle shards: enough to cross the watermark (base + 1 + 30 > base + 24) while
         # staying under the cap, so the inline path is never needed.
+        #
+        # The evictor skips shards used within `:pre_evict_min_idle_ms` (expert review 2026-10-21
+        # rv6 F10), and these 30 were all opened within milliseconds. So they age past a short
+        # window first, and one more admission kicks the evictor.
+        Application.put_env(:fathom, :pre_evict_min_idle_ms, 200)
         ids = for _ <- 1..30, do: open_dirty(uniq())
+        await_pre_evictor()
+        wait(400)
+        kick = open_dirty(uniq())
+        ids = ids ++ [kick]
         await_pre_evictor()
 
         assert Registry.count(Fathom.ShardRegistry) < low,
@@ -169,6 +191,60 @@ defmodule Fathom.Shards.PreEvictTest do
 
         cleanup([held_id | ids])
       end
+    end
+  end
+
+  # EVICT-BEFORE-CHECKOUT CHURN (expert review 2026-10-21 rv6 F10). The evictor took the LRU-coldest
+  # idle shards whatever their age, so in a burst of fresh opens it dropped shards a client had used
+  # a moment ago, and their next checkout paid a cold reopen. A shard used within
+  # `:pre_evict_min_idle_ms` (default 1 s) is skipped.
+  test "shards used within the last second are not pre-evicted" do
+    base = Registry.count(Fathom.ShardRegistry)
+    Application.put_env(:fathom, :max_open_shards, base + 40)
+    ids = for _ <- 1..30, do: open_dirty(uniq())
+    await_pre_evictor()
+
+    assert Enum.all?(ids, &open?/1), "a shard used a moment ago was pre-evicted"
+    refute_received {[:fathom, :shards, :pre_evicted], _}
+    cleanup(ids)
+  end
+
+  # ONE FREED SLOT, COUNTED ONCE (expert review 2026-10-21 rv6 F10). The inline admission path and the
+  # background evictor can pick the same victim; both counted its slot, and an admission could land
+  # one shard over the soft cap. A victim already gone, or being dropped by another probe, must not
+  # read as freed.
+  describe "evict/2 counts only the slot it frees" do
+    test "a victim that is already gone is not a freed slot" do
+      assert {:error, :gone} = Shards.evict(uniq(), 1_000)
+    end
+
+    test "a victim another probe holds the eviction claim on is left alone" do
+      Application.put_env(:fathom, :max_open_shards, :infinity)
+      id = open_dirty(uniq())
+      assert Lru.claim_eviction(id)
+
+      assert {:error, :claimed} = Shards.evict(id, 1_000)
+      assert open?(id), "the claimed victim was evicted twice"
+
+      :ok = Lru.release_eviction(id)
+      assert :ok = Shards.evict(id, 5_000)
+      refute open?(id)
+      cleanup([id])
+    end
+
+    test "a claim held by a dead process is taken over" do
+      id = uniq()
+      test_pid = self()
+
+      {pid, ref} =
+        spawn_monitor(fn ->
+          send(test_pid, {:claimed, Lru.claim_eviction(id)})
+        end)
+
+      assert_receive {:claimed, true}
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}
+      assert Lru.claim_eviction(id)
+      :ok = Lru.release_eviction(id)
     end
   end
 

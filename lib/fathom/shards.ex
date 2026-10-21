@@ -1506,13 +1506,24 @@ defmodule Fathom.Shards do
   # rather than by the caller shutting it down.
   @evict_probe_grace_ms 250
 
-  defp evict(shard_id, budget_ms) do
+  #
+  # ONE SLOT, COUNTED ONCE (expert review 2026-10-21 rv6 F10). The inline admission path and the
+  # background pre-evictor can pick the same victim. Both used to answer `:ok` for it: a victim
+  # already gone answered `:ok` outright, and two probes draining one live coordinator both saw its
+  # `:normal` DOWN. Each caller then counted the one freed slot, and an admission landed one shard
+  # over the soft cap. Now a victim already gone is `{:error, :gone}` (we freed nothing), and the
+  # probe holds an eviction claim (`Lru.claim_eviction/1`) for the whole drain: a victim another
+  # probe is already dropping is `{:error, :claimed}`. Both route the inline path to its next
+  # candidate. Public for the test.
+  @doc false
+  @spec evict(String.t(), non_neg_integer()) :: :ok | {:error, term()}
+  def evict(shard_id, budget_ms) do
     case registry_lookup(shard_id) do
       {:error, :unavailable} = unavailable ->
         unavailable
 
       {:ok, []} ->
-        :ok
+        {:error, :gone}
 
       {:ok, [{pid, _}]} ->
         # Probe from a SHORT-LIVED process, not the caller (expert review 2026-08-01 #34).
@@ -1536,9 +1547,15 @@ defmodule Fathom.Shards do
         # unlinked so a probe crash cannot take the stream down with it.
         task =
           Task.Supervisor.async_nolink(Fathom.TaskSupervisor, fn ->
-            ref = Process.monitor(pid)
-            Fathom.Shard.request_drain(pid, 0, self())
-            await_coordinator_exit(pid, ref, budget_ms)
+            if Fathom.Shards.Lru.claim_eviction(shard_id) do
+              try do
+                evict_claimed(pid, budget_ms)
+              after
+                Fathom.Shards.Lru.release_eviction(shard_id)
+              end
+            else
+              {:error, :claimed}
+            end
           end)
 
         case Task.yield(task, budget_ms + @evict_probe_grace_ms) ||
@@ -1551,6 +1568,20 @@ defmodule Fathom.Shards do
 
   defp evict_budget_ms,
     do: Application.get_env(:fathom, :evict_budget_ms, @default_evict_budget_ms)
+
+  # A coordinator already dead when we monitor it was freed by someone else (rv6 F10): the
+  # `:noproc` DOWN of a local pid is in the mailbox when `monitor/1` returns.
+  defp evict_claimed(pid, budget_ms) do
+    ref = Process.monitor(pid)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, :noproc} -> {:error, :gone}
+    after
+      0 ->
+        Fathom.Shard.request_drain(pid, 0, self())
+        await_coordinator_exit(pid, ref, budget_ms)
+    end
+  end
 
   # THE LOW-WATERMARK PRE-EVICTOR (perf review 2026-10-21 #14, user decision: headroom 1% of the
   # cap, minimum 16). At the cap, every admitted cold open used to pay a victim's WHOLE drop inline
@@ -1579,6 +1610,10 @@ defmodule Fathom.Shards do
   # Victims drained at once per pass: each is an independent coordinator stop (its own DELETE), so a
   # burst of admissions is not refilled one round trip at a time.
   @pre_evict_concurrency 8
+  # Skip candidates used within this long (expert review 2026-10-21 rv6 F10). Dropping a shard a
+  # client touched a moment ago mostly buys an immediate cold reopen: evict-before-checkout churn.
+  # The inline path ignores it; it needs room now. `:pre_evict_min_idle_ms`, 0 disables.
+  @default_pre_evict_min_idle_ms 1_000
 
   @doc false
   # The headroom for a cap: `:pre_evict_headroom` (an integer, 0 = off), or `:auto` (the default) =
@@ -1629,11 +1664,13 @@ defmodule Fathom.Shards do
   # re-kicks, so there is no spin.
   defp pre_evict_pass(low) do
     excess = open_count() - low + 1
+    min_idle_ms = pre_evict_min_idle_ms()
 
     with true <- excess > 0,
          [_ | _] = victims <-
            Fathom.Shards.Lru.lru_order(@max_evict_probes)
            |> Enum.filter(&shard_open?/1)
+           |> Enum.reject(&Fathom.Shards.Lru.touched_within?(&1, min_idle_ms))
            |> prefer_clean()
            |> Enum.take(excess),
          freed when freed > 0 <- pre_evict_batch(victims) do
@@ -1642,6 +1679,9 @@ defmodule Fathom.Shards do
       _ -> :ok
     end
   end
+
+  defp pre_evict_min_idle_ms,
+    do: Application.get_env(:fathom, :pre_evict_min_idle_ms, @default_pre_evict_min_idle_ms)
 
   defp pre_evict_batch(victims) do
     Fathom.TaskSupervisor
