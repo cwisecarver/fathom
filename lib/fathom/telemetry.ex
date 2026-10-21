@@ -1318,6 +1318,11 @@ defmodule Fathom.Telemetry do
         description:
           "Idle shards LRU-evicted at the soft cap to admit a new open (#14) — node running at :max_open_shards; sustained ⇒ under-provisioned"
       ),
+      counter("fathom.shards.pre_evicted.count",
+        event_name: [:fathom, :shards, :pre_evicted],
+        description:
+          "Idle shards LRU-evicted in the background within :pre_evict_headroom of :max_open_shards (perf review 2026-10-21 #14), so admissions skip the inline drop — rising alongside shards.evicted ⇒ admissions outrun the evictor"
+      ),
 
       # Liveness — the mass-self-fence precursor.
       counter("fathom.shard.heartbeat.lapsed.count",

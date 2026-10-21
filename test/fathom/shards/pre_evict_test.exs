@@ -1,0 +1,200 @@
+defmodule Fathom.Shards.PreEvictTest do
+  @moduledoc """
+  The low-watermark pre-evictor (perf review 2026-10-21 #14, user decision: headroom 1% of the cap,
+  minimum 16).
+
+  Symptom it fixes: at `:max_open_shards`, every admitted cold open first evicted a victim INLINE —
+  waiting on the victim's whole terminate, including the S3 DELETE of its lock — so a node sized to
+  its cap paid an extra storage round trip on every reopen. Now an admission that leaves the node
+  within `headroom` of the cap starts one background eviction that brings it back below
+  `cap - headroom`, so the next admissions find free slots.
+
+  Pinned invariants (each against the pre-fix code, the first fails: nothing pre-evicts):
+    * an admission near the cap drops LRU idle shards in the background, down below the watermark,
+      and no admission had to evict inline;
+    * a shard holding a connection is never pre-evicted;
+    * a DIRTY idle victim is flushed before it drops — its writes survive the reopen;
+    * a cap too small to hold the headroom twice over, or `:pre_evict_headroom` 0, disables it.
+
+  Both liveness modes (eviction is a drop), mode asserted.
+  """
+  use ExUnit.Case, async: false
+
+  alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Shard.Heartbeat
+  alias Fathom.Shards.Lru
+  alias Filo.Stmt
+
+  @moduletag :capture_log
+  @modes [:legacy, :heartbeat]
+
+  @env [:max_open_shards, :pre_evict_headroom, :shard_idle_ms, :evict_idle_at_capacity]
+
+  setup do
+    prev = Map.new(@env, &{&1, Application.get_env(:fathom, &1)})
+    Lru.reset()
+    test_pid = self()
+    handler = "pre_evict_test_#{System.unique_integer([:positive])}"
+
+    :telemetry.attach_many(
+      handler,
+      [[:fathom, :shards, :evicted], [:fathom, :shards, :pre_evicted]],
+      fn event, _, %{shard_id: id}, _ -> send(test_pid, {event, id}) end,
+      nil
+    )
+
+    on_exit(fn ->
+      :telemetry.detach(handler)
+
+      for {k, v} <- prev do
+        if is_nil(v),
+          do: Application.delete_env(:fathom, k),
+          else: Application.put_env(:fathom, k, v)
+      end
+
+      Lru.reset()
+    end)
+
+    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    :ok
+  end
+
+  defp set_mode!(:legacy) do
+    refute Heartbeat.running?()
+    :ok
+  end
+
+  defp set_mode!(:heartbeat) do
+    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
+    _ = :sys.get_state(hb)
+    :ok
+  end
+
+  defp assert_mode!(id, mode) do
+    [{pid, _}] = Registry.lookup(Fathom.ShardRegistry, id)
+    gen = :sys.get_state(pid).acquire_gen
+
+    if mode == :heartbeat,
+      do: assert(is_integer(gen), "heartbeat mode did not take"),
+      else: assert(is_nil(gen), "legacy mode did not take")
+  end
+
+  defp uniq, do: "preev_#{System.unique_integer([:positive])}"
+  defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
+
+  # Open, write one row (so the shard is DIRTY: written, not yet flushed), release the stream.
+  defp open_dirty(id) do
+    {:ok, conn} = ShardExecutor.open(id)
+    {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (a TEXT)"))
+    {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (?1)", [id]))
+    :ok = ShardExecutor.close(conn)
+    [{pid, _}] = Registry.lookup(Fathom.ShardRegistry, id)
+    _ = :sys.get_state(pid)
+    id
+  end
+
+  defp open_held(id) do
+    {:ok, pid, _ref, _path} = Shards.checkout(id)
+    pid
+  end
+
+  # The evictor is single-flight under a registered name: wait until no run is in flight.
+  defp await_pre_evictor do
+    case Process.whereis(Fathom.Shards.PreEvictor) do
+      nil ->
+        :ok
+
+      pid ->
+        ref = Process.monitor(pid)
+        assert_receive {:DOWN, ^ref, :process, ^pid, _}, 30_000
+        await_pre_evictor()
+    end
+  end
+
+  defp open?(id), do: Registry.lookup(Fathom.ShardRegistry, id) != []
+
+  defp cleanup(ids) do
+    Application.put_env(:fathom, :max_open_shards, :infinity)
+    Enum.each(ids, &Shards.stop/1)
+
+    for id <- ids,
+        f <- Path.wildcard(Fathom.Shard.db_path(id) <> "*"),
+        do: File.rm_rf(f)
+
+    for id <- ids, do: Fathom.Shard.Storage.Local.purge_shard(id)
+  end
+
+  for mode <- @modes do
+    describe "#{mode} mode" do
+      setup do: set_mode!(unquote(mode))
+
+      test "near the cap, idle shards drop in the background; busy never, dirty flushed first" do
+        # Cap 40 over the live population: headroom = 16 (the minimum), watermark = base + 24.
+        base = Registry.count(Fathom.ShardRegistry)
+        cap = base + 40
+        assert Shards.pre_evict_headroom(40) == 16
+        Application.put_env(:fathom, :max_open_shards, cap)
+        low = cap - 16
+
+        # The coldest shard is HELD: a live connection, never evictable.
+        held_id = uniq()
+        held = open_held(held_id)
+        held_ref = Process.monitor(held)
+        assert_mode!(held_id, unquote(mode))
+
+        # 30 dirty idle shards: enough to cross the watermark (base + 1 + 30 > base + 24) while
+        # staying under the cap, so the inline path is never needed.
+        ids = for _ <- 1..30, do: open_dirty(uniq())
+        await_pre_evictor()
+
+        assert Registry.count(Fathom.ShardRegistry) < low,
+               "the node was left within the headroom of the cap: nothing pre-evicted"
+
+        evicted = Enum.reject(ids, &open?/1)
+        assert evicted != [], "fixture: no idle shard was evicted"
+        assert_received {[:fathom, :shards, :pre_evicted], _}
+        refute_received {[:fathom, :shards, :evicted], _}, "an admission evicted inline"
+
+        refute_received {:DOWN, ^held_ref, :process, ^held, _},
+                        "a shard holding a connection was pre-evicted"
+
+        # Dirty victims flushed before dropping: each reopens with its row.
+        Application.put_env(:fathom, :max_open_shards, :infinity)
+
+        for id <- evicted do
+          {:ok, conn} = ShardExecutor.open(id)
+          assert {:ok, %{rows: [[^id]]}} = ShardExecutor.execute(conn, stmt("SELECT a FROM t"))
+          :ok = ShardExecutor.close(conn)
+        end
+
+        cleanup([held_id | ids])
+      end
+    end
+  end
+
+  describe "headroom" do
+    test "1% of the cap, at least 16; off for a cap that cannot hold it twice; 0 disables" do
+      assert Shards.pre_evict_headroom(10_000) == 100
+      assert Shards.pre_evict_headroom(1_000) == 16
+      assert Shards.pre_evict_headroom(33) == 16
+      assert Shards.pre_evict_headroom(32) == 0
+      assert Shards.pre_evict_headroom(1) == 0
+
+      Application.put_env(:fathom, :pre_evict_headroom, 0)
+      assert Shards.pre_evict_headroom(10_000) == 0
+      Application.put_env(:fathom, :pre_evict_headroom, 50)
+      assert Shards.pre_evict_headroom(10_000) == 50
+    end
+
+    test "with :pre_evict_headroom 0, nothing is evicted before the cap" do
+      Application.put_env(:fathom, :pre_evict_headroom, 0)
+      base = Registry.count(Fathom.ShardRegistry)
+      Application.put_env(:fathom, :max_open_shards, base + 40)
+      ids = for _ <- 1..30, do: open_dirty(uniq())
+      await_pre_evictor()
+      assert Enum.all?(ids, &open?/1), "pre-eviction ran with the headroom set to 0"
+      refute_received {[:fathom, :shards, :pre_evicted], _}
+      cleanup(ids)
+    end
+  end
+end

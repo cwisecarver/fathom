@@ -1395,6 +1395,12 @@ if config_env() == :prod do
     config :fathom, :max_open_shards, String.to_integer(cap)
   end
 
+  # Background pre-eviction headroom below that cap (perf review 2026-10-21 #14). Unset = auto (1% of
+  # the cap, at least 16); 0 turns it off (inline eviction at the cap only).
+  if n = env_nonneg_int.("PRE_EVICT_HEADROOM") do
+    config :fathom, :pre_evict_headroom, n
+  end
+
   # Per-shard size cap (expert review 2026-07-14 #19): the max SQLite pages a single tenant's db may
   # grow to (size = pages × page_size, default 4096B; e.g. 262144 ≈ 1 GiB). A write past it fails
   # SQLITE_FULL, so one runaway tenant can't inflate flush/cold-open/standby costs fleet-wide.

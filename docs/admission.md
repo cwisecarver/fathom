@@ -56,6 +56,18 @@ one, so the admitting request rarely waits on someone else's flush + PUT (expert
 #6); with no watermark data (`Fathom.Admin` off) it is plain LRU. Set `:evict_idle_at_capacity` false
 for a **hard cap** (503 at the limit). Either way the open count stays bounded by the cap.
 
+**Pre-eviction headroom** (perf review 2026-10-21 #14). That inline eviction makes the admitting
+request wait for the victim's whole drop, ending in the lock release (an S3 DELETE round trip),
+before its own cold open: measured in-process with 25 ms injected on the release and the pull,
+an admitted open at the cap took p50 52.8 ms vs 26.9 ms uncapped. So an admission that leaves the
+node within `:pre_evict_headroom` of the cap (default `:auto` = 1% of the cap, at least 16) starts
+one background evictor that drops LRU idle shards, using the same candidates and the same
+evict-if-idle primitive, until the node is back below `cap - headroom`. With it, the same probe
+measured p50 26.3 ms. The inline path stays as the fallback for bursts that outrun it. The trade:
+idle tenants drop slightly before strictly necessary. It is off for a cap that cannot hold twice
+the headroom (≤ 32 with the minimum), or with `:pre_evict_headroom` 0. It reports
+`[:fathom,:shards,:pre_evicted]`.
+
 **2. `Fathom.Shards.NovelLimiter` — rate-limit how fast *unseen* ids mint new shards.** Gated
 `:novel_shard_rate` (off by default; `NOVEL_SHARD_RATE` in prod). Over budget ⇒ **429**, refused
 **before** any novel work runs (the S3 lock PUT + the Postgres directory row). Crucially, **existing
