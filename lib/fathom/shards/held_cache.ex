@@ -42,6 +42,9 @@ defmodule Fathom.Shards.HeldCache do
   @table __MODULE__
   @default_ceiling_ms 2_000
   @sweep_threshold 1024
+  # Last-sweep timestamp, stored as a 2-tuple in the same table. Its shape never matches the 4-tuple
+  # rows the sweep selects, and a ShardId is a string, so no lookup can collide with it.
+  @sweep_stamp :__last_sweep__
 
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -73,7 +76,7 @@ defmodule Fathom.Shards.HeldCache do
 
     if window > 0 do
       now = System.monotonic_time(:millisecond)
-      if :ets.info(@table, :size) >= @sweep_threshold, do: sweep(now)
+      maybe_sweep(now)
       :ets.insert(@table, {shard_id, owner, at, now + window})
     end
 
@@ -91,6 +94,27 @@ defmodule Fathom.Shards.HeldCache do
     :ok
   rescue
     ArgumentError -> :ok
+  end
+
+  # The full-table sweep is amortized: at most once per ceiling window, and only once the table is
+  # above the threshold. The old per-put sweep cost O(rows) under the table's write lock on every
+  # insert of a failover herd (248 us per put at 15k unexpired rows; expert review 2026-10-21 #10).
+  # That is safe because `recent/1` checks expiry itself, so a row the sweep has not reached is
+  # never served.
+  defp maybe_sweep(now) do
+    if :ets.info(@table, :size) >= @sweep_threshold and sweep_due?(now) do
+      :ets.insert(@table, {@sweep_stamp, now})
+      sweep(now)
+    end
+
+    :ok
+  end
+
+  defp sweep_due?(now) do
+    case :ets.lookup(@table, @sweep_stamp) do
+      [{@sweep_stamp, last}] -> now - last >= max(ceiling_ms(), 1)
+      [] -> true
+    end
   end
 
   defp sweep(now),

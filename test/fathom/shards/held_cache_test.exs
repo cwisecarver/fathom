@@ -164,6 +164,75 @@ defmodule Fathom.Shards.HeldCacheTest do
       HeldCache.clear(id)
       assert HeldCache.recent(id) == nil
     end
+
+    # Symptom (expert review 2026-10-21 #10): once the table held 1,024 rows, EVERY put swept the
+    # whole table under its write lock, so a failover herd of unexpired rows made each insert cost
+    # O(rows) (248 us at 15k). The sweep is now amortized to once per ceiling window. That is safe
+    # only because the lookup enforces expiry itself: a row the sweep has not reached yet is
+    # never served.
+    test "the sweep runs at most once per ceiling window, and an expired row is never served",
+         %{id: id} do
+      Application.put_env(:fathom, :held_refusal_cache_ms, 60_000)
+      mono = System.monotonic_time(:millisecond)
+      wall = System.system_time(:millisecond) + 600_000
+      expired = mono - 1
+      live = mono + 600_000
+
+      # The last-sweep stamp is global to the table: an earlier test may have set it inside this
+      # ceiling window. Clear it so the first put below is due for a sweep.
+      :ets.delete(HeldCache, :__last_sweep__)
+
+      # 1,100 expired rows: the first put is due for a sweep and removes them.
+      for i <- 1..1_100, do: :ets.insert(HeldCache, {"stale_a_#{i}", "o", wall, expired})
+      HeldCache.put(id, "o", wall)
+      assert :ets.lookup(HeldCache, "stale_a_1") == []
+
+      # 1,100 live rows keep the table above the sweep threshold; 3 more expired rows arrive
+      # inside the same ceiling window.
+      for i <- 1..1_100, do: :ets.insert(HeldCache, {"live_#{i}", "o", wall, live})
+      for i <- 1..3, do: :ets.insert(HeldCache, {"stale_b_#{i}", "o", wall, expired})
+
+      HeldCache.put(id, "o", wall)
+
+      # Never served, whether or not the sweep has reached them.
+      assert HeldCache.recent("stale_b_1") == nil
+      # Amortized: inside the window the put does not rescan, so the expired rows are still
+      # physically present. A per-put sweep (the old behaviour) removes them here.
+      assert :ets.lookup(HeldCache, "stale_b_1") != []
+
+      for k <- Enum.map(1..3, &"stale_b_#{&1}") ++ Enum.map(1..1_100, &"live_#{&1}"),
+          do: :ets.delete(HeldCache, k)
+
+      HeldCache.clear(id)
+    end
+
+    # Hot-path floor (expert review 2026-10-21 #10): a put against 15k unexpired rows must not
+    # rescan them. Pre-fix this was ~248 us per put; the floor is 5 us.
+    @tag :bench
+    test "put at 15k unexpired rows averages under 5 us", %{id: id} do
+      Application.put_env(:fathom, :held_refusal_cache_ms, 2_000)
+      mono = System.monotonic_time(:millisecond)
+      wall = System.system_time(:millisecond) + 600_000
+      live = mono + 600_000
+      keys = Enum.map(1..15_000, &"bench_#{&1}")
+      for k <- keys, do: :ets.insert(HeldCache, {k, "o", wall, live})
+      # Start from a due sweep (the stamp is global; see the amortization test above).
+      :ets.delete(HeldCache, :__last_sweep__)
+
+      # Warm-up: the first put of a window sweeps once, outside the timed loop.
+      HeldCache.put(id, "o", wall)
+
+      {us, _} =
+        :timer.tc(fn ->
+          for i <- 1..1_000, do: HeldCache.put("#{id}_#{i}", "o", wall)
+        end)
+
+      per_put = us / 1_000
+      assert per_put < 5, "put at 15k unexpired rows took #{per_put} us per put (floor 5 us)"
+
+      for k <- keys ++ Enum.map(1..1_000, &"#{id}_#{&1}"), do: :ets.delete(HeldCache, k)
+      HeldCache.clear(id)
+    end
   end
 
   defp foreign_lock(expires_in_ms) do
