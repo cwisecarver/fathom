@@ -147,6 +147,35 @@ defmodule Fathom.Telemetry do
         tags: [:result],
         description: "Connection-pool takes on a stream open, by hit/miss"
       ),
+      # A yielded lock wait retried from the BEAM (expert review 2026-10-20-2027 #13), one event
+      # per wait episode. Tagged by kind (:step | :prepare) and result (:ok | :busy), never by
+      # shard. `oversleep_us` is actual minus requested sleep summed over the episode's timed-out
+      # waits: a large value means BEAM timers are late (see the timers-stall-during-dirty-NIF
+      # note), not that the lock was held.
+      counter("fathom.shard.busy_retry.count",
+        event_name: [:fathom, :shard, :busy_retry],
+        tags: [:kind, :result],
+        description: "Lock waits retried from the BEAM after the busy handler yielded"
+      ),
+      sum("fathom.shard.busy_retry.attempts",
+        event_name: [:fathom, :shard, :busy_retry],
+        measurement: :attempts,
+        tags: [:kind, :result],
+        description: "Re-steps spent in yielded lock waits"
+      ),
+      distribution("fathom.shard.busy_retry.wait_us",
+        event_name: [:fathom, :shard, :busy_retry],
+        measurement: :wait_us,
+        tags: [:kind, :result],
+        reporter_options: [buckets: [100, 1_000, 5_000, 20_000, 100_000, 1_000_000, 5_000_000]],
+        description: "Total time a statement spent waiting for a yielded lock, µs"
+      ),
+      sum("fathom.shard.busy_retry.oversleep_us",
+        event_name: [:fathom, :shard, :busy_retry],
+        measurement: :oversleep_us,
+        tags: [:kind, :result],
+        description: "Busy-retry sleep overrun (actual minus requested), µs"
+      ),
       # Held-WAL-fd cache hit/miss on a follower append (expert review 2026-10-19 #16). Tagged by
       # result only (:hit | :miss), never by shard.
       counter("fathom.replication.held_fd.count",
