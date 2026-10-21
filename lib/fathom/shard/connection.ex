@@ -1613,7 +1613,14 @@ defmodule Fathom.Shard.Connection do
           # Mark BEFORE cancelling (expert review 2026-08-01 #46): the cancel is what lets the
           # statement return, so the owner's read of the mark afterwards cannot miss it.
           :atomics.put(flags, @fired_slot, gen)
-          await_disarm(conn, flags, gen, mon)
+
+          # Expert review 2026-10-20-2027 #19: re-read the generation AFTER the mark. The owner
+          # disarms (bumps the generation) and THEN reads the mark; the watchdog marks and THEN
+          # re-reads the generation. Atomics are sequentially consistent, so either the owner sees
+          # the mark (and `stop_watchdog/1` waits for this process) or this re-read sees the
+          # disarm and no cancel is issued. That is what lets `stop_watchdog/1` skip the
+          # synchronous wait for a watchdog whose mark it has not seen.
+          if :atomics.get(flags, @gen_slot) == gen, do: await_disarm(conn, flags, gen, mon)
         end
 
         watchdog_loop(conn, flags, mon)
@@ -1697,24 +1704,35 @@ defmodule Fathom.Shard.Connection do
   # within @cancel_retry_ms; past @watchdog_stop_ms it is killed rather than waited on.
   @watchdog_stop_ms 1_000
 
+  #
+  # Expert review 2026-10-20-2027 #19: the wait is only needed when this watchdog EVER FIRED
+  # (`@fired_slot` != 0): an unfired watchdog has never called `Sqlite3.cancel` on this handle, and
+  # the re-read in `watchdog_loop/3` guarantees a fire the owner has not seen cannot cancel after
+  # its disarm. So the common pooled checkin sends `:stop` and moves on instead of a monitor +
+  # message + DOWN round trip (measured 15 us after a 20 ms gap vs 8 us spawn + async kill). The
+  # `Process.delete` below still drops the handle's entry, so the next stream spawns a fresh one.
   defp stop_watchdog(conn) do
     case Process.delete({__MODULE__, :watchdog, conn}) do
       nil ->
         :ok
 
-      {pid, _flags} ->
-        mon = Process.monitor(pid)
-        send(pid, :stop)
+      {pid, flags} ->
+        if :atomics.get(flags, @fired_slot) == 0 do
+          send(pid, :stop)
+        else
+          mon = Process.monitor(pid)
+          send(pid, :stop)
 
-        receive do
-          {:DOWN, ^mon, :process, _, _} -> :ok
-        after
-          @watchdog_stop_ms ->
-            Process.exit(pid, :kill)
+          receive do
+            {:DOWN, ^mon, :process, _, _} -> :ok
+          after
+            @watchdog_stop_ms ->
+              Process.exit(pid, :kill)
 
-            receive do
-              {:DOWN, ^mon, :process, _, _} -> :ok
-            end
+              receive do
+                {:DOWN, ^mon, :process, _, _} -> :ok
+              end
+          end
         end
     end
 

@@ -69,8 +69,23 @@ defmodule Fathom.ConnectionWatchdogTest do
   # The race itself is scheduler-timed, so the test makes the watchdog SLOW instead: it is suspended
   # (standing in for "not yet scheduled to process :stop") and resumed 50 ms later. Pre-fix,
   # release_owner_state/1 returned at once with the watchdog still alive; now it waits it out.
-  test "release_owner_state/1 returns only once the watchdog is gone (pooled handoff)",
+  #
+  # Expert review 2026-10-20-2027 #19: that wait is only owed by a watchdog that has FIRED (the only
+  # kind that can have a cancel in flight). This test therefore makes its watchdog fire first; the
+  # never-fired case returns without waiting and is pinned by the next test. Before #19 this test
+  # used an unfired watchdog and so pinned the wait for a watchdog that could not cancel anything.
+  test "release_owner_state/1 returns only once a FIRED watchdog is gone (pooled handoff)",
        %{conn: conn} do
+    Application.put_env(:fathom, :query_timeout_ms, 5)
+
+    assert {:error, :query_timeout} =
+             query(
+               conn,
+               "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 5000000) " <>
+                 "SELECT count(*) FROM c",
+               []
+             )
+
     Application.put_env(:fathom, :query_timeout_ms, 5_000)
     assert {:ok, _} = query(conn, "SELECT 1", [])
 
@@ -102,6 +117,42 @@ defmodule Fathom.ConnectionWatchdogTest do
 
     refute Process.alive?(watchdog),
            "the watchdog outlived the handoff, so a late cancel can hit the next stream"
+  end
+
+  # Expert review 2026-10-20-2027 #19. A watchdog that never fired has never cancelled this handle,
+  # so the pooled checkin must not wait for it: the common stream used to pay a monitor + :stop +
+  # DOWN round trip for nothing. The watchdog is FROZEN (suspended) to make the cost deterministic:
+  # a synchronous stop would block until the 1 s kill fallback, an async one returns at once.
+  # Pre-fix this took ~1 s.
+  test "release_owner_state/1 does not wait for a watchdog that never fired", %{conn: conn} do
+    Application.put_env(:fathom, :query_timeout_ms, 5_000)
+    assert {:ok, _} = query(conn, "SELECT 1", [])
+
+    {watchdog, flags} = Process.get({Connection, :watchdog, conn})
+    assert :atomics.get(flags, 2) == 0, "the watchdog fired; the fixture is wrong"
+    mon = Process.monitor(watchdog)
+    test = self()
+
+    spawn(fn ->
+      true = :erlang.suspend_process(watchdog)
+      send(test, :suspended)
+
+      receive do
+        :resume -> :erlang.resume_process(watchdog)
+      end
+    end)
+    |> then(fn helper ->
+      assert_receive :suspended, 1_000
+      {us, :ok} = :timer.tc(fn -> Connection.release_owner_state(conn) end)
+
+      assert us < 300_000,
+             "release_owner_state/1 waited #{div(us, 1000)} ms on an unfired watchdog"
+
+      send(helper, :resume)
+    end)
+
+    # It is still told to stop: once it runs again it exits.
+    assert_receive {:DOWN, ^mon, :process, ^watchdog, _}, 2_000
   end
 
   test "a genuine timeout is still reported", %{conn: conn} do
