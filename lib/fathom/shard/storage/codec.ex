@@ -120,6 +120,25 @@ defmodule Fathom.Shard.Storage.Codec do
   @spec compress_to_temp_hashed(Path.t(), :zlib | :zstd, :md5 | :crc32) ::
           {:ok, Path.t(), non_neg_integer(), binary(), String.t()} | {:error, term()}
   def compress_to_temp_hashed(path, encoding, body_hash \\ :md5) do
+    case compress_to_temp_digests(path, encoding, body_hash, false) do
+      {:ok, tmp, size, body, plain_hex, _no_sha} -> {:ok, tmp, size, body, plain_hex}
+      {:error, _} = error -> error
+    end
+  end
+
+  @doc """
+  `compress_to_temp_hashed/3` that can ALSO hash the plaintext with SHA-256 in the same pass
+  (`plain_sha256? = true`; expert review 2026-10-20-2027 #23). Returns
+  `{:ok, tmp, body_size, body_digest, plain_md5_hex, plain_sha256_hex | nil}`.
+
+  The MD5 stays: it is the object's IDENTITY (`x-amz-meta-fathom-md5`, the PUT intents `Fork`
+  adopts on). The SHA-256 exists only so the PULL can verify the decoded bytes with a cheaper hash
+  than MD5 on CPUs with SHA extensions; it costs the upload one more plaintext hash pass.
+  """
+  @spec compress_to_temp_digests(Path.t(), :zlib | :zstd, :md5 | :crc32, boolean()) ::
+          {:ok, Path.t(), non_neg_integer(), binary(), String.t(), String.t() | nil}
+          | {:error, term()}
+  def compress_to_temp_digests(path, encoding, body_hash, plain_sha256?) do
     tmp = "#{path}.z.#{System.unique_integer([:positive])}"
     ctx = compressor(encoding)
     dctx = init(encoding)
@@ -143,21 +162,27 @@ defmodule Fathom.Shard.Storage.Codec do
           {size + IO.iodata_length(piece), body_hash_update(h, piece)}
         end
 
-        {plain, body} =
+        sha = if plain_sha256?, do: :crypto.hash_init(:sha256)
+
+        {plain, sha, body} =
           Enum.reduce(
             File.stream!(path, @chunk),
-            {:crypto.hash_init(:md5), {0, body_hash_init(body_hash)}},
-            fn chunk, {plain, body} ->
-              {:crypto.hash_update(plain, chunk), write.(compress_chunk(ctx, chunk), body)}
+            {:crypto.hash_init(:md5), sha, {0, body_hash_init(body_hash)}},
+            fn chunk, {plain, sha, body} ->
+              {:crypto.hash_update(plain, chunk), sha && :crypto.hash_update(sha, chunk),
+               write.(compress_chunk(ctx, chunk), body)}
             end
           )
 
         {size, body_h} = write.(compress_finish(ctx), body)
         plain_hex = Base.encode16(:crypto.hash_final(plain), case: :lower)
+        sha_hex = sha && Base.encode16(:crypto.hash_final(sha), case: :lower)
 
-        {size, body_hash_final(body_h), plain_hex}
+        {size, body_hash_final(body_h), plain_hex, sha_hex}
       end)
-      |> then(fn {size, body_md5, plain_hex} -> {:ok, tmp, size, body_md5, plain_hex} end)
+      |> then(fn {size, body_md5, plain_hex, sha_hex} ->
+        {:ok, tmp, size, body_md5, plain_hex, sha_hex}
+      end)
     rescue
       e ->
         File.rm(tmp)
