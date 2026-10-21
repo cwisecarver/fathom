@@ -77,7 +77,10 @@ defmodule Fathom.Shard.HandlePoolTest do
   # tail and MatchError-crashed the coordinator. put must now evict+return ALL the extras. Construct
   # the over-cap state directly, since the public API cannot reach it.
   test "put evicts ALL over-cap handles without crashing (#24)" do
-    over = %HandlePool{idle: %{ro: [], rw: [{:a, 1}, {:b, 2}, {:c, 3}]}, max_per_scope: 1}
+    over = %HandlePool{
+      idle: %{ro: [], rw: [{:a, 1, :fresh}, {:b, 2, :fresh}, {:c, 3, :fresh}]},
+      max_per_scope: 1
+    }
 
     assert {%HandlePool{} = pool, evicted} = HandlePool.put(over, :rw, :d, 4)
 

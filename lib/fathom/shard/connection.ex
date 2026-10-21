@@ -1842,6 +1842,17 @@ defmodule Fathom.Shard.Connection do
     :ok
   end
 
+  @doc """
+  Release this connection's SQLite page cache (`PRAGMA shrink_memory`), for an IDLE pooled handle
+  (expert review 2026-10-21 #15). Best effort: a handle closed underneath it just errors.
+  """
+  @spec shrink_memory(reference()) :: :ok | {:error, term()}
+  def shrink_memory(conn) do
+    Sqlite3.execute(conn, "PRAGMA shrink_memory")
+  rescue
+    e -> {:error, e}
+  end
+
   @doc false
   # Stop this stream's watchdog only (the half of `release_owner_state/1` a pooled checkin still
   # needs once the statements travel with the handle).

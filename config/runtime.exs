@@ -495,6 +495,12 @@ if ms = System.get_env("POOL_DRAIN_GRACE_MS") do
   config :fathom, :connection_pool_opts, drain_grace_ms: String.to_integer(ms)
 end
 
+# Expert review 2026-10-21 #15: how long a POOLED idle handle sits before `PRAGMA shrink_memory`
+# releases its SQLite page cache (up to 2 MiB; nothing else returns it). Default 5000 ms; 0 = off.
+if ms = System.get_env("POOL_SHRINK_IDLE_MS") do
+  config :fathom, :connection_pool_opts, shrink_idle_ms: String.to_integer(ms)
+end
+
 # Perf review 2026-10-14 #16: node-wide cap on idle pooled handles (default 8192). Over it a checkin
 # is closed instead of pooled; a checkout is never refused.
 if n = System.get_env("POOL_IDLE_BUDGET") do

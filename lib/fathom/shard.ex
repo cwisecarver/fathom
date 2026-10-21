@@ -2065,10 +2065,20 @@ defmodule Fathom.Shard do
 
     # Off the coordinator, on the close chain (expert review 2026-10-17 #19; see `pool_checkin/3`).
     state = if expired == [], do: state, else: start_close(state, expired)
+    {pool, shrinkable} = HandlePool.begin_shrink(pool, System.monotonic_time(:millisecond))
+    state = if shrinkable == [], do: state, else: start_shrink(state, shrinkable)
     # cancel_sweep, not just clearing the field: a tick from a timer cancelled by drain_pool can
     # already be in the mailbox when checkin arms a new one, and cancelling here keeps it to ONE
     # live timer instead of two chains.
     {:noreply, schedule_sweep(cancel_sweep(put_pool(state, pool)))}
+  end
+
+  # A shrink side process finished (expert review 2026-10-21 #15): its handles become lendable again.
+  def handle_info({:shrink_done, _handles}, %{pool: nil} = state), do: {:noreply, state}
+
+  def handle_info({:shrink_done, handles}, %{pool: pool} = state) do
+    # Count is unchanged, so no PoolBudget adjust. Re-arm: a handle may be waiting to age in.
+    {:noreply, schedule_sweep(%{state | pool: HandlePool.end_shrink(pool, handles)})}
   end
 
   # The pool drain grace ran out (perf review 2026-10-14 #4; see THE POOL DRAIN GRACE above
@@ -2748,7 +2758,8 @@ defmodule Fathom.Shard do
       HandlePool.new(
         max_per_scope: Keyword.get(cfg, :max_per_scope, 1),
         ttl_ms: Keyword.get(cfg, :ttl_ms, 30_000),
-        drain_grace_ms: Keyword.get(cfg, :drain_grace_ms, 250)
+        drain_grace_ms: Keyword.get(cfg, :drain_grace_ms, 250),
+        shrink_idle_ms: Keyword.get(cfg, :shrink_idle_ms, 5_000)
       )
     else
       nil
@@ -3383,6 +3394,27 @@ defmodule Fathom.Shard do
     :ok
   rescue
     e -> Logger.warning("shard #{id}: pooled-handle close crashed (#{Exception.message(e)})")
+  end
+
+  # `PRAGMA shrink_memory` on idle pooled handles, on a monitored side process (expert review
+  # 2026-10-21 #15). The page cache of an idle handle is up to 2 MiB (`cache_size`) and nothing else
+  # ever returns it. The handles are already marked :shrinking in the pool, so `HandlePool.take/2`
+  # will not lend them while this runs; they stay in the pool, so drain/terminate still close them,
+  # and the pid rides `side_closes` so the chain and `close_pool/1` wait for it before closing.
+  # `:shrink_done` is sent from `after`, so a crashed shrink still releases the handles.
+  defp start_shrink(state, handles) do
+    parent = self()
+
+    {pid, ref} =
+      spawn_monitor(fn ->
+        try do
+          Enum.each(handles, &Connection.shrink_memory(bare_conn(&1)))
+        after
+          send(parent, {:shrink_done, handles})
+        end
+      end)
+
+    %{state | side_closes: Map.put(state.side_closes, ref, pid)}
   end
 
   defp bare_conn({conn, _cache}), do: conn
@@ -6019,8 +6051,15 @@ defmodule Fathom.Shard do
   defp schedule_sweep(%{sweep_timer: timer} = state) when timer != nil, do: state
 
   defp schedule_sweep(%{pool: pool} = state) do
+    # One pool-level timer serves both jobs (no per-handle timers): the ttl cadence, tightened to
+    # the shrink threshold only while an un-shrunk handle is waiting to age in (2026-10-21 #15).
+    interval =
+      if HandlePool.shrink_pending?(pool),
+        do: min(pool.ttl_ms, pool.shrink_idle_ms),
+        else: pool.ttl_ms
+
     if HandlePool.count(pool) > 0,
-      do: %{state | sweep_timer: Process.send_after(self(), :sweep_pool, pool.ttl_ms)},
+      do: %{state | sweep_timer: Process.send_after(self(), :sweep_pool, interval)},
       else: state
   end
 
