@@ -309,6 +309,9 @@ defmodule Fathom.Shard.Replication.Session do
        # error. `Fathom.Shard.Replication.Wal` revalidates it by INODE on every use, so an
        # unlink+recreate reopens rather than silently serving the old generation.
        wal_fd: nil,
+       # The armed quiet-shard fd release timer (expert review 2026-10-20-2027 #2), nil when none.
+       # See `handle_info({:release_wal_fds, _}, _)`.
+       fd_release_ref: nil,
        # PER-FOLLOWER position: %{shipper => %{wal_gen, salt1, offset}}.
        #
        # A single shared offset was the original shape and it made catch-up impossible: followers
@@ -410,7 +413,9 @@ defmodule Fathom.Shard.Replication.Session do
       :telemetry.execute([:fathom, :replication, :commit_dropped], %{count: 1}, %{})
       {:reply, {:error, :timeout}, state}
     else
-      run_commit(wal_path, mode, commit_deadline(now, caller_deadline), state)
+      wal_path
+      |> run_commit(mode, commit_deadline(now, caller_deadline), state)
+      |> with_fd_release()
     end
   end
 
@@ -785,8 +790,35 @@ defmodule Fathom.Shard.Replication.Session do
   def handle_info({:idle_close?, coordinator, token}, state) do
     {verdict, state} = idle_close_verdict(state)
     send(coordinator, {:idle_close_verdict, token, verdict})
-    {:noreply, state}
+    {:noreply, arm_fd_release(state)}
   end
+
+  # RELEASE THE HELD WAL / -shm FDS ON A QUIET SHARD (expert review 2026-10-20-2027 #2).
+  #
+  # `wal_fd` pins the `-wal` inode and its `-shm` wal-index. When the shard's last SQLite connection
+  # closes (the pool drain grace, or a stream's own close with pooling off), SQLite checkpoints and
+  # UNLINKS both files, but this Session lives as long as the coordinator (60 s idle) and kept both
+  # fds open on the deleted inodes until then: 2 fds per shard touched in the last minute, invisible
+  # to `du`, holding up to the WAL's size of disk each. 1k distinct shards/s is ~120k fds — past a
+  # 65,536 nofile, i.e. `emfile` for every open on the node.
+  #
+  # So: if no commit (tenant or catch-up) has run for a whole `fd_release_ms/0`, close them. A timer
+  # rather than a coordinator notification because the last close happens on several paths
+  # (the pool's off-process close chain, a non-pooled stream's own close, terminate), and none of
+  # them needs to know this process exists; a quiet shard's fds go at most ~2x the interval after
+  # its last commit. A busy shard pays one timer per interval and no syscall.
+  #
+  # DURABILITY: closing the handle is the Session's starting state (`wal_fd: nil`). The next
+  # `Wal.read_held/2` stats, reopens and re-pins the inode, and with no cursor derives the extent
+  # from the wal-index or the backward walk — exactly as a fresh Session's first commit does. No
+  # position, `seen` or follower record is touched, so nothing about what was shipped or acked
+  # changes; only a stale cursor (a walk-length hint) is dropped.
+  def handle_info({:release_wal_fds, at}, %{commits: at} = state),
+    do: {:noreply, %{state | wal_fd: Wal.close_held(state.wal_fd), fd_release_ref: nil}}
+
+  # A commit ran since the timer was armed: the shard is busy, look again one interval later.
+  def handle_info({:release_wal_fds, _at}, state),
+    do: {:noreply, arm_fd_release(%{state | fd_release_ref: nil})}
 
   def handle_info(:catch_up, %{wal_path: nil} = state),
     do: {:noreply, clear_catchup(state)}
@@ -855,6 +887,23 @@ defmodule Fathom.Shard.Replication.Session do
     _ = Wal.close_held(Map.get(state, :wal_fd))
     unregister(state)
   end
+
+  # The quiet-shard fd release (#2, `handle_info({:release_wal_fds, _}, _)`). Armed whenever a held
+  # fd exists and no timer is; carries the commit count at arm time so the fire can tell quiet from
+  # busy without a syscall.
+  defp with_fd_release({:reply, reply, state}), do: {:reply, reply, arm_fd_release(state)}
+
+  defp arm_fd_release(%{wal_fd: fd, fd_release_ref: nil} = state) when fd != nil do
+    ref = Process.send_after(self(), {:release_wal_fds, state.commits}, fd_release_ms())
+    %{state | fd_release_ref: ref}
+  end
+
+  defp arm_fd_release(state), do: state
+
+  @doc false
+  # How long a Session keeps its WAL/-shm fds with no commit (#2). Long enough that a steadily
+  # writing shard never reopens; short against the coordinator's 60 s idle stop.
+  def fd_release_ms, do: Application.get_env(:fathom, :replication_fd_release_ms, 1_000)
 
   # A reply cannot exist before the commit that provoked it, so `wal_path` is always set by the time
   # this runs. Matching on it anyway keeps a reply that somehow arrived first from crashing the

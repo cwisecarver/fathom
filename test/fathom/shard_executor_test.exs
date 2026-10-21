@@ -625,8 +625,11 @@ defmodule Fathom.ShardExecutorTest do
 
     log = capture_log(fn -> assert Fathom.Application.check_pool_fd_budget!() == nil end)
     assert log =~ "connection_pool is ON"
-    # per_shard = 1 + 2*2 = 5, so 1000 coordinators -> ~5000 connections.
-    assert log =~ "5000 connections"
+
+    # Expert review 2026-10-20-2027 #2: counted in FDS (lsof). 5 connections (1 + 2*2) at 2 fds each,
+    # plus the shared -shm = 11 per shard. Previously asserted "5000 connections" (1 fd/connection),
+    # about half the real number.
+    assert log =~ "11000 fds"
 
     # Quiet when the cap is unbounded (nothing to inflate past).
     Application.put_env(:fathom, :max_open_shards, :infinity)
@@ -666,15 +669,17 @@ defmodule Fathom.ShardExecutorTest do
 
     log = capture_log(fn -> assert Fathom.Application.check_pool_fd_budget!() == nil end)
     assert log =~ "replication is ON"
-    # per_shard = 1 coordinator connection + 1 WAL fd.
-    assert log =~ "2000 connections"
+
+    # per_shard = 1 coordinator connection (2 fds) + -shm + the Session's -wal and -shm (2026-10-20-2027
+    # #2: previously counted as 1 + 1 = "2000 connections").
+    assert log =~ "5000 fds"
     refute log =~ "connection_pool is ON"
 
-    # Both on: 1 + 2*1 (default max_per_scope 1) + 1.
+    # Both on: 3 connections (1 + 2*1, default max_per_scope 1) * 2 + -shm + 2 replication fds.
     Application.put_env(:fathom, :connection_pool, true)
     Application.delete_env(:fathom, :connection_pool_opts)
     log = capture_log(fn -> Fathom.Application.check_pool_fd_budget!() end)
-    assert log =~ "4000 connections"
+    assert log =~ "9000 fds"
 
     # Replication off and pool off: quiet.
     Application.put_env(:fathom, :connection_pool, false)

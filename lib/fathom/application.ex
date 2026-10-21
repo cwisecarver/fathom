@@ -504,9 +504,9 @@ defmodule Fathom.Application do
   def check_pool_fd_budget! do
     cap = Application.get_env(:fathom, :max_open_shards, :infinity)
     pooled? = Application.get_env(:fathom, :connection_pool, false) == true
-    # Replication holds ONE raw WAL read fd per replicated shard on top of the coordinator's
-    # connection (`Session`'s `wal_fd`, expert review 2026-08-26 #32), invisible to the cap too
-    # (expert review 2026-10-10 #P1).
+    # Replication holds a raw read fd on the `-wal` AND one on the `-shm` wal-index per replicated
+    # shard (`Session`'s `wal_fd`, expert review 2026-08-26 #32 and 2026-10-20 #1), invisible to
+    # the cap too (expert review 2026-10-10 #P1).
     replicating? = Application.get_env(:fathom, :replication_enabled, false) == true
 
     if Application.get_env(:fathom, :env) == :prod and (pooled? or replicating?) and
@@ -514,26 +514,31 @@ defmodule Fathom.Application do
       cfg = Application.get_env(:fathom, :connection_pool_opts, [])
       per_scope = Keyword.get(cfg, :max_per_scope, 1)
 
-      # The coordinator's own working connection plus up to max_per_scope idle handles in each of the
-      # two scopes (:ro, :rw), plus the held WAL fd when replicating.
+      # FDS, NOT CONNECTIONS (expert review 2026-10-20-2027 #2). Counted with lsof on this repo's
+      # exqlite: a WAL-mode connection holds TWO fds (`.db` and `-wal`), and the shard's `-shm` is ONE
+      # fd per OS process however many connections map it (SQLite shares one `unixShmNode` per
+      # inode). The old count was one fd per connection plus one for replication, about half the
+      # real number. Connections are the coordinator's working one plus up to max_per_scope idle
+      # handles in each of the two scopes (:ro, :rw); replicating adds the Session's -wal and -shm
+      # read fds (released ~1 s after a shard's last commit, but held by every active one).
       pool_extra = if pooled?, do: 2 * per_scope, else: 0
-      per_shard = 1 + pool_extra + if(replicating?, do: 1, else: 0)
+      per_shard = 2 * (1 + pool_extra) + 1 + if(replicating?, do: 2, else: 0)
 
       why =
         [
           pooled? &&
             "connection_pool is ON (up to #{2 * per_scope} idle pooled handles per shard, " <>
               "max_per_scope=#{per_scope})",
-          replicating? && "replication is ON (one held WAL read fd per replicated shard)"
+          replicating? && "replication is ON (two held -wal/-shm read fds per replicated shard)"
         ]
         |> Enum.filter(& &1)
         |> Enum.join(" and ")
 
       Logger.warning(
         "config warning: #{why} with :max_open_shards = #{cap}, but that cap bounds COORDINATORS only. Each open shard " <>
-          "can hold up to #{per_shard} fds/connections, so the node can hold " <>
-          "~#{cap * per_shard} connections, not #{cap}. Size :max_open_shards and the OS fd " <>
-          "limit (ulimit -n) for #{cap} * #{per_shard} = #{cap * per_shard} connections, or the " <>
+          "can hold up to #{per_shard} fds (2 per SQLite connection, plus -shm and replication), " <>
+          "so the node can hold ~#{cap * per_shard} fds, not #{cap}. Size :max_open_shards and " <>
+          "the OS fd limit (ulimit -n) for #{cap} * #{per_shard} = #{cap * per_shard} fds, or the " <>
           "node hits emfile well below the intended shard count (expert review 2026-09-18 #12)."
       )
     end
