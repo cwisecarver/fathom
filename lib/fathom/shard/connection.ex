@@ -74,11 +74,17 @@ defmodule Fathom.Shard.Connection do
 
     case open_handle_ensuring_dir(path, scope, tenant?, dir) do
       {:ok, conn, :readonly} ->
-        track_open(close_on_error(conn, configure_readonly(conn, tenant?, guard_opts)))
+        track_open(
+          close_on_error(conn, configure_readonly(conn, tenant?, guard_opts)),
+          tenant?,
+          path
+        )
 
       {:ok, conn, :readwrite} ->
         track_open(
-          close_on_error(conn, configure_readwrite(conn, tenant?, scope, guard_opts, wal?))
+          close_on_error(conn, configure_readwrite(conn, tenant?, scope, guard_opts, wal?)),
+          tenant?,
+          path
         )
 
       {:error, reason} ->
@@ -130,7 +136,7 @@ defmodule Fathom.Shard.Connection do
       :ets.new(@live_table, [:named_table, :public, :set, write_concurrency: true])
     end
 
-    :ok
+    create_busy_queue()
   end
 
   @doc "Number of connections opened through `open/2` and not yet closed through `close/1`."
@@ -142,12 +148,17 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  defp track_open({:ok, conn} = ok) do
-    _ = if :ets.whereis(@live_table) != :undefined, do: :ets.insert(@live_table, {live_key(conn)})
+  # A TENANT handle's row carries its file path: the busy queue's shard key (expert review
+  # 2026-10-20-2027 #13), read only on the lock-contended path (`busy_shard/1`).
+  defp track_open({:ok, conn} = ok, tenant?, path) do
+    _ =
+      if :ets.whereis(@live_table) != :undefined,
+        do: :ets.insert(@live_table, {live_key(conn), if(tenant?, do: path)})
+
     ok
   end
 
-  defp track_open(other), do: other
+  defp track_open(other, _tenant?, _path), do: other
 
   defp live_key(conn), do: :erlang.ref_to_list(conn)
 
@@ -869,20 +880,35 @@ defmodule Fathom.Shard.Connection do
     # RPO), and its drop keeps the local copy instead of uploading it. The deadline bounds what a
     # CLIENT can make the node do; `Fathom.ShardExecutor` is the one path that runs client SQL, and
     # it opts in.
-    case Keyword.get(opts, :deadline, false) && timeout_ms() do
-      falsy when falsy in [nil, false] ->
-        do_query(conn, sql, args, dml?, read?, control?, state?, nil)
+    # Busy-queue admission (expert review 2026-10-20-2027 #13, see `busy_gate/1`): while this
+    # shard has queued lock waiters, a DML statement outside any transaction joins the queue
+    # instead of barging past it.
+    if dml? and not read? and busy_waiters?(), do: busy_gate(conn)
 
-      ms when is_integer(ms) and ms > 0 ->
-        with_deadline(conn, ms, fn deadline_at ->
-          do_query(conn, sql, args, dml?, read?, control?, state?, deadline_at)
-        end)
+    result =
+      case Keyword.get(opts, :deadline, false) && timeout_ms() do
+        falsy when falsy in [nil, false] ->
+          do_query(conn, sql, args, dml?, read?, control?, state?, nil)
 
-      _ ->
-        do_query(conn, sql, args, dml?, read?, control?, state?, nil)
-    end
+        ms when is_integer(ms) and ms > 0 ->
+          with_deadline(conn, ms, fn deadline_at ->
+            do_query(conn, sql, args, dml?, read?, control?, state?, deadline_at)
+          end)
+
+        _ ->
+          do_query(conn, sql, args, dml?, read?, control?, state?, nil)
+      end
+
+    # Busy-queue handoff (expert review 2026-10-20-2027 #13, see `busy_wait/6`). A read-verb
+    # statement never frees a write lock, and a BUSY result never held one, so neither wakes.
+    busy_ungate()
+    if not read? and busy_waiters?(), do: wake_after(conn, result)
+    result
   rescue
     e in ArgumentError -> {:error, Exception.message(e)}
+  after
+    # Idempotent; here so a raise cannot strand the gate ticket at the head of the queue.
+    busy_ungate()
   end
 
   defp do_query(conn, sql, args, dml?, read?, control?, state?, deadline_at) do
@@ -1015,15 +1041,36 @@ defmodule Fathom.Shard.Connection do
   # timeout still maps to FILO_QUERY_TIMEOUT in `with_deadline/3`. No extension (cargo absent) -> no
   # yield, the handler waited out the full timeout already, and the budget read fails -> no retry.
   #
-  # The backoff is SQLite's own ladder. A shorter one (capped at 20 ms) was tried and made same-shard
-  # write p99 WORSE (K=32 writers on one shard: ~38 ms -> 67-85 ms, in-process probe, 2026-10-20):
-  # more retriers collide on the lock. What this change does cost: with waiters on dirty threads,
-  # the dirty-IO run queue acted as a FIFO admission gate for the hot shard, so its write p99 was
-  # lower (K=16: ~0.5 ms vs ~11 ms now) — paid for by every OTHER tenant on the node (unrelated
-  # File.stat p99 33 ms / 153 ms at K=16 / 32, now ~0.1 ms). A per-shard FIFO write token would
-  # restore the hot shard's fairness without the cross-tenant cost; not built (expert review
-  # 2026-10-20 #2 option b).
+  # FAIRNESS (expert review 2026-10-20-2027 #13). The first version backed off on SQLite's own
+  # 1..100 ms ladder, per waiter and per statement. That is ~LIFO: a waiter already on 50-100 ms
+  # steps loses the lock to every newcomer still on 1-2 ms steps, so the hot shard's write tail
+  # was bad (in-process probe `busy_fairness_bench_test.exs`, K closed-loop writers on one shard:
+  # K=16 p99 22 ms / max 946 ms, K=32 p99 38 ms / max 2.2 s). A plain shorter ladder (capped at
+  # 20 ms) was tried first and made it WORSE (K=32 ~38 -> 67-85 ms): more blind retriers collide
+  # on the lock. So the wait is now a per-shard FIFO queue (`busy_wait/6`):
+  #
+  #   * a statement that gets a yielded BUSY joins its shard's queue (an ordered ETS set keyed by
+  #     `{path, arrival}`) and waits for a wake message, not a timer;
+  #   * a statement on that shard that ends with the connection in AUTOCOMMIT (an autocommit write,
+  #     a COMMIT/ROLLBACK — the moments the write lock goes free) wakes the queue's HEAD only
+  #     (`wake_busy_head/2`, called from `query/4`); the head retries, and when its own statement
+  #     completes it wakes the next;
+  #   * while a queue exists, a new autocommit DML statement joins it instead of barging
+  #     (`busy_gate/1`, which says why BEGIN and in-transaction statements are not gated);
+  #   * only the head also polls, on a ladder capped at 20 ms (`@busy_head_poll_ms`): the lock can
+  #     be held by something that never wakes anyone — fathom's own handles (checkpoint, snapshot),
+  #     a tenant script, a stream that rolled back by closing. Non-head waiters poll only every
+  #     `@busy_tail_poll_ms` as a liveness backstop (a head that died without dequeuing).
+  #
+  # The hot path pays one `:persistent_term` read + one `:atomics` read per statement (the
+  # node-wide waiter count, `busy_waiters?/0`); everything else runs only while someone waits.
   @busy_ladder_ms {1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100}
+  @busy_head_poll_ms {1, 2, 5, 10, 15, 20}
+  @busy_tail_poll_ms 100
+  @busy_queue __MODULE__.BusyQueue
+  @busy_waiters {__MODULE__, :busy_waiters}
+  @busy_gate_key {__MODULE__, :busy_gate}
+  @busy_gate_max_ms 1_000
 
   # exqlite's message for a `prepare` the busy handler gave up on (SQLITE_BUSY).
   @locked "database is locked"
@@ -1037,31 +1084,21 @@ defmodule Fathom.Shard.Connection do
 
   defp retry_busy(conn, stmt, cap, deadline_at) do
     with {:ok, budget_ms} when budget_ms > 0 <- busy_retry_budget_ms(conn) do
-      give_up_at = System.monotonic_time(:millisecond) + budget_ms
-      give_up_at = if deadline_at, do: min(give_up_at, deadline_at), else: give_up_at
-      retry_busy(conn, stmt, cap, give_up_at, 0)
+      # `busy_wait/6` serves both the step and the prepare retry, so dialyzer's success typing for
+      # it is the union of both; the match narrows it back to what `collect/3` returns.
+      case busy_wait(
+             conn,
+             :step,
+             give_up_at(budget_ms, deadline_at),
+             fn -> collect(conn, stmt, cap) end,
+             &(&1 == :busy_before_rows),
+             {:error, :busy}
+           ) do
+        {:ok, _rows, _count} = done -> done
+        {:error, _} = err -> err
+      end
     else
       _ -> {:error, :busy}
-    end
-  end
-
-  defp retry_busy(conn, stmt, cap, give_up_at, attempt) do
-    left = give_up_at - System.monotonic_time(:millisecond)
-
-    if left <= 0 do
-      {:error, :busy}
-    else
-      step = elem(@busy_ladder_ms, min(attempt, tuple_size(@busy_ladder_ms) - 1))
-
-      receive do
-      after
-        min(step, left) -> :ok
-      end
-
-      case collect(conn, stmt, cap) do
-        :busy_before_rows -> retry_busy(conn, stmt, cap, give_up_at, attempt + 1)
-        other -> other
-      end
     end
   end
 
@@ -1069,16 +1106,25 @@ defmodule Fathom.Shard.Connection do
   # handle whose schema is not loaded reads the schema, which needs a SHARED lock, so the busy handler
   # can yield DURING `prepare` (e.g. while another handle holds EXCLUSIVE in rollback-journal mode, or
   # a last-close checkpoint+unlink). `prepare` reports that as the message "database is locked", and
-  # only a step-time BUSY used to be retried, so this failed at once. Same budget and ladder as
-  # `retry_busy/5`; re-preparing is valid for the same reason (the handler runs only while the
+  # only a step-time BUSY used to be retried, so this failed at once. Same budget and queue as
+  # `retry_busy/4`; re-preparing is valid for the same reason (the handler runs only while the
   # connection holds no transaction on the database).
   defp prepare_retrying(conn, sql, deadline_at) do
     case Sqlite3.prepare(conn, sql) do
       {:error, @locked} = locked ->
         with {:ok, budget_ms} when budget_ms > 0 <- busy_retry_budget_ms(conn) do
-          give_up_at = System.monotonic_time(:millisecond) + budget_ms
-          give_up_at = if deadline_at, do: min(give_up_at, deadline_at), else: give_up_at
-          retry_prepare(conn, sql, give_up_at, 0)
+          # Narrowed for dialyzer, as in `retry_busy/4`.
+          case busy_wait(
+                 conn,
+                 :prepare,
+                 give_up_at(budget_ms, deadline_at),
+                 fn -> Sqlite3.prepare(conn, sql) end,
+                 &(&1 == locked),
+                 locked
+               ) do
+            {:ok, stmt} when is_reference(stmt) -> {:ok, stmt}
+            {:error, _} = err -> err
+          end
         else
           _ -> locked
         end
@@ -1088,25 +1134,270 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  defp retry_prepare(conn, sql, give_up_at, attempt) do
+  defp give_up_at(budget_ms, deadline_at) do
+    give_up_at = System.monotonic_time(:millisecond) + budget_ms
+    if deadline_at, do: min(give_up_at, deadline_at), else: give_up_at
+  end
+
+  @doc false
+  # Called from `create_live_table/0` at boot. Without it (a bare script) the queue is off and a
+  # yielded wait falls back to the plain ladder.
+  @spec create_busy_queue() :: :ok
+  def create_busy_queue do
+    if :ets.whereis(@busy_queue) == :undefined do
+      :ets.new(@busy_queue, [:named_table, :public, :ordered_set])
+    end
+
+    if :persistent_term.get(@busy_waiters, nil) == nil,
+      do: :persistent_term.put(@busy_waiters, :atomics.new(1, signed: true))
+
+    :ok
+  end
+
+  # One yielded-lock wait episode: enqueue, wait/retry until `attempt` stops returning BUSY or the
+  # budget runs out, dequeue (in `after`, so a raise cannot strand the entry), one telemetry event.
+  #
+  # A statement admitted through `busy_gate/1` keeps its gate ticket (and so its place in line)
+  # for its retry; the gate's owner dequeues it.
+  defp busy_wait(conn, kind, give_up_at, attempt, busy?, gave_up) do
+    started = System.monotonic_time(:microsecond)
+    gate = Process.get(@busy_gate_key)
+    ticket = gate || busy_enqueue(conn)
+
+    {result, attempts, oversleep_us} =
+      try do
+        busy_loop(ticket, give_up_at, attempt, busy?, gave_up, 0, 0)
+      after
+        if gate == nil, do: busy_dequeue(ticket)
+      end
+
+    :telemetry.execute(
+      [:fathom, :shard, :busy_retry],
+      %{
+        attempts: attempts,
+        wait_us: System.monotonic_time(:microsecond) - started,
+        oversleep_us: oversleep_us
+      },
+      %{kind: kind, result: if(busy?.(result) or result == gave_up, do: :busy, else: :ok)}
+    )
+
+    result
+  end
+
+  defp busy_loop(ticket, give_up_at, attempt, busy?, gave_up, n, oversleep_us) do
     left = give_up_at - System.monotonic_time(:millisecond)
 
     if left <= 0 do
-      {:error, @locked}
+      {gave_up, n, oversleep_us}
     else
-      step = elem(@busy_ladder_ms, min(attempt, tuple_size(@busy_ladder_ms) - 1))
+      wait_ms = min(busy_poll_ms(ticket, n), left)
+      t0 = System.monotonic_time(:microsecond)
 
-      receive do
-      after
-        min(step, left) -> :ok
-      end
+      oversleep_us =
+        if busy_await(ticket, wait_ms) == :woken,
+          do: oversleep_us,
+          else: oversleep_us + max(0, System.monotonic_time(:microsecond) - t0 - wait_ms * 1000)
 
-      case Sqlite3.prepare(conn, sql) do
-        {:error, @locked} -> retry_prepare(conn, sql, give_up_at, attempt + 1)
-        other -> other
+      result = attempt.()
+
+      if busy?.(result),
+        do: busy_loop(ticket, give_up_at, attempt, busy?, gave_up, n + 1, oversleep_us),
+        else: {result, n + 1, oversleep_us}
+    end
+  end
+
+  # No ticket (no queue table, or not a tenant handle): a plain sleep.
+  defp busy_await(nil, wait_ms) do
+    receive do
+    after
+      wait_ms -> :timeout
+    end
+  end
+
+  defp busy_await({_key, alias}, wait_ms) do
+    receive do
+      {:fathom_busy_wake, ^alias} -> :woken
+    after
+      wait_ms -> :timeout
+    end
+  end
+
+  # No ticket: the plain SQLite ladder, as before the queue.
+  defp busy_poll_ms(nil, n), do: ladder(@busy_ladder_ms, n)
+
+  defp busy_poll_ms(ticket, n) do
+    if busy_head?(ticket), do: ladder(@busy_head_poll_ms, n), else: @busy_tail_poll_ms
+  end
+
+  defp ladder(steps, n), do: elem(steps, min(n, tuple_size(steps) - 1))
+
+  # ADMISSION. Waking only the head is not enough on its own: the stream that just released the
+  # lock is usually back with its next write before the woken head has been scheduled, so the head
+  # lost nearly every handoff and the queue barely moved (measured, K=32 autocommit writers in a
+  # closed loop: p99 38 -> 122 ms with wake-only, throughput halved). So while a shard has a queue,
+  # a DML statement (`dml?`, the executor's verb check) on a connection that holds no transaction
+  # (autocommit: the one dirty dispatch this costs, paid only then) queues at the tail and runs
+  # when woken. Not gated:
+  #   * a connection INSIDE a transaction: it may hold the write lock the head is waiting for, and
+  #     queuing it would deadlock until the poll fallback;
+  #   * BEGIN and other non-DML statements: a deferred BEGIN takes no lock, and gating it would
+  #     hold the queue's turn across the client's whole transaction, reads and round trips
+  #     included (Django's ATOMIC_REQUESTS wraps every view, read-only ones too).
+  # Bounded: the head proceeds after its first poll, a non-head after `@busy_gate_max_ms`, so a
+  # lost wake costs latency, never liveness.
+  defp busy_gate(conn) do
+    with path when is_binary(path) <- busy_shard(conn),
+         {_, _} = head <- busy_head(path),
+         :ok <- reap_if_dead(head),
+         true <- autocommit?(conn),
+         {_, _} = ticket <- busy_enqueue_path(path) do
+      Process.put(@busy_gate_key, ticket)
+      gate_loop(ticket, System.monotonic_time(:millisecond) + @busy_gate_max_ms, 0)
+    end
+  end
+
+  defp gate_loop(ticket, until, n) do
+    head? = busy_head?(ticket)
+    wait_ms = if head?, do: ladder(@busy_head_poll_ms, n), else: @busy_tail_poll_ms
+
+    cond do
+      busy_await(ticket, wait_ms) == :woken -> :ok
+      head? or System.monotonic_time(:millisecond) >= until -> :ok
+      true -> gate_loop(ticket, until, n + 1)
+    end
+  end
+
+  defp busy_ungate do
+    case Process.delete(@busy_gate_key) do
+      nil -> :ok
+      ticket -> busy_dequeue(ticket)
+    end
+  end
+
+  # A ticket is `{key, alias}`: `key = {path, arrival}` orders the shard's queue in ETS, and the
+  # wake message goes to the waiter's process ALIAS. Dequeuing unaliases it, so a wake that loses
+  # the race with the dequeue is dropped by the runtime instead of landing in the stream process's
+  # mailbox, where it would sit forever (or reach a `handle_info` that does not expect it).
+  defp busy_enqueue(conn) do
+    case busy_shard(conn) do
+      path when is_binary(path) -> busy_enqueue_path(path)
+      _ -> nil
+    end
+  end
+
+  defp busy_enqueue_path(path) do
+    case :persistent_term.get(@busy_waiters, nil) do
+      nil ->
+        nil
+
+      counter ->
+        key = {path, :erlang.unique_integer([:monotonic, :positive])}
+        alias = :erlang.alias()
+        true = :ets.insert(@busy_queue, {key, self(), alias})
+        :atomics.add(counter, 1, 1)
+        {key, alias}
+    end
+  end
+
+  defp busy_dequeue(nil), do: :ok
+
+  defp busy_dequeue({key, alias}) do
+    _ = :erlang.unalias(alias)
+    busy_remove(key)
+    flush_busy_wakes(alias)
+  end
+
+  defp busy_remove(key) do
+    if :ets.take(@busy_queue, key) != [],
+      do: :atomics.sub(:persistent_term.get(@busy_waiters), 1, 1)
+
+    :ok
+  end
+
+  defp flush_busy_wakes(alias) do
+    receive do
+      {:fathom_busy_wake, ^alias} -> flush_busy_wakes(alias)
+    after
+      0 -> :ok
+    end
+  end
+
+  # Only TENANT handles carry their path in the live table (`open/2`): fathom's own handles never
+  # yield a lock wait, so they neither queue, nor are gated, nor wake anyone.
+  defp busy_shard(conn) do
+    case :ets.lookup(@live_table, live_key(conn)) do
+      [{_, path}] -> path
+      _ -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  # The first queue key for `path`, or nil. Arrival numbers are positive, so `{path, 0}` sorts
+  # immediately before the shard's first key.
+  defp busy_head(path) do
+    case :ets.next(@busy_queue, {path, 0}) do
+      {^path, _} = key -> key
+      _ -> nil
+    end
+  end
+
+  defp busy_head?({{path, _} = key, _alias}), do: busy_head(path) == key
+
+  defp busy_waiters? do
+    case :persistent_term.get(@busy_waiters, nil) do
+      nil -> false
+      counter -> :atomics.get(counter, 1) > 0
+    end
+  end
+
+  # A waiter killed mid-wait never ran its `after`, so its row would stay at the head of the queue
+  # and every gated writer behind it would wait out `@busy_gate_max_ms` (measured: 994 ms without
+  # this). Checked where a head is about to be trusted: on admission, and on each wake. A ghost on
+  # a shard that never sees another write stays until that shard's next contended statement; its
+  # only cost meanwhile is that `busy_waiters?/0` reads true, so each non-read statement node-wide
+  # pays the two ETS reads that find its own shard has no queue.
+  defp reap_if_dead(key) do
+    case :ets.lookup(@busy_queue, key) do
+      [{_, pid, _alias}] -> if Process.alive?(pid), do: :ok, else: busy_remove(key)
+      [] -> :ok
+    end
+  end
+
+  # After a statement: if anyone waits on this shard and the connection is now in autocommit (so
+  # it holds no write lock), hand the lock to the queue's head. `autocommit` is the flag the
+  # statement already fetched (`conn_state?`), or nil to ask SQLite — a dirty dispatch, paid only
+  # while someone is queued on this shard.
+  defp wake_busy_head(conn, autocommit) do
+    with path when is_binary(path) <- busy_shard(conn),
+         {_, _} <- busy_head(path),
+         true <- if(is_boolean(autocommit), do: autocommit, else: autocommit?(conn)) do
+      wake_head(path)
+    end
+
+    :ok
+  end
+
+  defp wake_head(path) do
+    with {_, _} = key <- busy_head(path) do
+      case :ets.lookup(@busy_queue, key) do
+        [{_, pid, alias}] ->
+          if Process.alive?(pid) do
+            send(alias, {:fathom_busy_wake, alias})
+          else
+            busy_remove(key)
+            wake_head(path)
+          end
+
+        [] ->
+          wake_head(path)
       end
     end
   end
+
+  defp wake_after(_conn, {:error, :busy}), do: :ok
+  defp wake_after(conn, {:ok, %{autocommit?: ac}}), do: wake_busy_head(conn, ac)
+  defp wake_after(conn, _), do: wake_busy_head(conn, nil)
 
   # How long to keep retrying: the handle's busy timeout when the handler yielded for the statement
   # that just returned BUSY, else 0
