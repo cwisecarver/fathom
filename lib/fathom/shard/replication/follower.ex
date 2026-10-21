@@ -2339,8 +2339,11 @@ defmodule Fathom.Shard.Replication.Follower do
     if Fathom.Tenants.Tombstones.tombstoned?(shard_id) do
       # A replica of a DELETED tenant (expert review 2026-09-29 #5): the delete happened while this
       # node was down, or before its Follower booted, so `Tombstones`' erase hook had nothing to
-      # erase yet. Erase it here rather than recover it — `Tombstones` starts before the Follower in
-      # the application tree, so its set is already loaded.
+      # erase yet. Erase it here rather than recover it. `Tombstones` starts before the Follower in
+      # the application tree, but its set is NOT necessarily loaded by the time this runs: it loads
+      # in `handle_continue` (expert review 2026-10-21 rv6 F11 corrected the old claim that it was
+      # loaded when the Follower starts). An id it has not loaded yet is erased when it is learned,
+      # through `Tombstones`' erase hook, which calls `forget/2` once this Follower is running.
       forget(name, shard_id)
       false
     else
