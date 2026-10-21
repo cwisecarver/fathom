@@ -178,6 +178,34 @@ defmodule Fathom.Shard.ReplicationLagTest do
     refute Enum.any?(second, fn {_, r} -> r end)
   end
 
+  # Expert review 2026-10-20-2027 #5: the catch-up (and idle-close) cycles ran through the same
+  # `[:fathom, :replication, :commit]` execute as a tenant's commit with no way to tell them apart,
+  # so the tenant-visible histogram counted cycles nobody waited on. Each cycle now carries its origin.
+  test "commit and commit_stage events carry the cycle's mode; stages carry skipped", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 3)
+    configure!(followers, 2)
+    {coordinator, path} = open_shard!(id)
+    for {n, _} <- followers, do: Follower.seed(n, id, 0, 0, 0, 0)
+
+    assert :ok = Session.commit(id, path <> "-wal", coordinator)
+    assert_receive {:tel, [:fathom, :replication, :commit], _, %{outcome: :ok, mode: :tenant}}
+
+    assert_receive {:tel, [:fathom, :replication, :commit_stage], _,
+                    %{stage: :collect, mode: :tenant, skipped: skipped}}
+
+    assert is_boolean(skipped)
+
+    # Fire the catch-up as the timer would on a quiet shard (`commits == catchup_at`).
+    [{session, _}] = Registry.lookup(@registry, id)
+    :sys.replace_state(session, fn s -> %{s | catchup_at: s.commits} end)
+    send(session, :catch_up)
+    _ = :sys.get_state(session)
+
+    assert_receive {:tel, [:fathom, :replication, :commit], _, %{mode: :catch_up}}
+    refute_receive {:tel, [:fathom, :replication, :commit], _, %{mode: :tenant}}, 50
+  end
+
   test "a failed quorum emits outcome no_quorum", ctx do
     %{id: id, root: root} = ctx
     [{name, port}] = start_followers!(root, 1)

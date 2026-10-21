@@ -367,7 +367,11 @@ defmodule Fathom.Shard.Replication.Session do
        registered: nil,
        last_header: nil,
        seen: [],
-       ckpt_at: nil
+       ckpt_at: nil,
+       # WHO this commit cycle is for (expert review 2026-10-20-2027 #5): `:tenant` (a caller's
+       # commit), `:catch_up` (the retry timer) or `:idle_close` (the coordinator's covered-idle-close
+       # ask). Set by `run_commit/5` for the cycle's duration; read only as a telemetry tag.
+       cycle: :tenant
      }}
   end
 
@@ -410,7 +414,7 @@ defmodule Fathom.Shard.Replication.Session do
       :telemetry.execute([:fathom, :replication, :commit_dropped], %{count: 1}, %{})
       {:reply, {:error, :timeout}, state}
     else
-      run_commit(wal_path, mode, commit_deadline(now, caller_deadline), state)
+      run_commit(wal_path, mode, commit_deadline(now, caller_deadline), state, origin(mode))
     end
   end
 
@@ -444,6 +448,21 @@ defmodule Fathom.Shard.Replication.Session do
 
   defp now_ms, do: System.monotonic_time(:millisecond)
 
+  # A `:no_checkpoint` request from outside is the catch-up's shape (tests drive it that way); the
+  # Session's own internal cycles name their origin through `internal_cycle/2`.
+  defp origin(:checkpoint), do: :tenant
+  defp origin(_), do: :catch_up
+
+  # A cycle with no caller (the catch-up timer, the covered-idle-close ask): exactly the
+  # `handle_call({:commit, wal_path, :no_checkpoint}, ...)` path with no caller deadline (so never
+  # dropped), tagged with its origin.
+  defp internal_cycle(state, origin) do
+    {:reply, _discarded, state} =
+      run_commit(state.wal_path, :no_checkpoint, commit_deadline(now_ms(), nil), state, origin)
+
+    state
+  end
+
   # The handler's own budget, further bounded by the caller's deadline less the reply margin (the
   # same margin `commit_deadline_budget/0` keeps, so the reply still lands before the caller's timer).
   # A caller with less than the margin left gets what it has left rather than nothing: a commit with
@@ -459,8 +478,8 @@ defmodule Fathom.Shard.Replication.Session do
     if capped > now, do: min(own, capped), else: min(own, caller_deadline)
   end
 
-  defp run_commit(wal_path, mode, deadline, state) do
-    state = ensure_registered(state, wal_path)
+  defp run_commit(wal_path, mode, deadline, state, origin) do
+    state = ensure_registered(%{state | cycle: origin}, wal_path)
     {pin, state} = if mode == :checkpoint, do: maybe_pin(state, wal_path), else: {nil, state}
     t0 = System.monotonic_time()
     # The catch-up (no caller) holds the Session no longer than its own retry interval: it now
@@ -480,10 +499,14 @@ defmodule Fathom.Shard.Replication.Session do
     # cycle, after the ack work and before the checkpoint start so it measures only what the tenant
     # waits on. The outcome is a bounded 4-value tag; shard_id is deliberately not a tag. `batch` is
     # how many callers this cycle answered.
+    #
+    # `mode` (expert review 2026-10-20-2027 #5): `:tenant | :catch_up | :idle_close`. The catch-up
+    # and idle-close cycles ran through this same execute untagged, so the tenant-visible commit
+    # histogram (and the rig's commit counts) mixed in cycles no tenant waited on. Bounded 3 values.
     :telemetry.execute(
       [:fathom, :replication, :commit],
       %{duration: System.monotonic_time() - t0, batch: length(batch) + 1},
-      %{outcome: commit_outcome(reply)}
+      %{outcome: commit_outcome(reply), mode: state.cycle}
     )
 
     {:reply, reply, start_checkpoint(state, pin, wal_path)}
@@ -792,14 +815,7 @@ defmodule Fathom.Shard.Replication.Session do
     do: {:noreply, clear_catchup(state)}
 
   def handle_info(:catch_up, %{commits: n, catchup_at: n} = state) do
-    {:reply, _discarded, state} =
-      handle_call(
-        {:commit, state.wal_path, :no_checkpoint},
-        {self(), make_ref()},
-        clear_catchup(state)
-      )
-
-    {:noreply, state}
+    {:noreply, internal_cycle(clear_catchup(state), :catch_up)}
   end
 
   def handle_info(:catch_up, state) do
@@ -1299,7 +1315,7 @@ defmodule Fathom.Shard.Replication.Session do
 
       t_build = System.monotonic_time()
       built = build_pushes(state, wal_path, epoch, header, sendable)
-      stage_duration(:build, t_build, reset_round?(sendable))
+      stage_duration(:build, t_build, reset_round?(sendable), skipped != [], state.cycle)
 
       case built do
         {:ok, pushes, state} ->
@@ -1617,11 +1633,16 @@ defmodule Fathom.Shard.Replication.Session do
   # absorb (two fsync-bearing checkpoints) before it acks. Tagging it lets the rig compare reset vs
   # plain `:collect` p99 and decide whether the async-absorb redesign is worth building. Bounded
   # (`true | false`).
-  defp stage_duration(stage, t0, reset?) do
+  #
+  # `skipped` (expert review 2026-10-20-2027 #5) is true when the round skipped a follower (a push
+  # still in flight, or a seed) — the "Q of FREE followers" round #8 asks about: compare `:collect`
+  # p99 with `skipped=true` against `false` before building push pipelining. `mode` is the cycle's
+  # origin, as on `[:fathom, :replication, :commit]`. Both bounded.
+  defp stage_duration(stage, t0, reset?, skipped?, mode) do
     :telemetry.execute(
       [:fathom, :replication, :commit_stage],
       %{duration: System.monotonic_time() - t0},
-      %{stage: stage, reset: reset?}
+      %{stage: stage, reset: reset?, skipped: skipped?, mode: mode}
     )
   end
 
@@ -1637,7 +1658,7 @@ defmodule Fathom.Shard.Replication.Session do
         shard_id: state.shard_id
       )
 
-    stage_duration(:collect, t_collect, reset?)
+    stage_duration(:collect, t_collect, reset?, skipped != [], state.cycle)
 
     case result do
       {:ok, acked, rejects} ->
@@ -2411,8 +2432,7 @@ defmodule Fathom.Shard.Replication.Session do
         if nothing_owed?(state, header) do
           {:ready, state}
         else
-          {:reply, _discarded, state} =
-            handle_call({:commit, state.wal_path, :no_checkpoint}, {self(), make_ref()}, state)
+          state = internal_cycle(state, :idle_close)
 
           header = state.last_header || header
           {if(nothing_owed?(state, header), do: :ready, else: :wait), state}

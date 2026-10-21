@@ -1130,10 +1130,10 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :replication, :commit],
         measurement: :duration,
         unit: {:native, :millisecond},
-        tags: [:outcome],
+        tags: [:outcome, :mode],
         reporter_options: [buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]],
         description:
-          "Replicated-commit latency from commit start to quorum decision, by outcome (ok / no_quorum / timeout / other). Tail growth here is the tenant-visible cost of a slow follower"
+          "Replicated-commit latency from commit start to quorum decision, by outcome (ok / no_quorum / timeout / other) and mode (tenant / catch_up / idle_close: only mode=tenant is a cycle a tenant waited on). Tail growth here is the tenant-visible cost of a slow follower"
       ),
       # Caller-side total (includes Session mailbox wait + ensure_started) and the two stages
       # (expert review 2026-10-17 #10). total - commit.duration = the queue wait.
@@ -1157,10 +1157,10 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :replication, :commit_stage],
         measurement: :duration,
         unit: {:native, :millisecond},
-        tags: [:stage, :reset],
+        tags: [:stage, :reset, :skipped, :mode],
         reporter_options: [buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]],
         description:
-          "Per-round commit stage latency: build (WAL read + stability recheck + compress) vs collect (quorum wait). reset=true is the first commit after a checkpoint (waits on the follower absorb)"
+          "Per-round commit stage latency: build (WAL read + stability recheck + compress) vs collect (quorum wait). reset=true is the first commit after a checkpoint (waits on the follower absorb); skipped=true is a round that skipped a follower with a push or seed in flight; mode as on replication.commit"
       ),
       distribution("fathom.replication.catchup.fails",
         event_name: [:fathom, :replication, :catchup],

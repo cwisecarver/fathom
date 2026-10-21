@@ -115,13 +115,15 @@ defmodule Fathom.Telemetry.FastCounterTest do
 
     :telemetry.execute([:fathom, :replication, :commit_stage], %{duration: ms.(7)}, %{
       stage: :build,
-      reset: false
+      reset: false,
+      skipped: false,
+      mode: :tenant
     })
 
     text = FastHistogram.render(fast)
     assert text =~ ~s(fathom_replication_commit_total_duration_count{outcome="ok"} 1)
 
     assert text =~
-             ~s(fathom_replication_commit_stage_duration_count{reset="false",stage="build"} 1)
+             ~s(fathom_replication_commit_stage_duration_count{mode="tenant",reset="false",skipped="false",stage="build"} 1)
   end
 end
