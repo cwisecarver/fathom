@@ -390,6 +390,16 @@ defmodule Fathom.Shard.Storage.Codec do
   `:zstd.finish/2` after a complete frame, at chunk sizes from 1 B to 1 MiB, provided the
   remainder loop below runs). A TRUNCATED body is not reported by either codec — the download's
   plaintext MD5 over every byte written is what fails it.
+
+  DO NOT DROP THAT PLAINTEXT HASH FOR zstd ON THE STRENGTH OF THE FRAME CHECKSUM (expert review
+  2026-10-21 #23, parked; probed on OTP 29). OTP's `:zstd` exposes no frame-completion signal:
+  decompress `stream/2` never returns `{:done, _}`, `finish/2` answers `{:done, _}` for a frame cut
+  in half, and even one-shot `decompress/1` returns `{:ok, ""}` for that half frame. The xxh64 is
+  verified only when its 4-byte trailer arrives, so a frame missing its last 1-4 bytes decodes to
+  the full plaintext UNVERIFIED, and a body bit-flip plus a stripped trailer decodes to plaintext
+  of the right length with wrong bytes, silently: a `page_count x page_size` length check passes
+  it too. (A flip with the trailer present does fail: "Restored data doesn't match checksum".)
+  Revisit only if OTP surfaces `ZSTD_decompressStream`'s "frame complete" return.
   """
   @spec init(:none | :zlib | :zstd) :: nil | {:zlib | :zstd, term()}
   def init(:none), do: nil
