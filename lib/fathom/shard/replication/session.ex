@@ -46,6 +46,7 @@ defmodule Fathom.Shard.Replication.Session do
   alias Fathom.Shard.Replication.SeedPin
   alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shard.Replication.Wal
+  alias Fathom.Shard.Replication.WalSync
 
   @registry Fathom.Shard.Replication.SessionRegistry
 
@@ -109,14 +110,21 @@ defmodule Fathom.Shard.Replication.Session do
 
   Synchronous by design: this is the quorum wait, and the point of A2 is that the client's success
   is gated on it. Returns `:ok` when nothing needed shipping, too.
+
+  ## Options
+
+    * `sync: true` — the caller's handle runs `synchronous=NORMAL` under the deferred WAL sync
+      (`Fathom.Shard.Replication.WalSync`, expert review 2026-10-21 #7). The round then reports
+      `:ok` only after an `fdatasync` of the `-wal` that STARTED after this caller's COMMIT has
+      succeeded, as well as the quorum. Default `false`: SQLite already synced the commit (FULL).
   """
-  @spec commit(String.t(), Path.t(), pid()) :: :ok | {:error, term()}
-  def commit(shard_id, wal_path, coordinator) do
+  @spec commit(String.t(), Path.t(), pid(), keyword()) :: :ok | {:error, term()}
+  def commit(shard_id, wal_path, coordinator, opts \\ []) do
     # CALLER-SIDE TOTAL SPAN (expert review 2026-10-17 #10). `:replication, :commit` is timed inside
     # `handle_call`, so it misses the Session-mailbox queue wait and `ensure_started`, both of which
     # the tenant also waits on. This one covers the whole call; the gap between the two is the queue.
     t0 = System.monotonic_time()
-    reply = commit_call(shard_id, wal_path, coordinator)
+    reply = commit_call(shard_id, wal_path, coordinator, Keyword.get(opts, :sync, false))
 
     :telemetry.execute(
       [:fathom, :replication, :commit_total],
@@ -127,13 +135,21 @@ defmodule Fathom.Shard.Replication.Session do
     reply
   end
 
-  defp commit_call(shard_id, wal_path, coordinator) do
+  defp commit_call(shard_id, wal_path, coordinator, sync?) do
     with {:ok, pid} <- ensure_started(shard_id, coordinator) do
       # The caller's own give-up time travels with the request (expert review 2026-10-20 #5(a)),
       # so a request still queued when its caller has gone is dropped instead of executed. Taken
       # immediately before the call, on the same clock `GenServer.call`'s timer runs on.
       t = timeout()
-      GenServer.call(pid, {:commit, wal_path, :checkpoint, now_ms() + t}, t)
+
+      # The deferred-sync request carries a fifth element (2026-10-21 #7). The four-tuple stays
+      # the FULL caller's shape, so a flag-off node's messages do not change.
+      msg =
+        if sync?,
+          do: {:commit, wal_path, :checkpoint, now_ms() + t, true},
+          else: {:commit, wal_path, :checkpoint, now_ms() + t}
+
+      GenServer.call(pid, msg, t)
     end
   catch
     :exit, reason -> {:error, {:session_down, reason}}
@@ -372,8 +388,16 @@ defmodule Fathom.Shard.Replication.Session do
        ckpt_at: nil,
        # WHO this commit cycle is for (expert review 2026-10-20-2027 #5): `:tenant` (a caller's
        # commit), `:catch_up` (the retry timer) or `:idle_close` (the coordinator's covered-idle-close
-       # ask). Set by `run_commit/5` for the cycle's duration; read only as a telemetry tag.
-       cycle: :tenant
+       # ask). Set by `run_commit/6` for the cycle's duration; read only as a telemetry tag.
+       cycle: :tenant,
+       # DEFERRED WAL SYNC (expert review 2026-10-21 #7, `Fathom.Shard.Replication.WalSync`).
+       # `wal_sync` is the one fdatasync in flight, `%{token, pid, mref, started}`, or nil. A round
+       # that cannot learn its result before its deadline leaves it here, and the NEXT tenant round
+       # must resolve it before it may ack anything. `wal_sync_poison` is the reason of the first
+       # failed fdatasync: once set, every tenant round on this Session fails (see `WalSync`'s
+       # moduledoc for why one failure must fail every later ack).
+       wal_sync: nil,
+       wal_sync_poison: nil
      }}
   end
 
@@ -409,7 +433,12 @@ defmodule Fathom.Shard.Replication.Session do
   #
   # The internal deadline is also bounded by the CALLER'S: a call that waited 4 s in the queue no
   # longer gets a fresh `commit_deadline_budget/0` that would outlive its caller by 4 s.
-  def handle_call({:commit, wal_path, mode, caller_deadline}, _from, state) do
+  def handle_call({:commit, wal_path, mode, caller_deadline}, from, state),
+    do: handle_call({:commit, wal_path, mode, caller_deadline, false}, from, state)
+
+  # The fifth element is the deferred-sync request (expert review 2026-10-21 #7): this caller's
+  # handle is `synchronous=NORMAL` and its ack needs the round's fdatasync.
+  def handle_call({:commit, wal_path, mode, caller_deadline, sync?}, _from, state) do
     now = now_ms()
 
     if is_integer(caller_deadline) and now >= caller_deadline do
@@ -417,7 +446,13 @@ defmodule Fathom.Shard.Replication.Session do
       {:reply, {:error, :timeout}, state}
     else
       wal_path
-      |> run_commit(mode, commit_deadline(now, caller_deadline), state, origin(mode))
+      |> run_commit(
+        mode,
+        commit_deadline(now, caller_deadline),
+        state,
+        origin(mode),
+        sync? == true
+      )
       |> with_fd_release()
     end
   end
@@ -465,7 +500,7 @@ defmodule Fathom.Shard.Replication.Session do
     deadline = deadline || commit_deadline(now_ms(), nil)
 
     {:reply, _discarded, state} =
-      run_commit(state.wal_path, :no_checkpoint, deadline, state, origin)
+      run_commit(state.wal_path, :no_checkpoint, deadline, state, origin, false)
 
     # The cycle's `Wal.read_held/2` reopens the fds the quiet-shard release (#2) closed, so it must
     # re-arm that release like a tenant commit does (`with_fd_release/1`), or a catch-up on a quiet
@@ -489,7 +524,7 @@ defmodule Fathom.Shard.Replication.Session do
     if capped > now, do: min(own, capped), else: min(own, caller_deadline)
   end
 
-  defp run_commit(wal_path, mode, deadline, state, origin) do
+  defp run_commit(wal_path, mode, deadline, state, origin, sync?) do
     state = ensure_registered(%{state | cycle: origin}, wal_path)
     {pin, state} = if mode == :checkpoint, do: maybe_pin(state, wal_path), else: {nil, state}
     t0 = System.monotonic_time()
@@ -500,9 +535,23 @@ defmodule Fathom.Shard.Replication.Session do
       if mode == :no_checkpoint, do: min(deadline, now_ms() + catchup_ms()), else: deadline
 
     # GROUP COMMIT (expert review 2026-10-20 #5(b)), before ANY header read: see `coalesce_queued/2`.
-    batch = if mode == :checkpoint, do: coalesce_queued(wal_path, []), else: []
+    {batch, sync?} =
+      if mode == :checkpoint, do: coalesce_queued(wal_path, [], sync?), else: {[], sync?}
+
+    # DEFERRED WAL SYNC (expert review 2026-10-21 #7). Only tenant rounds ack anyone, so only they
+    # (and, defensively, any request that asked for a sync whatever its mode) resolve an earlier
+    # sync, check the poison and start a sync. The fdatasync starts HERE: after
+    # `coalesce_queued/3` gathered every request this round answers (so after every one of their
+    # COMMITs returned) and before `do_commit/4`, so that it overlaps the push.
+    gated? = mode == :checkpoint or sync?
+    {pre, state} = if gated?, do: settle_wal_sync(state, deadline), else: {:ok, state}
+    state = maybe_start_wal_sync(state, wal_path, sync? and pre == :ok)
 
     {:reply, reply, state} = do_commit(wal_path, state, deadline, mode)
+
+    # No caller in the round hears `:ok` unless the fdatasync started for it succeeded too.
+    {reply, state} =
+      if gated?, do: gate_on_wal_sync(reply, pre, state, deadline), else: {reply, state}
 
     for from <- batch, do: GenServer.reply(from, reply)
 
@@ -537,21 +586,140 @@ defmodule Fathom.Shard.Replication.Session do
   # up is dropped, as in `handle_call/3` (#5(a)). Only tenant commits (`:checkpoint`) coalesce.
   #
   # Reads the call envelopes directly; `GenServer.reply/2` is the documented way to answer them.
-  defp coalesce_queued(wal_path, acc) do
+  #
+  # Returns `{callers, sync?}`. `sync?` is true when the round's own caller or ANY coalesced one runs
+  # a deferred-sync handle (expert review 2026-10-21 #7); one fdatasync then covers the whole group.
+  defp coalesce_queued(wal_path, acc, sync?) do
     receive do
       {:"$gen_call", from, {:commit, ^wal_path, :checkpoint, dl}} ->
-        if is_integer(dl) and now_ms() >= dl do
-          :telemetry.execute([:fathom, :replication, :commit_dropped], %{count: 1}, %{})
-          GenServer.reply(from, {:error, :timeout})
-          coalesce_queued(wal_path, acc)
-        else
-          coalesce_queued(wal_path, [from | acc])
-        end
+        coalesce_one(wal_path, acc, sync?, from, dl, false)
+
+      {:"$gen_call", from, {:commit, ^wal_path, :checkpoint, dl, s?}} ->
+        coalesce_one(wal_path, acc, sync?, from, dl, s? == true)
 
       {:"$gen_call", from, {:commit, ^wal_path}} ->
-        coalesce_queued(wal_path, [from | acc])
+        coalesce_queued(wal_path, [from | acc], sync?)
     after
-      0 -> acc
+      0 -> {acc, sync?}
+    end
+  end
+
+  defp coalesce_one(wal_path, acc, sync?, from, dl, s?) do
+    if is_integer(dl) and now_ms() >= dl do
+      :telemetry.execute([:fathom, :replication, :commit_dropped], %{count: 1}, %{})
+      GenServer.reply(from, {:error, :timeout})
+      coalesce_queued(wal_path, acc, sync?)
+    else
+      coalesce_queued(wal_path, [from | acc], sync? or s?)
+    end
+  end
+
+  # ------------------------------------------------------------------------------------------
+  # deferred WAL sync (expert review 2026-10-21 #7); see `Fathom.Shard.Replication.WalSync`
+  # ------------------------------------------------------------------------------------------
+
+  # One fdatasync, in its own process so it overlaps the push. `spawn_monitor`, not a link, for the
+  # same reason as the seed tasks: nothing the sync does may take down the shard's serialization
+  # point. The body cannot raise past its `try`, so the result message always arrives unless the
+  # process is killed; a kill surfaces as DOWN, which poisons (an unknown outcome is a failure).
+  defp maybe_start_wal_sync(%{wal_sync_poison: nil, wal_sync: nil} = state, wal_path, true) do
+    parent = self()
+    token = make_ref()
+
+    {pid, mref} =
+      spawn_monitor(fn ->
+        result =
+          try do
+            WalSync.sync(wal_path)
+          catch
+            kind, reason -> {:error, {:datasync, {kind, reason}}}
+          end
+
+        send(parent, {:wal_synced, token, result})
+      end)
+
+    %{state | wal_sync: %{token: token, pid: pid, mref: mref, started: System.monotonic_time()}}
+  end
+
+  defp maybe_start_wal_sync(state, _wal_path, _start?), do: state
+
+  # Resolve the sync in flight, waiting until `deadline` at most. `{:ok, state}` when there is none
+  # or it succeeded; `{{:error, {:wal_sync_failed, _}}, state}` otherwise, including still running
+  # (it then stays in `wal_sync`, and the next tenant round or `handle_info/2` resolves it).
+  defp settle_wal_sync(%{wal_sync: nil} = state, _deadline), do: {:ok, state}
+
+  defp settle_wal_sync(%{wal_sync: %{token: token, mref: mref}} = state, deadline) do
+    receive do
+      {:wal_synced, ^token, result} ->
+        Process.demonitor(mref, [:flush])
+        apply_wal_sync(state, result)
+
+      {:DOWN, ^mref, :process, _pid, reason} ->
+        apply_wal_sync(state, {:error, {:datasync, {:sync_task_down, reason}}})
+    after
+      max(deadline - now_ms(), 0) -> {{:error, {:wal_sync_failed, :pending}}, state}
+    end
+  end
+
+  defp apply_wal_sync(%{wal_sync: sync} = state, result) do
+    state = %{state | wal_sync: nil}
+
+    :telemetry.execute(
+      [:fathom, :replication, :wal_sync],
+      %{duration: System.monotonic_time() - sync.started},
+      %{outcome: wal_sync_outcome(result)}
+    )
+
+    case result do
+      :ok ->
+        {:ok, state}
+
+      # No sync ran, so the kernel dropped nothing. This round fails; the next round's sync covers
+      # the same pages.
+      {:error, {:open, _} = reason} ->
+        {{:error, {:wal_sync_failed, reason}}, state}
+
+      # A sync that FAILED, or a result nothing here expects: POISON (fail-safe; see `WalSync`).
+      other ->
+        reason = poison_reason(other)
+
+        Logger.error(
+          "shard #{state.shard_id}: WAL fdatasync failed (#{inspect(reason)}); refusing every " <>
+            "further write ack on this shard until it is reopened"
+        )
+
+        {{:error, {:wal_sync_failed, reason}}, %{state | wal_sync_poison: reason}}
+    end
+  end
+
+  defp poison_reason({:error, reason}), do: reason
+  defp poison_reason(other), do: {:unexpected, other}
+
+  defp wal_sync_outcome(:ok), do: :ok
+  defp wal_sync_outcome({:error, {:open, _}}), do: :open_error
+  defp wal_sync_outcome(_), do: :error
+
+  # The tenant round's reply, gated on the deferred sync. A poisoned Session never acks; an earlier
+  # sync still unresolved at the start of the round (`pre`) fails it; and the round's own sync must
+  # finish `:ok` by the deadline. A round that requested no sync with none in flight passes `reply`
+  # through unchanged: that is the flag-off path, at the cost of two map reads.
+  defp gate_on_wal_sync(reply, pre, state, deadline) do
+    {own, state} = settle_wal_sync(state, deadline)
+
+    # The failure this round itself saw comes first (it names the cause); the poison catches every
+    # round after it.
+    cond do
+      pre != :ok ->
+        {pre, state}
+
+      own != :ok ->
+        {own, state}
+
+      state.wal_sync_poison != nil ->
+        {{:error, {:wal_sync_failed, {:poisoned, state.wal_sync_poison}}}, state}
+
+      true ->
+        {reply, state}
     end
   end
 
@@ -906,6 +1074,20 @@ defmodule Fathom.Shard.Replication.Session do
   #
   # `:normal` is the ordinary end of a task that already sent its result and whose entry is
   # therefore gone, so this clause only ever finds something on the failure path.
+  # A deferred WAL sync whose round already replied (it was still running at that round's deadline).
+  # Its outcome must still land, because a failure poisons the Session (expert review 2026-10-21 #7).
+  # Both clauses sit above the seed DOWN clause, which would otherwise swallow the sync task's DOWN.
+  def handle_info({:wal_synced, token, result}, %{wal_sync: %{token: token, mref: mref}} = state) do
+    Process.demonitor(mref, [:flush])
+    {_verdict, state} = apply_wal_sync(state, result)
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, mref, :process, _pid, reason}, %{wal_sync: %{mref: mref}} = state) do
+    {_verdict, state} = apply_wal_sync(state, {:error, {:datasync, {:sync_task_down, reason}}})
+    {:noreply, state}
+  end
+
   def handle_info({:DOWN, ref, :process, _pid, reason}, state),
     do: {:noreply, apply_seed_down(state, ref, reason)}
 

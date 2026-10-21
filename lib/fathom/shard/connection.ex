@@ -69,7 +69,14 @@ defmodule Fathom.Shard.Connection do
     unless tenant?, do: ensure_dir(dir)
 
     scope = Keyword.get(opts, :scope, :rw)
-    guard_opts = [block_user_version?: Keyword.get(opts, :block_user_version?, false)]
+    # `deferred_sync?` (expert review 2026-10-21 #7) only ever applies to a TENANT `:rw` handle,
+    # the one kind whose commits are acked through `ShardExecutor` and so through the deferred
+    # sync. Every other handle stays FULL whatever a caller passes.
+    guard_opts = [
+      block_user_version?: Keyword.get(opts, :block_user_version?, false),
+      deferred_sync?: tenant? and scope == :rw and Keyword.get(opts, :deferred_sync?, false)
+    ]
+
     wal? = Keyword.get(opts, :wal?, true)
 
     case open_handle_ensuring_dir(path, scope, tenant?, dir) do
@@ -259,7 +266,7 @@ defmodule Fathom.Shard.Connection do
   end
 
   defp configure_readwrite(conn, tenant?, scope, guard_opts, wal?) do
-    with :ok <- configure(conn, wal?),
+    with :ok <- configure(conn, wal?, guard_opts[:deferred_sync?]),
          {:ok, ext} <- load_extension(conn, tenant?),
          :ok <- maybe_harden(conn, tenant?, ext),
          :ok <- maybe_query_only(conn, scope),
@@ -394,7 +401,7 @@ defmodule Fathom.Shard.Connection do
 
     with {:ok, stmt} <- Sqlite3.prepare(conn, "SELECT fathom_pragma_guard(?1, ?2)") do
       try do
-        with :ok <- Sqlite3.bind(stmt, [names, pinned_pragmas()]),
+        with :ok <- Sqlite3.bind(stmt, [names, pinned_pragmas(guard_opts[:deferred_sync?])]),
              {:row, [1]} <- Sqlite3.step(conn, stmt) do
           :ok
         else
@@ -424,9 +431,14 @@ defmodule Fathom.Shard.Connection do
   # Read from config at open, the same reads those paths make. If an operator changes
   # `:shard_cache_size_kb` or the size cap at runtime, a pooled handle's reuse batch is refused and
   # `reset_for_reuse/2`'s caller discards the handle and opens a fresh one — the safe direction.
-  defp pinned_pragmas do
+  #
+  # `synchronous` is pinned to the ONE value this handle was opened with (expert review 2026-10-21
+  # #7): NORMAL only on a deferred-sync handle, FULL everywhere else, so a tenant can never move a
+  # FULL handle to NORMAL through it. A pooled handle reused under the other mode is refused by its
+  # own guard, and `reset_for_reuse/3`'s caller discards it and opens fresh, which is safe.
+  defp pinned_pragmas(deferred_sync?) do
     [
-      "synchronous=FULL",
+      if(deferred_sync?, do: "synchronous=NORMAL", else: "synchronous=FULL"),
       "query_only=ON",
       cache_size_kb() && "cache_size=-#{cache_size_kb()}",
       temp_cap_pages() && "temp.max_page_count=#{temp_cap_pages()}"
@@ -541,7 +553,7 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  defp configure(conn, wal?) do
+  defp configure(conn, wal?, deferred_sync?) do
     with :ok <- if(wal?, do: enable_wal(conn), else: :ok),
          # NOT `PRAGMA busy_timeout` (expert review 2026-07-24 #1): the pragma routes to
          # sqlite3_busy_timeout(), which REPLACES exqlite's custom busy handler with SQLite's
@@ -564,7 +576,7 @@ defmodule Fathom.Shard.Connection do
          # row that gates the open) and `max_page_count` stays separate (it may need a page_size
          # read). Everything here still runs BEFORE `load_extension/2`, which is what the
          # wal_autocheckpoint / wal-hook slot ordering needs (AGENTS.md loud warning).
-         :ok <- Sqlite3.execute(conn, rw_open_sql()),
+         :ok <- Sqlite3.execute(conn, rw_open_sql(deferred_sync?)),
          :ok <- maybe_max_page_count(conn) do
       :ok
     end
@@ -585,9 +597,18 @@ defmodule Fathom.Shard.Connection do
   #     waits. Raised, NOT disabled: at 0 a wedged coordinator would grow the WAL without bound.
   #   * `journal_size_limit`, `foreign_keys`, `cache_size`: see `journal_size_limit_sql/0`,
   #     `maybe_foreign_keys/1` and `maybe_cache_size/1`.
-  defp rw_open_sql do
+  #
+  # `deferred_sync?` (expert review 2026-10-21 #7, OFF by default): a tenant `:rw` handle on a
+  # replicating node with `:replication_deferred_wal_sync` on runs `synchronous=NORMAL`, and the
+  # A2 Session's per-round fdatasync takes the place of the per-commit one. NORMAL is NEVER set
+  # without that deferred sync behind it; see `Fathom.Shard.Replication.WalSync`.
+  defp rw_open_sql(deferred_sync?) do
+    sync = if deferred_sync?, do: "NORMAL", else: "FULL"
+
     IO.iodata_to_binary([
-      "PRAGMA synchronous=FULL;PRAGMA wal_autocheckpoint=4000",
+      "PRAGMA synchronous=",
+      sync,
+      ";PRAGMA wal_autocheckpoint=4000",
       journal_size_limit_sql(),
       foreign_keys_sql(),
       cache_size_sql()
@@ -629,9 +650,11 @@ defmodule Fathom.Shard.Connection do
   #     `:tenant_pragma_allow`, the one way a stream could have changed it.
   #
   # `synchronous` stays in the batch for the same operator-allow reason; inside one `execute` it is
-  # nearly free.
-  defp reconfigure_for_reuse(conn) do
-    with :ok <- Sqlite3.execute(conn, rw_reuse_sql()) do
+  # nearly free. It is also how a reused handle takes the CURRENT sync mode (expert review
+  # 2026-10-21 #7): the value must equal the one the handle's pragma guard pinned at open, or the
+  # batch is refused and the handle replaced (see `pinned_pragmas/1`).
+  defp reconfigure_for_reuse(conn, deferred_sync?) do
+    with :ok <- Sqlite3.execute(conn, rw_reuse_sql(deferred_sync?)) do
       if "max_page_count" in Application.get_env(:fathom, :tenant_pragma_allow, []),
         do: maybe_max_page_count(conn),
         else: :ok
@@ -640,7 +663,7 @@ defmodule Fathom.Shard.Connection do
 
   # Built from config (booleans and integers fathom owns, never tenant input), mirroring
   # `maybe_foreign_keys/1` and `maybe_cache_size/1` exactly.
-  defp rw_reuse_sql do
+  defp rw_reuse_sql(deferred_sync?) do
     fk =
       if Application.get_env(:fathom, :foreign_keys, true),
         do: [";PRAGMA foreign_keys=ON"],
@@ -653,7 +676,8 @@ defmodule Fathom.Shard.Connection do
       end
 
     IO.iodata_to_binary([
-      "SELECT 1 FROM sqlite_schema LIMIT 0;PRAGMA synchronous=FULL",
+      "SELECT 1 FROM sqlite_schema LIMIT 0;PRAGMA synchronous=",
+      if(deferred_sync?, do: "NORMAL", else: "FULL"),
       fk,
       cache
     ])
@@ -2470,8 +2494,8 @@ defmodule Fathom.Shard.Connection do
   # The `:ro` reuse batch: schema reload, then re-assert read-only. See `reset_for_reuse/2`.
   @ro_reuse_sql "SELECT 1 FROM sqlite_schema LIMIT 0;PRAGMA query_only=ON"
 
-  @spec reset_for_reuse(reference(), :ro | :rw) :: :ok | {:error, term()}
-  def reset_for_reuse(conn, scope) when scope in [:ro, :rw] do
+  @spec reset_for_reuse(reference(), :ro | :rw, keyword()) :: :ok | {:error, term()}
+  def reset_for_reuse(conn, scope, opts \\ []) when scope in [:ro, :rw] do
     with :ok <- rollback_if_open(conn) do
       # `:rw` re-applies the writable-path pragmas (`configure/1`). `:ro` RE-ASSERTS `query_only=ON`
       # (expert review 2026-09-18 #13): a `:ro` handle from the WAL-recovery / new-file fallback is
@@ -2484,7 +2508,11 @@ defmodule Fathom.Shard.Connection do
       # 2026-10-01 perf #24): every exqlite call is a dirty-IO NIF dispatch on a pool sized to the
       # core count, and the separate calls were ~7 per reuse. Measured on a warm handle (2026-10-01,
       # 3,000 samples): 19 us separate vs 7 us batched.
-      if scope == :rw, do: reconfigure_for_reuse(conn), else: Sqlite3.execute(conn, @ro_reuse_sql)
+      #
+      # `opts[:deferred_sync?]` picks the `:rw` sync mode, exactly as `open/2`'s option does.
+      if scope == :rw,
+        do: reconfigure_for_reuse(conn, Keyword.get(opts, :deferred_sync?, false)),
+        else: Sqlite3.execute(conn, @ro_reuse_sql)
     end
   end
 

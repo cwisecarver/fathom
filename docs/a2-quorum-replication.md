@@ -327,9 +327,18 @@ rejects and triggers a seed **per shard**, over the one socket that also carries
 
 ## The gap this closes
 
-A committed write is fsynced to local disk (`PRAGMA synchronous=FULL`,
-`lib/fathom/shard/connection.ex:175`), so a **process** crash — BEAM death, OOM kill, redeploy —
-loses nothing. `mix fathom.rpo` asserts it.
+A **process** crash (BEAM death, OOM kill, redeploy) loses nothing, and that does not depend on
+the sync mode: once a COMMIT returns, its WAL frames are in the kernel page cache, so they survive
+the process. `mix fathom.rpo` asserts it. What the per-commit fsync (`PRAGMA synchronous=FULL`,
+`Fathom.Shard.Connection.rw_open_sql/1`) adds is survival of a **kernel crash or power loss** on a
+node whose disk comes back. (Corrected 2026-10-21, expert review #7: this paragraph used to credit
+FULL with the process-crash case. Probed: 1,000 commits under `synchronous=NORMAL`, then
+`:erlang.halt(137, flush: false)`, then a reopen found all 1,000 rows.)
+
+`REPLICATION_DEFERRED_WAL_SYNC` (off by default; see `Fathom.Shard.Replication.WalSync`) keeps
+that guarantee for acks while moving the fsync out of SQLite's write lock. Tenant handles on a
+replicating node run NORMAL, and the Session issues one `fdatasync` of the `-wal` per commit round,
+overlapped with the push. No write is acked until both the quorum and that fdatasync succeed.
 
 What is exposed is **node loss**. On failover the survivor cold-opens the shard by pulling the last
 flushed object **from S3** ([durability](durability.md), "the survivor cold-opens"). Nothing ever

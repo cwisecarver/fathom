@@ -19,6 +19,7 @@ defmodule Fathom.ShardExecutor do
   alias Fathom.Shard
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.Session
+  alias Fathom.Shard.Replication.WalSync
   alias Fathom.Shard.WriteFence
   alias Fathom.Shards
   alias Filo.{Describe, Error, Stmt, StmtResult}
@@ -115,11 +116,17 @@ defmodule Fathom.ShardExecutor do
         # options and the stream options (expert review 2026-10-19 #22).
         template? = template?(shard_id)
 
-        case obtain_conn(reuse, path, scope, open_opts(scope, template?)) do
+        # DEFERRED WAL SYNC (expert review 2026-10-21 #7, off by default): decided ONCE per stream
+        # and carried both to the handle (NORMAL vs FULL) and to the stream opts, so the ack path
+        # below knows exactly which handles need the deferred fdatasync before an ack.
+        deferred? = scope == :rw and WalSync.deferred?()
+
+        case obtain_conn(reuse, path, scope, open_opts(scope, template?, deferred?)) do
           {:ok, conn} ->
             # The scope rides the handle so execute/2 can enforce read-only across baton-resumes
             # and every stream on the connection.
-            {:ok, {pid, ref, conn, shard_id, scope, token_version, stream_opts(template?)}}
+            {:ok,
+             {pid, ref, conn, shard_id, scope, token_version, stream_opts(template?, deferred?)}}
 
           {:error, reason} ->
             Shard.checkin(pid, ref)
@@ -139,7 +146,7 @@ defmodule Fathom.ShardExecutor do
   # they are adopted into THIS stream only after the reset succeeds, and released with the handle if
   # it does not.
   defp obtain_conn({:reuse, {conn, cache} = handle}, path, _scope, opts) do
-    case Connection.reset_for_reuse(conn, opts[:scope]) do
+    case Connection.reset_for_reuse(conn, opts[:scope], opts) do
       :ok ->
         Connection.adopt_statements(conn, cache)
         {:ok, conn}
@@ -151,7 +158,7 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp obtain_conn({:reuse, conn}, path, _scope, opts) do
-    case Connection.reset_for_reuse(conn, opts[:scope]) do
+    case Connection.reset_for_reuse(conn, opts[:scope], opts) do
       :ok ->
         {:ok, conn}
 
@@ -168,11 +175,12 @@ defmodule Fathom.ShardExecutor do
   # `user_version` assignment — the text gate (`user_version_write?/1`) only fires when the
   # statement starts with "pragma". Resolved once at open, like `stream_opts/1`; a pooled handle
   # keeps its open-time value (the guard is set-once per connection).
-  defp open_opts(scope, template?) do
+  defp open_opts(scope, template?, deferred?) do
     [
       tenant?: true,
       scope: scope,
-      block_user_version?: block_tenant_ddl?() and not template?
+      block_user_version?: block_tenant_ddl?() and not template?,
+      deferred_sync?: deferred?
     ]
   end
 
@@ -438,7 +446,17 @@ defmodule Fathom.ShardExecutor do
 
         # A2 quorum replication (off unless :replication_enabled). Computed BEFORE
         # track_txn_write/3, which clears the in-transaction flag this decision reads.
-        repl = maybe_replicate(shard_id, pid, conn, head, wrote?, repl_on?, result.autocommit?)
+        repl =
+          maybe_replicate(
+            shard_id,
+            pid,
+            conn,
+            head,
+            wrote?,
+            repl_on?,
+            result.autocommit?,
+            deferred_sync?(opts)
+          )
 
         track_txn_write(conn, sql, head, wrote?)
 
@@ -815,13 +833,30 @@ defmodule Fathom.ShardExecutor do
   #
   # `repl_on?` is the caller's one read of the gate; `autocommit` is the flag the statement step
   # already returned (`Connection.query` `conn_state?`), or nil to ask SQLite.
-  defp maybe_replicate(shard_id, pid, conn, head, wrote?, repl_on?, autocommit) do
-    if repl_on? and ships_now?(conn, head, wrote?, autocommit) do
-      Session.commit(shard_id, Shard.db_path(shard_id) <> "-wal", pid)
-    else
-      :ok
+  #
+  # `sync?` (expert review 2026-10-21 #7): this stream's handle runs `synchronous=NORMAL` under the
+  # deferred WAL sync, so SQLite did NOT sync this commit. It is acked only after an fdatasync that
+  # started after the COMMIT: the Session's round sync when replication is on, or — if replication
+  # was turned off at runtime under a live deferred handle — a sync right here in the stream
+  # process. There is no path on which a deferred handle's commit is acked without one.
+  defp maybe_replicate(shard_id, pid, conn, head, wrote?, repl_on?, autocommit, sync?) do
+    cond do
+      repl_on? and ships_now?(conn, head, wrote?, autocommit) ->
+        Session.commit(shard_id, Shard.db_path(shard_id) <> "-wal", pid, sync: sync?)
+
+      sync? and ships_now?(conn, head, wrote?, autocommit) ->
+        case WalSync.sync(Shard.db_path(shard_id) <> "-wal") do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:wal_sync_failed, reason}}
+        end
+
+      true ->
+        :ok
     end
   end
+
+  # Tolerates a handle built before the key existed (tests construct handles by hand).
+  defp deferred_sync?(opts), do: Map.get(opts, :deferred_sync?, false) == true
 
   # Only where the frames are actually COMMITTED: an autocommit write, or a commit boundary closing
   # a transaction that wrote. Shipping on every write statement inside a transaction would pay a
@@ -855,6 +890,24 @@ defmodule Fathom.ShardExecutor do
   # The reason can carry a data path and a pid (a Session call exit names both), so the tenant gets
   # the fixed message and the reason goes to the server log (expert review 2026-10-13 #23).
   @doc false
+  # A failed deferred WAL sync (expert review 2026-10-21 #7) is not a quorum problem, so it gets its
+  # own code. Same posture as a quorum failure: the commit is local and visible, it was NOT made
+  # durable as asked, and the client must not be told it was. 503: the statement was fine.
+  def no_quorum_error(shard_id, {:wal_sync_failed, reason}) do
+    :telemetry.execute([:fathom, :replication, :wal_sync_failed], %{count: 1}, %{})
+    query_error(:wal_sync_failed)
+
+    if Fathom.LogLimiter.check(:wal_sync_failed) != :suppress do
+      Logger.error("shard #{shard_id} write not acked: WAL fdatasync failed: #{inspect(reason)}")
+    end
+
+    %Error{
+      message: "write not durably synced to local disk",
+      code: "FILO_WAL_SYNC_FAILED",
+      status: 503
+    }
+  end
+
   def no_quorum_error(shard_id, reason) do
     :telemetry.execute([:fathom, :replication, :no_quorum], %{count: 1}, %{
       reason: no_quorum_reason(reason)
@@ -1125,7 +1178,16 @@ defmodule Fathom.ShardExecutor do
         # `mark_txn_write` above recorded the write; a script that committed ships here. Same error
         # mapping as `execute/2`: the local commit already happened, the client asked for a
         # quorum-durable write and did not get one, so it gets the 503.
-        case maybe_replicate(shard_id, pid, conn, sql, true, Session.enabled?(), nil) do
+        case maybe_replicate(
+               shard_id,
+               pid,
+               conn,
+               sql,
+               true,
+               Session.enabled?(),
+               nil,
+               deferred_sync?(opts)
+             ) do
           :ok -> :ok
           {:error, reason} -> {:error, no_quorum_error(shard_id, reason)}
         end
@@ -1487,8 +1549,8 @@ defmodule Fathom.ShardExecutor do
   # operator config — a stream seeing a consistent value for its lifetime is the correct
   # semantic (the DDL guard / template identity never flip mid-stream), and every existing
   # test configures them before opening.
-  defp stream_opts(template?) do
-    %{template?: template?, block_ddl?: block_tenant_ddl?()}
+  defp stream_opts(template?, deferred?) do
+    %{template?: template?, block_ddl?: block_tenant_ddl?(), deferred_sync?: deferred?}
   end
 
   # `shard_id` here is already canonical (normalized in open/1), so normalize the configured
