@@ -88,6 +88,56 @@ defmodule Fathom.Telemetry.FastHistogramTest do
     assert String.ends_with?(fast_text, "\n")
   end
 
+  # Expert review 2026-10-20-2027 #26. Symptom: the first sample of a label set (e.g. the first
+  # `outcome: :at_capacity` checkout) created its series by `:persistent_term.put` on the metric's
+  # EXISTING key, a node-wide literal GC scan on the request path. Invariant pinned here: every
+  # label set the emitters can produce exists at init, and recording one of them leaves the
+  # persistent_term value untouched (no put). Before the fix the map starts empty and this fails.
+  test "the known label sets are pre-created at init; a sample for them never updates persistent_term" do
+    name = start_fast()
+    checkout_key = {FastHistogram, name, [:fathom, :shards, :checkout, :stop, :duration]}
+    commit_stage_key = {FastHistogram, name, [:fathom, :replication, :commit_stage, :duration]}
+
+    checkout_sets = :persistent_term.get(checkout_key)
+    commit_stage_sets = :persistent_term.get(commit_stage_key)
+
+    assert MapSet.new(Map.keys(checkout_sets)) ==
+             MapSet.new(
+               for o <- [:ok, :held, :unavailable, :at_capacity, :novel_rate_limited, :error],
+                   do: %{outcome: o}
+             )
+
+    assert MapSet.new(Map.keys(commit_stage_sets)) ==
+             MapSet.new(
+               for s <- [:build, :collect], r <- [true, false], do: %{stage: s, reset: r}
+             )
+
+    for o <- [:ok, :held, :unavailable, :at_capacity, :novel_rate_limited, :error],
+        do: checkout(1, o)
+
+    :telemetry.execute(
+      [:fathom, :replication, :commit_stage],
+      %{duration: ms(1)},
+      %{stage: :build, reset: true}
+    )
+
+    assert :persistent_term.get(checkout_key) == checkout_sets
+    assert :persistent_term.get(commit_stage_key) == commit_stage_sets
+
+    # Pre-created zero-count series are not exposed: only the observed outcome renders.
+    samples = PrometheusScrape.parse(FastHistogram.render(name))
+
+    assert PrometheusScrape.value(samples, "fathom_shards_checkout_stop_duration_count", %{
+             "outcome" => "at_capacity"
+           }) == 1
+
+    assert PrometheusScrape.label_values(
+             samples,
+             "fathom_replication_commit_stage_duration",
+             "stage"
+           ) == ["build"]
+  end
+
   test "a value exactly on a bound lands in that bucket (le is inclusive)" do
     fast = start_fast()
     query(1)

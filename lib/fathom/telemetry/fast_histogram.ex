@@ -41,6 +41,27 @@ defmodule Fathom.Telemetry.FastHistogram do
   ]
   @sum_scale 1000
 
+  # Every label set these metrics can emit, created at init (expert review 2026-10-20-2027 #26).
+  # Creating a series at runtime is a `:persistent_term.put` on an EXISTING key, which forces a
+  # node-wide literal GC scan, so a first-seen outcome used to pay it on the request path. Each set
+  # below is the closed set the emitter produces (checkout: `checkout_outcome/1` in shards.ex;
+  # commit/commit_total: `commit_outcome/1` in session.ex; commit_stage: `stage` x `reset` in
+  # session.ex). A label set NOT listed here still works, it just takes the runtime path once.
+  # render/1 skips zero-count series, so pre-creating a set does not change the exposition text.
+  @label_sets %{
+    [:fathom, :shards, :checkout, :stop, :duration] =>
+      for(
+        o <- [:ok, :held, :unavailable, :at_capacity, :novel_rate_limited, :error],
+        do: %{outcome: o}
+      ),
+    [:fathom, :replication, :commit, :duration] =>
+      for(o <- [:ok, :no_quorum, :timeout, :other], do: %{outcome: o}),
+    [:fathom, :replication, :commit_total, :duration] =>
+      for(o <- [:ok, :no_quorum, :timeout, :other], do: %{outcome: o}),
+    [:fathom, :replication, :commit_stage, :duration] =>
+      for(s <- [:build, :collect], r <- [true, false], do: %{stage: s, reset: r})
+  }
+
   @doc "True for the metrics this module records instead of `TelemetryMetricsPrometheus.Core`."
   @spec handles?(Telemetry.Metrics.t()) :: boolean()
   def handles?(%Distribution{name: name}), do: name in @hot
@@ -91,15 +112,22 @@ defmodule Fathom.Telemetry.FastHistogram do
       for %Distribution{} = m <- metrics, handles?(m) do
         buckets = Keyword.fetch!(m.reporter_options, :buckets)
         key = {__MODULE__, name, m.name}
-        :persistent_term.put(key, %{})
+        # one slot per bound, one for +Inf, one for the sum
+        size = length(buckets) + 2
+
+        series =
+          for labels <- Map.get(@label_sets, m.name, []),
+              into: %{},
+              do: {labels, :counters.new(size, [:write_concurrency])}
+
+        :persistent_term.put(key, series)
 
         cfg = %{
           server: name,
           key: key,
           metric: m,
           buckets: buckets,
-          # one slot per bound, one for +Inf, one for the sum
-          size: length(buckets) + 2,
+          size: size,
           keep: m.keep,
           measurement: m.measurement,
           tags: m.tags,
@@ -172,16 +200,23 @@ defmodule Fathom.Telemetry.FastHistogram do
 
   # --- exposition, matching TelemetryMetricsPrometheus.Core.Exporter's distribution format ---
 
+  # Zero-count series are pre-created label sets nothing has hit yet; they are left out so the text
+  # matches what Core prints (Core only ever shows observed series).
   defp render_metric(cfg) do
-    case :persistent_term.get(cfg.key, %{}) do
-      series when map_size(series) == 0 ->
+    observed =
+      for {labels, ref} <- :persistent_term.get(cfg.key, %{}),
+          count(ref, cfg) > 0,
+          do: {labels, ref}
+
+    case observed do
+      [] ->
         []
 
-      series ->
+      observed ->
         name = format_name(cfg.metric.name)
 
         rows =
-          series
+          observed
           |> Enum.map(fn {labels, ref} -> {format_labels(labels), ref} end)
           |> Enum.sort()
           |> Enum.map(fn {labels, ref} -> format_series(name, labels, cfg, ref) end)
@@ -194,6 +229,9 @@ defmodule Fathom.Telemetry.FastHistogram do
         ]
     end
   end
+
+  # Sum of the bucket slots (1..length(buckets)+1, the last being +Inf): the sample count.
+  defp count(ref, cfg), do: Enum.sum(for i <- 1..(cfg.size - 1), do: :counters.get(ref, i))
 
   defp format_series(name, labels, cfg, ref) do
     {bucket_rows, count} =
