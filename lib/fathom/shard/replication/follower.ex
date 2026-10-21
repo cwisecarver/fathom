@@ -66,6 +66,7 @@ defmodule Fathom.Shard.Replication.Follower do
   # Other names (tests standing up several followers) keep the concat.
   @default_table Module.concat(__MODULE__, Shards)
   @default_locks Module.concat(__MODULE__, ShardLocks)
+  @default_touches Module.concat(__MODULE__, ShardTouches)
 
   # A WAL frame header: pgno, nTruncate, two salts, two checksums; and the two header magics (`Wal`).
   @wal_frame_header_bytes 24
@@ -82,6 +83,15 @@ defmodule Fathom.Shard.Replication.Follower do
   def locks(name \\ __MODULE__)
   def locks(__MODULE__), do: @default_locks
   def locks(name), do: Module.concat(name, ShardLocks)
+
+  @doc false
+  # When each replica row was last written, `{shard_id, monotonic_s}` (expert review
+  # 2026-10-20-2027 #11, see "SWEEPING IDLE REPLICA ROWS"). Separate from `table/1` for the same
+  # reason as `locks/1`.
+  @spec touches(atom()) :: atom()
+  def touches(name \\ __MODULE__)
+  def touches(__MODULE__), do: @default_touches
+  def touches(name), do: Module.concat(name, ShardTouches)
 
   # ------------------------------------------------------------------------------------------
   # the per-shard lock
@@ -358,6 +368,7 @@ defmodule Fathom.Shard.Replication.Follower do
 
   defp do_forget(name, shard_id) do
     :ets.delete(table(name), shard_id)
+    :ets.delete(touches(name), shard_id)
     File.rm(db_path(name, shard_id))
     File.rm(wal_path(name, shard_id))
     # And the torn marker (expert review 2026-08-20 #11b), or a promoted-then-re-followed shard
@@ -371,12 +382,17 @@ defmodule Fathom.Shard.Replication.Follower do
     ArgumentError -> :ok
   end
 
-  @doc "Current replication state for a shard, or nil if it was never seeded."
+  @doc """
+  Current replication state for a shard, or nil if it was never seeded.
+
+  A row the idle sweep dropped (`sweep_idle_rows/1`) is re-derived from the replica's files here,
+  exactly as boot recovery derives it, so no caller can tell a swept replica from a resident one.
+  """
   @spec state_of(atom(), String.t()) :: FollowerLog.t() | nil
   def state_of(name \\ __MODULE__, shard_id) do
     case :ets.lookup(table(name), shard_id) do
       [{^shard_id, s}] -> s
-      [] -> nil
+      [] -> rederive(name, shard_id)
     end
   end
 
@@ -560,6 +576,7 @@ defmodule Fathom.Shard.Replication.Follower do
     # Owned here for the same reason as the state table: it dies with this process, and a holder
     # whose release then raises is rescued (`unlock_shard/2`). See the lock section above.
     :ets.new(locks(name), [:named_table, :public, :set, write_concurrency: true])
+    :ets.new(touches(name), [:named_table, :public, :set, write_concurrency: true])
 
     # Which registry says "this node coordinates that shard" (`coordinated_here?/2`). `Fleet` passes
     # `Fathom.ShardRegistry`, so production always has it. The DEFAULT is off (`nil`) because a
@@ -574,6 +591,7 @@ defmodule Fathom.Shard.Replication.Follower do
     reap_stale_seed_temps(dir)
     schedule_seed_temp_reap()
     recover(tab, name, dir)
+    schedule_row_sweep()
 
     # `ip:` is a security control, not tuning. This socket takes raw WAL frames for a tenant's
     # database and the protocol has NO authentication — whoever reaches the port can write into
@@ -646,7 +664,19 @@ defmodule Fathom.Shard.Replication.Follower do
     {:noreply, state}
   end
 
+  def handle_info(:sweep_rows, state) do
+    _ = sweep_idle_rows(state.name)
+    schedule_row_sweep()
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
+
+  defp schedule_row_sweep do
+    Process.send_after(self(), :sweep_rows, row_sweep_ms())
+  end
+
+  defp row_sweep_ms, do: Application.get_env(:fathom, :replication_row_sweep_ms, 60_000)
 
   defp schedule_seed_temp_reap do
     Process.send_after(self(), :reap_seed_temps, seed_temp_reap_ms())
@@ -1921,6 +1951,7 @@ defmodule Fathom.Shard.Replication.Follower do
     ordinal = {Map.get(state, :wal_ordinal, 0), state.salt1}
     if ordinal != was_ordinal, do: sync_ordinal(name, shard_id, ordinal)
     :ets.insert(tab, {shard_id, state})
+    touch(name, shard_id)
     state
   end
 
@@ -2257,6 +2288,21 @@ defmodule Fathom.Shard.Replication.Follower do
     # under this WAL's salts, which a zeroed tail is not. Frames are written POSITIONALLY
     # (`write_frame/4`), so resuming at the lower offset overwrites the junk rather than appending
     # after it.
+    case derive_state(name, shard_id) do
+      nil ->
+        false
+
+      state ->
+        :ets.insert(tab, {shard_id, state})
+        touch(name, shard_id)
+        true
+    end
+  end
+
+  # What the replica's files say, or nil when they say nothing (no readable WAL, or no `.db`).
+  # Shared by boot recovery and the lazy re-derive of a swept row, so the two can never disagree.
+  # `log?` false for the sweep's equivalence check, which runs every round on a row it keeps.
+  defp derive_state(name, shard_id, log? \\ true) do
     with {:ok, header} <- Wal.read(wal_path(name, shard_id)),
          true <- File.exists?(db_path(name, shard_id)) do
       # Carry `torn` across the restart (expert review 2026-08-20 #11b). `FollowerLog.seeded/4`
@@ -2265,14 +2311,149 @@ defmodule Fathom.Shard.Replication.Follower do
       # thing that remembers the two files were a generation apart when we went down.
       torn? = File.exists?(torn_path(name, shard_id))
       lineage = recovered_lineage(name, shard_id)
-      :ets.insert(tab, {shard_id, recovered_state(name, shard_id, header, torn?, lineage)})
-      true
+      recovered_state(name, shard_id, header, torn?, lineage, log?)
     else
-      _ -> false
+      _ -> nil
     end
   end
 
-  defp recovered_state(name, shard_id, %{ckpt_seq: gen, salt1: salt} = header, torn?, lineage) do
+  # SWEEPING IDLE REPLICA ROWS (expert review 2026-10-20-2027 #11). Every shard this node ever
+  # replicated kept a row here until a promotion or a tombstone forgot it — measured 247 B (plus
+  # 103 B for its touch row now), ~80 MB per node at a million fleet shards over three nodes,
+  # ~800 MB at ten million, nearly all for replicas nobody pushes to.
+  # A row untouched (no `put_state/3`) for `:replication_row_idle_ms` (default 10 x
+  # `:shard_idle_ms`) is dropped, and `state_of/2` re-derives it from the files on the next use,
+  # through the same `derive_state/2` boot recovery uses.
+  #
+  # WHY DROPPING IT LOSES NOTHING. Every field of the row is either durable beside the replica or
+  # recovered in the safe direction, which is what already makes a follower restart (every deploy)
+  # safe:
+  #   * `wal_gen`, `salt1`, `next_offset` — the `-wal` header and its commit extent (or, for an
+  #     empty WAL, the `.db.position` record, else TORN);
+  #   * `torn` — the durable marker, which `put_state/3` writes BEFORE the ETS row, so a torn row is
+  #     never swept into an untorn one;
+  #   * `lineage`, `wal_ordinal` — their sidecars, written by `put_state/3` when they change;
+  #   * `epoch` — nowhere on disk, recovered as 0: the next push takes `decide_fresh/2`, the one
+  #     round trip a restart already costs. A replica whose lineage is unstated (0) is NOT swept,
+  #     because there the epoch is the only ownership evidence and re-deriving 0 would read as a
+  #     new ownership and re-seed it (`FollowerLog.ownership_change?/2`).
+  # And the sweep does not trust that argument blindly: under the shard's lock it re-derives the
+  # row from the files and drops it only when the result is no less safe than the row — same
+  # generation, salt, lineage and ordinal, no more bytes claimed, torn if the row is torn. Anything
+  # else (a file write the row is ahead of, a missing sidecar) keeps the row.
+  #
+  # UNDER THE SHARD'S LOCK, never waited for: a push, seed or promotion holding it is using the row,
+  # so the sweep skips the shard this round. The lazy re-derive takes the lock too, so a re-derived
+  # row cannot interleave with `forget/2` removing the files.
+  #
+  # Not re-derived: `replica_shard_ids/1` (the rebalancer's warm set) lists only resident rows, so a
+  # replica idle for the sweep window stops advertising warmth until its next push. A shard that
+  # idle is not a placement candidate anyway, and listing it would mean a directory scan per beat.
+  @sweep_chunk 500
+
+  @doc false
+  # Public for the test; the timer calls it every `:replication_row_sweep_ms`.
+  @spec sweep_idle_rows(atom()) :: non_neg_integer()
+  def sweep_idle_rows(name \\ __MODULE__) do
+    cutoff = System.monotonic_time(:second) - div(row_idle_ms(), 1000)
+    spec = [{{:"$1", :"$2"}, [{:<, :"$2", cutoff}], [:"$1"]}]
+    sweep_chunks(name, :ets.select(touches(name), spec, @sweep_chunk), cutoff, 0)
+  rescue
+    ArgumentError -> 0
+  end
+
+  defp sweep_chunks(_name, :"$end_of_table", _cutoff, swept), do: swept
+
+  defp sweep_chunks(name, {ids, cont}, cutoff, swept) do
+    swept = swept + Enum.count(ids, &sweep_row(name, &1, cutoff))
+    sweep_chunks(name, :ets.select(cont), cutoff, swept)
+  end
+
+  defp sweep_row(name, shard_id, cutoff) do
+    case lock_shard(name, shard_id, 0) do
+      {:ok, {:held, _} = lock} ->
+        try do
+          with [{_, touched}] when touched < cutoff <- :ets.lookup(touches(name), shard_id),
+               [{_, %{lineage: lineage} = row}] when is_integer(lineage) and lineage > 0 <-
+                 :ets.lookup(table(name), shard_id),
+               true <- rederivable?(row, derive_state(name, shard_id, false)) do
+            :ets.delete(table(name), shard_id)
+            :ets.delete(touches(name), shard_id)
+            true
+          else
+            _ -> false
+          end
+        after
+          unlock_shard(name, lock)
+        end
+
+      _busy_or_stopped ->
+        false
+    end
+  end
+
+  # The files re-derive this row, or something safer: same WAL identity and ownership, no bytes the
+  # row does not claim, and never less torn.
+  defp rederivable?(_row, nil), do: false
+
+  defp rederivable?(row, derived) do
+    derived.wal_gen == row.wal_gen and derived.salt1 == row.salt1 and
+      derived.lineage == row.lineage and
+      Map.get(derived, :wal_ordinal, 0) == Map.get(row, :wal_ordinal, 0) and
+      derived.next_offset <= row.next_offset and
+      (derived.torn or not row.torn)
+  end
+
+  defp row_idle_ms do
+    Application.get_env(:fathom, :replication_row_idle_ms) ||
+      10 * Application.get_env(:fathom, :shard_idle_ms, 60_000)
+  end
+
+  defp touch(name, shard_id),
+    do: :ets.insert(touches(name), {shard_id, System.monotonic_time(:second)})
+
+  # A miss in `state_of/2`: the shard was never replicated here, or its row was swept. Only the
+  # files can say which, and only under the shard's lock (see the sweep section). A busy lock is a
+  # push, seed or promotion that is about to write the row itself; answer what the files say
+  # without inserting it, never a definite "nothing" over a replica that is on disk (the
+  # 2026-10-15 #4 bug class).
+  defp rederive(name, shard_id) do
+    if Fathom.ShardId.valid?(shard_id) do
+      case with_shard_lock(name, shard_id, lock_wait_ms(), fn ->
+             rederive_locked(name, shard_id)
+           end) do
+        {:error, :replica_busy} -> derive_state(name, shard_id)
+        {:error, :no_replica} -> nil
+        state -> state
+      end
+    end
+  end
+
+  defp rederive_locked(name, shard_id) do
+    tab = table(name)
+
+    case :ets.lookup(tab, shard_id) do
+      [{^shard_id, s}] ->
+        s
+
+      [] ->
+        if recover_shard(tab, name, shard_id) do
+          case :ets.lookup(tab, shard_id) do
+            [{^shard_id, s}] -> s
+            [] -> nil
+          end
+        end
+    end
+  end
+
+  defp recovered_state(
+         name,
+         shard_id,
+         %{ckpt_seq: gen, salt1: salt} = header,
+         torn?,
+         lineage,
+         _log?
+       ) do
     # Only for the WAL whose salt it was written for (expert review 2026-10-15 #4).
     ordinal = recovered_ordinal(name, shard_id, salt)
 
@@ -2294,16 +2475,18 @@ defmodule Fathom.Shard.Replication.Follower do
   #
   # Epoch 0 as for every recovered replica, so the first push takes `decide_fresh/2` and resets
   # from offset 0 — nothing is ever appended to the empty WAL at the recorded offset.
-  defp recovered_state(name, shard_id, :empty, torn?, lineage) do
+  defp recovered_state(name, shard_id, :empty, torn?, lineage, log?) do
     case recovered_db_position(name, shard_id) do
       {:ok, %{lineage: ^lineage, wal_ordinal: ordinal, next_offset: extent}} ->
         %{FollowerLog.seeded(0, 0, 0, extent, lineage) | torn: torn?, wal_ordinal: ordinal}
 
       _ ->
-        Logger.info(
-          "replication follower recovered #{shard_id} with an empty WAL and no position for its " <>
-            ".db; holding it as torn (unrankable) until it is re-seeded"
-        )
+        if log?,
+          do:
+            Logger.info(
+              "replication follower recovered #{shard_id} with an empty WAL and no position for " <>
+                "its .db; holding it as torn (unrankable) until it is re-seeded"
+            )
 
         %{FollowerLog.seeded(0, 0, 0, 0, lineage) | torn: true}
     end
