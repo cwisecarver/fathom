@@ -11,7 +11,7 @@ Durability in fathom is two independent layers, each covering a different failur
 
 | Layer | Mechanism | Survives | Loses |
 |---|---|---|---|
-| **Local** | WAL + `PRAGMA synchronous=FULL` (fsync the WAL every commit) | a **process / OS crash** on the same node (local disk intact) | nothing — the WAL is durable |
+| **Local** | WAL + `PRAGMA synchronous=FULL` (fsync the WAL every commit) | a **process crash** under any sync mode (the frames are in the page cache); a **kernel crash or power loss** only because of FULL's fsync | nothing — the WAL is durable |
 | **Cross-node** | the periodic **flush** of the file to `Fathom.Shard.Storage` (S3/R2/…) | **node / disk loss** | committed-but-**unflushed** writes since the last flush = the **RPO window** |
 
 `synchronous=FULL` is the default (measured ~free for fathom's sharded, wire-bound model —
@@ -72,8 +72,9 @@ that dies just before a flush loses the full interval; the p50 is ~half, mid-saw
 `RPO ≈ interval` formula empirically. And **lost rows ≈ rate × interval**, so the window is a knob you
 set by the interval: tighten `:shard_flush_interval_ms` and the loss shrinks linearly (5 s → ~0.5 k
 rows, 1 s → ~0.15 k). **Idle-only (`0`)** loses the whole busy session — only the run length bounded it
-here. The **process-crash row is 0** (`synchronous=FULL`: wrote 200, survived 200, with nothing flushed
-first — survival came purely from the local WAL), the local-durability layer proven end to end. The
+here. The **process-crash row is 0** (wrote 200, survived 200, with nothing flushed
+first — survival came purely from the local WAL, which a process kill leaves in the page cache under
+NORMAL as well; it does not exercise FULL's fsync), the local-durability layer proven end to end. The
 boundary is pinned as deterministic invariants in `test/fathom/rpo_test.exs`; the multi-node /
 real-disk complement is `deploy/chaos/chaos.sh soak`.
 
@@ -334,7 +335,8 @@ a tenant looping TRUNCATE would churn the replication link.
 - **`:fork_evidence_timeout_ms`** — bounds the overlapped fork-evidence HEAD taken during lease
   acquisition. Default 5000 ms. A timeout or any error is `:unreachable`, which fails safe.
 
-- **`synchronous`** — `FULL` (default): per-commit fsync, local durability to a process crash.
+- **`synchronous`** — `FULL` (default): per-commit fsync, local durability to a kernel crash or power
+  loss (a process crash loses nothing under either mode; expert review 2026-10-21 rv6 F7).
   `NORMAL` trades that for fewer fsyncs (was the old default; FULL is ~free here, so there's little
   reason to weaken it).
 - **`:shard_flush_interval_ms`** — the RPO knob for hot shards. **Library default 5 s; deployment
@@ -358,7 +360,8 @@ a tenant looping TRUNCATE would churn the replication link.
 
 ## One-line summary
 
-A process crash loses nothing (WAL + `synchronous=FULL`); a node-disk loss loses only the writes
+A process crash loses nothing (the WAL; `synchronous=FULL` adds kernel-crash and power-loss
+survival); a node-disk loss loses only the writes
 since the last flush — and that window is bounded by a **periodic, lease-fenced, write-gated
 snapshot flush** (`:shard_flush_interval_ms`) for busy shards plus an idle flush-and-drop for quiet
 ones, with the flushed S3 object as the cross-node durable record the next owner pulls.

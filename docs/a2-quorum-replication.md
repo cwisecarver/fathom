@@ -340,6 +340,16 @@ that guarantee for acks while moving the fsync out of SQLite's write lock. Tenan
 replicating node run NORMAL, and the Session issues one `fdatasync` of the `-wal` per commit round,
 overlapped with the push. No write is acked until both the quorum and that fdatasync succeed.
 
+**The flag requires ext4 or xfs** for the shard data directory (expert review 2026-10-21 rv6 F7).
+Under FULL, SQLite fsyncs the directory on a new `-wal`'s first sync, so the file's NAME is durable
+with its first commit. Under NORMAL that directory sync waits for the first checkpoint, and Erlang
+cannot fsync a directory (`:file.open/2` on one is `eisdir`). On ext4 and xfs, an `fdatasync` that
+grows a newly created file forces the journal commit that also carries its directory entry, so the
+round's sync covers the name in practice. That is filesystem behaviour, not POSIX; on another
+filesystem a power loss can lose a new WAL's directory entry together with acked commits. The
+alternative, a `fathom_udf` SQL function that fsyncs the directory once per new WAL inode, was not
+built: it is a new native entry point for a case the supported filesystems already cover.
+
 What is exposed is **node loss**. On failover the survivor cold-opens the shard by pulling the last
 flushed object **from S3** ([durability](durability.md), "the survivor cold-opens"). Nothing ever
 reads the dead node's disk; there is no re-attach path. So every write since the last flush is gone

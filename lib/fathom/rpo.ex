@@ -3,13 +3,17 @@ defmodule Fathom.Rpo do
   Loss-window (RPO) measurement harness — quantifies how much a shard would lose
   on **node/disk loss**, as a function of the flush-interval knob
   (`:shard_flush_interval_ms`) and the write rate, and confirms the
-  **process-crash** case loses nothing (`synchronous=FULL` local durability).
+  **process-crash** case loses nothing (a committed WAL frame is in the kernel page cache, so it
+  survives the process under `synchronous=FULL` and `NORMAL` alike).
 
   Two deaths, two numbers (see `docs/durability.md`):
 
-    * **Process / OS crash, disk intact** → the WAL is fsynced per commit
-      (`synchronous=FULL`), so a same-node restart re-adopts the present local
-      file and loses nothing. Measured by `process_kill/1`: write N rows with the
+    * **Process crash, disk intact** → a COMMIT that returned has its WAL frames
+      in the kernel page cache, so a same-node restart re-adopts the present local
+      file and loses nothing, whatever the sync mode. What `synchronous=FULL` adds
+      is survival of a kernel crash or power loss, which this harness does not
+      simulate (expert review 2026-10-21 rv6 F7: this used to credit FULL with the
+      process case; NORMAL survives it too). Measured by `process_kill/1`: write N rows with the
       flush disabled, hard-kill the coordinator, re-open on the same disk, count
       survivors.
     * **Node / disk loss** → a survivor cold-opens the **last flushed object**, so
@@ -358,7 +362,8 @@ defmodule Fathom.Rpo do
 
   # The process-crash case: with the periodic + idle flush disabled (nothing
   # reaches storage), write N rows, hard-kill the coordinator, re-open on the same
-  # local file, and count survivors. `synchronous=FULL` ⇒ zero loss. The stored
+  # local file, and count survivors. Zero loss, from the page cache, not from FULL's
+  # fsync: a hard kill leaves the kernel's copy intact (rv6 F7). The stored
   # object stays empty, so survival can only come from the local WAL.
   @spec process_kill(pos_integer()) :: map()
   defp process_kill(n \\ 200) do

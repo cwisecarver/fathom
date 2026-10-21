@@ -57,6 +57,15 @@ defmodule Fathom.Shard.Replication.WalSync do
     engine): they never pass `:deferred_sync?` and stay FULL.
   * Checkpoints: they still sync the WAL before backfill and the `.db` after, under NORMAL.
 
+  ## Filesystem requirement: ext4 or xfs (expert review 2026-10-21 rv6 F7)
+
+  Under FULL, SQLite fsyncs the directory on a new `-wal`'s first sync. Under NORMAL it defers that
+  to the first checkpoint, and nothing here fsyncs the directory (Erlang cannot open one). On ext4
+  and xfs, an `fdatasync` that grows a newly created file forces the journal commit that carries
+  its directory entry, so the round's sync covers the name. That is filesystem behaviour, not
+  POSIX: the flag is supported only with `:shard_data_dir` on ext4 or xfs. See
+  `docs/a2-quorum-replication.md`.
+
   ## Visibility before durability (accepted, 2026-10-21)
 
   Under FULL a commit becomes visible to other connections only after its WAL fsync. Under this

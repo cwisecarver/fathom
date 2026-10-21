@@ -13,8 +13,10 @@ defmodule Mix.Tasks.Fathom.Rpo do
   unbounded window for a never-idle shard); the periodic flush bounds it.
 
   The process-crash line writes N rows with the flush disabled, hard-kills the
-  coordinator, re-opens on the same disk, and confirms `synchronous=FULL` loses
-  nothing. See `Fathom.Rpo` and `docs/durability.md`.
+  coordinator, re-opens on the same disk, and confirms nothing is lost. That holds
+  under `synchronous=NORMAL` too (the frames are in the page cache); FULL's per-commit
+  fsync matters only for a kernel crash or power loss, which this does not simulate.
+  See `Fathom.Rpo` and `docs/durability.md`.
 
   ## Cost side (`--cost`, expert review #20)
 
