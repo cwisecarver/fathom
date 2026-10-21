@@ -1511,6 +1511,44 @@ defmodule Fathom.Telemetry do
         unit: :byte,
         description: ":erlang.memory/0 system bytes"
       ),
+      last_value("fathom.node.memory_breakdown.allocated_carriers",
+        event_name: [:fathom, :node, :memory_breakdown],
+        measurement: :allocated_carriers,
+        unit: :byte,
+        description:
+          "Bytes ERTS holds from the OS across all alloc_util carriers; compare with :erlang.memory (blocks) and rss"
+      ),
+      last_value("fathom.node.memory_breakdown.allocated_blocks",
+        event_name: [:fathom, :node, :memory_breakdown],
+        measurement: :allocated_blocks,
+        unit: :byte,
+        description: "Live allocated block bytes across all alloc_util allocators"
+      ),
+      last_value("fathom.node.memory_breakdown.driver_carriers",
+        event_name: [:fathom, :node, :memory_breakdown],
+        measurement: :driver_carriers,
+        unit: :byte,
+        description:
+          "driver_alloc carrier bytes (all SQLite allocations); freed only when a carrier is completely empty"
+      ),
+      last_value("fathom.node.memory_breakdown.driver_blocks",
+        event_name: [:fathom, :node, :memory_breakdown],
+        measurement: :driver_blocks,
+        unit: :byte,
+        description: "driver_alloc live block bytes (SQLite page caches, statements, schema)"
+      ),
+      last_value("fathom.node.memory_breakdown.driver_fragmentation",
+        event_name: [:fathom, :node, :memory_breakdown],
+        measurement: :driver_fragmentation,
+        description:
+          "driver_carriers / driver_blocks; well above 1 after connection churn means freed SQLite memory is held, not returned to the OS"
+      ),
+      last_value("fathom.node.memory_breakdown.rss",
+        event_name: [:fathom, :node, :memory_breakdown],
+        measurement: :rss,
+        unit: :byte,
+        description: "Process resident set size from /proc/self/status (Linux only)"
+      ),
       last_value("fathom.directory.recorder.buffered",
         event_name: [:fathom, :directory, :recorder],
         measurement: :buffered,

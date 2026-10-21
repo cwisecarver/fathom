@@ -179,11 +179,134 @@ defmodule Fathom.Admin.Measurements do
     mem = :erlang.memory()
     :telemetry.execute([:fathom, :node, :memory], %{total: Keyword.fetch!(mem, :total)}, %{})
 
+    breakdown =
+      Map.new([:processes, :binary, :ets, :code, :atom, :system], &{&1, Keyword.fetch!(mem, &1)})
+
     :telemetry.execute(
       [:fathom, :node, :memory_breakdown],
-      Map.new([:processes, :binary, :ets, :code, :atom, :system], &{&1, Keyword.fetch!(mem, &1)}),
+      Map.merge(breakdown, carrier_gauges()),
       %{}
     )
+  end
+
+  # Carrier-level gauges, so the density numbers cannot be misread (expert review 2026-10-21 r7 #3).
+  #
+  # Every figure above is `:erlang.memory/0`, which sums allocated BLOCKS. SQLite's page caches
+  # live in `driver_alloc` multiblock carriers, interleaved across connections, and an ERTS carrier
+  # goes back to the OS only when it is completely empty. After a churn (most connections closed,
+  # `PRAGMA shrink_memory` run) the blocks are freed and `:erlang.memory`, `served_kb_per_shard`
+  # and `system` all fall while the process RSS stays at the high-water mark. These gauges put the
+  # three quantities side by side:
+  #
+  #   * `allocated_blocks` / `allocated_carriers` - sum over every `alloc_util` allocator
+  #   * `driver_blocks` / `driver_carriers` - the `driver_alloc` slice (all SQLite allocations)
+  #   * `driver_fragmentation` - driver carriers / driver blocks (1.0 = no reusable-but-held slack)
+  #   * `rss` - the OS resident set from `/proc/self/status` (Linux only; absent elsewhere)
+  #
+  # Cost: ~1 ms per poll on a 12-scheduler VM (`allocator_sizes` for the 10 allocators).
+  @spec carrier_gauges() :: %{optional(atom()) => number()}
+  defp carrier_gauges do
+    {carriers, blocks} = alloc_sizes(:erlang.system_info(:alloc_util_allocators))
+    {driver_carriers, driver_blocks} = alloc_sizes([:driver_alloc])
+
+    gauges = %{
+      allocated_carriers: carriers,
+      allocated_blocks: blocks,
+      driver_carriers: driver_carriers,
+      driver_blocks: driver_blocks
+    }
+
+    gauges =
+      if driver_blocks > 0,
+        do: Map.put(gauges, :driver_fragmentation, driver_carriers / driver_blocks),
+        else: gauges
+
+    case Fathom.FS.read("/proc/self/status") do
+      {:ok, status} ->
+        case rss_bytes(status) do
+          nil -> gauges
+          rss -> Map.put(gauges, :rss, rss)
+        end
+
+      {:error, _} ->
+        gauges
+    end
+  end
+
+  defp alloc_sizes(allocators) do
+    Enum.reduce(allocators, {0, 0}, fn alloc, {c, b} ->
+      case :erlang.system_info({:allocator_sizes, alloc}) do
+        instances when is_list(instances) ->
+          {ic, ib} = sum_allocator_sizes(instances)
+          {c + ic, b + ib}
+
+        _disabled ->
+          {c, b}
+      end
+    end)
+  end
+
+  @doc """
+  Sums `{carriers_size, blocks_size}` over the instances of one `:erlang.system_info({:allocator_sizes, a})`
+  result. Carriers are the memory ERTS holds from the OS (multiblock, single-block and pooled
+  carriers); blocks are the live allocations inside them. Public only so the parser is testable
+  against a fixed shape.
+  """
+  @spec sum_allocator_sizes([term()]) :: {non_neg_integer(), non_neg_integer()}
+  def sum_allocator_sizes(instances) do
+    Enum.reduce(instances, {0, 0}, fn
+      {:instance, _n, areas}, acc ->
+        Enum.reduce(areas, acc, fn
+          {area, props}, {c, b} when area in [:mbcs, :sbcs, :mbcs_pool, :sbcs_pool] ->
+            {c + carriers_of(props), b + blocks_of(props)}
+
+          _other, acc ->
+            acc
+        end)
+
+      _other, acc ->
+        acc
+    end)
+  end
+
+  defp carriers_of(props) do
+    case List.keyfind(props, :carriers_size, 0) do
+      {:carriers_size, cur, _, _} -> cur
+      {:carriers_size, cur} -> cur
+      _ -> 0
+    end
+  end
+
+  defp blocks_of(props) do
+    case List.keyfind(props, :blocks, 0) do
+      {:blocks, types} ->
+        Enum.reduce(types, 0, fn
+          {_type, sizes}, acc when is_list(sizes) ->
+            case List.keyfind(sizes, :size, 0) do
+              {:size, cur, _, _} -> acc + cur
+              {:size, cur} -> acc + cur
+              _ -> acc
+            end
+
+          _other, acc ->
+            acc
+        end)
+
+      _ ->
+        0
+    end
+  end
+
+  @doc """
+  The `VmRSS` line of a `/proc/<pid>/status` body, in bytes; `nil` when absent (non-Linux, or a
+  truncated read). Public only so the parser is testable.
+  """
+  @spec rss_bytes(binary()) :: non_neg_integer() | nil
+  def rss_bytes(status) when is_binary(status) do
+    case Regex.run(~r/^VmRSS:\s+(\d+)\s+kB$/m, status) do
+      [_, kb] -> String.to_integer(kb) * 1024
+      _ -> nil
+    end
   end
 
   @doc "Directory.Recorder buffer depth and flush freshness (expert review 2026-10-15 #17)."
