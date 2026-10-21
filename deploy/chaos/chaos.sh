@@ -2375,7 +2375,9 @@ cmd_tpc_tail() {
   local hist_before; hist_before=$(mktemp); repl_hist_dump "$hist_before"
 
   local txns=$(( per_client * tenants )) tps_list="" k json tps arm rate
-  for arm in closed open; do
+  # TPC_TAIL_ARMS="open" (with TPC_OPEN_RATE) runs only the open loop: the rig's MinIO fills after
+  # ~2 back-to-back 1024-tenant runs, so a clean A/B gives each run its own fresh fleet.
+  for arm in ${TPC_TAIL_ARMS:-closed open}; do
     if [ "$arm" = open ]; then
       rate=${TPC_OPEN_RATE:-$(printf '%s\n' $tps_list | sort -n | awk -v f="$frac" '{ v[NR] = $1 } END { if (NR) printf "%d", v[int((NR + 1) / 2)] * f }')}
       if [ -z "$rate" ] || [ "$rate" -le 0 ]; then echo "  tpc-tail: no closed-loop capacity to derive the open-loop rate from" >&2; break; fi
