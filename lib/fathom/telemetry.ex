@@ -1211,6 +1211,22 @@ defmodule Fathom.Telemetry do
         description:
           "Replicated-commit calls dropped unexecuted because the caller's timeout had already passed when the Session reached them (a stalled Session's queue)"
       ),
+      # Deferred WAL sync (expert review 2026-10-21 #7, off by default): the per-round fdatasync's
+      # own latency, and writes refused because it failed. Any nonzero failure count is an incident.
+      distribution("fathom.replication.wal_sync.duration",
+        event_name: [:fathom, :replication, :wal_sync],
+        measurement: :duration,
+        unit: {:native, :millisecond},
+        tags: [:outcome],
+        reporter_options: [buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]],
+        description:
+          "Deferred WAL fdatasync per Session commit round (REPLICATION_DEFERRED_WAL_SYNC), by outcome (ok / open_error / error)"
+      ),
+      counter("fathom.replication.wal_sync_failed.count",
+        event_name: [:fathom, :replication, :wal_sync_failed],
+        description:
+          "Tenant writes refused (FILO_WAL_SYNC_FAILED) because the deferred WAL fdatasync failed or the shard's Session is poisoned"
+      ),
       distribution("fathom.replication.commit_stage.duration",
         event_name: [:fathom, :replication, :commit_stage],
         measurement: :duration,

@@ -894,6 +894,17 @@ case env_bool.("REPLICATION_RESEED") do
   v -> config :fathom, :replication_reseed, v
 end
 
+# DEFERRED WAL SYNC (expert review 2026-10-21 #7). OFF BY DEFAULT, and it stays off until the rig
+# hot-shard write arm and the crash test named in the commit that added it have passed. With it on
+# (and replication on), tenant `:rw` handles run `synchronous=NORMAL` and the A2 Session issues one
+# `fdatasync` of the `-wal` per commit round, overlapped with the push; no write is acked until both
+# the quorum and that fdatasync succeed. See `Fathom.Shard.Replication.WalSync`. Inert with
+# replication off: handles stay FULL.
+case env_bool.("REPLICATION_DEFERRED_WAL_SYNC") do
+  nil -> :ok
+  v -> config :fathom, :replication_deferred_wal_sync, v
+end
+
 # Let a cold open serve a local REPLICA when it is provably newer than the stored object — the
 # failover half of A2, and the only thing that actually turns node-loss RPO from ~300 s into ~0.
 #
