@@ -5183,6 +5183,16 @@ defmodule Fathom.Shard do
   #   * WHAT IT COSTS. The pin holds a read mark across the PUT, so a checkpoint cannot make
   #     progress for that long; on a shard that was idle a moment ago that only delays WAL
   #     truncation. The upload is the live file's size, not its VACUUMed size (free pages included).
+  #     Since the fully-backfilled case (#11) this route also runs on shards with LIVE writers, and
+  #     there the cost is real (expert review 2026-10-21 rv6 F9): no checkpoint can backfill past
+  #     the pin's mark, and the log cannot restart while the pin holds a read lock, so every commit
+  #     made during the PUT appends to the `-wal` and stays there until the pin is released. The
+  #     WAL therefore grows by (write rate x PUT duration); a 100 MB shard PUT at 50 MB/s under a
+  #     tenant writing 5 MB/s adds ~10 MB of WAL that the next checkpoint backfills. The VACUUM
+  #     route does not have this cost during the PUT (its read ends when `VACUUM INTO` returns), but
+  #     it pays the same block for the length of the VACUUM. Not bounded here: a WAL-size gate read
+  #     at route time says nothing about the growth during the PUT, which is what costs. If a rig
+  #     shows WAL growth from this, bound the route by the `.db` size (a proxy for PUT duration).
   #
   # A FULLY BACKFILLED WAL COUNTS AS FOLDED (expert review 2026-10-21 #11). The route used to need
   # an absent/zero-length `-wal`, which a shard holding a stream open never has (a completed
