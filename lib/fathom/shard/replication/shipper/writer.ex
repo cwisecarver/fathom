@@ -32,9 +32,13 @@ defmodule Fathom.Shard.Replication.Shipper.Writer do
 
   ## Every send goes through here, including the seeds
 
-  Seed frames are sent with `send_now/2`, a synchronous call, so the shipper blocks exactly as it
-  did before — the seed state machine's ordering and abort semantics are untouched, which is the
-  half of #19 that was deliberately NOT made asynchronous.
+  Seed frames used to be sent with a synchronous `send_now/2` (now removed), so the shipper
+  blocked for a whole seed chunk's wire time (4 MiB is ~34 ms at 1 Gbit, seconds on a congested link) with every
+  other shard's acks unread behind it — the #19 hazard, back on the seed path (expert review
+  2026-10-20-2027 #14). Now a chunk is handed over with `frame_reply/3`: this process sends it and
+  reports `{:sent, writer, from, result}` back to the shipper, which answers the seeder. The seeder
+  still waits for each chunk's send (the 2026-10-01 #6 one-chunk-in-flight bound) and frames still
+  leave in cast order; only the shipper no longer waits. `seed_begin`/`end`/`abort` ride `frame/4`.
 
   Routing them through here anyway makes this socket **single-sender**, which is worth more than it
   looks: `send_timeout` and `send_timeout_close` are per-socket settings whose behaviour with two
@@ -48,10 +52,6 @@ defmodule Fathom.Shard.Replication.Shipper.Writer do
   the shipper matches on it, so a straggler is ignored rather than tearing down the socket that
   replaced it. The socket-level twin of that guard is on `{:tcp_closed, sock}` in `Shipper`.
   """
-
-  # `send_timeout` defaults to 5 s and is operator-tunable; this only has to be comfortably above
-  # whatever it is, because the socket is what actually bounds the send.
-  @call_timeout_ms 30_000
 
   alias Fathom.Shard.Replication.Budget
 
@@ -84,30 +84,33 @@ defmodule Fathom.Shard.Replication.Shipper.Writer do
   end
 
   @doc """
-  Send `iodata` and wait for the result — the seed path's shape, unchanged from an inline send.
-
-  `{:error, :no_writer}` for a link with no socket, which is what an inline
-  `:gen_tcp.send(nil, …)` could never express and the caller's `sock: nil` clauses already handle.
+  Queue a seed chunk and have the result reported back to the shipper as
+  `{:sent, writer, from, :ok | {:error, reason}}`, so the shipper can answer the seeder's call
+  (`from`) without blocking on the send (expert review 2026-10-20-2027 #14). On a failure the
+  `{:sent, …}` report precedes the `{:send_failed, …}` one (same sender, so in order); a request
+  still queued here when the writer stops is answered by the shipper's `drop/2`, never lost.
   """
-  @spec send_now(pid() | nil, iodata()) :: :ok | {:error, term()}
-  def send_now(nil, _iodata), do: {:error, :no_writer}
-
-  def send_now(writer, iodata) do
-    ref = make_ref()
-    send(writer, {:send_now, self(), ref, iodata})
-
-    receive do
-      {^ref, result} -> result
-    after
-      # Bounded by the socket's own `send_timeout` plus slack. A writer that misses this deadline is
-      # wedged in a way `send_timeout` was supposed to prevent, and reporting it as a send error
-      # routes into `drop/2` — the same place every other link failure goes.
-      @call_timeout_ms -> {:error, :writer_timeout}
-    end
+  @spec frame_reply(pid(), iodata(), GenServer.from()) :: :ok
+  def frame_reply(writer, iodata, from) do
+    send(writer, {:frame_reply, iodata, from})
+    :ok
   end
 
   defp loop(sock, shipper) do
     receive do
+      {:frame_reply, iodata, from} ->
+        result = :gen_tcp.send(sock, iodata)
+        send(shipper, {:sent, self(), from, result})
+
+        case result do
+          :ok ->
+            loop(sock, shipper)
+
+          {:error, reason} ->
+            send(shipper, {:send_failed, self(), reason})
+            exit(:normal)
+        end
+
       {:frame, iodata, budget_ref, reserved} ->
         case :gen_tcp.send(sock, iodata) do
           :ok ->
@@ -119,23 +122,6 @@ defmodule Fathom.Shard.Replication.Shipper.Writer do
             # link with a fresh writer, so anything still queued here belongs to a link that no
             # longer exists — draining it would send frames onto a closed socket and report N more
             # failures for one event.
-            send(shipper, {:send_failed, self(), reason})
-            exit(:normal)
-        end
-
-      {:send_now, from, ref, iodata} ->
-        result = :gen_tcp.send(sock, iodata)
-        send(from, {ref, result})
-
-        case result do
-          :ok ->
-            loop(sock, shipper)
-
-          {:error, reason} ->
-            # The caller already has the error and handles it, but the link is still broken and the
-            # shipper's `drop/2` is what fails the other waiters. Reporting is not redundant: the
-            # seed path's own `{:error, _}` branch drops too, and a second `drop/2` on an already
-            # dropped link is a no-op because `writer` no longer matches.
             send(shipper, {:send_failed, self(), reason})
             exit(:normal)
         end
