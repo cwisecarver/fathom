@@ -123,6 +123,17 @@ defmodule Fathom.RuntimeConfigTest do
            ) == 67_108_864
   end
 
+  # Expert review 2026-10-20-2027 #7: unset leaves the code default (256 KiB) in every env.
+  test "STMT_CACHE_BYTES: unset leaves the default; 0 turns the byte bound off; N overrides" do
+    refute Keyword.has_key?(prod_config(%{"STMT_CACHE_BYTES" => nil}), :stmt_cache_bytes)
+    refute Keyword.has_key?(fathom_config(%{"STMT_CACHE_BYTES" => nil}), :stmt_cache_bytes)
+
+    assert Keyword.fetch!(prod_config(%{"STMT_CACHE_BYTES" => "0"}), :stmt_cache_bytes) == nil
+
+    assert Keyword.fetch!(fathom_config(%{"STMT_CACHE_BYTES" => "1048576"}), :stmt_cache_bytes) ==
+             1_048_576
+  end
+
   test "SHARD_LOAD=true|1 turns on :shard_load (the deployed-node enable knob)" do
     assert Keyword.get(fathom_config(%{"SHARD_LOAD" => "true"}), :shard_load) == true
     assert Keyword.get(fathom_config(%{"SHARD_LOAD" => "1"}), :shard_load) == true

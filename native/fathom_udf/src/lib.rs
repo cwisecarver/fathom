@@ -443,7 +443,54 @@ fn register_misc(db: &Connection, det: FunctionFlags, nondet: FunctionFlags) -> 
         ))
     })?;
 
+    // `fathom_stmt_memused(sql)` (expert review 2026-10-20-2027 #7): the heap bytes SQLite holds
+    // for the prepared statement on THIS connection whose text is exactly `sql`
+    // (`sqlite3_stmt_status(SQLITE_STMTSTATUS_MEMUSED)`), or NULL if none is prepared. With a NULL
+    // argument, the sum over every statement on the connection. `Fathom.Shard.Connection` bounds
+    // its statement cache by these bytes: exqlite exposes no statement-status call, and a 29-column
+    // Django SELECT costs ~14 KiB where a point read costs ~2, so a COUNT cap is blind to the
+    // difference. It reads only the calling connection's own statements, whose text the tenant
+    // supplied; the byte count is the one new fact and says nothing about any other tenant.
+    db.create_scalar_function("fathom_stmt_memused", 1, nondet, |ctx| {
+        let want: Option<Vec<u8>> = match ctx.get_raw(0) {
+            ValueRef::Null => None,
+            ValueRef::Text(t) => Some(t.to_vec()),
+            _ => return Err(Error::InvalidFunctionParameterType(0, Type::Text)),
+        };
+        // SAFETY: the handle is the calling connection, used on this thread for read-only
+        // statement-list walks while SQLite holds its mutex for the duration of this call.
+        let conn = unsafe { ctx.get_connection() }?;
+        let db = unsafe { conn.handle() };
+        Ok(unsafe { stmt_memused(db, want.as_deref()) })
+    })?;
+
     Ok(())
+}
+
+/// Walk the connection's prepared-statement list (`sqlite3_next_stmt`) for `fathom_stmt_memused`.
+/// `Some(sql)`: the MEMUSED of the first statement whose text is byte-equal to `sql`, else `None`.
+/// `None`: the sum over every statement, including the one running this function.
+///
+/// # Safety
+///
+/// `db` must be the live handle of the connection executing the calling statement.
+unsafe fn stmt_memused(db: *mut ffi::sqlite3, want: Option<&[u8]>) -> Option<i64> {
+    let mut total: i64 = 0;
+    let mut stmt = ffi::sqlite3_next_stmt(db, std::ptr::null_mut());
+    while !stmt.is_null() {
+        let used = ffi::sqlite3_stmt_status(stmt, ffi::SQLITE_STMTSTATUS_MEMUSED, 0) as i64;
+        match want {
+            None => total += used,
+            Some(sql) => {
+                let text = ffi::sqlite3_sql(stmt);
+                if !text.is_null() && std::ffi::CStr::from_ptr(text).to_bytes() == sql {
+                    return Some(used);
+                }
+            }
+        }
+        stmt = ffi::sqlite3_next_stmt(db, stmt);
+    }
+    want.map_or(Some(total), |_| None)
 }
 
 // ---------------------------------------------------------------------------------------------

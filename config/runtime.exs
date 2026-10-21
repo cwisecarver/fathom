@@ -261,6 +261,16 @@ else
   end
 end
 
+# Per-connection prepared-statement cache budget, in SQLite statement bytes (expert review
+# 2026-10-20-2027 #7). Default 256 KiB in every env (`Fathom.Shard.Connection`), beside the
+# 64-entry count cap. A 29-column Django SELECT holds 10-19 KiB, so the default keeps ~25 wide
+# statements per stream; an app cycling more distinct wide statements than that per connection
+# re-prepares (measured: 32 distinct wide statements, Zipf access, 100% -> 90% hits). Raise it for
+# such an app if memory allows. STMT_CACHE_BYTES=0 turns the byte bound off (count cap only).
+if n = env_nonneg_int.("STMT_CACHE_BYTES") do
+  config :fathom, :stmt_cache_bytes, if(n == 0, do: nil, else: n)
+end
+
 # --- Herd-derived storm brakes (expert review 2026-08-26 #13b and #16) ------------------------
 #
 # Both replace a FIXED window with one derived from the open-shard population, and both are the
