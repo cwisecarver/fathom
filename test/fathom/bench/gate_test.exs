@@ -15,13 +15,7 @@ defmodule Fathom.Bench.GateTest do
   # #3, #12). The "gated but never emitted" check reads the LAST perf_history line, which cannot
   # carry a key until `scripts/benchmark.sh` runs once on the new code; the orchestrator empties
   # this list at integration, after that run. Delete an entry once its key is in the history.
-  @not_yet_in_history [
-    :wire_server_rows_per_s,
-    :hrana_ws_sparse_calibration_us,
-    :hrana_ws_sparse_ratio,
-    :served_mix_kb_per_shard,
-    :served_mix_binary_kb_per_shard
-  ]
+  @not_yet_in_history []
 
   # Lives here, not in bench_test.exs, because that whole module is @moduletag :bench and excluded
   # from the default suite — which is how this drift survived unnoticed. This needs no bench run.
