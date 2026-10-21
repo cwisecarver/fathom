@@ -136,7 +136,7 @@ defmodule Fathom.Shard.Replication.SeedPin do
     # `file_size/1` first: a `:ro` `Connection.open/2` materializes an ABSENT file, and a seed of a
     # shard with no `.db` must fail as it always did, not ship an empty database. A trusted handle
     # (no `tenant?`): no authorizer, no statement deadline.
-    with {:ok, _} <- File.stat(state.db_path),
+    with {:ok, _} <- Fathom.FS.stat(state.db_path),
          {:ok, conn} <- Connection.open(state.db_path, scope: :ro) do
       case pin_snapshot(conn) do
         :ok ->

@@ -658,7 +658,7 @@ defmodule Fathom.Shard.Storage.S3 do
         # each compressed piece to a decoder as it writes it, and refuses the body if the decoded MD5
         # is not the plaintext MD5. So a body that would not decode to its label never reaches this
         # `with`, and the temp file is not re-read to prove it.
-        with {:ok, %{size: psize, mtime: pmtime}} <- File.stat(local_path),
+        with {:ok, %{size: psize, mtime: pmtime}} <- Fathom.FS.stat(local_path),
              {:ok, tmp, size, body_digest, plain_hex, sha_hex} <-
                Codec.compress_to_temp_digests(local_path, encoding, body_hash, plain_sha256?()) do
           try do
@@ -674,7 +674,7 @@ defmodule Fathom.Shard.Storage.S3 do
               )
             end
           after
-            File.rm(tmp)
+            Fathom.FS.rm(tmp)
           end
         end
     end
@@ -695,7 +695,7 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   defp source_unchanged(path, size, mtime) do
-    case File.stat(path) do
+    case Fathom.FS.stat(path) do
       {:ok, %{size: ^size, mtime: ^mtime}} -> :ok
       {:ok, _changed} -> {:error, {:source_changed_during_upload, path}}
       {:error, reason} -> {:error, reason}
@@ -1318,7 +1318,7 @@ defmodule Fathom.Shard.Storage.S3 do
   # base64 form (the Content-MD5 header wire format) and the base16 hex form (the
   # metadata + download-comparison form).
   defp stat_and_md5(path) do
-    with {:ok, %{size: size, mtime: mtime}} <- File.stat(path) do
+    with {:ok, %{size: size, mtime: mtime}} <- Fathom.FS.stat(path) do
       if size > Application.get_env(:fathom, :s3_max_single_put, @max_single_put) do
         {:error, {:object_too_large, size}}
       else
@@ -1338,7 +1338,7 @@ defmodule Fathom.Shard.Storage.S3 do
         # while being uploaded; a BadDigest from the store says the credentials or the proxy are
         # broken. Those need completely different operator responses, and the window is real on
         # `upload_for_drop/1`, where the source is the LIVE database rather than a VACUUM temp.
-        case File.stat(path) do
+        case Fathom.FS.stat(path) do
           {:ok, %{size: ^size, mtime: ^mtime}} ->
             {:ok, size, Base.encode64(digest), Base.encode16(digest, case: :lower)}
 
@@ -1481,7 +1481,7 @@ defmodule Fathom.Shard.Storage.S3 do
   # A materialized download temp is empty (or unstattable). Empty is refused rather than promoted
   # (#6); unstattable is refused too — the safe direction for a file we are about to hand SQLite.
   defp empty_body?(path) do
-    case File.stat(path) do
+    case Fathom.FS.stat(path) do
       {:ok, %{size: 0}} -> true
       {:ok, _} -> false
       _ -> true
@@ -1654,7 +1654,7 @@ defmodule Fathom.Shard.Storage.S3 do
       # Release the inflate context on every exit path, exactly like the fd (#38).
       Codec.release(Process.delete({__MODULE__, :dl_z, tmp}))
 
-      File.rm(tmp)
+      Fathom.FS.rm(tmp)
     end
   end
 
@@ -2100,7 +2100,7 @@ defmodule Fathom.Shard.Storage.S3 do
           error
       end
     after
-      File.rm(tmp)
+      Fathom.FS.rm(tmp)
     end
   end
 

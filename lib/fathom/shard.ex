@@ -560,7 +560,7 @@ defmodule Fathom.Shard do
     # object and finishing the peer ask, so the file on disk is an unvetted pull: purge it and open
     # COLD, which recovers again (expert review 2026-10-13 #4). One stat per open.
     _ = PromoteOnOpen.purge_if_recovering(path)
-    file? = File.exists?(path)
+    file? = Fathom.FS.exists?(path)
     # Gathers evidence only — the verdict is `resolve_fork/4`, after the lease is held. See
     # `fork_evidence/2`: this HEAD races the steal-touch that `acquire_lease` performs, so a
     # decision made here can mistake our own touch for a fork.
@@ -1395,7 +1395,7 @@ defmodule Fathom.Shard do
       # clobber). Drop the now-wrong provenance sidecar so a crash before that
       # flush doesn't strand the next open fencing on the vanished etag.
       {:ok, nil} ->
-        File.rm(Provenance.sidecar_path(path))
+        Fathom.FS.rm(Provenance.sidecar_path(path))
         {:ok, nil}
 
       {:ok, current} when warm? ->
@@ -1447,7 +1447,7 @@ defmodule Fathom.Shard do
       # warm, fence with nil so the first flush RECREATES it (an If-Match against a
       # gone object could never succeed), and drop the dangling sidecar.
       {:ok, nil} ->
-        File.rm(Provenance.sidecar_path(path))
+        Fathom.FS.rm(Provenance.sidecar_path(path))
         {:ok, nil}
 
       # The release-in-gap fork (#19): another owner acquired, flushed, and
@@ -2378,7 +2378,7 @@ defmodule Fathom.Shard do
       # `:ok` rather than an error, and it is sound: every write goes through SQLite to
       # `state.path`, so no file means no writes landed. The dirty flag here is a conservative
       # UNKNOWN, not evidence of anything to upload.
-      not File.exists?(state.path) ->
+      not Fathom.FS.exists?(state.path) ->
         {:noreply, schedule_flush(settle_waiters(state, :nothing_to_flush))}
 
       true ->
@@ -3472,7 +3472,7 @@ defmodule Fathom.Shard do
   defp drop_clean(state) do
     # Clean: local == storage. Drop the local copy without re-uploading (nothing to
     # flush, no clobber possible) and release the lease for a clean handoff.
-    if File.exists?(state.path), do: drop_local_unless_serving(state)
+    if Fathom.FS.exists?(state.path), do: drop_local_unless_serving(state)
 
     # Release regardless of the local file (review 2026-07-23 #19): a coordinator can stop
     # clean with NO local file at all — a checkout abandoned before any connection opened on
@@ -3486,7 +3486,7 @@ defmodule Fathom.Shard do
   end
 
   defp flush_then_drop(state) do
-    if File.exists?(state.path) do
+    if Fathom.FS.exists?(state.path) do
       # Fence the flush: confirm we still own the shard right before uploading, so a
       # lease lost between acquire and now can't clobber a newer owner. See
       # Fathom.Shard.Fence.
@@ -3601,7 +3601,7 @@ defmodule Fathom.Shard do
             # not quarantining is correct and must stay, so re-tagging means changing a value two
             # paths agree on to fix one of them. The guard is local to the path that differs.
             {:error, {:corrupt_local, reason}} ->
-              if File.exists?(state.path),
+              if Fathom.FS.exists?(state.path),
                 do: Integrity.quarantine_corrupt!(state.path, state.id, reason)
 
               # Nothing was stamped, so keep the lineage claim (expert review 2026-10-12 #3).
@@ -4400,7 +4400,7 @@ defmodule Fathom.Shard do
     :ok
   end
 
-  defp drop_local(path), do: Enum.each(["", "-wal", "-shm", ".etag"], &File.rm(path <> &1))
+  defp drop_local(path), do: Enum.each(["", "-wal", "-shm", ".etag"], &Fathom.FS.rm(path <> &1))
 
   # Self-fence quarantine (expert review 2026-07-14 #5): the crash-steal counterpart to
   # quarantine_fork!. On a self-fence (a stealer took our lease during a GC pause/partition) the
@@ -4434,10 +4434,10 @@ defmodule Fathom.Shard do
       state.path <>
         ".fenced.#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
 
-    case File.rename(state.path, dest) do
+    case Fathom.FS.rename(state.path, dest) do
       :ok ->
-        Enum.each(["-wal", "-shm"], &File.rename(state.path <> &1, dest <> &1))
-        File.rm(Provenance.sidecar_path(state.path))
+        Enum.each(["-wal", "-shm"], &Fathom.FS.rename(state.path <> &1, dest <> &1))
+        Fathom.FS.rm(Provenance.sidecar_path(state.path))
         unflushed = max(WriteCounter.count(state.id) - state.flushed_through, 0)
 
         Logger.error(
@@ -5064,7 +5064,7 @@ defmodule Fathom.Shard do
           error
       end
     after
-      Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
+      Enum.each(["", "-wal", "-shm"], &Fathom.FS.rm(temp <> &1))
     end
   end
 
@@ -5188,7 +5188,7 @@ defmodule Fathom.Shard do
   # Absent or zero-length `-wal`: no frame, committed or not, outside the main file. A WAL that
   # holds only a header (restarted, nothing written) counts as non-empty: the conservative answer.
   defp wal_empty?(wal) do
-    case File.stat(wal) do
+    case Fathom.FS.stat(wal) do
       {:error, :enoent} -> true
       {:ok, %{size: 0}} -> true
       _ -> false
@@ -5295,7 +5295,7 @@ defmodule Fathom.Shard do
   # The .db plus its WAL: the snapshot is the merged content of both.
   defp local_db_bytes(path) do
     Enum.reduce([path, path <> "-wal"], 0, fn p, acc ->
-      case File.stat(p) do
+      case Fathom.FS.stat(p) do
         {:ok, %{size: size}} -> acc + size
         _ -> acc
       end

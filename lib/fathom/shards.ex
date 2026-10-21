@@ -1425,7 +1425,7 @@ defmodule Fathom.Shards do
   # dst that already has a stored object (`:dst_exists`), so a flushed-then-forgotten
   # shard is never overwritten.
   defp novel_shard?(shard_id) do
-    not File.exists?(Fathom.Shard.db_path(shard_id)) and not known_to_directory?(shard_id)
+    not Fathom.FS.exists?(Fathom.Shard.db_path(shard_id)) and not known_to_directory?(shard_id)
   end
 
   # How many least-recently-used shards to probe for idleness before giving up and

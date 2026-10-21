@@ -183,8 +183,8 @@ defmodule Fathom.Shard.Integrity do
     dest =
       "#{path}.corrupt.#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
 
-    _ = File.rename(path, dest)
-    Enum.each(["-wal", "-shm"], &File.rename(path <> &1, dest <> &1))
+    _ = Fathom.FS.rename(path, dest)
+    Enum.each(["-wal", "-shm"], &Fathom.FS.rename(path <> &1, dest <> &1))
 
     Logger.error(
       "shard #{shard_id}: local db failed quick_check (#{inspect(reason)}); REFUSING flush so the " <>

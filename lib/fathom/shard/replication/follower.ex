@@ -369,14 +369,14 @@ defmodule Fathom.Shard.Replication.Follower do
   defp do_forget(name, shard_id) do
     :ets.delete(table(name), shard_id)
     :ets.delete(touches(name), shard_id)
-    File.rm(db_path(name, shard_id))
-    File.rm(wal_path(name, shard_id))
+    Fathom.FS.rm(db_path(name, shard_id))
+    Fathom.FS.rm(wal_path(name, shard_id))
     # And the torn marker (expert review 2026-08-20 #11b), or a promoted-then-re-followed shard
     # inherits a quarantine flag from a replica that no longer exists.
-    File.rm(torn_path(name, shard_id))
-    File.rm(lineage_path(name, shard_id))
-    File.rm(ordinal_path(name, shard_id))
-    File.rm(db_position_path(name, shard_id))
+    Fathom.FS.rm(torn_path(name, shard_id))
+    Fathom.FS.rm(lineage_path(name, shard_id))
+    Fathom.FS.rm(ordinal_path(name, shard_id))
+    Fathom.FS.rm(db_position_path(name, shard_id))
     :ok
   rescue
     ArgumentError -> :ok
@@ -1330,7 +1330,7 @@ defmodule Fathom.Shard.Replication.Follower do
   defp replica_offer(name, shard_id) do
     with state when state != nil <- offerable(name, shard_id),
          {:ok, header} <- Wal.read(wal_path(name, shard_id)),
-         {:ok, %{size: db_size}} <- File.stat(db_path(name, shard_id)) do
+         {:ok, %{size: db_size}} <- Fathom.FS.stat(db_path(name, shard_id)) do
       {:ok,
        %{
          epoch: state.epoch,
@@ -1985,7 +1985,7 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   defp sync_ordinal(name, shard_id, _ordinal) do
-    File.rm(ordinal_path(name, shard_id))
+    Fathom.FS.rm(ordinal_path(name, shard_id))
     :ok
   end
 
@@ -1993,7 +1993,7 @@ defmodule Fathom.Shard.Replication.Follower do
   # The persisted ordinal for the WAL whose header salt is `salt1`, or 0. Public for the test.
   @spec recovered_ordinal(atom(), String.t(), non_neg_integer()) :: non_neg_integer()
   def recovered_ordinal(name \\ __MODULE__, shard_id, salt1) do
-    with {:ok, text} <- File.read(ordinal_path(name, shard_id)),
+    with {:ok, text} <- Fathom.FS.read(ordinal_path(name, shard_id)),
          [n, s] <- String.split(String.trim(text), " "),
          {ordinal, ""} when ordinal > 0 <- Integer.parse(n),
          {^salt1, ""} <- Integer.parse(s) do
@@ -2004,7 +2004,7 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   defp recovered_lineage(name, shard_id) do
-    with {:ok, text} <- File.read(lineage_path(name, shard_id)),
+    with {:ok, text} <- Fathom.FS.read(lineage_path(name, shard_id)),
          {n, ""} when n > 0 <- Integer.parse(String.trim(text)) do
       n
     else
@@ -2021,7 +2021,7 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   defp sync_torn_marker(name, shard_id, _state) do
-    File.rm(torn_path(name, shard_id))
+    Fathom.FS.rm(torn_path(name, shard_id))
     :ok
   end
 
@@ -2068,8 +2068,8 @@ defmodule Fathom.Shard.Replication.Follower do
     # void — invalidated BEFORE the rename, never after.
     with :ok <- invalidate_db_position(name, shard_id),
          :ok <- rm_if_present(wal),
-         :ok <- File.rename(state.db_temp, db),
-         :ok <- File.rename(state.wal_temp, wal) do
+         :ok <- Fathom.FS.rename(state.db_temp, db),
+         :ok <- Fathom.FS.rename(state.wal_temp, wal) do
       seeded =
         FollowerLog.seeded(
           state.epoch,
@@ -2135,7 +2135,7 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   defp rm_if_present(path) do
-    case File.rm(path) do
+    case Fathom.FS.rm(path) do
       :ok -> :ok
       {:error, :enoent} -> :ok
       other -> other
@@ -2143,7 +2143,7 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   defp rm_seed_temps(state) do
-    for key <- [:db_temp, :wal_temp], path = state[key], do: File.rm(path)
+    for key <- [:db_temp, :wal_temp], path = state[key], do: Fathom.FS.rm(path)
     :ok
   end
 
@@ -2172,8 +2172,8 @@ defmodule Fathom.Shard.Replication.Follower do
           |> Enum.filter(&String.contains?(&1, @seeding_marker))
           |> Enum.map(&Path.join(dir, &1))
           |> Enum.count(fn path ->
-            match?({:ok, %{mtime: m}} when m < cutoff, File.stat(path, time: :posix)) and
-              File.rm(path) == :ok
+            match?({:ok, %{mtime: m}} when m < cutoff, Fathom.FS.stat(path, time: :posix)) and
+              Fathom.FS.rm(path) == :ok
           end)
 
         if reaped > 0,
@@ -2304,12 +2304,12 @@ defmodule Fathom.Shard.Replication.Follower do
   # `log?` false for the sweep's equivalence check, which runs every round on a row it keeps.
   defp derive_state(name, shard_id, log? \\ true) do
     with {:ok, header} <- Wal.read(wal_path(name, shard_id)),
-         true <- File.exists?(db_path(name, shard_id)) do
+         true <- Fathom.FS.exists?(db_path(name, shard_id)) do
       # Carry `torn` across the restart (expert review 2026-08-20 #11b). `FollowerLog.seeded/4`
       # stamps `torn: false` because a real SEED is the one event that rebuilds both files
       # together — but this is not a seed, it is a recovery, and the marker on disk is the only
       # thing that remembers the two files were a generation apart when we went down.
-      torn? = File.exists?(torn_path(name, shard_id))
+      torn? = Fathom.FS.exists?(torn_path(name, shard_id))
       lineage = recovered_lineage(name, shard_id)
       recovered_state(name, shard_id, header, torn?, lineage, log?)
     else
@@ -2712,7 +2712,7 @@ defmodule Fathom.Shard.Replication.Follower do
     # it is simply new — `apply_write` is about to lay down a whole generation from offset 0. An
     # empty WAL over an existing `.db` has nothing to absorb either, but it does NOT make a torn
     # replica whole, so a sticky verdict survives this branch too.
-    if File.exists?(db) and wal_bytes(wal) > 0 do
+    if Fathom.FS.exists?(db) and wal_bytes(wal) > 0 do
       case absorb_recording_position(name, shard_id, prev, verdict, db, wal) do
         :ok when verdict == :already_torn ->
           # Absorbing is still right — the pages we hold are real — but it cannot clear the flag.
@@ -2747,7 +2747,7 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   defp wal_bytes(path) do
-    case File.stat(path) do
+    case Fathom.FS.stat(path) do
       {:ok, %{size: size}} -> size
       _ -> 0
     end
@@ -2810,7 +2810,7 @@ defmodule Fathom.Shard.Replication.Follower do
           end
         after
           _ = Sqlite3.close(conn)
-          File.rm(db <> "-shm")
+          Fathom.FS.rm(db <> "-shm")
         end
 
       {:error, reason} ->
@@ -2936,7 +2936,7 @@ defmodule Fathom.Shard.Replication.Follower do
   defp invalidate_db_position(name, shard_id) do
     path = db_position_path(name, shard_id)
 
-    if File.regular?(path) do
+    if Fathom.FS.regular?(path) do
       with {:ok, fd} <- :file.open(path, [:write, :raw, :binary]) do
         synced = maybe_sync(fd)
         _ = :file.close(fd)
@@ -2979,7 +2979,7 @@ defmodule Fathom.Shard.Replication.Follower do
           {:ok, %{lineage: pos_integer(), wal_ordinal: pos_integer(), next_offset: pos_integer()}}
           | :none
   def recovered_db_position(name \\ __MODULE__, shard_id) do
-    with {:ok, text} <- File.read(db_position_path(name, shard_id)),
+    with {:ok, text} <- Fathom.FS.read(db_position_path(name, shard_id)),
          [l, n, x, "end"] <- String.split(String.trim(text), " "),
          {lineage, ""} when lineage > 0 <- Integer.parse(l),
          {ordinal, ""} when ordinal > 0 <- Integer.parse(n),
@@ -3262,7 +3262,7 @@ defmodule Fathom.Shard.Replication.Follower do
     if fsync?() do
       with :ok <- Fathom.Shard.Storage.atomic_write(path, body), do: emit_state_sync(what)
     else
-      File.write(path, body)
+      Fathom.FS.write(path, body)
     end
   end
 

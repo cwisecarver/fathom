@@ -159,7 +159,7 @@ defmodule Fathom.Shard.Materializer do
   def promote_pull(path, etag) do
     temp = pull_temp(path)
 
-    if File.exists?(temp) do
+    if Fathom.FS.exists?(temp) do
       # Remove any stale sidecars BEFORE the pulled file lands (expert review #18): a
       # crash between drop_local's two File.rm calls (db deleted, -wal not yet) leaves
       # an orphan WAL, and SQLite's first open would run WAL recovery against it —
@@ -167,8 +167,8 @@ defmodule Fathom.Shard.Materializer do
       # (resurrected deletes, torn pages, or a malformed db, then flushed back as the
       # durable object). A pulled object is always a self-contained checkpointed
       # image, so any sidecars next to it are by definition stale.
-      File.rm(path <> "-wal")
-      File.rm(path <> "-shm")
+      Fathom.FS.rm(path <> "-wal")
+      Fathom.FS.rm(path <> "-shm")
 
       # …and any `.db` ALREADY at the path, BEFORE the sidecar is written (expert review 2026-10-08
       # #10). Sidecar-first below is safe only if a crash between it and the rename leaves "a
@@ -178,7 +178,7 @@ defmodule Fathom.Shard.Materializer do
       # stale copy, and its first flush If-Matched the newer object and overwrote it: a silent
       # rollback of acked writes. Those bytes were already judged stale and no connection has
       # opened them (the pull runs inside the open), so removing them first loses nothing.
-      File.rm(path)
+      Fathom.FS.rm(path)
 
       # Establish provenance BEFORE the pulled file becomes authoritative (expert
       # review 2026-07-14 #5). Writing the sidecar AFTER the rename left a crash
@@ -189,14 +189,14 @@ defmodule Fathom.Shard.Materializer do
       # is served and fenced with the NEW lineage's etag — its first flush If-Matches
       # and clobbers the newer owner's writes (the #1 clobber, through the promote's
       # crash hole). Sidecar-first inverts the residue to an orphan `<path>.etag` with
-      # no `.db`, which is harmless: warm detection gates on File.exists?(path) (the
+      # no `.db`, which is harmless: warm detection gates on Fathom.FS.exists?(path) (the
       # `.db`, see handle_continue's `warm?`), and the brand-new-open branch below
       # File.rm's a stale sidecar before landing. The sidecar path is `<path>.etag`,
       # derived from the FINAL path, so it's writable before the rename.
       Provenance.write(path, etag)
       before_promote_rename(path)
 
-      case File.rename(temp, path) do
+      case Fathom.FS.rename(temp, path) do
         :ok ->
           {:ok, etag}
 
@@ -261,7 +261,7 @@ defmodule Fathom.Shard.Materializer do
   # 2026-10-15). Only this shard's one pull ever writes under its pull-temp name, and every caller
   # runs after that pull has finished or been killed, so the glob cannot take a live download.
   defp rm_pull_temp(path) do
-    Enum.each(["", "-wal", "-shm"], &File.rm(pull_temp(path) <> &1))
+    Enum.each(["", "-wal", "-shm"], &Fathom.FS.rm(pull_temp(path) <> &1))
     Enum.each(Path.wildcard(pull_temp(path) <> ".dl.*"), &File.rm/1)
   end
 end
