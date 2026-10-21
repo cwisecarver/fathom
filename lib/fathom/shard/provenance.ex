@@ -107,7 +107,7 @@ defmodule Fathom.Shard.Provenance do
         :error -> etag
       end
 
-    case File.write(sidecar_path(path), bytes) do
+    case Fathom.FS.write(sidecar_path(path), bytes) do
       :ok -> :ok
       {:error, reason} -> Logger.warning("etag sidecar write failed: #{inspect(reason)}")
     end
@@ -188,7 +188,7 @@ defmodule Fathom.Shard.Provenance do
     # general path below costs `read` + `read_intents` + `put_record`'s stat and read before the
     # write, on every flush. The pre-PUT fsync (pwrite_sync) and the demotion rule are unchanged,
     # and `encode_record` recomputes the CRC.
-    case File.read(sidecar) do
+    case Fathom.FS.read(sidecar) do
       {:ok, @record_magic <> _ = bin} when byte_size(bin) == @record_size ->
         record_intent_in_place(sidecar, bin, md5_hex)
 
@@ -254,7 +254,7 @@ defmodule Fathom.Shard.Provenance do
   @doc "Every unresolved PUT intent, newest first (at most two); `[]` for none or a legacy sidecar."
   @spec read_intents(String.t()) :: [String.t()]
   def read_intents(path) do
-    case File.read(sidecar_path(path)) do
+    case Fathom.FS.read(sidecar_path(path)) do
       {:ok, @record_magic <> _ = bin} ->
         case parse_record(bin) do
           {:ok, _etag, intent, prev} -> Enum.reject([intent, prev], &is_nil/1)
@@ -287,8 +287,8 @@ defmodule Fathom.Shard.Provenance do
   end
 
   defp in_place_ok?(sidecar) do
-    case File.stat(sidecar) do
-      {:ok, %{size: @record_size}} -> match?({:ok, @record_magic <> _}, File.read(sidecar))
+    case Fathom.FS.stat(sidecar) do
+      {:ok, %{size: @record_size}} -> match?({:ok, @record_magic <> _}, Fathom.FS.read(sidecar))
       _ -> false
     end
   end
@@ -422,7 +422,7 @@ defmodule Fathom.Shard.Provenance do
 
   @spec read(String.t()) :: {:ok, String.t()} | :no_object | :missing | :corrupt
   def read(path) do
-    case File.read(sidecar_path(path)) do
+    case Fathom.FS.read(sidecar_path(path)) do
       # A zero-length sidecar is a TORN WRITE, not "no provenance" (expert review
       # #12): File.write is O_TRUNC and power loss classically leaves the truncated
       # empty file. Mapping it to :missing fell through to the legacy adopt-current

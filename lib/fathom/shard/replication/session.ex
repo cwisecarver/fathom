@@ -2113,7 +2113,7 @@ defmodule Fathom.Shard.Replication.Session do
   @spec with_flush_pin(Path.t(), (reference() -> result)) :: result | :skipped
         when result: var
   def with_flush_pin(db_path, fun) when is_function(fun, 1) do
-    with {:ok, _} <- File.stat(db_path),
+    with {:ok, _} <- Fathom.FS.stat(db_path),
          {:ok, pin} <- Connection.open(db_path) do
       try do
         case pin_snapshot(pin) do
@@ -2147,7 +2147,7 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   defp open_pin(db_path) do
-    with {:ok, _} <- File.stat(db_path),
+    with {:ok, _} <- Fathom.FS.stat(db_path),
          {:ok, conn} <- Connection.open(db_path, scope: :ro) do
       case pin_snapshot(conn) do
         :ok ->
@@ -3152,7 +3152,7 @@ defmodule Fathom.Shard.Replication.Session do
   @spec seed_bytes(Path.t(), Path.t()) :: non_neg_integer()
   def seed_bytes(db_path, wal_path) do
     db =
-      case File.stat(db_path) do
+      case Fathom.FS.stat(db_path) do
         {:ok, %{size: size}} -> size
         _ -> 0
       end
@@ -3211,7 +3211,7 @@ defmodule Fathom.Shard.Replication.Session do
   # then sit on its own timeout.
   #
   # Nothing here holds the database in memory — `:file.pread` walks it a chunk at a time. That is
-  # the point of the change: the old path did `File.read(db_path)`, so a 2 GB tenant was 2 GB
+  # the point of the change: the old path did `Fathom.FS.read(db_path)`, so a 2 GB tenant was 2 GB
   # resident on the primary and again on the follower.
   #
   # Public (`@doc false`) only so the 2026-10-08 #12 regression test can drive a seed against a fake
@@ -3403,7 +3403,7 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   defp file_size(path) do
-    case File.stat(path) do
+    case Fathom.FS.stat(path) do
       {:ok, %{size: size}} -> {:ok, size}
       {:error, reason} -> {:error, reason}
     end

@@ -295,14 +295,14 @@ defmodule Fathom.Shard.Replication.Promote do
   # alternative; refusing keeps the decision with the human who is mid-incident anyway.)
   defp ensure_no_local_copy(shard_id) do
     path = Shard.db_path(shard_id)
-    if File.exists?(path), do: {:error, {:local_copy_exists, path}}, else: :ok
+    if Fathom.FS.exists?(path), do: {:error, {:local_copy_exists, path}}, else: :ok
   end
 
   # A `-wal`/`-shm` left beside an ABSENT `.db` would be applied by SQLite to the promoted pages
   # (the same hazard `copy_wal/3` guards against on the staging temp). Removed before the rename.
   defp clear_stale_sidefiles(path) do
     for suffix <- ["-wal", "-shm"] do
-      case File.rm(path <> suffix) do
+      case Fathom.FS.rm(path <> suffix) do
         r when r in [:ok, {:error, :enoent}] -> :ok
         {:error, _} = err -> err
       end
@@ -347,7 +347,7 @@ defmodule Fathom.Shard.Replication.Promote do
       with :ok <- stage(follower, shard_id, temp, epoch: lease.epoch),
            {:ok, expected} <- current_object_etag(shard_id),
            :ok <- clear_stale_sidefiles(path),
-           :ok <- File.rename(temp, path),
+           :ok <- Fathom.FS.rename(temp, path),
            {:ok, etag, _carried} <- Storage.flush(shard_id, path, expected),
            :ok <- stamp_provenance(shard_id) do
         # Only now does the follower stop being a replica of this shard. Doing it earlier would
@@ -364,7 +364,7 @@ defmodule Fathom.Shard.Replication.Promote do
         {:ok, %{shard_id: shard_id, epoch: lease.epoch, etag: etag, bytes: bytes}}
       end
     after
-      Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
+      Enum.each(["", "-wal", "-shm"], &Fathom.FS.rm(temp <> &1))
     end
   end
 
@@ -390,10 +390,10 @@ defmodule Fathom.Shard.Replication.Promote do
     src = Follower.wal_path(follower, shard_id)
     dst = path <> "-wal"
 
-    _ = File.rm(dst)
-    _ = File.rm(path <> "-shm")
+    _ = Fathom.FS.rm(dst)
+    _ = Fathom.FS.rm(path <> "-shm")
 
-    case File.stat(src) do
+    case Fathom.FS.stat(src) do
       {:ok, %{size: size}} when size > 0 -> File.cp(src, dst)
       _ -> :ok
     end
@@ -505,7 +505,7 @@ defmodule Fathom.Shard.Replication.Promote do
 
   defp ensure_replica(follower, shard_id) do
     if Follower.state_of(follower, shard_id) &&
-         File.exists?(Follower.db_path(follower, shard_id)) do
+         Fathom.FS.exists?(Follower.db_path(follower, shard_id)) do
       :ok
     else
       {:error, :no_replica}

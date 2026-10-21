@@ -201,7 +201,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
   def finish_prefetch(nil, _path), do: :ok
 
   def finish_prefetch({:asked, _}, path) do
-    _ = File.rm(recovering_path(path))
+    _ = Fathom.FS.rm(recovering_path(path))
     :ok
   end
 
@@ -349,7 +349,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
     if ask == nil, do: mark_recovering(path)
     before_recovery_ask(path)
     result = decide_from_fleet(shard_id, path, lease, etag, lineage, prefetched, ask)
-    File.rm(recovering_path(path))
+    Fathom.FS.rm(recovering_path(path))
     result
   end
 
@@ -423,9 +423,9 @@ defmodule Fathom.Shard.PromoteOnOpen do
   end
 
   defp refuse_open(path, refusal) do
-    Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1))
-    File.rm(Provenance.sidecar_path(path))
-    File.rm(recovering_path(path))
+    Enum.each(["", "-wal", "-shm"], &Fathom.FS.rm(path <> &1))
+    Fathom.FS.rm(Provenance.sidecar_path(path))
+    Fathom.FS.rm(recovering_path(path))
     raise refusal
   end
 
@@ -468,15 +468,15 @@ defmodule Fathom.Shard.PromoteOnOpen do
   def purge_if_recovering(path) do
     marker = recovering_path(path)
 
-    if File.exists?(marker) do
+    if Fathom.FS.exists?(marker) do
       Logger.warning(
         "shard open found #{marker}: a previous open died before peer recovery finished; " <>
           "discarding the unvetted pull and recovering again"
       )
 
-      Enum.each(["-wal", "-shm", ""], &File.rm(path <> &1))
-      File.rm(Provenance.sidecar_path(path))
-      File.rm(marker)
+      Enum.each(["-wal", "-shm", ""], &Fathom.FS.rm(path <> &1))
+      Fathom.FS.rm(Provenance.sidecar_path(path))
+      Fathom.FS.rm(marker)
       true
     else
       false
@@ -627,9 +627,9 @@ defmodule Fathom.Shard.PromoteOnOpen do
         Provenance.write(path, new_etag)
         before_promote_rename(path)
 
-        case File.rename(temp, path) do
+        case Fathom.FS.rename(temp, path) do
           :ok ->
-            Enum.each(["-wal", "-shm", ""], &File.rm(prepromote(path) <> &1))
+            Enum.each(["-wal", "-shm", ""], &Fathom.FS.rm(prepromote(path) <> &1))
             Follower.forget(follower, shard_id)
 
             Logger.warning(
@@ -667,7 +667,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
           etag
       end
     after
-      Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
+      Enum.each(["", "-wal", "-shm"], &Fathom.FS.rm(temp <> &1))
     end
   end
 
@@ -711,9 +711,9 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # than a wal with no db. A missing db (nothing was pulled) is fine; any other failure declines the
   # promotion before anything is published.
   defp aside_pre_promotion(path) do
-    Enum.each(["-wal", "-shm"], &File.rename(path <> &1, prepromote(path) <> &1))
+    Enum.each(["-wal", "-shm"], &Fathom.FS.rename(path <> &1, prepromote(path) <> &1))
 
-    case File.rename(path, prepromote(path)) do
+    case Fathom.FS.rename(path, prepromote(path)) do
       :ok ->
         :ok
 
@@ -728,7 +728,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
 
   defp restore_pre_promotion(path) do
     for suffix <- ["", "-wal", "-shm"] do
-      File.rename(prepromote(path) <> suffix, path <> suffix)
+      Fathom.FS.rename(prepromote(path) <> suffix, path <> suffix)
     end
 
     :ok

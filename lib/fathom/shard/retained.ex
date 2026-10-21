@@ -71,8 +71,8 @@ defmodule Fathom.Shard.Retained do
   """
   @spec unflushed_local?(Path.t()) :: boolean()
   def unflushed_local?(path) do
-    File.exists?(path) and not File.exists?(marker(path)) and
-      not File.exists?(claimed_marker(path))
+    Fathom.FS.exists?(path) and not Fathom.FS.exists?(marker(path)) and
+      not Fathom.FS.exists?(claimed_marker(path))
   end
 
   # --- the dropping coordinator ---
@@ -87,10 +87,10 @@ defmodule Fathom.Shard.Retained do
       {:ok, bytes} ->
         # No WAL content, so the -wal/-shm are just SQLite scratch: remove them so the retained set
         # is the `.db` + sidecar + marker only.
-        File.rm(path <> "-wal")
-        File.rm(path <> "-shm")
+        Fathom.FS.rm(path <> "-wal")
+        Fathom.FS.rm(path <> "-shm")
 
-        case File.write(marker(path), "") do
+        case Fathom.FS.write(marker(path), "") do
           :ok ->
             GenServer.cast(__MODULE__, {:retained, shard_id, path, bytes, now_ms()})
             :retained
@@ -114,9 +114,9 @@ defmodule Fathom.Shard.Retained do
     budget = budget_bytes()
 
     with true <- budget > 0,
-         {:ok, %File.Stat{size: bytes}} when bytes <= budget <- File.stat(path),
+         {:ok, %File.Stat{size: bytes}} when bytes <= budget <- Fathom.FS.stat(path),
          true <- wal_empty?(path),
-         true <- File.exists?(path <> ".etag") do
+         true <- Fathom.FS.exists?(path <> ".etag") do
       {:ok, bytes}
     else
       _ -> :no
@@ -124,7 +124,7 @@ defmodule Fathom.Shard.Retained do
   end
 
   defp wal_empty?(path) do
-    case File.stat(path <> "-wal") do
+    case Fathom.FS.stat(path <> "-wal") do
       {:error, :enoent} -> true
       {:ok, %File.Stat{size: 0}} -> true
       _ -> false
@@ -140,7 +140,7 @@ defmodule Fathom.Shard.Retained do
   """
   @spec claim(String.t(), Path.t()) :: :ok | {:error, term()}
   def claim(shard_id, path) do
-    if File.exists?(marker(path)) do
+    if Fathom.FS.exists?(marker(path)) do
       try do
         GenServer.call(__MODULE__, {:claim, shard_id, path}, 30_000)
       catch
@@ -153,7 +153,7 @@ defmodule Fathom.Shard.Retained do
 
   @doc "Is this open working on a claimed (clean) retained copy?"
   @spec claimed?(Path.t()) :: boolean()
-  def claimed?(path), do: File.exists?(claimed_marker(path))
+  def claimed?(path), do: Fathom.FS.exists?(claimed_marker(path))
 
   @doc """
   Called by the open right before it serves: removes the claimed marker and answers whether there
@@ -162,7 +162,7 @@ defmodule Fathom.Shard.Retained do
   """
   @spec settle_claim!(Path.t()) :: boolean()
   def settle_claim!(path) do
-    case File.rm(claimed_marker(path)) do
+    case Fathom.FS.rm(claimed_marker(path)) do
       :ok -> true
       {:error, :enoent} -> false
       {:error, reason} -> raise "retained claim marker not removable: #{inspect(reason)}"
@@ -177,14 +177,14 @@ defmodule Fathom.Shard.Retained do
   def restore_claim(shard_id, path) do
     claimed = claimed_marker(path)
 
-    if File.exists?(claimed) do
-      case File.stat(path) do
+    if Fathom.FS.exists?(claimed) do
+      case Fathom.FS.stat(path) do
         {:ok, %File.Stat{size: bytes}} ->
-          if File.rename(claimed, marker(path)) == :ok,
+          if Fathom.FS.rename(claimed, marker(path)) == :ok,
             do: GenServer.cast(__MODULE__, {:retained, shard_id, path, bytes, now_ms()})
 
         _ ->
-          File.rm(claimed)
+          Fathom.FS.rm(claimed)
       end
     end
 
@@ -197,12 +197,12 @@ defmodule Fathom.Shard.Retained do
   """
   @spec discard(String.t(), Path.t(), atom()) :: :ok | {:error, term()}
   def discard(shard_id, path, reason) do
-    File.rm(path <> "-wal")
-    File.rm(path <> "-shm")
+    Fathom.FS.rm(path <> "-wal")
+    Fathom.FS.rm(path <> "-shm")
 
-    case File.rm(path) do
+    case Fathom.FS.rm(path) do
       result when result in [:ok, {:error, :enoent}] ->
-        File.rm(path <> ".etag")
+        Fathom.FS.rm(path <> ".etag")
 
         Logger.info(
           "shard #{shard_id}: retained clean copy no longer matches the stored lineage " <>
@@ -278,7 +278,7 @@ defmodule Fathom.Shard.Retained do
     state = delete_entry(state, id)
 
     reply =
-      case File.rename(marker(path), claimed_marker(path)) do
+      case Fathom.FS.rename(marker(path), claimed_marker(path)) do
         :ok -> :ok
         # Evicted (or erased) before we got here: the files are gone, the open sees no file.
         {:error, :enoent} -> :ok
@@ -297,8 +297,8 @@ defmodule Fathom.Shard.Retained do
     do: {:reply, %{count: map_size(state.entries), bytes: state.total}, state}
 
   defp index_found(state, id, path) do
-    with {:ok, %File.Stat{size: bytes}} <- File.stat(path),
-         {:ok, %File.Stat{mtime: mtime}} <- File.stat(marker(path), time: :posix) do
+    with {:ok, %File.Stat{size: bytes}} <- Fathom.FS.stat(path),
+         {:ok, %File.Stat{mtime: mtime}} <- Fathom.FS.stat(marker(path), time: :posix) do
       put_entry(state, id, path, bytes, mtime * 1000)
     else
       # A marker without its db: a half-finished eviction. Finish it.
@@ -362,13 +362,13 @@ defmodule Fathom.Shard.Retained do
   # it), and the file is not ours to touch. The marker goes LAST, so a crash mid-eviction leaves a
   # marked set that the next claim (cold: no db) or reconcile (finishes the job) handles.
   defp evict_files(path) do
-    if File.exists?(marker(path)) do
-      Enum.each(["-wal", "-shm"], &File.rm(path <> &1))
+    if Fathom.FS.exists?(marker(path)) do
+      Enum.each(["-wal", "-shm"], &Fathom.FS.rm(path <> &1))
 
-      case File.rm(path) do
+      case Fathom.FS.rm(path) do
         result when result in [:ok, {:error, :enoent}] ->
-          File.rm(path <> ".etag")
-          File.rm(marker(path))
+          Fathom.FS.rm(path <> ".etag")
+          Fathom.FS.rm(marker(path))
           :evicted
 
         {:error, reason} ->

@@ -317,10 +317,10 @@ defmodule Fathom.Shard.Fork do
 
     # The main-file rename is load-bearing; the WAL/SHM companions are best-effort
     # (promote_pull removes stale ones before landing the pulled object).
-    case File.rename(path, dest) do
+    case Fathom.FS.rename(path, dest) do
       :ok ->
-        Enum.each(["-wal", "-shm"], &File.rename(path <> &1, dest <> &1))
-        File.rm(Provenance.sidecar_path(path))
+        Enum.each(["-wal", "-shm"], &Fathom.FS.rename(path <> &1, dest <> &1))
+        Fathom.FS.rm(Provenance.sidecar_path(path))
 
         cause =
           case reason do

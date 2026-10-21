@@ -1452,7 +1452,7 @@ defmodule Fathom.Shard.Storage do
   cleaned up on a write or rename error.
   """
   @spec atomic_write(Path.t(), iodata()) :: :ok | {:error, term()}
-  def atomic_write(path, body), do: with_atomic_temp(path, &File.write(&1, body))
+  def atomic_write(path, body), do: with_atomic_temp(path, &Fathom.FS.write(&1, body))
 
   @doc "Like `atomic_write/2` but copies `src`'s bytes into `dst` (temp + rename)."
   @spec atomic_copy(Path.t(), Path.t()) :: :ok | {:error, term()}
@@ -1475,11 +1475,11 @@ defmodule Fathom.Shard.Storage do
 
     with :ok <- produce.(tmp),
          :ok <- sync_file(tmp),
-         :ok <- File.rename(tmp, dst) do
+         :ok <- Fathom.FS.rename(tmp, dst) do
       :ok
     else
       {:error, _} = err ->
-        File.rm(tmp)
+        Fathom.FS.rm(tmp)
         err
     end
   end
@@ -1516,11 +1516,11 @@ defmodule Fathom.Shard.Storage do
     ensure_dir(Path.dirname(dst))
 
     with :ok <- sync_file(tmp),
-         :ok <- File.rename(tmp, dst) do
+         :ok <- Fathom.FS.rename(tmp, dst) do
       :ok
     else
       {:error, _} = err ->
-        File.rm(tmp)
+        Fathom.FS.rm(tmp)
         err
     end
   end
@@ -1815,7 +1815,7 @@ defmodule Fathom.Shard.Storage do
         stale_file?(tmp, cutoff),
         reduce: 0 do
       acc ->
-        case File.rm(tmp) do
+        case Fathom.FS.rm(tmp) do
           :ok -> acc + 1
           _ -> acc
         end
@@ -1872,7 +1872,7 @@ defmodule Fathom.Shard.Storage do
 
     Enum.reduce(paths, 0, fn path, acc ->
       with true <- stale_file?(path, cutoff),
-           :ok <- File.rm(path) do
+           :ok <- Fathom.FS.rm(path) do
         acc + 1
       else
         _ -> acc
@@ -1881,7 +1881,7 @@ defmodule Fathom.Shard.Storage do
   end
 
   defp stale_file?(path, cutoff) do
-    case File.stat(path, time: :posix) do
+    case Fathom.FS.stat(path, time: :posix) do
       {:ok, %File.Stat{mtime: mtime}} -> mtime < cutoff
       _ -> false
     end

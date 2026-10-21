@@ -560,7 +560,7 @@ defmodule Fathom.Shard do
     # object and finishing the peer ask, so the file on disk is an unvetted pull: purge it and open
     # COLD, which recovers again (expert review 2026-10-13 #4). One stat per open.
     _ = PromoteOnOpen.purge_if_recovering(path)
-    file? = File.exists?(path)
+    file? = Fathom.FS.exists?(path)
     # Gathers evidence only — the verdict is `resolve_fork/4`, after the lease is held. See
     # `fork_evidence/2`: this HEAD races the steal-touch that `acquire_lease` performs, so a
     # decision made here can mistake our own touch for a fork.
@@ -1395,7 +1395,7 @@ defmodule Fathom.Shard do
       # clobber). Drop the now-wrong provenance sidecar so a crash before that
       # flush doesn't strand the next open fencing on the vanished etag.
       {:ok, nil} ->
-        File.rm(Provenance.sidecar_path(path))
+        Fathom.FS.rm(Provenance.sidecar_path(path))
         {:ok, nil}
 
       {:ok, current} when warm? ->
@@ -1447,7 +1447,7 @@ defmodule Fathom.Shard do
       # warm, fence with nil so the first flush RECREATES it (an If-Match against a
       # gone object could never succeed), and drop the dangling sidecar.
       {:ok, nil} ->
-        File.rm(Provenance.sidecar_path(path))
+        Fathom.FS.rm(Provenance.sidecar_path(path))
         {:ok, nil}
 
       # The release-in-gap fork (#19): another owner acquired, flushed, and
@@ -2388,7 +2388,7 @@ defmodule Fathom.Shard do
       # `:ok` rather than an error, and it is sound: every write goes through SQLite to
       # `state.path`, so no file means no writes landed. The dirty flag here is a conservative
       # UNKNOWN, not evidence of anything to upload.
-      not File.exists?(state.path) ->
+      not Fathom.FS.exists?(state.path) ->
         {:noreply, schedule_flush(settle_waiters(state, :nothing_to_flush))}
 
       true ->
@@ -3504,7 +3504,7 @@ defmodule Fathom.Shard do
   defp drop_clean(state) do
     # Clean: local == storage. Drop the local copy without re-uploading (nothing to
     # flush, no clobber possible) and release the lease for a clean handoff.
-    if File.exists?(state.path), do: drop_local_unless_serving(state)
+    if Fathom.FS.exists?(state.path), do: drop_local_unless_serving(state)
 
     # Release regardless of the local file (review 2026-07-23 #19): a coordinator can stop
     # clean with NO local file at all — a checkout abandoned before any connection opened on
@@ -3518,7 +3518,7 @@ defmodule Fathom.Shard do
   end
 
   defp flush_then_drop(state) do
-    if File.exists?(state.path) do
+    if Fathom.FS.exists?(state.path) do
       # Fence the flush: confirm we still own the shard right before uploading, so a
       # lease lost between acquire and now can't clobber a newer owner. See
       # Fathom.Shard.Fence.
@@ -3633,7 +3633,7 @@ defmodule Fathom.Shard do
             # not quarantining is correct and must stay, so re-tagging means changing a value two
             # paths agree on to fix one of them. The guard is local to the path that differs.
             {:error, {:corrupt_local, reason}} ->
-              if File.exists?(state.path),
+              if Fathom.FS.exists?(state.path),
                 do: Integrity.quarantine_corrupt!(state.path, state.id, reason)
 
               # Nothing was stamped, so keep the lineage claim (expert review 2026-10-12 #3).
@@ -4187,7 +4187,7 @@ defmodule Fathom.Shard do
           # The checkpoint folded the WAL, so the header counts are current. The VACUUM route
           # compacts; it takes `pre` because the checkpoint already unlinked `-wal`.
           emit_drop_route(state, :snapshot_compact)
-          snapshot_and_upload(state, pre)
+          snapshot_and_upload(state, pre, true)
         else
           # The WAL has just been folded into the database, so the object holds everything through
           # the end of `pre`'s generation — see flush_position/2 for why that is claimed as gen + 1.
@@ -4432,7 +4432,7 @@ defmodule Fathom.Shard do
     :ok
   end
 
-  defp drop_local(path), do: Enum.each(["", "-wal", "-shm", ".etag"], &File.rm(path <> &1))
+  defp drop_local(path), do: Enum.each(["", "-wal", "-shm", ".etag"], &Fathom.FS.rm(path <> &1))
 
   # Self-fence quarantine (expert review 2026-07-14 #5): the crash-steal counterpart to
   # quarantine_fork!. On a self-fence (a stealer took our lease during a GC pause/partition) the
@@ -4466,10 +4466,10 @@ defmodule Fathom.Shard do
       state.path <>
         ".fenced.#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
 
-    case File.rename(state.path, dest) do
+    case Fathom.FS.rename(state.path, dest) do
       :ok ->
-        Enum.each(["-wal", "-shm"], &File.rename(state.path <> &1, dest <> &1))
-        File.rm(Provenance.sidecar_path(state.path))
+        Enum.each(["-wal", "-shm"], &Fathom.FS.rename(state.path <> &1, dest <> &1))
+        Fathom.FS.rm(Provenance.sidecar_path(state.path))
         unflushed = max(WriteCounter.count(state.id) - state.flushed_through, 0)
 
         Logger.error(
@@ -5068,7 +5068,7 @@ defmodule Fathom.Shard do
   # `Position.snapshot_position/2`: the position as of `pre`, read BEFORE the snapshot, so the stamp
   # under-claims and never over-claims (expert review 2026-10-15 #5, user decision Q3 = A).
 
-  defp snapshot_and_upload(state, pre_override \\ nil) do
+  defp snapshot_and_upload(state, pre_override \\ nil, verified? \\ false) do
     temp = "#{state.path}.snap.#{System.unique_integer([:positive])}"
 
     # THE POSITION THE STAMP CLAIMS, read BEFORE the snapshot (expert review 2026-10-15 #5, user
@@ -5090,7 +5090,7 @@ defmodule Fathom.Shard do
       # Integrity BEFORE the snapshot: quarantine_corrupt!/2 renames the live path, so checking
       # after would spend a full VACUUM on a file we are about to refuse and move aside.
       with :ok <- flush_space_preflight(state),
-           {:ok, new_etag, carried} <- scan_and_upload(state, temp, pre) do
+           {:ok, new_etag, carried} <- scan_and_upload(state, temp, pre, verified?) do
         {:ok, new_etag, carried}
       else
         {:error, :superseded} = superseded ->
@@ -5104,7 +5104,7 @@ defmodule Fathom.Shard do
           error
       end
     after
-      Enum.each(["", "-wal", "-shm"], &File.rm(temp <> &1))
+      Enum.each(["", "-wal", "-shm"], &Fathom.FS.rm(temp <> &1))
     end
   end
 
@@ -5112,12 +5112,19 @@ defmodule Fathom.Shard do
 
   # The scan + upload half of `snapshot_and_upload/1`: the folded-WAL route when it applies, else
   # `quick_check` + `VACUUM INTO` a temp and upload that.
-  defp scan_and_upload(state, temp, pre) do
-    case pinned_live_upload(state, pre) do
+  #
+  # `verified?` (expert review 2026-10-21 #21, from 59034f88's compaction reroute): the caller has
+  # JUST run the TRUNCATE checkpoint + `quick_check` on this exact file with `conns == 0` and the
+  # coordinator terminating, so nothing can have changed the bytes. Skip the pin (it could only
+  # answer `:fallback`: the file is mostly free, which is why we are here) and the second
+  # `quick_check`; the integrity gate has then run exactly once, BEFORE the upload. Every other
+  # caller passes false and keeps both.
+  defp scan_and_upload(state, temp, pre, verified?) do
+    case if(verified?, do: :fallback, else: pinned_live_upload(state, pre)) do
       :fallback ->
         emit_flush_route(state, :vacuum)
 
-        with :ok <- verify_and_snapshot(state, temp),
+        with :ok <- verify_and_snapshot(state, temp, verified?),
              :ok <- after_snapshot_hook(state),
              :ok <- recheck_before_put(state) do
           upload_flush_object(state, temp, pre)
@@ -5228,7 +5235,7 @@ defmodule Fathom.Shard do
   # Absent or zero-length `-wal`: no frame, committed or not, outside the main file. A WAL that
   # holds only a header (restarted, nothing written) counts as non-empty: the conservative answer.
   defp wal_empty?(wal) do
-    case File.stat(wal) do
+    case Fathom.FS.stat(wal) do
       {:error, :enoent} -> true
       {:ok, %{size: 0}} -> true
       _ -> false
@@ -5335,7 +5342,7 @@ defmodule Fathom.Shard do
   # The .db plus its WAL: the snapshot is the merged content of both.
   defp local_db_bytes(path) do
     Enum.reduce([path, path <> "-wal"], 0, fn p, acc ->
-      case File.stat(p) do
+      case Fathom.FS.stat(p) do
         {:ok, %{size: size}} -> acc + size
         _ -> acc
       end
@@ -5515,9 +5522,9 @@ defmodule Fathom.Shard do
   # so a flush wave could hold every thread. `ScanGate` bounds concurrent scans to SDio-2, held
   # across the open..close here and NOT across the PUT. Bounded wait (`@scan_permit_wait_ms`), then
   # scan anyway: a durability flush must not fail because the gate was busy.
-  defp verify_and_snapshot(state, temp) do
+  defp verify_and_snapshot(state, temp, verified?) do
     Fathom.Shard.ScanGate.with_permit(@scan_permit_wait_ms, fn ->
-      verify_and_snapshot_unpermitted(state, temp)
+      verify_and_snapshot_unpermitted(state, temp, verified?)
     end)
   end
 
@@ -5541,13 +5548,13 @@ defmodule Fathom.Shard do
     :ok
   end
 
-  defp verify_and_snapshot_unpermitted(state, temp) do
+  defp verify_and_snapshot_unpermitted(state, temp, verified?) do
     case Connection.open(state.path) do
       {:ok, conn} ->
         try do
           apply_scan_mmap(conn)
 
-          with :ok <- Integrity.run_quick_check(conn) do
+          with :ok <- if(verified?, do: :ok, else: Integrity.run_quick_check(conn)) do
             do_snapshot(conn, temp, state.id)
           end
         after

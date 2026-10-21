@@ -92,12 +92,12 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  defp ensure_dir(dir), do: unless(File.dir?(dir), do: File.mkdir_p!(dir))
+  defp ensure_dir(dir), do: unless(Fathom.FS.dir?(dir), do: File.mkdir_p!(dir))
 
   defp open_handle_ensuring_dir(path, scope, true = _tenant?, dir) do
     case open_handle(path, scope) do
       {:error, _} = err ->
-        if File.dir?(dir) do
+        if Fathom.FS.dir?(dir) do
           err
         else
           File.mkdir_p!(dir)
@@ -231,7 +231,7 @@ defmodule Fathom.Shard.Connection do
   defp readonly_open(path) do
     case Sqlite3.open(path, mode: :readonly) do
       {:ok, conn} -> {:ok, conn}
-      {:error, _} = err -> if File.exists?(path), do: err, else: create_then_readonly(path)
+      {:error, _} = err -> if Fathom.FS.exists?(path), do: err, else: create_then_readonly(path)
     end
   end
 
