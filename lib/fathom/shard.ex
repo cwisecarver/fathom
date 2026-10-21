@@ -4155,7 +4155,7 @@ defmodule Fathom.Shard do
           # The checkpoint folded the WAL, so the header counts are current. The VACUUM route
           # compacts; it takes `pre` because the checkpoint already unlinked `-wal`.
           emit_drop_route(state, :snapshot_compact)
-          snapshot_and_upload(state, pre)
+          snapshot_and_upload(state, pre, true)
         else
           # The WAL has just been folded into the database, so the object holds everything through
           # the end of `pre`'s generation — see flush_position/2 for why that is claimed as gen + 1.
@@ -5028,7 +5028,7 @@ defmodule Fathom.Shard do
   # `Position.snapshot_position/2`: the position as of `pre`, read BEFORE the snapshot, so the stamp
   # under-claims and never over-claims (expert review 2026-10-15 #5, user decision Q3 = A).
 
-  defp snapshot_and_upload(state, pre_override \\ nil) do
+  defp snapshot_and_upload(state, pre_override \\ nil, verified? \\ false) do
     temp = "#{state.path}.snap.#{System.unique_integer([:positive])}"
 
     # THE POSITION THE STAMP CLAIMS, read BEFORE the snapshot (expert review 2026-10-15 #5, user
@@ -5050,7 +5050,7 @@ defmodule Fathom.Shard do
       # Integrity BEFORE the snapshot: quarantine_corrupt!/2 renames the live path, so checking
       # after would spend a full VACUUM on a file we are about to refuse and move aside.
       with :ok <- flush_space_preflight(state),
-           {:ok, new_etag, carried} <- scan_and_upload(state, temp, pre) do
+           {:ok, new_etag, carried} <- scan_and_upload(state, temp, pre, verified?) do
         {:ok, new_etag, carried}
       else
         {:error, :superseded} = superseded ->
@@ -5072,12 +5072,19 @@ defmodule Fathom.Shard do
 
   # The scan + upload half of `snapshot_and_upload/1`: the folded-WAL route when it applies, else
   # `quick_check` + `VACUUM INTO` a temp and upload that.
-  defp scan_and_upload(state, temp, pre) do
-    case pinned_live_upload(state, pre) do
+  #
+  # `verified?` (expert review 2026-10-21 #21, from 59034f88's compaction reroute): the caller has
+  # JUST run the TRUNCATE checkpoint + `quick_check` on this exact file with `conns == 0` and the
+  # coordinator terminating, so nothing can have changed the bytes. Skip the pin (it could only
+  # answer `:fallback`: the file is mostly free, which is why we are here) and the second
+  # `quick_check`; the integrity gate has then run exactly once, BEFORE the upload. Every other
+  # caller passes false and keeps both.
+  defp scan_and_upload(state, temp, pre, verified?) do
+    case if(verified?, do: :fallback, else: pinned_live_upload(state, pre)) do
       :fallback ->
         emit_flush_route(state, :vacuum)
 
-        with :ok <- verify_and_snapshot(state, temp),
+        with :ok <- verify_and_snapshot(state, temp, verified?),
              :ok <- after_snapshot_hook(state),
              :ok <- recheck_before_put(state) do
           upload_flush_object(state, temp, pre)
@@ -5475,9 +5482,9 @@ defmodule Fathom.Shard do
   # so a flush wave could hold every thread. `ScanGate` bounds concurrent scans to SDio-2, held
   # across the open..close here and NOT across the PUT. Bounded wait (`@scan_permit_wait_ms`), then
   # scan anyway: a durability flush must not fail because the gate was busy.
-  defp verify_and_snapshot(state, temp) do
+  defp verify_and_snapshot(state, temp, verified?) do
     Fathom.Shard.ScanGate.with_permit(@scan_permit_wait_ms, fn ->
-      verify_and_snapshot_unpermitted(state, temp)
+      verify_and_snapshot_unpermitted(state, temp, verified?)
     end)
   end
 
@@ -5501,13 +5508,13 @@ defmodule Fathom.Shard do
     :ok
   end
 
-  defp verify_and_snapshot_unpermitted(state, temp) do
+  defp verify_and_snapshot_unpermitted(state, temp, verified?) do
     case Connection.open(state.path) do
       {:ok, conn} ->
         try do
           apply_scan_mmap(conn)
 
-          with :ok <- Integrity.run_quick_check(conn) do
+          with :ok <- if(verified?, do: :ok, else: Integrity.run_quick_check(conn)) do
             do_snapshot(conn, temp, state.id)
           end
         after

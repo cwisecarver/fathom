@@ -143,6 +143,48 @@ defmodule Fathom.Shard.DropCompactionTest do
     end
   end
 
+  # Stops the shard while tracing (all processes: the drop-flush runs in a Task) the calls that
+  # define the cost: `quick_check` queries, `Connection.open`, and `Storage.flush` (the upload).
+  # Returns them in trace order.
+  defp trace_drop(id) do
+    alias Fathom.Shard.Connection
+    me = self()
+
+    qc_ms = [{[:_, :"$1", :_], [{:==, :"$1", "PRAGMA quick_check"}], []}]
+    :erlang.trace_pattern({Connection, :query, 3}, qc_ms, [])
+    :erlang.trace_pattern({Connection, :open, 1}, true, [])
+    :erlang.trace_pattern({Connection, :open, 2}, true, [])
+    :erlang.trace_pattern({Storage, :flush, 6}, true, [])
+    :erlang.trace(:all, true, [:call, {:tracer, me}])
+
+    try do
+      assert :ok = Shards.stop(id)
+    after
+      :erlang.trace(:all, false, [:call])
+      :erlang.trace_pattern({Connection, :query, 3}, false, [])
+      :erlang.trace_pattern({Connection, :open, 1}, false, [])
+      :erlang.trace_pattern({Connection, :open, 2}, false, [])
+      :erlang.trace_pattern({Storage, :flush, 6}, false, [])
+    end
+
+    collect_trace([])
+  end
+
+  defp collect_trace(acc) do
+    receive do
+      {:trace, _pid, :call, {Fathom.Shard.Connection, :query, _}} ->
+        collect_trace([{:qc, 1} | acc])
+
+      {:trace, _pid, :call, {Fathom.Shard.Connection, :open, _}} ->
+        collect_trace([{:open, 1} | acc])
+
+      {:trace, _pid, :call, {Fathom.Shard.Storage, :flush, _}} ->
+        collect_trace([{:flush, 1} | acc])
+    after
+      100 -> Enum.reverse(acc)
+    end
+  end
+
   defp object(id), do: Path.join(Storage.Local.dir(), id <> ".db")
 
   defp rows(file) do
@@ -171,6 +213,33 @@ defmodule Fathom.Shard.DropCompactionTest do
       remote = object(id)
       assert File.stat!(remote).size < div(local_size, 3)
       assert rows(remote) == 80
+    end
+
+    # Expert review 2026-10-21 #21. SYMPTOM: the compaction reroute re-ran `quick_check` (a full
+    # page scan) and opened a read-pin connection that could only answer :fallback, on a file the
+    # drop's checkpoint+quick_check had verified moments earlier with nothing able to touch it.
+    # INVARIANT: integrity is verified EXACTLY ONCE, and BEFORE the upload; connection opens are
+    # checkpoint + snapshot only (2, not 3).
+    test "[#{mode}] compaction reroute verifies integrity once, before the upload", %{
+      id: id,
+      path: path
+    } do
+      set_mode!(unquote(mode))
+      coordinator = seed!(id, path, true)
+      assert_mode!(coordinator, unquote(mode))
+
+      events = trace_drop(id)
+
+      assert_received {:drop_route, :snapshot_compact}
+      qc = for {:qc, _} = e <- events, do: e
+      opens = for {:open, _} = e <- events, do: e
+      assert length(qc) == 1, "quick_check ran #{length(qc)} times: #{inspect(events)}"
+      assert length(opens) == 2, "Connection.open ran #{length(opens)} times"
+
+      # ordering: the one quick_check precedes the upload (Storage.flush)
+      kinds = Enum.map(events, &elem(&1, 0))
+      assert Enum.find_index(kinds, &(&1 == :qc)) < Enum.find_index(kinds, &(&1 == :flush))
+      assert rows(object(id)) == 80
     end
 
     test "[#{mode}] idle drop of a normal file keeps the fast checkpoint route", %{
