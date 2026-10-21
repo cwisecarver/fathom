@@ -280,6 +280,15 @@ defmodule Fathom.Shard.Fork do
   # would overwrite the recovery copy the quarantine exists to preserve).
   @spec quarantine!(String.t(), Path.t(), atom()) :: :ok | {:error, term()}
   def quarantine!(shard_id, path, reason) do
+    # A claimed CLEAN-RETAINED copy (expert review 2026-10-20-2027 #22) holds nothing the store
+    # lacks: its drop made the object durable first. A mismatch there means the lineage moved on
+    # elsewhere, so delete it and let the caller pull — a `.forked` copy would only leak disk.
+    if Fathom.Shard.Retained.claimed?(path),
+      do: Fathom.Shard.Retained.discard(shard_id, path, reason),
+      else: quarantine_copy!(shard_id, path, reason)
+  end
+
+  defp quarantine_copy!(shard_id, path, reason) do
     # Unique per quarantine (expert review #14): a fixed `.forked` name + rm-first
     # destroyed the FIRST fork's recovery copy whenever the same shard forked twice —
     # and a crash-looping node in a stolen/written/released environment is exactly

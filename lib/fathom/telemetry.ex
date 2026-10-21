@@ -140,6 +140,34 @@ defmodule Fathom.Telemetry do
         ],
         description: "Time from an idle drop to the shard's next cold open, ms"
       ),
+      # The pre-PUT intent write + fsync that gates every S3 flush PUT's first byte (expert review
+      # 2026-10-20-2027 #21). Decides whether overlapping it with the body upload is worth building.
+      distribution("fathom.shard.flush.pre_put.duration",
+        event_name: [:fathom, :shard, :flush, :pre_put],
+        measurement: :duration,
+        unit: {:native, :millisecond},
+        reporter_options: [buckets: [0.25, 0.5, 1, 2, 5, 10, 25, 50, 100]],
+        description:
+          "Time the pre-PUT intent (sidecar pwrite + fsync + ownership recheck) holds an S3 flush PUT, ms. p50 under 1 ms means overlapping it with the body is not worth building"
+      ),
+      # Local retention after a clean durable drop (expert review 2026-10-20-2027 #22). Untagged
+      # beyond the bounded discard reason — never the shard id.
+      counter("fathom.shard.retained.discarded.count",
+        event_name: [:fathom, :shard, :retained, :discarded],
+        tags: [:reason],
+        description:
+          "Retained clean copies deleted on reopen because the stored lineage moved on (another node wrote) — the copy is pulled instead. A high rate relative to warm opens means retention is mostly paying disk for shards that come back elsewhere"
+      ),
+      counter("fathom.shard.retained.evicted.count",
+        event_name: [:fathom, :shard, :retained, :evicted],
+        description:
+          "Retained clean copies evicted (LRU by bytes) to stay under :shard_retain_local_bytes"
+      ),
+      sum("fathom.shard.retained.evicted.bytes",
+        event_name: [:fathom, :shard, :retained, :evicted],
+        measurement: :bytes,
+        description: "Bytes of retained clean copies evicted under the node retention budget"
+      ),
       # Pooled-handle reuse rate (expert review 2026-10-01 perf #19/#24). Tagged by result only
       # (:hit | :miss), never by shard.
       counter("fathom.shard.pool_take.count",

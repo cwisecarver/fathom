@@ -159,6 +159,9 @@ defmodule Fathom.Shard.TempReaper do
     reaped = Storage.reap_named_temps(temps, @stale_after_ms)
     if reaped > 0, do: Logger.info("shard temp reaper: reaped #{reaped} orphaned temp(s)")
     sweep_quarantines(Shard.quarantine_files_in(names, dir))
+
+    # The same listing indexes and evicts clean-retained copies (expert review 2026-10-20-2027 #22).
+    Fathom.Shard.Retained.reconcile(names, dir)
     reaped + sweep_scratch()
   rescue
     e ->

@@ -76,6 +76,14 @@ defmodule Fathom.Shard.Storage.S3 do
   # metadata survives the touch. See verify_integrity/3.
   @md5_meta "x-amz-meta-fathom-md5"
 
+  # SHA-256 of the same UNCOMPRESSED bytes (expert review 2026-10-20-2027 #23), written by every
+  # compressed flush when `:s3_plain_sha256` is on (default). It is a VERIFY hash only: a pull of an
+  # object that carries it checks the decoded bytes with SHA-256 instead of MD5 (measured 1.06 vs
+  # 0.31 ms/MB on Apple Silicon; the plaintext MD5 was ~60% of pull CPU). `@md5_meta` stays the
+  # object's identity — PUT intents and `Fork` compare it — and objects without this key verify by
+  # MD5 as before, so turning the flag off (or an object written before it) needs no migration.
+  @sha256_meta "x-amz-meta-fathom-sha256"
+
   # How much of the shard's history the object's bytes contain (Phase 2 A2 promote-on-open).
   # User metadata on the SAME PUT — S3 charges per request and ingress is free, so a stamp that
   # cost its own request would make every durability flush more expensive to buy a failover-only
@@ -578,7 +586,19 @@ defmodule Fathom.Shard.Storage.S3 do
         :ok
 
       fun ->
-        case fun.(md5_hex) do
+        # How long the pre-PUT intent (sidecar pwrite + fsync, plus the ownership recheck) holds
+        # the PUT's first byte (expert review 2026-10-20-2027 #21). Measure-first: the panel's
+        # overlap-the-fsync-with-the-body restructure is built only if the Linux rig shows p50 > 1 ms.
+        started = System.monotonic_time()
+        result = fun.(md5_hex)
+
+        :telemetry.execute(
+          [:fathom, :shard, :flush, :pre_put],
+          %{duration: System.monotonic_time() - started},
+          %{}
+        )
+
+        case result do
           :ok ->
             :ok
 
@@ -639,8 +659,8 @@ defmodule Fathom.Shard.Storage.S3 do
         # is not the plaintext MD5. So a body that would not decode to its label never reaches this
         # `with`, and the temp file is not re-read to prove it.
         with {:ok, %{size: psize, mtime: pmtime}} <- File.stat(local_path),
-             {:ok, tmp, size, body_digest, plain_hex} <-
-               Codec.compress_to_temp_hashed(local_path, encoding, body_hash) do
+             {:ok, tmp, size, body_digest, plain_hex, sha_hex} <-
+               Codec.compress_to_temp_digests(local_path, encoding, body_hash, plain_sha256?()) do
           try do
             with :ok <- after_compress(local_path),
                  :ok <- source_unchanged(local_path, psize, pmtime),
@@ -650,7 +670,7 @@ defmodule Fathom.Shard.Storage.S3 do
                 size,
                 body_integrity_header(body_hash, body_digest),
                 plain_hex,
-                Codec.upload_headers(encoding)
+                Codec.upload_headers(encoding) ++ sha256_meta_header(sha_hex)
               )
             end
           after
@@ -659,6 +679,11 @@ defmodule Fathom.Shard.Storage.S3 do
         end
     end
   end
+
+  defp plain_sha256?, do: Application.get_env(:fathom, :s3_plain_sha256, true)
+
+  defp sha256_meta_header(nil), do: []
+  defp sha256_meta_header(hex), do: [{@sha256_meta, hex}]
 
   # Test seam: runs after the single compress read, before the source-changed check (the race the
   # check exists to catch). Unset in every real config — one env read per compressed flush.
@@ -1344,12 +1369,17 @@ defmodule Fathom.Shard.Storage.S3 do
   # (which `verify_md5/2` skips) the decoded bytes are not checked at all. Every fathom write that
   # sets the marker also sets the digest; an object that has one without the other came from
   # something else, and is refused rather than served unverified.
-  defp verify_decoded(digest, headers) do
-    case {meta_enc(headers), meta_md5(headers)} do
-      {enc, nil} when is_binary(enc) and enc != "" ->
+  # The `@md5_meta` requirement holds for a SHA-256-verified object too: the MD5 is the identity,
+  # and an encoded object without it came from something other than a fathom flush.
+  defp verify_decoded({kind, digest}, headers) do
+    case {meta_enc(headers), meta_md5(headers), kind} do
+      {enc, nil, _} when is_binary(enc) and enc != "" ->
         {:error, {:missing_plain_digest, enc}}
 
-      {_enc, meta_hex} ->
+      {_enc, _md5, :sha256} ->
+        verify_integrity(digest, header_value(headers, @sha256_meta), nil)
+
+      {_enc, meta_hex, :md5} ->
         verify_integrity(digest, meta_hex, etag(headers))
     end
   end
@@ -1692,7 +1722,7 @@ defmodule Fathom.Shard.Storage.S3 do
 
               {:error, :empty_object}
             else
-              digest = :crypto.hash_final(resp.private[:fathom_md5] || :crypto.hash_init(:md5))
+              digest = plain_digest(resp)
 
               # Prefer the etag-form-independent metadata hash (#17); fall back to the etag-MD5
               # check when the object predates the metadata or came from an unfenced copy path.
@@ -1749,10 +1779,25 @@ defmodule Fathom.Shard.Storage.S3 do
   # Write decoded bytes to the temp and fold them into the plaintext digest. The digest is over the
   # DECODED bytes, so it still means "this database's hash" and matches @md5_meta whether or not
   # the object was compressed.
+  #
+  # WHICH hash is decided by the object's own headers (expert review 2026-10-20-2027 #23): SHA-256
+  # when it carries `@sha256_meta`, else MD5 against `@md5_meta` / the etag. Never both — the point
+  # is to drop the MD5 pass from the pull.
   defp write_plain(resp, fd, plain) do
     :ok = IO.binwrite(fd, plain)
-    md5 = resp.private[:fathom_md5] || :crypto.hash_init(:md5)
-    Req.Response.put_private(resp, :fathom_md5, :crypto.hash_update(md5, plain))
+    {kind, ctx} = resp.private[:fathom_plain] || plain_hash_init(resp.headers)
+    Req.Response.put_private(resp, :fathom_plain, {kind, :crypto.hash_update(ctx, plain)})
+  end
+
+  defp plain_hash_init(headers) do
+    if header_value(headers, @sha256_meta),
+      do: {:sha256, :crypto.hash_init(:sha256)},
+      else: {:md5, :crypto.hash_init(:md5)}
+  end
+
+  defp plain_digest(resp) do
+    {kind, ctx} = resp.private[:fathom_plain] || plain_hash_init(resp.headers)
+    {kind, :crypto.hash_final(ctx)}
   end
 
   # `nil` for the raw path, a decode context for a decodable encoding, or the error tuple

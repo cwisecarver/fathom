@@ -917,7 +917,11 @@ defmodule Fathom.Application do
       Fathom.Shard.ScanGate,
       # Owns the node-wide idle pooled-handle budget (perf review 2026-10-14 #16). Before the shard
       # supervisor so it outlives every coordinator's terminate-time pool close.
-      Fathom.Shard.PoolBudget
+      Fathom.Shard.PoolBudget,
+      # Serializes retained-copy claims against eviction (expert review 2026-10-20-2027 #22). Always
+      # on (a claim needs it whenever a marker exists, even with retention since turned off). Before
+      # the shard supervisor so it outlives every coordinator's terminate-time retain.
+      Fathom.Shard.Retained
     ] ++
       temp_reaper_children() ++
       heartbeat_children() ++
