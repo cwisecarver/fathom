@@ -45,7 +45,7 @@ defmodule Fathom.Telemetry.FastHistogramTest do
     do: :telemetry.execute(@checkout_stop, %{duration: ms(v)}, %{outcome: outcome})
 
   defp commit(v, outcome),
-    do: :telemetry.execute(@commit, %{duration: ms(v)}, %{outcome: outcome})
+    do: :telemetry.execute(@commit, %{duration: ms(v)}, %{outcome: outcome, mode: :tenant})
 
   # Bucket and count samples must match exactly; `_sum` is a float Core accumulates from floats
   # and FastHistogram from integer µs, so it is compared to the µs.
