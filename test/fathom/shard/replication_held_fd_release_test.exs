@@ -151,4 +151,41 @@ defmodule Fathom.Shard.ReplicationHeldFdReleaseTest do
     # The write above was quorum-acked (Q = 2 of 3), and nobody is left behind.
     assert eventually(fn -> match?(%{behind_followers: 0}, Session.lag_info(id)) end)
   end
+
+  # Integration review of expert review 2026-10-20-2027 #2. Symptom: the release timer was armed
+  # only on the tenant commit path and the idle-close ask, so an INTERNAL cycle (the catch-up timer)
+  # on a quiet shard reopened the fds via `Wal.read_held/2` with no timer armed, and they stayed
+  # open until the coordinator's idle stop — the leak #2 closed, reached through a second door.
+  # Invariant: whenever the Session holds a WAL fd after a cycle, a release timer is armed.
+  test "an internal catch-up cycle that reopens the fds re-arms their release", %{
+    id: id,
+    root: root
+  } do
+    enable!(root)
+
+    {:ok, h} = ShardExecutor.open(id)
+    exec!(h, "CREATE TABLE t (a INTEGER, b BLOB)")
+    for i <- 1..3, do: exec!(h, "INSERT INTO t VALUES (#{i}, randomblob(4000))")
+    # The handle stays open, so the WAL is NOT unlinked: the cycle below can reopen it.
+
+    [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+
+    assert eventually(fn -> :sys.get_state(session).wal_fd == nil end),
+           "precondition: the quiet-shard release never closed the fds"
+
+    # `seen: []` is a fresh Session's "nothing read yet", which `catch_up_need/1` answers `:short`,
+    # so the timer message runs a real internal cycle (a header read reopening the fds).
+    :sys.replace_state(session, &%{&1 | seen: []})
+    send(session, :catch_up)
+    st = :sys.get_state(session)
+
+    assert st.wal_fd != nil, "precondition: the catch-up cycle did not reopen the WAL fd"
+
+    assert st.fd_release_ref != nil,
+           "the catch-up cycle reopened the WAL fds with no release timer armed"
+
+    # And the armed timer does release them again.
+    assert eventually(fn -> :sys.get_state(session).wal_fd == nil end)
+    :ok = ShardExecutor.close(h)
+  end
 end

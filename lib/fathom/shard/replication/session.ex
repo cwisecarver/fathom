@@ -467,7 +467,11 @@ defmodule Fathom.Shard.Replication.Session do
     {:reply, _discarded, state} =
       run_commit(state.wal_path, :no_checkpoint, deadline, state, origin)
 
-    state
+    # The cycle's `Wal.read_held/2` reopens the fds the quiet-shard release (#2) closed, so it must
+    # re-arm that release like a tenant commit does (`with_fd_release/1`), or a catch-up on a quiet
+    # shard pins the -wal/-shm until the coordinator's idle stop (integration review of expert
+    # review 2026-10-20-2027 #2). Armed here, not in each caller, so every internal origin is covered.
+    arm_fd_release(state)
   end
 
   # The handler's own budget, further bounded by the caller's deadline less the reply margin (the
