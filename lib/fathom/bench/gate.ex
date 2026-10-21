@@ -205,6 +205,9 @@ defmodule Fathom.Bench.Gate do
     # Storage.S3 client against a loopback stub. Watch-only until a band is measured.
     {:cold_open_stub_p50_us, :higher_worse, :watch},
     {:concurrent_cold_cycle_per_s, :lower_worse, :watch},
+    # The libSQL Rust SDK request shape over HTTP (expert review 2026-10-21 #3). Watch-only.
+    {:hrana_sdk_write_rt_us, :higher_worse, :watch},
+    {:hrana_sdk_read_rt_us, :higher_worse, :watch},
     # THE TAIL, gated from 2026-08-03 (expert review #41.5). Every metric above is a p50, and
     # `delta/4` is a pure ratio — which AGENTS.md forbids in as many words ("Assert an absolute
     # floor, not only a ratio… The ratio holds while throughput collapses"). A change that leaves

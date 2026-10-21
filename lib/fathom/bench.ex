@@ -136,7 +136,9 @@ defmodule Fathom.Bench do
     :serial_checkout,
     :hrana_wide,
     :cold_open_stub,
-    :concurrent_cold_cycle
+    :concurrent_cold_cycle,
+    :hrana_sdk_write,
+    :hrana_sdk_read
   ]
 
   @doc false
@@ -299,7 +301,11 @@ defmodule Fathom.Bench do
       concurrent_cold_cycle_per_s:
         run_if(only, :concurrent_cold_cycle, fn ->
           Fathom.Bench.StorageIO.concurrent_cold_cycle(opts)
-        end)
+        end),
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-21 #3): the libSQL Rust SDK's request shape
+      # (describe before every statement, batch + get_autocommit + close, reads via /v3/cursor).
+      hrana_sdk_write_rt_us: run_if(only, :hrana_sdk_write, fn -> hrana_sdk_rt(opts, :write) end),
+      hrana_sdk_read_rt_us: run_if(only, :hrana_sdk_read, fn -> hrana_sdk_rt(opts, :read) end)
     }
     |> Map.merge(sparse_ws_metrics(only, opts))
   end
@@ -1128,6 +1134,245 @@ defmodule Fathom.Bench do
 
       p50(us)
     end)
+  end
+
+  @doc """
+  `hrana_sdk_write_rt_us` / `hrana_sdk_read_rt_us` - median round trip of a statement sent EXACTLY as
+  the libSQL Rust SDK over HTTP (`libsql-experimental` 0.0.55, libsql crate 0.9.10) sends it, replayed
+  from a capture against `Filo.Plug` (expert review 2026-10-21 #3; fixtures: panel 2 `p2/probe_out3.log`).
+  No other metric sends this shape, and it is unlike `hrana_oneshot_rt_us`: the SDK describes the
+  statement first, and the describe pipeline carries no `close`, so the inline-oneshot fast path never
+  applies.
+
+    * WRITE (`hrana_sdk_write_rt_us`): two HTTP round trips on a fresh stream -
+      `POST /v3/pipeline [describe]` (no baton, opens a stream), then
+      `POST /v3/pipeline [batch(1 step, condition null), get_autocommit, close]` on the returned baton.
+      The describe text lacks the trailing `;` that the executed text carries, as the SDK sends it.
+    * READ (`hrana_sdk_read_rt_us`): a HELD stream; per statement `[describe]` then `POST /v3/cursor`
+      (a chunked NDJSON body) with a one-step batch.
+
+  Real Bandit + `Filo.Plug` listener with the connection pool forced on (as prod) and the
+  `Filo.Client` Mint transport; the cursor request is sent through the client's own transport because
+  `Filo.Client` has no cursor sugar. WATCH-ONLY, new series. Compare `hrana_sdk_write_rt_us` with
+  `hrana_oneshot_rt_us`: if it is ~2x and a later describe-cache change moves it by less than the
+  noise band, the SDK path is RTT-bound and that change is hygiene.
+
+  Preconditions (raises otherwise): the describe was served (`describe` response with the right
+  parameter count), the batch step had no condition and no step error, the write affected exactly one
+  row / the read returned its row in a `row` cursor entry, `get_autocommit` and `close` returned ok,
+  the pool served at least half the write streams from a pooled handle, and no stream is left live.
+  """
+  @spec hrana_sdk_write_rt_us(keyword()) :: float() | nil
+  def hrana_sdk_write_rt_us(opts \\ []), do: hrana_sdk_rt(opts, :write)
+
+  @doc "The READ half of `hrana_sdk_write_rt_us/1`: describe + `/v3/cursor` on a held stream."
+  @spec hrana_sdk_read_rt_us(keyword()) :: float() | nil
+  def hrana_sdk_read_rt_us(opts \\ []), do: hrana_sdk_rt(opts, :read)
+
+  @sdk_insert "INSERT INTO sdk_kv VALUES (?, ?)"
+  @sdk_select "SELECT v FROM sdk_kv WHERE k = ?"
+
+  defp hrana_sdk_rt(opts, mode) do
+    samples = Keyword.get(opts, :hrana_rt_samples, @hrana_rt_samples)
+    label = "hrana_sdk_#{mode}_rt_us"
+    prev_pool = Application.get_env(:fathom, :connection_pool)
+    Application.put_env(:fathom, :connection_pool, true)
+    hits = :counters.new(2, [])
+    handler = "bench-sdk-#{mode}-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :pool_take],
+      fn _event, _m, %{result: result}, _ ->
+        :counters.add(hits, if(result == :hit, do: 1, else: 2), 1)
+      end,
+      nil
+    )
+
+    try do
+      with_wire(
+        opts,
+        "benchsdk#{mode}",
+        fn client ->
+          {:ok, _, client} =
+            Filo.Client.execute(
+              client,
+              "CREATE TABLE IF NOT EXISTS sdk_kv (k INTEGER PRIMARY KEY, v TEXT)"
+            )
+
+          {:ok, _, client} =
+            Filo.Client.execute(client, "INSERT OR REPLACE INTO sdk_kv VALUES (1, 'one')")
+
+          {:ok, _, client} = Filo.Client.pipeline(client, [%{"type" => "close"}])
+          client = %{client | baton: nil}
+
+          p50(sdk_samples(mode, client, samples, label, hits))
+        end,
+        [],
+        version: "v3"
+      )
+    after
+      :telemetry.detach(handler)
+
+      if is_nil(prev_pool),
+        do: Application.delete_env(:fathom, :connection_pool),
+        else: Application.put_env(:fathom, :connection_pool, prev_pool)
+    end
+  end
+
+  defp sdk_samples(:write, client, samples, label, hits) do
+    # Warm: opens the shard and puts a handle in the pool. Never timed.
+    {_, parts, client} = sdk_write(client, 2_000_000)
+    sdk_check_write!(parts, label)
+    :counters.put(hits, 1, 0)
+    :counters.put(hits, 2, 0)
+
+    {_client, us} =
+      Enum.reduce(1..samples, {client, []}, fn i, {c, acc} ->
+        {t, parts, c} = sdk_write(c, 2_000_000 + i)
+        sdk_check_write!(parts, label)
+        {c, [t | acc]}
+      end)
+
+    hit = :counters.get(hits, 1)
+
+    unless hit * 2 >= samples,
+      do:
+        raise(
+          "#{label} got #{hit} pool hits in #{samples} samples; the SDK stream is not " <>
+            "reusing a pooled handle, so this is not the prod regime"
+        )
+
+    sdk_assert_no_live_streams!(label)
+    us
+  end
+
+  defp sdk_samples(:read, client, samples, label, _hits) do
+    # The SDK holds one stream open for its reads: a describe opens it, the cursor keeps it.
+    {_, parts, client} = sdk_read(client)
+    sdk_check_read!(parts, label)
+
+    {client, us} =
+      Enum.reduce(1..samples, {client, []}, fn _, {c, acc} ->
+        {t, parts, c} = sdk_read(c)
+        sdk_check_read!(parts, label)
+        {c, [t | acc]}
+      end)
+
+    {:ok, [%{"type" => "ok"}], _} = Filo.Client.pipeline(client, [%{"type" => "close"}])
+    sdk_assert_no_live_streams!(label)
+    us
+  end
+
+  # One SDK write: describe on a fresh stream, then batch + get_autocommit + close on its baton.
+  # Returns the timed span (both round trips) and the raw replies for the precondition checks,
+  # which run OUTSIDE the timed window.
+  defp sdk_write(c, key) do
+    c = %{c | baton: nil}
+
+    {t, {d, b}} =
+      :timer.tc(fn ->
+        {:ok, d, c1} = Filo.Client.pipeline(c, [sdk_describe(@sdk_insert)])
+
+        {:ok, b, _} =
+          Filo.Client.pipeline(c1, [
+            sdk_batch(@sdk_insert <> ";", [key, "x"]),
+            %{"type" => "get_autocommit"},
+            %{"type" => "close"}
+          ])
+
+        {d, b}
+      end)
+
+    {t, {d, b}, c}
+  end
+
+  # One SDK read on the held stream: describe, then /v3/cursor.
+  defp sdk_read(c) do
+    {t, {d, raw, c2}} =
+      :timer.tc(fn ->
+        {:ok, d, c1} = Filo.Client.pipeline(c, [sdk_describe(@sdk_select)])
+        {raw, c2} = sdk_cursor(c1, sdk_batch(@sdk_select <> ";", [1], false))
+        {d, raw, c2}
+      end)
+
+    {t, {d, raw}, c2}
+  end
+
+  defp sdk_describe(sql),
+    do: %{"type" => "describe", "sql" => sql, "sql_id" => nil, "replication_index" => nil}
+
+  # The exact step the SDK sends: `condition: null`, `want_rows: true`, args typed. With
+  # `wrap? = true` it is a pipeline `batch` request, else the bare batch the cursor endpoint takes.
+  defp sdk_batch(sql, args, wrap? \\ true) do
+    batch = %{
+      "steps" => [
+        %{
+          "condition" => nil,
+          "stmt" => %{
+            "sql" => sql,
+            "sql_id" => nil,
+            "args" => Enum.map(args, &Filo.Value.encode/1),
+            "named_args" => [],
+            "want_rows" => true,
+            "replication_index" => nil
+          }
+        }
+      ],
+      "replication_index" => nil
+    }
+
+    if wrap?, do: %{"type" => "batch", "batch" => batch}, else: batch
+  end
+
+  # `Filo.Client` has no cursor sugar, so the request goes through its own transport. The response
+  # is NDJSON: line 1 `{"baton": ..., "base_url": null}`, then step_begin / row / step_end entries.
+  defp sdk_cursor(c, batch) do
+    body = Jason.encode_to_iodata!(%{"baton" => c.baton, "batch" => batch})
+    headers = [{"host", c.authority} | c.headers]
+
+    {:ok, %{status: 200, body: raw}, state} =
+      c.transport.request(c.transport_state, "POST", "/v3/cursor", headers, body)
+
+    [first | _] = String.split(raw, "\n", parts: 2)
+    {raw, %{c | transport_state: state, baton: Jason.decode!(first)["baton"]}}
+  end
+
+  defp sdk_check_write!({d, b}, label) do
+    with [%{"type" => "ok", "response" => %{"type" => "describe", "result" => dr}}] <- d,
+         2 <- length(dr["params"] || []),
+         [
+           %{"type" => "ok", "response" => %{"type" => "batch", "result" => br}},
+           %{
+             "type" => "ok",
+             "response" => %{"type" => "get_autocommit", "is_autocommit" => true}
+           },
+           %{"type" => "ok", "response" => %{"type" => "close"}}
+         ] <- b,
+         [nil] <- br["step_errors"],
+         [%{"affected_row_count" => 1}] <- br["step_results"] do
+      :ok
+    else
+      other ->
+        raise "#{label}: the SDK write shape was not served as expected (#{inspect({d, b})}; #{inspect(other)})"
+    end
+  end
+
+  defp sdk_check_read!({d, raw}, label) do
+    served? =
+      match?([%{"type" => "ok", "response" => %{"type" => "describe"}}], d) and
+        String.contains?(raw, ~s("type":"row")) and String.contains?(raw, "step_end")
+
+    unless served?,
+      do: raise("#{label}: describe or the /v3/cursor row was not served (#{inspect({d, raw})})")
+
+    :ok
+  end
+
+  defp sdk_assert_no_live_streams!(label) do
+    live = Registry.count(Module.concat(Fathom.Bench.WireStreams, Registry))
+    unless live <= 1, do: raise("#{label} left #{live} live streams; it is not closing them")
+    :ok
   end
 
   @doc """

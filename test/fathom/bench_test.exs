@@ -483,6 +483,20 @@ defmodule Fathom.BenchTest do
              before_env
   end
 
+  # expert review 2026-10-21 #3. The libSQL Rust SDK request shape (describe, then batch +
+  # get_autocommit + close; reads via /v3/cursor). The arms raise if the describe, the
+  # condition-less batch step, the cursor row or the pooled-handle reuse did not happen, and must
+  # restore the connection_pool env they force on.
+  test "hrana_sdk_write/read run the SDK shape and restore the pool env" do
+    prev = Application.get_env(:fathom, :connection_pool)
+    w = Fathom.Bench.hrana_sdk_write_rt_us(hrana_rt_samples: 20)
+    r = Fathom.Bench.hrana_sdk_read_rt_us(hrana_rt_samples: 20)
+    IO.puts("hrana_sdk_write_rt_us=#{w} hrana_sdk_read_rt_us=#{r}")
+    assert is_float(w) and w > 20 and w < 100_000
+    assert is_float(r) and r > 20 and r < 100_000
+    assert Application.get_env(:fathom, :connection_pool) == prev
+  end
+
   # expert review 2026-10-19 #12. A warm-stream SELECT 1 over the WebSocket path; the metric
   # asserts each reply is [[1]]. Prod ~100-200 us.
   # The full `mix fathom.bench` run crashed in await_upgrade/2 with a CaseClauseError on :unknown
