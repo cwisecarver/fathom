@@ -2302,28 +2302,68 @@ defmodule Fathom.Shard.Connection do
   Introspects a statement WITHOUT running it (the Hrana `describe` request, #34): returns its result
   column names and its bound-parameter count as `%{params: [nil, …], cols: [name, …]}`. Parameters
   are reported positionally (`nil` each — exqlite exposes the count, not the names), which is what a
-  libSQL client needs to know how many values to bind. The prepared statement is always released.
+  libSQL client needs to know how many values to bind.
+
+  GOES THROUGH THE STATEMENT CACHE (expert review 2026-10-21 #16a). The Rust/Python SDKs send one
+  `describe` before every statement, and this used to prepare + `columns` + release a fresh
+  statement each time (3 dirty dispatches, the compiled statement thrown away) while the cache
+  held the same compiled statement. Now a describe hit costs a map lookup + the non-dirty
+  `bind_parameter_count`, and a describe MISS prepares and caches, so the execute that follows
+  hits (and the reverse). The cache owns the statement; nothing is released here.
+
+  Exact-text keys only: `describe("X")` and `execute("X;")` are two entries (parked, #16b — no
+  trailing-`;` aliasing).
+
+  One case needs care: a hit whose `SchemaGen` moved (`refresh?`). `cached_stmt/3` re-prepares and
+  re-stamps the entry with the CURRENT generation, trusting the caller to re-read the columns after
+  the statement steps (which describe never does). Left alone, the next execute would take the
+  ordinary hit path and report the stale pre-DDL column list. So describe re-marks that entry with
+  a generation that never matches (-1): the next execute takes the refresh branch again, and the
+  describe answer is the fresh prepare's columns, exactly as the uncached describe returned.
   """
   @spec describe(reference(), String.t()) ::
           {:ok, %{params: [nil], cols: [String.t()]}} | {:error, term()}
   def describe(conn, sql) do
-    with {:ok, stmt} <- prepare_retrying(conn, sql, nil) do
-      try do
-        cols = with {:ok, c} <- Sqlite3.columns(conn, stmt), do: c, else: (_ -> [])
+    case cached_stmt(conn, sql) do
+      {:ok, stmt, cols, _enc, false} ->
+        {:ok, describe_result(stmt, cols)}
 
-        count =
-          case Sqlite3.bind_parameter_count(stmt) do
-            n when is_integer(n) and n >= 0 -> n
-            _ -> 0
-          end
+      {:ok, stmt, cols, _enc, true} ->
+        mark_stale(conn, sql)
+        {:ok, describe_result(stmt, cols)}
 
-        {:ok, %{params: List.duplicate(nil, count), cols: cols}}
-      after
-        Sqlite3.release(conn, stmt)
-      end
+      {:error, _} = err ->
+        err
     end
   rescue
     e in ArgumentError -> {:error, Exception.message(e)}
+  end
+
+  defp describe_result(stmt, cols) do
+    count =
+      case Sqlite3.bind_parameter_count(stmt) do
+        n when is_integer(n) and n >= 0 -> n
+        _ -> 0
+      end
+
+    %{params: List.duplicate(nil, count), cols: cols}
+  end
+
+  # Re-mark `sql`'s entry with a generation no `SchemaGen.current/0` ever equals, so the next
+  # `cached_stmt/3` hit takes the refresh branch (the column list is re-read after the step).
+  defp mark_stale(conn, sql) do
+    key = {__MODULE__, :stmt_cache, conn}
+
+    case Process.get(key) do
+      {seq, %{^sql => {stmt, stamp, _gen, bytes, packed}} = cache} ->
+        # Re-put under the CANONICAL key, never the caller's sub-binary (see `cached_stmt/3`).
+        {canonical, _cols, _enc} = decoded(conn, stmt, packed, sql)
+        Process.put(key, {seq, Map.put(cache, canonical, {stmt, stamp, -1, bytes, packed})})
+        :ok
+
+      _ ->
+        :ok
+    end
   end
 
   @doc """
