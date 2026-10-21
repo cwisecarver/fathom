@@ -464,6 +464,19 @@ fn register_misc(db: &Connection, det: FunctionFlags, nondet: FunctionFlags) -> 
         Ok(unsafe { stmt_memused(db, want.as_deref()) })
     })?;
 
+    // `fathom_cache_used()` (expert review 2026-10-21 #15): the bytes of page cache THIS connection
+    // holds (`sqlite3_db_status(SQLITE_DBSTATUS_CACHE_USED)`). exqlite exposes no db-status call;
+    // the idle-handle `PRAGMA shrink_memory` (`Fathom.Shard.HandlePool`) is verified against it.
+    // It reads only the calling connection's own counter.
+    db.create_scalar_function("fathom_cache_used", 0, nondet, |ctx| {
+        // SAFETY: the calling connection, used on this thread while SQLite holds its mutex.
+        let conn = unsafe { ctx.get_connection() }?;
+        let db = unsafe { conn.handle() };
+        let (mut cur, mut hi) = (0i32, 0i32);
+        unsafe { ffi::sqlite3_db_status(db, ffi::SQLITE_DBSTATUS_CACHE_USED, &mut cur, &mut hi, 0) };
+        Ok(cur as i64)
+    })?;
+
     Ok(())
 }
 
