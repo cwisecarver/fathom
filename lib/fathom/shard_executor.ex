@@ -385,6 +385,9 @@ defmodule Fathom.ShardExecutor do
     if ddl?, do: cap_temp(conn)
 
     read? = read_verb?(head)
+    # Expert review 2026-10-20-2027 #1: a transaction-control statement has no counters of its own;
+    # `Connection.query` skips both getters for it (see `txn_control?/1`).
+    control? = not dml? and not read? and txn_control?(head)
     # Read once per statement and shared with `maybe_replicate/6`: no extra `get_env`. With
     # replication ON a DML statement also needs the autocommit flag right after the step, which
     # `Connection.query` can return in the same dispatch as changes + rowid (expert review
@@ -394,6 +397,7 @@ defmodule Fathom.ShardExecutor do
     case Connection.query(conn, sql, bind,
            dml?: dml?,
            read?: read?,
+           control?: control?,
            deadline: true,
            conn_state?: repl_on? and (dml? or commit_boundary?(head))
          ) do
@@ -616,6 +620,18 @@ defmodule Fathom.ShardExecutor do
   defp read_verb?(head), do: Enum.any?(@read_verbs, &String.starts_with?(head, &1))
 
   @control_prefixes ~w(begin commit end rollback savepoint release pragma)
+
+  # Expert review 2026-10-20-2027 #1: the transaction-control subset of `@control_prefixes` (no
+  # PRAGMA, whose assignments can be durable). Such a statement changes no row, so it reports
+  # 0 affected rows / no rowid. SQLite's `sqlite3_changes()` / `last_insert_rowid()` keep the
+  # PREVIOUS write's values across it, so before this the wire said "BEGIN changed 3 rows" after
+  # an INSERT of 3, and the statement paid two extra dirty dispatches to read them. (sqld's own
+  # value for BEGIN-after-write could not be verified offline; 0/nil is the only sensible report
+  # for a statement that modifies nothing.)
+  defp txn_control?(head) do
+    Enum.any?(@control_prefixes, &String.starts_with?(head, &1)) and
+      not String.starts_with?(head, "pragma")
+  end
 
   # Header-writing pragma ASSIGNMENTS are durable file mutations that report
   # num_changes == 0 and no columns, so the blanket "pragma is control" rule dropped

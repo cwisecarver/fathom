@@ -837,6 +837,10 @@ defmodule Fathom.Shard.Connection do
   When the statement also returns columns, `sqlite3_changes()` is not fetched (a dirty-NIF
   dispatch) and `num_changes` is reported as 0; the caller must not need the inherited count.
 
+  `control?: true` is the caller's promise that the statement is transaction control (BEGIN /
+  COMMIT / END / ROLLBACK / SAVEPOINT / RELEASE): `num_changes` is reported as 0 and no rowid
+  without fetching either (expert review 2026-10-20-2027 #1).
+
   `conn_state?: true` fetches changes, last rowid and the autocommit flag in one statement step
   via the extension's `fathom_conn_state()` and reports the flag as `autocommit?` (expert review
   2026-10-17 #6); `autocommit?` is nil when that path was not taken. The CALLER decides when it is
@@ -849,6 +853,7 @@ defmodule Fathom.Shard.Connection do
   def query(conn, sql, args, opts \\ []) do
     dml? = Keyword.get(opts, :dml?, true)
     read? = Keyword.get(opts, :read?, false)
+    control? = Keyword.get(opts, :control?, false)
     state? = Keyword.get(opts, :conn_state?, false)
 
     # Statement deadline (expert review 2026-07-14 #26): when `:query_timeout_ms` is set, a runaway
@@ -866,21 +871,21 @@ defmodule Fathom.Shard.Connection do
     # it opts in.
     case Keyword.get(opts, :deadline, false) && timeout_ms() do
       falsy when falsy in [nil, false] ->
-        do_query(conn, sql, args, dml?, read?, state?, nil)
+        do_query(conn, sql, args, dml?, read?, control?, state?, nil)
 
       ms when is_integer(ms) and ms > 0 ->
         with_deadline(conn, ms, fn deadline_at ->
-          do_query(conn, sql, args, dml?, read?, state?, deadline_at)
+          do_query(conn, sql, args, dml?, read?, control?, state?, deadline_at)
         end)
 
       _ ->
-        do_query(conn, sql, args, dml?, read?, state?, nil)
+        do_query(conn, sql, args, dml?, read?, control?, state?, nil)
     end
   rescue
     e in ArgumentError -> {:error, Exception.message(e)}
   end
 
-  defp do_query(conn, sql, args, dml?, read?, state?, deadline_at) do
+  defp do_query(conn, sql, args, dml?, read?, control?, state?, deadline_at) do
     # A 4-tuple with a plain pattern, not a 3-tuple plus a guard. A `with` whose pattern carries a
     # guard lets the unmatched value fall through as the function's return, which dialyzer caught
     # as `{:ok, _, _} | {:refresh, reference(), [any()]}` escaping `query/4`'s spec.
@@ -937,8 +942,14 @@ defmodule Fathom.Shard.Connection do
                 {ch, rid, ac}
 
               _ ->
-                {if(read? and columns != [], do: 0, else: changes(conn)), :lazy, nil}
+                {if(control? or (read? and columns != []), do: 0, else: changes(conn)), :lazy,
+                 nil}
             end
+
+          # Expert review 2026-10-20-2027 #1: a transaction-control statement (BEGIN / SAVEPOINT /
+          # RELEASE / ROLLBACK / COMMIT) modifies nothing, so it reports 0 changes and no rowid
+          # even when the fast path returned the PREVIOUS write's inherited values.
+          changes = if control?, do: 0, else: changes
 
           {:ok,
            %{

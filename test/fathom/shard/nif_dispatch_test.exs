@@ -123,9 +123,10 @@ defmodule Fathom.Shard.NifDispatchTest do
       assert {total, by_fun} == {3, %{multi_step: 1, changes: 1, last_insert_rowid: 1}}
     end
 
-    test "BEGIN / COMMIT with no inherited changes fetch no rowid (2 dispatches, was 4)", %{
-      shard: shard
-    } do
+    test "BEGIN / COMMIT are exactly 1 dispatch each (was 4; 2 before expert review 2026-10-20-2027 #1)",
+         %{
+           shard: shard
+         } do
       # A FRESH handle: sqlite3_changes() is 0 here. (On the writing handle a BEGIN inherits the
       # last write's changes()>0 and reports it, exactly as before this change.)
       {:ok, fresh} = ShardExecutor.open(shard)
@@ -136,11 +137,42 @@ defmodule Fathom.Shard.NifDispatchTest do
 
       {res, total, by_fun} = count(fn -> ShardExecutor.execute(fresh, stmt("BEGIN")) end)
       assert {:ok, %StmtResult{affected_row_count: 0, last_insert_rowid: nil}} = res
-      assert {total, by_fun} == {2, %{multi_step: 1, changes: 1}}
+      assert {total, by_fun} == {1, %{multi_step: 1}}
 
       {res, total, _} = count(fn -> ShardExecutor.execute(fresh, stmt("COMMIT")) end)
       assert {:ok, %StmtResult{last_insert_rowid: nil}} = res
-      assert total == 2
+      assert total == 1
+    end
+
+    # expert review 2026-10-20-2027 #1: sqlite3_changes()/last_insert_rowid() keep the PREVIOUS
+    # write's values across a control statement, so after `INSERT` of 3 rows a BEGIN / SAVEPOINT /
+    # RELEASE / COMMIT reported affected_row_count 3 + a rowid on the wire, and paid `changes`
+    # (+ `last_insert_rowid`) dirty dispatches to read them. Invariant: a transaction-control
+    # statement reports 0 / nil and costs exactly its `multi_step`.
+    test "control statements after a write report 0 / nil and cost 1 dispatch each", %{conn: conn} do
+      {:ok, _} =
+        ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (11, 'x'), (12, 'y'), (13, 'z')"))
+
+      seq = ["BEGIN", "SAVEPOINT sp1", "RELEASE sp1", "ROLLBACK", "BEGIN", "COMMIT"]
+      write = stmt("INSERT OR REPLACE INTO kv VALUES (11, 'x')")
+
+      # One warm lap so every statement is in the cache: the count is the steady state.
+      for sql <- seq do
+        {:ok, _} = ShardExecutor.execute(conn, stmt(sql))
+        {:ok, _} = ShardExecutor.execute(conn, write)
+      end
+
+      for sql <- seq do
+        {res, total, by_fun} = count(fn -> ShardExecutor.execute(conn, stmt(sql)) end)
+
+        assert {:ok, %StmtResult{affected_row_count: 0, last_insert_rowid: nil, rows_written: 0}} =
+                 res,
+               "#{sql} leaked the previous write's counters"
+
+        assert {sql, total, by_fun} == {sql, 1, %{multi_step: 1}}
+        # A write between control statements re-arms the inherited counters.
+        {:ok, _} = ShardExecutor.execute(conn, write)
+      end
     end
 
     test "INSERT ... RETURNING keeps affected_row_count and last_insert_rowid", %{conn: conn} do
