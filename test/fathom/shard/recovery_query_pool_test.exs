@@ -84,19 +84,19 @@ defmodule Fathom.Shard.RecoveryQueryPoolTest do
           ])
 
         {:ok, bound} = :inet.port(lsock)
-        send(test, {:peer_port, self(), bound})
+        send(test, {:peer_port, self(), bound, lsock})
         accept_loop(lsock, script, test, 1)
       end)
 
-    port =
+    {port, lsock} =
       receive do
-        {:peer_port, ^acceptor, p} -> p
+        {:peer_port, ^acceptor, p, l} -> {p, l}
       after
         5_000 -> flunk("scripted peer did not start")
       end
 
     on_exit(fn -> Process.exit(acceptor, :kill) end)
-    %{acceptor: acceptor, port: port, endpoint: {"peer#{port}", "127.0.0.1", port}}
+    %{acceptor: acceptor, lsock: lsock, port: port, endpoint: {"peer#{port}", "127.0.0.1", port}}
   end
 
   defp accept_loop(lsock, script, test, n) do
@@ -285,8 +285,13 @@ defmodule Fathom.Shard.RecoveryQueryPoolTest do
       assert answered_at(1001) == ask(peer.endpoint, "r")
 
       ref = Process.monitor(peer.acceptor)
+      # The listen socket closes asynchronously after its owner dies, so the acceptor's DOWN alone
+      # does not free the port: re-listening on it raced the close and failed with `eaddrinuse`
+      # ("scripted peer did not start"). Wait for the port's own DOWN.
+      lref = :erlang.monitor(:port, peer.lsock)
       Process.exit(peer.acceptor, :kill)
       assert_receive {:DOWN, ^ref, :process, _, :killed}
+      assert_receive {:DOWN, ^lref, :port, _, _}
 
       # Same host and port, new process: the pooled socket is dead.
       restarted = start_peer(fn _s, _c, _q -> [:answer] end, peer.port)
@@ -430,6 +435,22 @@ defmodule Fathom.Shard.RecoveryQueryPoolTest do
         |> Enum.map(fn {:ok, a} -> a end)
 
       assert Enum.count(answers, &(&1 == :silent)) == 0
+    end
+
+    # A peer partitioned after the handshake (expert review 2026-10-21 rv6 F8) first shows up as a
+    # recv timeout on a reused socket, which marks nothing. The dial that follows must mark it even
+    # when it lost a millisecond of its connect bound: the old rule was `bound == connect_ms`, so
+    # 1999 of 2000 ms read as "cut short" and the peer was never skipped. A dial clipped well short
+    # (half the bound) still proves nothing and must not mark.
+    test "a dial timeout marks the peer when it ran about its full connect bound" do
+      alias Fathom.Shard.Replication.Recovery.QueryPool.Slot
+
+      assert Slot.full_dial?(2_000, 2_000)
+      assert Slot.full_dial?(1_999, 2_000)
+      assert Slot.full_dial?(1_800, 2_000)
+      refute Slot.full_dial?(1_799, 2_000)
+      refute Slot.full_dial?(1_000, 2_000)
+      refute Slot.full_dial?(0, 2_000)
     end
 
     test "with the pool off, asks dial fresh exactly as before" do
