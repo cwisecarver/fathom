@@ -31,7 +31,10 @@ defmodule Fathom.Shard.ReopenGap do
   use GenServer
 
   @table __MODULE__
-  @horizon_ms 60 * 60 * 1000
+  # The top finite bucket of `fathom.shard.reopen.gap_ms` (telemetry.ex). A row older than that only
+  # lands in +Inf, so keeping it buys no resolution and costs ETS memory (expert review 2026-10-21
+  # #28). The test pins this equal to the bucket.
+  @horizon_ms 30 * 60 * 1000
   @sweep_ms 60 * 1000
 
   @doc false
@@ -77,6 +80,10 @@ defmodule Fathom.Shard.ReopenGap do
 
   @doc false
   def now_ms, do: System.monotonic_time(:millisecond)
+
+  @doc false
+  # The retention horizon, exposed so the test can pin it to the histogram's top finite bucket.
+  def horizon_ms, do: @horizon_ms
 
   @impl true
   def init(_opts) do

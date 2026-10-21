@@ -104,4 +104,39 @@ defmodule Fathom.Shard.ReopenGapTest do
     assert [{^new, _}] = :ets.lookup(ReopenGap, new)
     :ets.delete(ReopenGap, new)
   end
+
+  # Symptom (expert review 2026-10-21 #28): rows were kept for an hour, but the histogram's top
+  # finite bucket is 30 min, so every row aged 30-60 min landed in +Inf and bought no resolution
+  # while costing ETS memory. The retention horizon must be the top finite bucket.
+  test "the retention horizon is the gap histogram's top finite bucket" do
+    top =
+      Fathom.Telemetry.metrics()
+      |> Enum.find(&(&1.name == [:fathom, :shard, :reopen, :gap_ms]))
+      |> Map.fetch!(:reporter_options)
+      |> Keyword.fetch!(:buckets)
+      |> List.last()
+
+    assert ReopenGap.horizon_ms() == top
+  end
+
+  # Boundary: a reopen 1 s inside the horizon is still in the table and is reported with a gap
+  # that lands in the top finite bucket; a row 1 s past the horizon is swept and not reported.
+  test "a reopen just inside the horizon is recorded in a finite bucket; just past it is swept",
+       %{shard: shard} do
+    horizon = ReopenGap.horizon_ms()
+    now = ReopenGap.now_ms()
+    outside = shard <> "_outside"
+
+    :ets.insert(ReopenGap, {shard, now - (horizon - 1_000)})
+    :ets.insert(ReopenGap, {outside, now - (horizon + 1_000)})
+
+    assert ReopenGap.sweep(now - horizon) >= 1
+    assert :ets.lookup(ReopenGap, outside) == []
+    assert [{^shard, _}] = :ets.lookup(ReopenGap, shard)
+
+    :ok = ReopenGap.reopened(shard)
+    assert_receive {:reopen, gap_ms}, 1_000
+    assert gap_ms >= horizon - 1_000
+    assert gap_ms <= 1_800_000, "gap #{gap_ms} ms falls past the top finite bucket"
+  end
 end
