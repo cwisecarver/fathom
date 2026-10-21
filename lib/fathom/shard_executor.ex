@@ -845,13 +845,36 @@ defmodule Fathom.ShardExecutor do
         Session.commit(shard_id, Shard.db_path(shard_id) <> "-wal", pid, sync: sync?)
 
       sync? and ships_now?(conn, head, wrote?, autocommit) ->
-        case WalSync.sync(Shard.db_path(shard_id) <> "-wal") do
-          :ok -> :ok
-          {:error, reason} -> {:error, {:wal_sync_failed, reason}}
-        end
+        fallback_sync(shard_id, pid)
 
       true ->
         :ok
+    end
+  end
+
+  # The replication-off fallback sync (rv6 F6). It honours and sets the same coordinator-keyed
+  # poison as the Session: a shard whose fdatasync failed acks nothing more until it is reopened,
+  # whichever path saw the failure. An open failure ran no sync, so it fails only this write.
+  # The fd is fresh (no Session holds one here), so it can miss an error a checkpoint consumed
+  # (rv6 F1); this path exists only for a runtime replication-off flip, and the next reuse of the
+  # handle reopens it FULL.
+  defp fallback_sync(shard_id, coordinator) do
+    case WalSync.poisoned(coordinator) do
+      nil ->
+        case WalSync.sync(Shard.db_path(shard_id) <> "-wal") do
+          :ok ->
+            :ok
+
+          {:error, {:open, _} = reason} ->
+            {:error, {:wal_sync_failed, reason}}
+
+          {:error, reason} ->
+            WalSync.poison(coordinator, reason)
+            {:error, {:wal_sync_failed, reason}}
+        end
+
+      reason ->
+        {:error, {:wal_sync_failed, {:poisoned, reason}}}
     end
   end
 

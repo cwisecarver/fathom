@@ -458,6 +458,36 @@ defmodule Fathom.Shard.ReplicationDeferredSyncTest do
     end
   end
 
+  # Expert review 2026-10-21 rv6 F6. The poison lived only in the Session's state: a Session that
+  # crashed or was stopped under the SAME coordinator came back clean and acked again, and the
+  # replication-off fallback never poisoned at all. It is now keyed by the coordinator pid.
+  describe "the poison outlives the Session (rv6 F6)" do
+    test "a Session restarted under the same coordinator still refuses", ctx do
+      followers = replicate!(ctx.root)
+      {coordinator, conn, wal} = primary!(ctx.id, followers)
+      seam!({:error, {:datasync, :eio}})
+      insert!(conn, 1)
+
+      assert {:error, {:wal_sync_failed, {:datasync, :eio}}} =
+               Session.commit(ctx.id, wal, coordinator, sync: true)
+
+      [{old, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, ctx.id)
+      ref = Process.monitor(old)
+      Session.stop(ctx.id)
+      assert_receive {:DOWN, ^ref, :process, ^old, _}, 2_000
+
+      seam!(:ok)
+      insert!(conn, 2)
+
+      assert {:error, {:wal_sync_failed, {:poisoned, {:datasync, :eio}}}} =
+               Session.commit(ctx.id, wal, coordinator, sync: true),
+             "a restarted Session forgot the failed fdatasync and acked"
+
+      [{new, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, ctx.id)
+      assert new != old, "fixture: the Session was not actually restarted"
+    end
+  end
+
   describe "through ShardExecutor" do
     defp run(h, sql), do: ShardExecutor.execute(h, %Stmt{sql: sql, args: []})
 
@@ -521,6 +551,33 @@ defmodule Fathom.Shard.ReplicationDeferredSyncTest do
                run(h, "INSERT INTO t VALUES (1)")
 
       assert_received {:wal_sync_called, _, _}
+
+      # rv6 F6: the fallback poisons too. A later sync that succeeds cannot vouch for the pages.
+      seam!(:ok)
+
+      assert {:error, %Filo.Error{code: "FILO_WAL_SYNC_FAILED"}} =
+               run(h, "INSERT INTO t VALUES (2)"),
+             "the replication-off fallback acked after a failed fdatasync"
+    end
+
+    # rv6 F6: a poison the Session set must also stop the replication-off fallback.
+    test "the fallback refuses a shard the Session poisoned", ctx do
+      followers = replicate!(ctx.root)
+      Application.put_env(:fathom, :replication_deferred_wal_sync, true)
+      h = stream!(ctx.id, followers)
+      {:ok, _} = run(h, "CREATE TABLE t (k INTEGER PRIMARY KEY)")
+
+      seam!({:error, {:datasync, :eio}})
+
+      assert {:error, %Filo.Error{code: "FILO_WAL_SYNC_FAILED"}} =
+               run(h, "INSERT INTO t VALUES (1)")
+
+      Application.put_env(:fathom, :replication_enabled, false)
+      seam!(:ok)
+
+      assert {:error, %Filo.Error{code: "FILO_WAL_SYNC_FAILED"}} =
+               run(h, "INSERT INTO t VALUES (2)"),
+             "the fallback acked on a shard whose Session saw a failed fdatasync"
     end
   end
 end

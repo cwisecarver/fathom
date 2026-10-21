@@ -39,9 +39,10 @@ defmodule Fathom.Shard.Replication.WalSync do
 
   ## Fail-safe on an fsync error
 
-  A failed `fdatasync` POISONS the Session: every later tenant round on it fails with
-  `{:error, {:wal_sync_failed, {:poisoned, reason}}}` until the coordinator (and with it the Session)
-  is replaced. Failing only the one round is not enough. After an fsync error, Linux may mark the
+  A failed `fdatasync` POISONS the shard: every later tenant round fails with
+  `{:error, {:wal_sync_failed, {:poisoned, reason}}}` until the coordinator is replaced. The poison
+  is keyed by the coordinator pid (`poison/2`), so a restarted Session and the replication-off
+  fallback both see it (rv6 F6). Failing only the one round is not enough. After an fsync error, Linux may mark the
   dirty pages clean without having written them, so a LATER fdatasync can succeed while the earlier
   frames never reached the disk. SQLite's WAL recovery stops at the first frame whose cumulative
   checksum breaks, so a power loss would then drop the later, acked commits too.
@@ -206,6 +207,48 @@ defmodule Fathom.Shard.Replication.WalSync do
       :ok -> :ok
       {:error, reason} -> {:error, {:datasync, reason}}
     end
+  end
+
+  # ---------------------------------------------------------------------------------------------
+  # The poison, durable for the coordinator's life (expert review 2026-10-21 rv6 F6)
+  # ---------------------------------------------------------------------------------------------
+  #
+  # The poison used to live only in the Session's state, so a Session crash (or a Fleet restart)
+  # under the SAME coordinator started a clean Session that acked again, and the replication-off
+  # fallback in `Fathom.ShardExecutor` never poisoned at all. The rule is "no ack on this shard
+  # until it is reopened", and a reopen is a new coordinator, so the poison is keyed by the
+  # coordinator pid and kept outside both.
+  #
+  # `:persistent_term`, not an ETS table: it needs no owner process (and so no new supervision
+  # child that both the Session and the stream process would depend on), a read is a lookup with no
+  # copy, and a write happens only on an fsync failure. Entries of dead coordinators are swept on
+  # the next write, so they stay bounded by the number of failures between two of them.
+
+  @doc "Record that `coordinator`'s shard must not ack another write. The first reason is kept."
+  @spec poison(pid(), term()) :: :ok
+  def poison(coordinator, reason) when is_pid(coordinator) do
+    key = {__MODULE__, :poison, coordinator}
+
+    if :persistent_term.get(key, nil) == nil do
+      sweep_dead()
+      :persistent_term.put(key, reason)
+    end
+
+    :ok
+  end
+
+  @doc "The poison recorded for `coordinator`, or nil."
+  @spec poisoned(pid()) :: term() | nil
+  def poisoned(coordinator) when is_pid(coordinator),
+    do: :persistent_term.get({__MODULE__, :poison, coordinator}, nil)
+
+  # Coordinators are local processes, so `Process.alive?/1` is a local check.
+  defp sweep_dead do
+    for {{__MODULE__, :poison, pid} = key, _} <- :persistent_term.get(),
+        not Process.alive?(pid),
+        do: :persistent_term.erase(key)
+
+    :ok
   end
 
   @doc """

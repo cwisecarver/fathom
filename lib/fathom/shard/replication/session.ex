@@ -401,7 +401,9 @@ defmodule Fathom.Shard.Replication.Session do
        # failed fdatasync: once set, every tenant round on this Session fails (see `WalSync`'s
        # moduledoc for why one failure must fail every later ack).
        wal_sync: nil,
-       wal_sync_poison: nil,
+       # Seeded from the coordinator-keyed poison (rv6 F6): a Session restarted under the same
+       # coordinator after a failed fdatasync must not start acking again.
+       wal_sync_poison: WalSync.poisoned(coordinator),
        # The long-lived fd every round's fdatasync goes through, `WalSync.held()` (expert review
        # 2026-10-21 rv6 F1): a fresh fd per round misses a write-back error another fd consumed.
        # Opened at the first deferred round on a WAL inode, retired (synced, then closed) on an
@@ -710,8 +712,11 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  # Refuse every later tenant ack on this Session. The FIRST reason is kept: it names the cause.
+  # Refuse every later tenant ack on this shard. The FIRST reason is kept: it names the cause. Also
+  # recorded against the coordinator, so it outlives this Session (rv6 F6).
   defp poison(%{wal_sync_poison: nil} = state, reason) do
+    WalSync.poison(state.coordinator, reason)
+
     Logger.error(
       "shard #{state.shard_id}: WAL fdatasync failed (#{inspect(reason)}); refusing every " <>
         "further write ack on this shard until it is reopened"
@@ -747,6 +752,12 @@ defmodule Fathom.Shard.Replication.Session do
   # through unchanged: that is the flag-off path, at the cost of two map reads.
   defp gate_on_wal_sync(reply, pre, state, deadline) do
     {own, state} = settle_wal_sync(state, deadline)
+
+    # The replication-off fallback poisons the coordinator, not this Session (rv6 F6).
+    state =
+      if state.wal_sync_poison == nil,
+        do: %{state | wal_sync_poison: WalSync.poisoned(state.coordinator)},
+        else: state
 
     # The failure this round itself saw comes first (it names the cause); the poison catches every
     # round after it.
