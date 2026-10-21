@@ -291,7 +291,9 @@ defmodule Fathom.Shard.PoolGraceTest do
 
       cache = Connection.detach_statements(conn)
       assert {_seq, entries} = cache
-      assert map_size(entries) == 2
+      # The two statements plus the `fathom_stmt_memused` probe each miss runs to size its entry
+      # (expert review 2026-10-20-2027 #7), which lives in the same cache and must be finalized too.
+      assert map_size(entries) == 3
 
       :ok = Connection.close_pooled({conn, cache})
 
@@ -299,7 +301,7 @@ defmodule Fathom.Shard.PoolGraceTest do
              "the WAL survived the last close: a carried statement was not finalized, so " <>
                "sqlite3_close_v2 deferred the close and skipped the checkpoint"
 
-      assert map_size(elem(cache, 1)) == 2
+      assert map_size(elem(cache, 1)) == 3
     end
   end
 

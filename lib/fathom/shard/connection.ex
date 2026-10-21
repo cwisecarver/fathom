@@ -1206,11 +1206,11 @@ defmodule Fathom.Shard.Connection do
         encoded = encode_cols(cols)
 
         case Process.get(key) do
-          {seq, %{^sql => {canonical, ^stmt, _cols, _enc, stamp, gen}} = cache} ->
-            Process.put(
-              key,
-              {seq, Map.put(cache, canonical, {canonical, stmt, cols, encoded, stamp, gen})}
-            )
+          {seq, %{^sql => {^stmt, stamp, gen, bytes, packed}} = cache} ->
+            {canonical, _cols, _enc} = decoded(conn, stmt, packed, sql)
+            entry = {stmt, stamp, gen, bytes, pack(cols, encoded)}
+            Process.put(key, {seq, Map.put(cache, canonical, entry)})
+            put_decoded(conn, stmt, {canonical, cols, encoded})
 
           _ ->
             :ok
@@ -1238,6 +1238,20 @@ defmodule Fathom.Shard.Connection do
   # close is sqlite3_close_v2, which defers until they are), and keeps the executor-handle
   # shape unchanged. `close/1` releases the cached statements explicitly for the orderly path.
   @stmt_cache_cap 64
+
+  # THE CACHE IS ALSO BOUNDED BY BYTES (expert review 2026-10-20-2027 #7). The count cap alone was
+  # blind to statement width: measured with `fathom_stmt_memused` (the extension's
+  # `sqlite3_stmt_status(SQLITE_STMTSTATUS_MEMUSED)`), a 29-column Django SELECT on `ks_scalars`
+  # holds 10-19 KiB of SQLite heap where a point read holds ~2 KiB, so 64 wide statements is
+  # ~1 MiB per connection and a node's stream count multiplies it. `soft_heap_limit` cannot reclaim
+  # it (a prepared statement's memory is not cache). Each entry records its MEMUSED at prepare
+  # (it does not change on execution — measured identical after the first and second step), and a
+  # miss evicts LRU entries until the sum fits `:stmt_cache_bytes` (default 256 KiB; nil disables
+  # the byte bound, leaving the count cap). The just-prepared statement is never evicted, so one
+  # statement wider than the budget still caches. Only SQLite's side is counted: the BEAM side is a
+  # few hundred bytes per entry beside it.
+  @stmt_cache_bytes_default 256 * 1024
+  @memused_sql "SELECT fathom_stmt_memused(?1)"
 
   # Cache entries are `{canonical_sql, stmt, stamp}` (expert review 2026-07-24 #8). The key is
   # stored alongside the statement so the HIT path can re-put under the CANONICAL binary rather
@@ -1281,12 +1295,14 @@ defmodule Fathom.Shard.Connection do
     gen = Fathom.Shard.SchemaGen.current()
 
     case cache do
-      %{^sql => {canonical, stmt, cols, enc, _stamp, ^gen}} ->
+      %{^sql => {stmt, _stamp, ^gen, bytes, packed}} ->
+        {canonical, cols, enc} = decoded(conn, stmt, packed, sql)
+
         # Re-put under `canonical`, never the incoming sub-binary: a map that has grown past a
         # flatmap adopts the new key term, which would silently reinstate the pin.
         Process.put(
           key,
-          {seq + 1, Map.put(cache, canonical, {canonical, stmt, cols, enc, seq + 1, gen})}
+          {seq + 1, Map.put(cache, canonical, {stmt, seq + 1, gen, bytes, packed})}
         )
 
         {:ok, stmt, cols, enc, false}
@@ -1307,17 +1323,20 @@ defmodule Fathom.Shard.Connection do
       # only exist after execution. The re-prepare is still worth doing — it drops a statement
       # compiled against a schema this connection has since left behind — but the authoritative
       # read happens in `do_query/4`.
-      %{^sql => {canonical, stmt, _stale_cols, _stale_enc, _stamp, _older_gen}} ->
+      %{^sql => {stmt, _stamp, _older_gen, _bytes, packed}} ->
+        {canonical, _cols, _enc} = decoded(conn, stmt, packed, sql)
         Sqlite3.release(conn, stmt)
+        drop_decoded(conn, stmt)
 
         with {:ok, fresh} <- prepare_retrying(conn, canonical, deadline_at),
              {:ok, cols} <- Sqlite3.columns(conn, fresh) do
+          bytes = stmt_bytes(conn, canonical)
+          # Re-read: measuring ran a statement through this same cache.
+          {seq, cache} = Process.get(key, {seq, cache})
           enc = encode_cols(cols)
-
-          Process.put(
-            key,
-            {seq + 1, Map.put(cache, canonical, {canonical, fresh, cols, enc, seq + 1, gen})}
-          )
+          entry = {fresh, seq + 1, gen, bytes, pack(cols, enc)}
+          Process.put(key, {seq + 1, Map.put(cache, canonical, entry)})
+          put_decoded(conn, fresh, {canonical, cols, enc})
 
           {:ok, fresh, cols, enc, true}
         end
@@ -1326,32 +1345,125 @@ defmodule Fathom.Shard.Connection do
         with {:ok, stmt} <- prepare_retrying(conn, sql, deadline_at),
              {:ok, cols} <- Sqlite3.columns(conn, stmt) do
           canonical = :binary.copy(sql)
-          cache = maybe_evict(conn, cache)
+          bytes = stmt_bytes(conn, canonical)
+          # Re-read: measuring ran a statement through this same cache (and may have cached it).
+          {seq, cache} = Process.get(key, {seq, cache})
+          cache = maybe_evict(conn, cache, bytes)
 
           enc = encode_cols(cols)
-
-          Process.put(
-            key,
-            {seq + 1, Map.put(cache, canonical, {canonical, stmt, cols, enc, seq + 1, gen})}
-          )
+          entry = {stmt, seq + 1, gen, bytes, pack(cols, enc)}
+          Process.put(key, {seq + 1, Map.put(cache, canonical, entry)})
+          put_decoded(conn, stmt, {canonical, cols, enc})
 
           {:ok, stmt, cols, enc, false}
         end
     end
   end
 
-  # At the cap, release the least-recently-used statement to make room. O(cap) scan, paid
-  # only on an over-cap miss — a workload cycling >64 distinct statements per stream is
-  # re-preparing anyway, exactly as before the cache.
-  defp maybe_evict(conn, cache) when map_size(cache) >= @stmt_cache_cap do
-    {lru_sql, {_canonical, stmt, _cols, _enc, _stamp, _gen}} =
-      Enum.min_by(cache, fn {_sql, {_canonical, _stmt, _cols, _enc, stamp, _gen}} -> stamp end)
-
-    Sqlite3.release(conn, stmt)
-    Map.delete(cache, lru_sql)
+  # Make room for a new entry of `incoming` bytes: release least-recently-used statements while the
+  # cache is at the count cap or the bytes would exceed the budget. O(cache) per eviction, paid only
+  # on a miss — a workload cycling more distinct statements than fit is re-preparing anyway, exactly
+  # as before the cache.
+  defp maybe_evict(conn, cache, incoming) do
+    budget = Application.get_env(:fathom, :stmt_cache_bytes, @stmt_cache_bytes_default)
+    evict_until_fits(conn, cache, incoming, budget, cache_bytes(cache))
   end
 
-  defp maybe_evict(_conn, cache), do: cache
+  defp evict_until_fits(_conn, cache, _incoming, _budget, _used) when map_size(cache) == 0,
+    do: cache
+
+  defp evict_until_fits(conn, cache, incoming, budget, used) do
+    if map_size(cache) >= @stmt_cache_cap or (is_integer(budget) and used + incoming > budget) do
+      {lru_sql, {stmt, _stamp, _gen, bytes, _packed}} =
+        Enum.min_by(cache, fn {_sql, {_stmt, stamp, _gen, _bytes, _packed}} -> stamp end)
+
+      Sqlite3.release(conn, stmt)
+      drop_decoded(conn, stmt)
+      evict_until_fits(conn, Map.delete(cache, lru_sql), incoming, budget, used - bytes)
+    else
+      cache
+    end
+  end
+
+  defp cache_bytes(cache),
+    do:
+      Enum.reduce(cache, 0, fn {_sql, {_stmt, _stamp, _gen, bytes, _packed}}, acc ->
+        acc + bytes
+      end)
+
+  # SQLite heap held by the just-prepared statement `sql`, via the extension's
+  # `fathom_stmt_memused`. The probe statement lives in this same cache and is never measured itself
+  # (that would recurse; it is ~1.6 KiB). If the extension is not loaded (config-disabled, or a dev
+  # box without cargo) the probe cannot prepare and the size is ESTIMATED from the SQL length:
+  # measured MEMUSED runs 13-27x the SQL text across the keystone mix, so 16x keeps the bound
+  # meaningful rather than silently turning it off.
+  #
+  # fathom's own one-row probes are not measured either (they are ~1.6 KiB each), and for
+  # `fathom_busy_retry_ms()` it is a correctness rule, not a saving: that function grants a retry
+  # budget only when the PREVIOUS statement on the connection is the one that yielded BUSY
+  # (src/backstop.rs), so running the memused probe in front of its first execution made every lock
+  # wait give up at once (caught by busy_yield_test and query_bounds_test).
+  defp stmt_bytes(_conn, sql)
+       when sql in [
+              @memused_sql,
+              "SELECT fathom_busy_retry_ms()",
+              "SELECT fathom_conn_state()"
+            ],
+       do: 0
+
+  defp stmt_bytes(conn, sql) do
+    with {:ok, probe, _cols, _enc, _refresh} <- cached_stmt(conn, @memused_sql),
+         :ok <- Sqlite3.bind(probe, [sql]),
+         {:done, [[n]]} when is_integer(n) <- Sqlite3.multi_step(conn, probe, 2) do
+      n
+    else
+      _ -> 16 * byte_size(sql)
+    end
+  end
+
+  # ENTRIES CARRY THEIR COLUMNS PACKED; THE DECODED FORM IS PROCESS-LOCAL (expert review
+  # 2026-10-20-2027 #20). A pooled handle's cache crosses two process boundaries per stream cycle
+  # (stream -> coordinator -> next stream), each a full heap copy, and an entry's column names and
+  # their wire form were most of it (~60 small terms for a 29-column statement). So an entry holds
+  # them as ONE refc binary (`packed`, which copies as a pointer), and the decoded
+  # `{canonical, cols, enc}` the hit path uses lives in a separate per-process overlay keyed by the
+  # statement ref, which `detach_statements/1` simply drops. The next stream decodes each entry on
+  # its first hit (`binary_to_term`, ~1 us for 29 columns) and re-copies its canonical key from the
+  # caller's SQL (`:binary.copy/1`, as on a miss). Entries are `{stmt, stamp, gen, bytes, packed}`.
+  # Measured, 64 29-column entries, pooled round trip: 110 KiB / 62-81 us carried whole -> ~8 us.
+  #
+  # Rejected, both measured: (a) stripping the decoded fields at detach — 20 us at 64 entries,
+  # because rebuilding a >32-key map re-hashes every key and the keys are the full SQL text (~800 B
+  # for a wide SELECT); (b) keeping `canonical` in the entry — the copy is not sharing-preserving,
+  # so the key and the element become two refc headers, and the round trip was 14 us, not 8.
+  defp pack(cols, enc), do: :erlang.term_to_binary({cols, enc})
+
+  defp decoded(conn, stmt, packed, sql) do
+    case Process.get({__MODULE__, :stmt_cols, conn}) do
+      %{^stmt => decoded} ->
+        decoded
+
+      _ ->
+        {cols, enc} = :erlang.binary_to_term(packed)
+        decoded = {:binary.copy(sql), cols, enc}
+        put_decoded(conn, stmt, decoded)
+        decoded
+    end
+  end
+
+  defp put_decoded(conn, stmt, decoded) do
+    key = {__MODULE__, :stmt_cols, conn}
+    Process.put(key, Map.put(Process.get(key, %{}), stmt, decoded))
+  end
+
+  defp drop_decoded(conn, stmt) do
+    key = {__MODULE__, :stmt_cols, conn}
+
+    case Process.get(key) do
+      %{^stmt => _} = overlay -> Process.put(key, Map.delete(overlay, stmt))
+      _ -> :ok
+    end
+  end
 
   @doc """
   Drops this connection's cached prepared statements (and their cached column lists).
@@ -1365,6 +1477,7 @@ defmodule Fathom.Shard.Connection do
   def purge_statements(conn), do: purge_stmt_cache(conn)
 
   defp purge_stmt_cache(conn) do
+    Process.delete({__MODULE__, :stmt_cols, conn})
     release_cache(conn, Process.delete({__MODULE__, :stmt_cache, conn}))
   end
 
@@ -1376,7 +1489,7 @@ defmodule Fathom.Shard.Connection do
   end
 
   defp release_cache(conn, {_seq, cache}) do
-    Enum.each(cache, fn {_sql, {_canonical, stmt, _cols, _enc, _stamp, _gen}} ->
+    Enum.each(cache, fn {_sql, {stmt, _stamp, _gen, _bytes, _packed}} ->
       Sqlite3.release(conn, stmt)
     end)
   end
@@ -1409,8 +1522,12 @@ defmodule Fathom.Shard.Connection do
 
   @doc false
   # Remove this stream's statement cache WITHOUT releasing it, for handing to the pool.
+  # Only the packed entries travel; the decoded overlay stays behind as garbage (see `pack/2`).
   @spec detach_statements(reference()) :: term()
-  def detach_statements(conn), do: Process.delete({__MODULE__, :stmt_cache, conn})
+  def detach_statements(conn) do
+    Process.delete({__MODULE__, :stmt_cols, conn})
+    Process.delete({__MODULE__, :stmt_cache, conn})
+  end
 
   @doc false
   # Install a cache a previous stream detached, in THIS stream's dictionary.
@@ -1418,6 +1535,7 @@ defmodule Fathom.Shard.Connection do
   def adopt_statements(_conn, nil), do: :ok
 
   def adopt_statements(conn, cache) do
+    Process.delete({__MODULE__, :stmt_cols, conn})
     Process.put({__MODULE__, :stmt_cache, conn}, cache)
     :ok
   end
