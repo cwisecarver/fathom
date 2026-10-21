@@ -1438,9 +1438,12 @@ defmodule Fathom.Shard.Replication.Session do
     # reason. Failing here re-plans on the next round, which is correct and cheap; shipping
     # mis-stamped bytes is neither.
     # The re-check reads through the SAME held fd, so it is one stat + one pread rather than a
-    # third open/close pair — and the inode revalidation inside `recheck_held/2` makes it a STRICTLY
-    # STRONGER recreate detector than before, when an unlink+recreate between the two reads was
-    # caught only if the salt happened to differ. It reads the header only (`stable?/3` compares
+    # third open/close pair. With the `-shm` fd held it is one INDEX pread and no stat (expert
+    # review 2026-10-20-2027 #16): an in-place restart moves the index salts first and drops to the
+    # stat + header path, and an unlink+recreate leaves the held fds on a frozen, fully
+    # checkpointed generation whose bytes are consistent with its own header — see
+    # `Wal.recheck_held/2`. Without the index, the inode revalidation in the stat path catches a
+    # recreate the original salt-only check could miss. It reads the header only (`stable?/3` compares
     # nothing else), skipping the commit-extent pread `read_held/2` would add (expert review
     # 2026-10-19 #17).
     {recheck, fd} =

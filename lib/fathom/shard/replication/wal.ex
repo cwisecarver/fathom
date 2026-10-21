@@ -281,7 +281,9 @@ defmodule Fathom.Shard.Replication.Wal do
 
   `Session.stable?/3` compares only `ckpt_seq` and `salt1`, but the recheck used to call
   `read_held/2` again, which also walked for the commit extent (one more pread, on a dirty-IO
-  scheduler, on the ack path) and then threw it away. This is a path stat plus ONE header pread.
+  scheduler, on the ack path) and then threw it away. This is a path stat plus ONE header pread —
+  or, with the `-shm` index held, ONE index pread and no stat (expert review 2026-10-20-2027 #16,
+  see the comment above the first clause).
 
   Everything that makes `read_held/2` safe is kept: the path is stat'd and its inode compared with
   the handle's, so an unlink+recreate reopens the fd and reports the NEW file's identity (never the
@@ -295,7 +297,43 @@ defmodule Fathom.Shard.Replication.Wal do
   """
   @spec recheck_held(handle(), Path.t()) ::
           {:ok, identity(), handle()} | {:ok, :empty, handle()} | {:error, term(), handle()}
-  def recheck_held(handle, path) do
+  # THE RECHECK FROM THE HELD WAL-INDEX (expert review 2026-10-20-2027 #16): ONE pread, no stat.
+  #
+  # When the handle holds the `-shm` fd and a cursor from this commit's `read_held/2`, a valid
+  # wal-index header (the same two-copy + checksum read `header_from/2` uses) still showing the
+  # cursor's salts and page size means the WAL header has not changed since: `ckpt_seq` and the
+  # salts are written once per generation, and an in-place restart (`walRestartHdr`) publishes the
+  # NEW salts in the index BEFORE it rewrites the WAL header or overwrites any frame. So a payload
+  # read between `read_held/2` and this call that straddled a restart always sees the index move,
+  # and the round falls back to the stat + header read below — today's path, which then reports the
+  # new generation (or, in the window before the header is rewritten, the old one, whose frames are
+  # not yet overwritten either) and `Session.stable?/3` decides exactly as before. An unusable index
+  # (torn, short, rebuilding) falls back too.
+  #
+  # WHAT THE DROPPED STAT USED TO CATCH, and why it is not needed here: an unlink+recreate of `-wal`
+  # between `read_held/2`'s stat and this recheck. SQLite unlinks `-wal` and `-shm` only in the
+  # last connection's close, AFTER checkpointing every frame into the `.db`; nothing ever writes the
+  # old inodes again. So the held fds still describe a complete, frozen generation: the index read
+  # through the old `-shm` matches the cursor, and the payload read through the old `-wal` is that
+  # generation's committed bytes under that generation's own header — consistent, not a splice.
+  # Shipping it is the same outcome as a recreate landing just AFTER the old stat-based recheck,
+  # which that recheck could never prevent either; the next commit's `read_held/2` stats, sees the
+  # new inode and takes the reset path. (Same argument as `read_delta_held/4`'s dropped stat,
+  # expert review 2026-10-17 #10a.) Pinned by the collapse test's unlink+recreate variant of #9.
+  def recheck_held(%{path: path, shm: shm, cursor: %{} = c} = handle, path) when shm != nil do
+    case read_index(shm) do
+      {:ok, %{salt1: s1, salt2: s2, page: page}}
+      when s1 == c.salt1 and s2 == c.salt2 and page == c.page ->
+        {:ok, %{ckpt_seq: c.ckpt_seq, salt1: s1}, handle}
+
+      _ ->
+        recheck_stat(handle, path)
+    end
+  end
+
+  def recheck_held(handle, path), do: recheck_stat(handle, path)
+
+  defp recheck_stat(handle, path) do
     case stat(path) do
       {:ok, %{size: size, inode: inode}} when size >= @header_bytes ->
         case ensure_fd(handle, path, inode) do
@@ -529,12 +567,14 @@ defmodule Fathom.Shard.Replication.Wal do
   # (panel 3: 6.0 / 9.2 / 21.6 preads per read at 1 / 4 / 16-row commits; now 1). A replicated
   # commit's raw file jobs go 6 → 5 (stat, index, payload, recheck stat, recheck header), which is
   # what #23 asked of the EOF-probe/payload fusion — with the index there is no EOF probe left
-  # to fuse, so #23 is subsumed rather than built.
+  # to fuse, so #23 is subsumed rather than built. The recheck now reads the index too, 5 → 4
+  # (stat, index, payload, index; expert review 2026-10-20-2027 #16).
   #
   # Inode recreation is still caught by the stat in `read_held/2` before this runs; a WAL restart
-  # after this read is still caught by the commit's trailing `recheck_held/2`, which reads the WAL
-  # header itself (SQLite rewrites it before overwriting any frame, so a payload that straddles a
-  # restart always fails `Session.stable?/3`).
+  # after this read is still caught by the commit's trailing `recheck_held/2`: a restart publishes
+  # new salts in the index first, so the recheck's index read misses and it reads the WAL header
+  # itself (SQLite rewrites it before overwriting any frame, so a payload that straddles a restart
+  # always fails `Session.stable?/3`).
   defp header_from(handle, size) do
     index = read_index(handle.shm)
 
