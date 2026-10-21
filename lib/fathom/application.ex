@@ -39,6 +39,7 @@ defmodule Fathom.Application do
     check_s3_static_credentials!()
     check_throttle_proxy!()
     check_admin_credentials!()
+    check_repo_pool_headroom!()
 
     # Node-wide SQLite page-cache bound (expert review 2026-10-08 #8). Before the tree, so no tenant
     # connection opens ahead of it; process-global, so this one trusted `:memory:` connection covers
@@ -308,6 +309,102 @@ defmodule Fathom.Application do
               "be on in prod. Unset :allow_shard_override (expert review 2026-07-14 #15)."
     end
   end
+
+  # Spare connections the prod pool should keep over the Oban floor; also the computed POOL_SIZE
+  # default's margin in config/runtime.exs (expert review 2026-10-21 #11).
+  @repo_pool_headroom 10
+
+  @doc """
+  The Repo pool against Oban's queue concurrency (expert review 2026-10-21 #11).
+
+  Every executing Oban job holds a `Fathom.Repo` connection, so the sum of the queue limits is a
+  floor on pool demand. Anything above it is all that is left for `HranaAuth.Revocations` on the
+  stream-open path, the Recorder, the pollers and the admin LiveViews; past `queue_interval` of
+  saturation DBConnection DROPS checkouts, which on a cold auth miss is floor 0 (`fail_open`) or a
+  401 (`fail_closed`). The queues summed to exactly the old fixed default of 25 after `tokens` and
+  `erasure` were added, with nothing checking.
+
+    * pool (`pool_size × pool_count`) at or under the queue sum: refuses to boot in prod, since
+      a full set of running jobs leaves the stream-open path no connection at all; warns elsewhere.
+    * pool under sum + #{@repo_pool_headroom} in prod: warns (the computed default is exactly that).
+    * Oban in `testing:` mode runs no queues, so there is nothing to check.
+
+  Returns `:ok`, `{:warn, message}` or raises. The pure decision is `repo_pool_verdict/4`.
+  """
+  @spec check_repo_pool_headroom!() :: :ok | {:warn, String.t()}
+  def check_repo_pool_headroom! do
+    oban = Application.get_env(:fathom, Oban, [])
+    repo = Application.get_env(:fathom, Fathom.Repo, [])
+
+    if Keyword.get(oban, :testing, :disabled) != :disabled do
+      :ok
+    else
+      pool = Keyword.get(repo, :pool_size, 10) * Keyword.get(repo, :pool_count, 1)
+      queues = oban_queue_limit_sum(Keyword.get(oban, :queues, []))
+
+      case repo_pool_verdict(
+             pool,
+             queues,
+             Application.get_env(:fathom, :env),
+             @repo_pool_headroom
+           ) do
+        :ok ->
+          :ok
+
+        {:raise, msg} ->
+          raise msg
+
+        {:warn, msg} = warn ->
+          Logger.warning(msg)
+          warn
+      end
+    end
+  end
+
+  @doc false
+  @spec repo_pool_verdict(integer(), integer(), atom(), integer()) ::
+          :ok | {:warn, String.t()} | {:raise, String.t()}
+  def repo_pool_verdict(pool, queues, env, headroom) do
+    cond do
+      queues > 0 and pool <= queues ->
+        msg =
+          "config error: the Repo pool (#{pool} = POOL_SIZE × pool_count) is at or under the sum " <>
+            "of Oban's queue limits (#{queues}). Every running job holds a connection, so a full " <>
+            "set of jobs leaves none for HranaAuth.Revocations on the stream-open path, and " <>
+            "DBConnection drops the queued checkouts. Raise POOL_SIZE to at least " <>
+            "#{queues + headroom}, or unset it for the computed default (expert review " <>
+            "2026-10-21 #11)."
+
+        if env == :prod,
+          do: {:raise, msg},
+          else: {:warn, String.replace_prefix(msg, "config error", "config warning")}
+
+      env == :prod and queues > 0 and pool < queues + headroom ->
+        {:warn,
+         "config warning: the Repo pool (#{pool}) leaves #{pool - queues} connection(s) over " <>
+           "the sum of Oban's queue limits (#{queues}); the computed default leaves " <>
+           "#{headroom}. The endpoint, the pollers and HranaAuth.Revocations share the rest " <>
+           "(expert review 2026-10-21 #11)."}
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc """
+  The sum of Oban's queue concurrency limits: an integer limit, or a keyword list's `:limit`.
+  `false` (no queues) is 0. `config/runtime.exs` computes the same sum for the POOL_SIZE default.
+  """
+  @spec oban_queue_limit_sum(term()) :: non_neg_integer()
+  def oban_queue_limit_sum(queues) when is_list(queues) do
+    Enum.reduce(queues, 0, fn
+      {_queue, limit}, acc when is_integer(limit) and limit > 0 -> acc + limit
+      {_queue, opts}, acc when is_list(opts) -> acc + max(Keyword.get(opts, :limit, 0), 0)
+      _, acc -> acc
+    end)
+  end
+
+  def oban_queue_limit_sum(_queues), do: 0
 
   # Expert review 2026-07-14 #16: a non-nil :default_shard in prod commingles EVERY unresolved
   # request (no Host subdomain, no override) into one shared shard instead of failing closed
