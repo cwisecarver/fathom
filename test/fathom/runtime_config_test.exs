@@ -361,6 +361,33 @@ defmodule Fathom.RuntimeConfigTest do
     refute Keyword.has_key?(fathom_config(%{"JOURNAL_SIZE_LIMIT" => nil}), :journal_size_limit)
   end
 
+  # Expert review 2026-10-21 #11 (Q10 option A): the prod POOL_SIZE default follows Oban's queue
+  # sum instead of a fixed 25, which the queues had grown to equal.
+  describe "POOL_SIZE default (#11)" do
+    defp repo_pool(overlay), do: prod_config(overlay) |> Keyword.fetch!(Fathom.Repo)
+
+    test "unset: the sum of Oban's queue limits + 10 (35 with the shipped queues)" do
+      assert Keyword.fetch!(repo_pool(%{"POOL_SIZE" => nil}), :pool_size) == 35
+    end
+
+    test "unset: it follows the queues, so a queue added later raises it" do
+      prev = Application.get_env(:fathom, Oban)
+      on_exit(fn -> Application.put_env(:fathom, Oban, prev) end)
+
+      Application.put_env(
+        :fathom,
+        Oban,
+        Keyword.put(prev, :queues, a: 30, b: [limit: 4, paused: true], c: false)
+      )
+
+      assert Keyword.fetch!(repo_pool(%{"POOL_SIZE" => nil}), :pool_size) == 44
+    end
+
+    test "an explicit POOL_SIZE still wins" do
+      assert Keyword.fetch!(repo_pool(%{"POOL_SIZE" => "60"}), :pool_size) == 60
+    end
+  end
+
   test "a non-integer JOURNAL_SIZE_LIMIT is a clear boot error naming the variable" do
     for bad <- ["64MiB", "1.5", "", "abc"] do
       error =
