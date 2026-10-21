@@ -155,6 +155,99 @@ defmodule Fathom.ConnectionWatchdogTest do
     assert_receive {:DOWN, ^mon, :process, ^watchdog, _}, 2_000
   end
 
+  # Expert review 2026-10-20-2027 #19 (the gap an Opus review found): `stop_watchdog/1` skips the
+  # wait for an UNFIRED watchdog only because of the watchdog's re-read of the generation after it
+  # writes the fired mark (R2 in `handle_fire/5`). Interleave the bad schedule deterministically:
+  # the watchdog has passed its generation check (R1), THEN the owner disarms and releases (the
+  # mark still reads 0, so the release is the async one), THEN the watchdog marks (W). With R2 the
+  # re-read sees the disarm and NO cancel is issued; without it the cancel lands on a handle that
+  # is by now another stream's (the 09-29 #33 cross-stream SQLITE_INTERRUPT).
+  test "a fire that loses the race to the owner's disarm issues no cancel", %{conn: conn} do
+    Application.put_env(:fathom, :query_timeout_ms, 5_000)
+    assert {:ok, _} = query(conn, "SELECT 1", [])
+
+    {watchdog, flags} = Process.get({Connection, :watchdog, conn})
+    mon = Process.monitor(self())
+    # The generation of the (finished) statement, as the timer message would carry it.
+    gen = :atomics.get(flags, 1) - 1
+    # Re-arm so R1 passes for `gen`: the statement is "still running" until the hook disarms.
+    :atomics.put(flags, 1, gen)
+
+    {:module, _} = Code.ensure_loaded(Exqlite.Sqlite3NIF)
+    :erlang.trace_pattern({Exqlite.Sqlite3NIF, :cancel, :_}, true, [:local])
+    me = self()
+
+    tracer =
+      spawn_link(fn ->
+        count = fn count, loop ->
+          receive do
+            {:trace, _, :call, {Exqlite.Sqlite3NIF, :cancel, _}} -> loop.(count + 1, loop)
+            :stop -> send(me, {:cancels, count})
+          end
+        end
+
+        count.(0, count)
+      end)
+
+    :erlang.trace(self(), true, [:call, {:tracer, tracer}])
+
+    hook = fn ->
+      :atomics.add(flags, 1, 1)
+      assert :atomics.get(flags, 2) == 0
+      assert :ok = Connection.release_owner_state(conn)
+    end
+
+    try do
+      assert :ok = Connection.handle_fire(conn, flags, gen, mon, hook)
+    after
+      :erlang.trace(self(), false, [:call])
+      :erlang.trace_pattern({Exqlite.Sqlite3NIF, :cancel, :_}, false, [:local])
+    end
+
+    send(tracer, :stop)
+    assert_receive {:cancels, cancels}, 2_000
+
+    assert cancels == 0,
+           "the fire cancelled after the owner had disarmed and released the handle"
+
+    assert :atomics.get(flags, 2) == gen, "the fire did not reach its mark; the fixture is wrong"
+    # The real watchdog was told to stop (async, mark was 0 at release).
+    ref = Process.monitor(watchdog)
+    assert_receive {:DOWN, ^ref, :process, ^watchdog, _}, 2_000
+  end
+
+  # The other half of the same invariant: once the fired mark IS set, the release must block until
+  # the watchdog is gone (a cancel may be in flight).
+  test "release_owner_state/1 blocks while a FIRED watchdog is frozen", %{conn: conn} do
+    Application.put_env(:fathom, :query_timeout_ms, 5_000)
+    assert {:ok, _} = query(conn, "SELECT 1", [])
+    {watchdog, flags} = Process.get({Connection, :watchdog, conn})
+    :atomics.put(flags, 2, 1)
+    test = self()
+
+    helper =
+      spawn(fn ->
+        true = :erlang.suspend_process(watchdog)
+        send(test, :suspended)
+
+        receive do
+          :resume -> :erlang.resume_process(watchdog)
+        end
+      end)
+
+    assert_receive :suspended, 1_000
+    # stop_watchdog/1 reads the CALLER's process dictionary, so the task adopts the entry.
+    task =
+      Task.async(fn ->
+        Process.put({Connection, :watchdog, conn}, {watchdog, flags})
+        Connection.release_owner_state(conn)
+      end)
+
+    assert Task.yield(task, 200) == nil, "release returned while a fired watchdog was still alive"
+    send(helper, :resume)
+    assert :ok = Task.await(task, 2_000)
+  end
+
   test "a genuine timeout is still reported", %{conn: conn} do
     # The reorder must not break detection: the message has to arrive before the peek.
     Application.put_env(:fathom, :query_timeout_ms, 5)
