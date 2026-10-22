@@ -1178,10 +1178,21 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :shard, :flush],
         measurement: :duration,
         unit: {:native, :millisecond},
-        tags: [:outcome],
+        tags: [:outcome, :route],
         reporter_options: [buckets: [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000]],
         description:
-          "Durability-flush latency by outcome (uploaded / reconciled / skipped / error). Flushes that SUCCEED but crawl grow the RPO exactly like flushes that fail, and nothing measured that — `flush.failed` only counts the ones that error out"
+          "Periodic durability-flush latency by outcome (uploaded / reconciled / skipped / error) and scan route (pinned_live / vacuum / none when the flush ended before choosing one; expert review 2026-10-21 r7 #2: the two routes cost differently, so an untagged series moves when the route mix does). Flushes that SUCCEED but crawl grow the RPO exactly like flushes that fail, and nothing measured that — `flush.failed` only counts the ones that error out"
+      ),
+      # Expert review 2026-10-21 r7 #2: the idle drop is prod's main durability producer
+      # (SHARD_IDLE_MS < SHARD_FLUSH_INTERVAL_MS) and had no duration at all. Bounded tags.
+      distribution("fathom.shard.drop_flush.duration",
+        event_name: [:fathom, :shard, :drop_flush],
+        measurement: :duration,
+        unit: {:native, :millisecond},
+        tags: [:outcome, :route],
+        reporter_options: [buckets: [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000]],
+        description:
+          "Drop-flush (idle drop / drain / rebalance handoff) upload latency by outcome and drop route (checkpoint / snapshot / snapshot_compact; unknown when the bounded upload timed out). Excludes the fence check and the local drop"
       ),
       # A2 commit -> quorum-ack latency, the number the tenant's write actually waits on.
       distribution("fathom.replication.commit.duration",
