@@ -382,16 +382,26 @@ defmodule Fathom.Shard.Replication.Follower do
   neither file exists and no row is resident there is nothing to erase, and nothing can bring one
   back for a tombstoned id: a push needs a row (`state_of/2` refuses to derive one for a tombstoned
   shard), `begin_seed/3` refuses it, and `finish_seed/3` re-checks the tombstone under the seed's
-  lock. What is left unerased in that case is at most a sidecar (`.lineage`, `.ordinal`,
-  `.position`, `.torn`: a number, no tenant data) stranded by a crash inside an earlier forget.
+  lock — and a held shard lock counts as present, so a seed past that re-check but not yet renamed
+  is waited for and then erased (rv7 F2). What is left unerased in that case is at most a sidecar
+  (`.lineage`, `.ordinal`, `.position`, `.torn`: a number, no tenant data) stranded by a crash
+  inside an earlier forget.
   """
   @spec forget_if_present(atom(), String.t()) :: :ok
   def forget_if_present(name \\ __MODULE__, shard_id) do
     if replica_present?(name, shard_id), do: forget(name, shard_id), else: :ok
   end
 
+  # A HELD SHARD LOCK COUNTS AS PRESENT (expert review 2026-10-21 rv7 F2). The file check is not
+  # under the lock, and `finish_seed/3` checks the tombstone and then renames the `.db` in, both
+  # under the lock. A seed that passed its check before this id was tombstoned and has not renamed
+  # yet holds the lock with no `.db` on disk: skipping here left the deleted tenant's replica to be
+  # installed right after the "absent" verdict and survive until the next boot's erase. `forget/2`
+  # waits for that lock, so the install lands first and is then erased. A held lock is rare (a push
+  # or seed of this very id), so the bulk load stays two stats and two ETS reads per id.
   defp replica_present?(name, shard_id) do
-    :ets.member(table(name), shard_id) or replica_files?(name, shard_id)
+    :ets.member(table(name), shard_id) or :ets.member(locks(name), shard_id) or
+      replica_files?(name, shard_id)
   rescue
     # No follower table, or an id that cannot name a file: there is no replica of it here.
     ArgumentError -> false
