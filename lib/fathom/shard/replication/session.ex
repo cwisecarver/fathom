@@ -3890,14 +3890,24 @@ defmodule Fathom.Shard.Replication.Session do
   # on a busy shard (the previous commit's straggler has not acked yet), not lag: arm quietly unless
   # `lagging?/1` says that push has been out a whole interval (expert review 2026-10-21 #25;
   # measured 45/100 healthy N=4/Q=2 commits marked through this path once `arm_if_short/1` alone
-  # was fixed). The backoff count moves as before. Any other reject is a real failure: loud.
+  # was fixed). Any other reject is a real failure: loud.
+  #
+  # A SKIP IS NOT A FAILURE (expert review 2026-10-21 r7 #9). The skip-only round used to add one
+  # to `catchup_fails` like a refusal, and only a reject-free round resets it, so on a busy N > Q
+  # shard the depth climbed by one per HEALTHY commit (measured 16 in 300 commits with two
+  # followers 3 ms slower, 95 with capped pushes). From depth 6 `retry_delay_ms/2` is its cap, the
+  # flush interval (30 s in prod), so the next REAL refusal after a burst waited that long for its
+  # retry instead of `catchup_ms`, and a follower still short at the covered idle close could be
+  # pushed into a full seed. The depth now counts refusals only: a skip-only round leaves it where
+  # it was (not reset either — a skip says nothing about whether an earlier refusal has cleared). A
+  # push skipped for longer than `timeout()` is pushed again and its shipper's real answer counts.
   defp arm_if_rejected(state, rejects) do
-    state = %{state | catchup_fails: state.catchup_fails + 1}
+    skip_only? = Enum.all?(rejects, &match?({_, :already_in_flight, _}, &1))
+    state = if skip_only?, do: state, else: %{state | catchup_fails: state.catchup_fails + 1}
 
-    if state.catchup_lag or lagging?(state) or
-         not Enum.all?(rejects, &match?({_, :already_in_flight, _}, &1)),
-       do: arm_catchup(state, rejects),
-       else: arm_quiet(state)
+    if state.catchup_lag or lagging?(state) or not skip_only?,
+      do: arm_catchup(state, rejects),
+      else: arm_quiet(state)
   end
 
   # Arm the catch-up when a connected follower is behind the newest extent this Session has read
