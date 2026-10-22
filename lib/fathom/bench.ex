@@ -1206,6 +1206,13 @@ defmodule Fathom.Bench do
     label = "hrana_sdk_#{mode}_rt_us"
     prev_pool = Application.get_env(:fathom, :connection_pool)
     Application.put_env(:fathom, :connection_pool, true)
+    # This arm writes THROUGH THE WIRE, and the prod-compiled bench has replication configured on
+    # but none of its processes started, so every write raised `unknown registry: ...SessionRegistry`
+    # and failed the whole run (first prod-compiled run of this arm, 2026-10-22). The arm measures
+    # the SDK's request shape, not the replication wait (hrana_write_rt_us owns that), so it runs
+    # with replication off for its duration.
+    prev_repl = Application.get_env(:fathom, :replication_enabled)
+    Application.put_env(:fathom, :replication_enabled, false)
     hits = :counters.new(2, [])
     handler = "bench-sdk-#{mode}-#{System.unique_integer([:positive])}"
 
@@ -1242,6 +1249,7 @@ defmodule Fathom.Bench do
       )
     after
       :telemetry.detach(handler)
+      restore_env(:replication_enabled, prev_repl)
 
       if is_nil(prev_pool),
         do: Application.delete_env(:fathom, :connection_pool),
