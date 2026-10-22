@@ -375,6 +375,10 @@ defmodule Fathom.Shard.Replication.Session do
        # `LagGauge` and the `:catchup` event count. False for a timer armed only as a safety net
        # behind fresh in-flight pushes, which every N > Q commit leaves at reply. See `arm_if_short/1`.
        catchup_lag: false,
+       # A catch-up episode with a laggard still short after its ONE round (expert review 2026-10-21
+       # r7 #8): the laggard's next advancing ack kicks the next round at once, instead of waiting a
+       # whole `catchup_ms` for the timer. See `handle_info({:repl_reply, _, {:ack, ...}}, ...)`.
+       catchup_chase: false,
        commits: 0,
        # Consecutive catch-up rounds that were ALSO refused. Drives the backoff in
        # `retry_delay_ms/2`; reset by any commit that comes back with no rejects.
@@ -539,9 +543,10 @@ defmodule Fathom.Shard.Replication.Session do
     state = ensure_registered(%{state | cycle: origin}, wal_path)
     {pin, state} = if mode == :checkpoint, do: maybe_pin(state, wal_path), else: {nil, state}
     t0 = System.monotonic_time()
-    # The catch-up (no caller) holds the Session no longer than its own retry interval: it now
-    # drives laggards to current itself (expert review 2026-10-20 #3), and a tenant commit arriving
-    # meanwhile queues behind it.
+
+    # The catch-up (no caller) holds the Session no longer than its own retry interval. Since expert
+    # review 2026-10-21 r7 #8 it is one round whenever the quorum holds (`ship/7`), so this bound
+    # binds only a catch-up whose quorum is short of its bytes, i.e. a shard failing its commits.
     deadline =
       if mode == :no_checkpoint, do: min(deadline, now_ms() + catchup_ms()), else: deadline
 
@@ -999,7 +1004,9 @@ defmodule Fathom.Shard.Replication.Session do
     # rule spread across three call sites produces. Found as a full-suite flake in
     # `replication_commit_test.exs`'s "a follower that rejects is no longer recorded as owing a
     # reply", not by reading.
-    {:noreply, state |> settle_late_ack(from, next) |> forget_inflight(from)}
+    advanced? = match?(%{offset: ^next}, Map.get(state.inflight, from))
+    state = state |> settle_late_ack(from, next) |> forget_inflight(from)
+    {:noreply, if(advanced?, do: maybe_chase(state), else: state)}
   end
 
   def handle_info({:repl_reply, from, {:reject, _shard, reason, follower_offset}}, state) do
@@ -1124,7 +1131,10 @@ defmodule Fathom.Shard.Replication.Session do
       :short ->
         LagGauge.mark(self(), true)
         state = internal_cycle(%{state | catchup_ref: nil, catchup_lag: true}, :catch_up)
-        {:noreply, if(state.catchup_ref == nil, do: clear_catchup(state), else: state)}
+
+        if state.catchup_ref == nil,
+          do: {:noreply, clear_catchup(state)},
+          else: {:noreply, %{state | catchup_chase: catch_up_need(state) != :none}}
     end
   end
 
@@ -1453,9 +1463,11 @@ defmodule Fathom.Shard.Replication.Session do
   # (the old frames were checkpointed; the reset carries what is left), as before.
   #
   # Followers left short at reply time are not abandoned: `arm_if_short/1` arms the catch-up timer,
-  # and the catch-up (`mode == :no_checkpoint`, no caller waiting) keeps the old stronger rule —
-  # it runs until every follower it could push to is current — under a deadline no longer than its
-  # own retry interval, so a quiet shard's laggards still converge without a tenant waiting on them.
+  # and the catch-up (`mode == :no_checkpoint`, no caller waiting) pushes to them. It used to keep
+  # the old stronger rule (every follower current, settling between rounds) and so held the Session
+  # for up to `catchup_ms` with tenant commits queued behind it; since expert review 2026-10-21 r7
+  # #8 it stops on the same quorum rule, ONE round, and its laggards' next rounds are kicked by
+  # their own acks (`maybe_chase/1`), so a quiet shard's laggards still converge at ack pace.
   #
   # Between rounds a tenant commit waits only until enough followers are free to make the quorum
   # (`await_stragglers_if_short/3`), never for a straggler the quorum does not need.
@@ -1501,20 +1513,21 @@ defmodule Fathom.Shard.Replication.Session do
           :nothing ->
             {:ok, state, seen_rejects(seen)}
 
-          {:ok, new_state, rejects, sent_complete?} ->
+          {:ok, new_state, rejects} ->
             seen = merge_rejects(seen, rejects)
             target = retarget(target, header)
-            held? = quorum_holds?(new_state, target)
 
             cond do
-              held? and (mode != :no_checkpoint or sent_complete?) ->
+              # A tenant commit stops when its quorum holds. So does a catch-up (expert review
+              # 2026-10-21 r7 #8): ONE ROUND, NO SETTLING. Its round was sent fire-and-forget
+              # (`deliver/7`, `needed == 0`) because the quorum already held, and the laggards'
+              # remaining bytes are the next round's, kicked by their ack (`maybe_chase/1`) or the
+              # timer. It used to loop until every follower was current, settling every push between
+              # rounds, which held the Session up to `catchup_ms` with tenant commits queued behind.
+              quorum_holds?(new_state, target) ->
                 {:ok, new_state, seen_rejects(seen)}
 
-              # Out of time. A catch-up whose quorum holds has nothing to report; a commit whose
-              # quorum does not hold its bytes fails rather than acks.
-              past?(deadline) and held? ->
-                {:ok, new_state, seen_rejects(seen)}
-
+              # Out of time with the quorum short of its bytes: a commit fails rather than acks.
               past?(deadline) ->
                 {:error, {:no_quorum, :catching_up}, new_state, seen_rejects(seen)}
 
@@ -1577,8 +1590,9 @@ defmodule Fathom.Shard.Replication.Session do
   # flight is SKIPPED rather than pushed to, so neither can happen to it any more — and waiting for
   # it is exactly what made one held follower cost every commit its deadline (2026-10-20 #3).
   #
-  # So a tenant commit waits only until enough followers are free to make the quorum. The catch-up,
-  # which has no caller and whose purpose IS the laggards, still settles every outstanding push.
+  # So a tenant commit waits only until enough followers are free to make the quorum. A catch-up
+  # reaches this only when its quorum does NOT hold (r7 #8: a held quorum ends it after one round),
+  # and then still settles every outstanding push before re-planning.
   defp between_rounds(state, wal_path, deadline, :no_checkpoint),
     do: settle_inflight(state, wal_path, deadline)
 
@@ -1670,13 +1684,7 @@ defmodule Fathom.Shard.Replication.Session do
 
       case built do
         {:ok, pushes, state} ->
-          # Completeness over what was SENT (expert review 2026-10-20 #3): a skipped follower was
-          # sent nothing, so its capped plan says nothing about this round.
-          tag(
-            deliver(state, header, sendable, pushes, current, skipped, deadline),
-            sendable,
-            header
-          )
+          deliver(state, header, sendable, pushes, current, skipped, deadline)
 
         {:error, reason, state} when reason in [:checkpoint_during_push, :short_read] ->
           {:replan, reason, state}
@@ -1707,25 +1715,6 @@ defmodule Fathom.Shard.Replication.Session do
     Map.has_key?(state.inflight, shipper) and
       now - Map.get(state.inflight_at, shipper, 0) < timeout()
   end
-
-  # Did this round hand every follower it SENT to the whole WAL, or did `Primary.plan/3`'s cap stop
-  # short? Only the catch-up's stopping rule reads it now; a tenant commit stops on
-  # `quorum_holds?/2` (expert review 2026-10-20 #3).
-  #
-  # Computed from the plans rather than signalled out of `plan/3`, so the cap stays a property of
-  # the pure planner and `deliver/5`'s return shape is left alone. `{:reset, 0, len}` compares the
-  # same way `{:append, off, len}` does — a reset that reached `size` is complete.
-  defp tag({:ok, state, rejects}, plans, header),
-    do: {:ok, state, rejects, complete?(plans, header)}
-
-  defp tag(other, _plans, _header), do: other
-
-  # Against the COMMIT EXTENT, the same bound `Primary.plan/3` ships to (expert review 2026-08-20 #5),
-  # not the file size. After a checkpoint the WAL keeps its high-water mark, so a round that shipped
-  # everything committed still compared short of `size` and forced a pointless extra round on every
-  # commit until the extent outgrew the old file (2026-10-02).
-  defp complete?(plans, %{commit_extent: extent}),
-    do: Enum.all?(plans, fn {_shipper, {_kind, off, len}} -> off + len >= extent end)
 
   # Public (`@doc false`) only so the 2026-10-12 #33 regression test can hand it a header taken
   # BEFORE a log reset — the exact window between `ship/5`'s header read and this function's payload
@@ -3873,12 +3862,36 @@ defmodule Fathom.Shard.Replication.Session do
         Map.get(state.followers, shipper)
       )
 
+  # THE CATCH-UP CHASES ITS LAGGARD AT ACK PACE (expert review 2026-10-21 r7 #8). A catch-up cycle
+  # is one round now (see `ship/7`), so a laggard more than `max_push_bytes` behind needs several
+  # cycles. Waiting `catchup_ms` (1 s) between them would turn a 16 MB re-ship after a follower
+  # restart into 16 s; instead the ack that advanced it fires the next round now, as a message
+  # BEHIND anything already in the mailbox, so tenant commits interleave between rounds instead of
+  # queueing behind all of them. Only inside a catch-up episode (`catchup_chase`, set by the fired
+  # timer's cycle) and only on an ack that ADVANCED a follower, so it cannot spin: each round sends a
+  # bounded push, and the next one waits for that push's ack.
+  defp maybe_chase(%{catchup_chase: true} = state) do
+    if catch_up_need(state) == :short do
+      if state.catchup_ref, do: Process.cancel_timer(state.catchup_ref)
+
+      %{
+        state
+        | catchup_ref: Process.send_after(self(), :catch_up, 0),
+          catchup_chase: false
+      }
+    else
+      state
+    end
+  end
+
+  defp maybe_chase(state), do: state
+
   # Every place that disarms the catch-up timer goes through here so the node-level gauge flag
   # (`LagGauge`, expert review 2026-10-17 #2) cannot drift from `catchup_ref`. `terminate/2` clears
   # it too; a Session killed without terminate is pruned by the gauge's liveness check.
   defp clear_catchup(state) do
     LagGauge.mark(self(), false)
-    %{state | catchup_ref: nil, catchup_lag: false}
+    %{state | catchup_ref: nil, catchup_lag: false, catchup_chase: false}
   end
 
   # A CLEAN commit is the only thing that clears the failure count. Not tidiness: without it a
