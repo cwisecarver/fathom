@@ -336,6 +336,169 @@ defmodule Fathom.Directory.RecorderTest do
     end
   end
 
+  # Expert review 2026-10-21 #19: with the buffer drained every second, a shard checked out
+  # continuously (the HTTP Hrana path, one checkout per stream) shipped one row per second, and the
+  # directory's 30 s write guard threw away 29 of every 30 (probe
+  # `directory_recorder_hotspot_test.exs`: 1000 busy shards, 983 rows/s shipped, 29.5x what was
+  # written). The Recorder now keeps the window the database reported for the last written touch and
+  # does not buffer a same-coordinator touch inside it. Each exactness edge has its own test, because
+  # dropping any one of them silently breaks only the guard it protects.
+  describe "2026-10-21 #19 — the quiet window after a written touch" do
+    defp quiet_row(id), do: :ets.lookup(Module.concat(Recorder, Quiet), id)
+    defp buffered?(id), do: :ets.member(Recorder, id)
+    defp proc, do: spawn(fn -> receive do: (:stop -> :ok) end)
+
+    defp set_quiet(id, p, until_us),
+      do: :ets.insert(Module.concat(Recorder, Quiet), {id, p, until_us})
+
+    test "REGRESSION: a busy shard's touch inside the window is not shipped again" do
+      a = uniq()
+      p = proc()
+      :ok = Recorder.record(a, p)
+      assert Recorder.flush() == 1
+
+      # The next second's checkout. Before #19 this re-buffered and shipped a row the guard rejects.
+      :ok = Recorder.record(a, p)
+
+      refute buffered?(a),
+             "a touch inside the guard's window was buffered, so it ships a row Postgres rejects"
+    end
+
+    test "the first touch of a shard lands and leaves a window matching the guard" do
+      a = uniq()
+      p = proc()
+      assert quiet_row(a) == []
+      :ok = Recorder.record(a, p)
+      [{^a, touched_us}] = :ets.lookup(Recorder, a)
+      assert Recorder.flush() == 1
+      assert {:ok, %{shard_id: ^a}} = Directory.get(a)
+
+      assert [{^a, ^p, until}] = quiet_row(a)
+      # stored last_active_at + 30 s, mapped back to this node's clock: the offset round trip can
+      # move it by the offset query's latency, never by seconds.
+      assert_in_delta until - touched_us, 30_000_000, 500_000
+    end
+
+    test "the window boundary: an expired window admits the touch, a live one does not" do
+      a = uniq()
+      p = proc()
+      now = System.os_time(:microsecond)
+
+      set_quiet(a, p, now + 1_000_000)
+      :ok = Recorder.record(a, p)
+      refute buffered?(a)
+
+      set_quiet(a, p, System.os_time(:microsecond))
+      :ok = Recorder.record(a, p)
+      assert buffered?(a), "a touch at or past the window's end must ship (the guard admits it)"
+    end
+
+    test "a NEW coordinator's touch always buffers (the cutover edge)" do
+      a = uniq()
+      old = proc()
+      :ok = Recorder.record(a, old)
+      Recorder.flush()
+      assert [{^a, ^old, _}] = quiet_row(a)
+
+      {:ok, cut} = Directory.cutover(a, 3)
+      :ok = Recorder.record(a, proc())
+
+      assert buffered?(a),
+             "the first post-cutover touch was suppressed by the old incarnation's window"
+
+      Recorder.flush()
+      {:ok, row} = Directory.get(a)
+
+      assert DateTime.compare(row.last_active_at, cut.cutover_at) == :gt,
+             "post-cutover use did not reach last_active_at, so an unforced revert would pass"
+    end
+
+    test "record_flush/1 ends the window, so the first post-flush touch lands (the flush edge)" do
+      a = uniq()
+      p = proc()
+      :ok = Recorder.record(a, p)
+      Recorder.flush()
+      assert [_] = quiet_row(a)
+
+      :ok = Recorder.record_flush(a)
+      assert quiet_row(a) == []
+      Recorder.flush()
+
+      :ok = Recorder.record(a, p)
+      assert buffered?(a)
+      Recorder.flush()
+
+      assert Enum.any?(Directory.flush_lag_report(100_000), &(&1.shard_id == a)),
+             "a checkout after the flush must mark the shard dirty"
+    end
+
+    test "a buffered flush row disables a live window" do
+      a = uniq()
+      p = proc()
+      set_quiet(a, p, System.os_time(:microsecond) + 30_000_000)
+      :ets.insert(Module.concat(Recorder, Flushes), {a, System.os_time(:microsecond)})
+      :ok = Recorder.record(a, p)
+      assert buffered?(a)
+    end
+
+    test "a window set after record_flush/1 (a racing drain) is cleared before the flush drains" do
+      a = uniq()
+      p = proc()
+      {:ok, _} = Directory.resolve(a)
+      :ok = Recorder.record_flush(a)
+      # What a drain racing record_flush/1 can leave behind.
+      set_quiet(a, p, System.os_time(:microsecond) + 30_000_000)
+
+      Recorder.flush()
+
+      assert quiet_row(a) == [],
+             "the flush-only drain left a window: the first post-flush touch would be dropped"
+
+      :ok = Recorder.record(a, p)
+      assert buffered?(a)
+    end
+
+    test "a joint write whose touch preceded the flush sets no window" do
+      a = uniq()
+      p = proc()
+      {:ok, _} = Directory.resolve(a)
+      :ok = Recorder.record(a, p)
+      # The touch is buffered before the flush stamp, as when a stream wrote, then the flush ran.
+      :ok = Recorder.record_flush(a)
+      Recorder.flush()
+      assert quiet_row(a) == []
+    end
+
+    test "the WebSocket shape (one touch per stream open) and record/1 are unchanged" do
+      # A WS stream touches only at open. An open past the window ships, as before.
+      a = uniq()
+      p = proc()
+      set_quiet(a, p, System.os_time(:microsecond) - 1)
+      :ok = Recorder.record(a, p)
+      assert buffered?(a)
+
+      # No coordinator: never coalesced and never given a window.
+      b = uniq()
+      :ok = Recorder.record(b)
+      Recorder.flush()
+      assert quiet_row(b) == []
+      :ok = Recorder.record(b)
+      assert buffered?(b)
+    end
+
+    test "sweep_quiet/1 deletes expired windows and keeps live ones" do
+      live = uniq()
+      dead = uniq()
+      now = System.os_time(:microsecond)
+      set_quiet(live, self(), now + 10_000_000)
+      set_quiet(dead, self(), now - 1)
+
+      assert Recorder.sweep_quiet(now) >= 1
+      assert quiet_row(dead) == []
+      assert [_] = quiet_row(live)
+    end
+  end
+
   describe "#38 — the shutdown flush is budgeted and says so when it gives up" do
     # This buffer holds a `last_flushed_at` row for every shard the node just flushed, and
     # terminate/2 is the only chance to persist them. Shutdown order is

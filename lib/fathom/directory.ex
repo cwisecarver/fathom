@@ -155,9 +155,29 @@ defmodule Fathom.Directory do
   even though it bypasses changeset validation.
   """
   @spec record_batch([{String.t(), DateTime.t()}]) :: non_neg_integer()
-  def record_batch([]), do: 0
+  def record_batch(entries), do: entries |> record_batch_with_quiet() |> elem(0)
 
-  def record_batch(entries) do
+  @typedoc """
+  A shard the directory just wrote, and the instant (Postgres clock) before which this guard would
+  reject a re-touch: its stored `last_active_at` plus the granularity. Returned only when that
+  stored value is past both edges (`last_flushed_at` and `cutover_at`), so that inside the window
+  the guard's first clause is the ONLY one that could pass, and it cannot (expert review 2026-10-21
+  #19).
+  """
+  @type quiet :: {String.t(), DateTime.t()}
+
+  @doc """
+  `record_batch/1`, also returning each written shard's `t:quiet/0` window. The Recorder uses the
+  windows to stop shipping touches the guard would reject (expert review 2026-10-21 #19).
+
+  A guard-REJECTED shard gets no window: its stored `last_active_at` is not returned by the UPDATE,
+  and guessing it (e.g. "the rejected stamp plus the granularity") would let `last_active_at` trail
+  by up to twice the granularity.
+  """
+  @spec record_batch_with_quiet([{String.t(), DateTime.t()}]) :: {non_neg_integer(), [quiet()]}
+  def record_batch_with_quiet([]), do: {0, []}
+
+  def record_batch_with_quiet(entries) do
     now = DateTime.utc_now()
 
     granularity_s =
@@ -165,7 +185,7 @@ defmodule Fathom.Directory do
 
     entries
     |> Enum.chunk_every(@batch_chunk)
-    |> Enum.reduce(0, fn chunk, acc ->
+    |> Enum.reduce({0, []}, fn chunk, {acc, quiet} ->
       ids = Enum.map(chunk, &elem(&1, 0))
       ats = Enum.map(chunk, &elem(&1, 1))
 
@@ -202,7 +222,8 @@ defmodule Fathom.Directory do
                 updated_at: ^now
               ]
             ],
-            select: s.shard_id
+            # The post-update stamps (RETURNING sees the new row), for the #19 quiet windows.
+            select: {s.shard_id, s.last_active_at, s.last_flushed_at, s.cutover_at}
           ),
           []
         )
@@ -212,14 +233,34 @@ defmodule Fathom.Directory do
       # ... WHERE, takes no tuple lock: ~3 B/row measured on 20k existing rows). A shard another
       # node inserted between the two statements is skipped; that node's own first-sight insert
       # carries a stamp from the same moment.
-      updated_set = MapSet.new(updated_ids)
-      inserted = chunk |> Enum.reject(fn {id, _} -> id in updated_set end) |> insert_new(now)
+      updated_set = MapSet.new(updated_ids, &elem(&1, 0))
 
-      acc + updated + inserted
+      {inserted, inserted_ids} =
+        chunk |> Enum.reject(fn {id, _} -> id in updated_set end) |> insert_new(now)
+
+      # A first-sight row has no flush or cutover stamp, so its window is its own stamp's.
+      fresh =
+        for {id, at} <- chunk, id in inserted_ids, do: {id, at, nil, nil}
+
+      {acc + updated + inserted, quiet_windows(updated_ids ++ fresh, granularity_s, quiet)}
     end)
   end
 
-  defp insert_new([], _now), do: 0
+  # The #19 quiet window of each written row whose stored `last_active_at` is past both edges.
+  # At or before either edge the guard's edge clause still admits the next touch, so no window.
+  defp quiet_windows(rows, granularity_s, acc) do
+    Enum.reduce(rows, acc, fn {id, active, flushed, cutover}, acc ->
+      if past_edge?(active, flushed) and past_edge?(active, cutover),
+        do: [{id, DateTime.add(active, granularity_s, :second)} | acc],
+        else: acc
+    end)
+  end
+
+  defp past_edge?(nil, _edge), do: false
+  defp past_edge?(_active, nil), do: true
+  defp past_edge?(active, edge), do: DateTime.compare(active, edge) == :gt
+
+  defp insert_new([], _now), do: {0, MapSet.new()}
 
   defp insert_new(entries, now) do
     rows =
@@ -234,8 +275,14 @@ defmodule Fathom.Directory do
         }
       end)
 
-    {count, _} = Repo.insert_all(Shard, rows, on_conflict: :nothing, conflict_target: :shard_id)
-    count
+    {count, returned} =
+      Repo.insert_all(Shard, rows,
+        on_conflict: :nothing,
+        conflict_target: :shard_id,
+        returning: [:shard_id]
+      )
+
+    {count, MapSet.new(returned, & &1.shard_id)}
   end
 
   @doc """
@@ -311,9 +358,20 @@ defmodule Fathom.Directory do
   """
   @spec record_flush_and_touch_batch([{String.t(), DateTime.t(), DateTime.t()}]) ::
           non_neg_integer()
-  def record_flush_and_touch_batch([]), do: 0
+  def record_flush_and_touch_batch(entries),
+    do: entries |> record_flush_and_touch_batch_with_quiet() |> elem(0)
 
-  def record_flush_and_touch_batch(entries) do
+  @doc """
+  `record_flush_and_touch_batch/1`, also returning the `t:quiet/0` window of each shard whose
+  stored `last_active_at` ended up past its (new) `last_flushed_at` and its `cutover_at` (expert
+  review 2026-10-21 #19). A shard whose touch preceded its flush gets none: the next touch is the
+  first after a flush and must land.
+  """
+  @spec record_flush_and_touch_batch_with_quiet([{String.t(), DateTime.t(), DateTime.t()}]) ::
+          {non_neg_integer(), [quiet()]}
+  def record_flush_and_touch_batch_with_quiet([]), do: {0, []}
+
+  def record_flush_and_touch_batch_with_quiet(entries) do
     now = DateTime.utc_now()
 
     granularity_s =
@@ -321,7 +379,7 @@ defmodule Fathom.Directory do
 
     entries
     |> Enum.chunk_every(@batch_chunk)
-    |> Enum.reduce(0, fn chunk, acc ->
+    |> Enum.reduce({0, []}, fn chunk, {acc, quiet} ->
       ids = Enum.map(chunk, &elem(&1, 0))
       flushed = Enum.map(chunk, &elem(&1, 1))
       touched = Enum.map(chunk, &elem(&1, 2))
@@ -362,25 +420,32 @@ defmodule Fathom.Directory do
                 updated_at: ^now
               ]
             ],
-            select: s.shard_id
+            # The post-update stamps, for the #19 quiet windows.
+            select: {s.shard_id, s.last_active_at, s.last_flushed_at, s.cutover_at}
           ),
           []
         )
 
       # Shards the directory has never seen: inserted once, with the value the sequential pair would
       # have left (flush sets both stamps, the touch then GREATEST-merges into last_active_at).
-      updated_set = MapSet.new(updated_ids)
+      updated_set = MapSet.new(updated_ids, &elem(&1, 0))
 
-      inserted =
+      {inserted, inserted_ids} =
         chunk
         |> Enum.reject(fn {id, _, _} -> id in updated_set end)
         |> insert_new_joint(now)
 
-      acc + length(updated_ids) + inserted
+      fresh =
+        for {id, flushed_at, touched_at} <- chunk,
+            id in inserted_ids,
+            do: {id, max_stamp(flushed_at, touched_at), flushed_at, nil}
+
+      {acc + length(updated_ids) + inserted,
+       quiet_windows(updated_ids ++ fresh, granularity_s, quiet)}
     end)
   end
 
-  defp insert_new_joint([], _now), do: 0
+  defp insert_new_joint([], _now), do: {0, MapSet.new()}
 
   defp insert_new_joint(entries, now) do
     rows =
@@ -396,8 +461,14 @@ defmodule Fathom.Directory do
         }
       end)
 
-    {count, _} = Repo.insert_all(Shard, rows, on_conflict: :nothing, conflict_target: :shard_id)
-    count
+    {count, returned} =
+      Repo.insert_all(Shard, rows,
+        on_conflict: :nothing,
+        conflict_target: :shard_id,
+        returning: [:shard_id]
+      )
+
+    {count, MapSet.new(returned, & &1.shard_id)}
   end
 
   defp max_stamp(a, b), do: if(DateTime.compare(a, b) == :lt, do: b, else: a)

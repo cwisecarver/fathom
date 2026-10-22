@@ -1294,20 +1294,41 @@ if config_env() == :prod do
 
   maybe_ipv6 = if System.get_env("ECTO_IPV6") in ~w(true 1), do: [:inet6], else: []
 
+  # The Oban demand floor: the sum of every queue's concurrency in config.exs (25 today: migrations
+  # 10, retirement 5, rebalance 3, tenants 3, tokens 3, erasure 1). Read from the merged config,
+  # not restated, so a queue added later raises the POOL_SIZE default with it (expert review
+  # 2026-10-21 #11: `tokens` and `erasure` were added without raising the old fixed 25, and the
+  # headroom became zero). A queue is an integer or a keyword list with `:limit`; `queues: false`
+  # runs none. `Fathom.Application.oban_queue_limit_sum/1` is the same sum for the boot guard; this
+  # copy exists because runtime.exs should not call into the application's own modules.
+  oban_queue_sum =
+    case Keyword.get(Application.get_env(:fathom, Oban, []), :queues, []) do
+      queues when is_list(queues) ->
+        Enum.reduce(queues, 0, fn
+          {_queue, limit}, acc when is_integer(limit) -> acc + limit
+          {_queue, opts}, acc when is_list(opts) -> acc + Keyword.get(opts, :limit, 0)
+          _, acc -> acc
+        end)
+
+      _ ->
+        0
+    end
+
   config :fathom, Fathom.Repo,
     # ssl: true,
     url: database_url,
-    # Expert review 2026-07-24 #21. The phx.new default of 10 sat under a demand floor of ~21 from
-    # Oban ALONE (`queues: [migrations: 10, retirement: 5, rebalance: 3, tenants: 3, tokens: 3, erasure: 1]`, config.exs),
-    # each executing job holding a connection — and ShardMigrationJob's cutover runs `Oban.insert`
-    # inside a transaction, holding one for its full duration. On top of that: the Oban
-    # Cron/Pruner/Peer plugins, the endpoint and every admin LiveView, Directory.Recorder,
-    # Migrator.HeadCache, HranaAuth.Revocations, Tenants.Tombstones/Suspensions,
-    # Rebalancer.Reporter, CommandPoller, and Shard.WarmFollower.
+    # Expert review 2026-07-24 #21. The phx.new default of 10 sat under the demand floor from Oban
+    # ALONE (`oban_queue_sum` above), each executing job holding a connection — and
+    # ShardMigrationJob's cutover runs `Oban.insert` inside a transaction, holding one for its full
+    # duration. On top of that: the Oban Cron/Pruner/Peer plugins, the endpoint and every admin
+    # LiveView, Directory.Recorder, Migrator.HeadCache, HranaAuth.Revocations (on the stream-open
+    # path), Tenants.Tombstones/Suspensions, Rebalancer.Reporter and CommandPoller.
     #
-    # Size it as sum(queue concurrency) + web concurrency + headroom for the pollers. RAISING
-    # `queues:` MEANS RAISING THIS.
-    pool_size: String.to_integer(System.get_env("POOL_SIZE") || "25"),
+    # The default is that floor + 10 (expert review 2026-10-21 #11, Q10 option A), so it follows
+    # `queues:` instead of drifting under it: the fixed 25 equalled the queue sum (25) once `tokens`
+    # and `erasure` were added. A POOL_SIZE at or under the queue sum refuses to boot
+    # (`Fathom.Application.check_repo_pool_headroom!/0`); one with less than 10 spare warns.
+    pool_size: String.to_integer(System.get_env("POOL_SIZE") || "#{oban_queue_sum + 10}"),
     # DBConnection's defaults (50/1000) were already in force implicitly; they are stated here
     # because they are load-bearing. Past `queue_interval` of saturation, checkouts are DROPPED
     # rather than queued — and the module that most needs them, HranaAuth.Revocations, sits on the

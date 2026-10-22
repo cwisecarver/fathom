@@ -511,6 +511,85 @@ defmodule Fathom.DirectoryTest do
     end
   end
 
+  # Expert review 2026-10-21 #19: the Recorder stops shipping a busy shard's touches inside the
+  # window this guard would reject them in. The window comes from the database, never a guess, and
+  # only for a stored stamp past BOTH edges: at or before either edge the guard's edge clause still
+  # admits the next touch, so a window there would drop the first post-flush / post-cutover touch.
+  describe "record_batch_with_quiet/1 and the joint form return the guard's own window (#19)" do
+    defp window(quiet, id) do
+      case List.keyfind(quiet, id, 0) do
+        {^id, until} -> until
+        nil -> nil
+      end
+    end
+
+    test "a first-seen and a written row get stored last_active_at + granularity" do
+      {:ok, stale} = Directory.resolve("q_write")
+      at = DateTime.add(stale.last_active_at, 40, :second)
+      new_at = DateTime.utc_now()
+
+      assert {2, quiet} = Directory.record_batch_with_quiet([{"q_write", at}, {"q_new", new_at}])
+      assert DateTime.compare(window(quiet, "q_write"), DateTime.add(at, 30, :second)) == :eq
+      assert DateTime.compare(window(quiet, "q_new"), DateTime.add(new_at, 30, :second)) == :eq
+    end
+
+    test "a guard-rejected row gets no window (its stored stamp is unknown)" do
+      {:ok, fresh} = Directory.resolve("q_reject")
+
+      assert {0, []} =
+               Directory.record_batch_with_quiet([
+                 {"q_reject", DateTime.add(fresh.last_active_at, 5, :second)}
+               ])
+    end
+
+    test "no window when the stored stamp is at or before cutover_at (cutover edge)" do
+      {:ok, _} = Directory.resolve("q_cut")
+      {:ok, cut} = Directory.cutover("q_cut", 2)
+
+      # A late pre-cutover touch passes the edge clause, but GREATEST leaves last_active_at at
+      # cutover_at, so the next touch must still be admitted.
+      assert {1, []} =
+               Directory.record_batch_with_quiet([
+                 {"q_cut", DateTime.add(cut.cutover_at, -1, :second)}
+               ])
+
+      # The first post-cutover touch moves it past the edge: now there is a window.
+      after_cut = DateTime.add(cut.cutover_at, 1, :second)
+      assert {1, [{"q_cut", until}]} = Directory.record_batch_with_quiet([{"q_cut", after_cut}])
+      assert DateTime.compare(until, DateTime.add(after_cut, 30, :second)) == :eq
+    end
+
+    test "no window when the stored stamp is at or before last_flushed_at (flush edge)" do
+      {:ok, first} = Directory.resolve("q_flush")
+      flushed = DateTime.add(first.last_active_at, 5, :second)
+      assert Directory.record_flush_batch([{"q_flush", flushed}]) == 1
+
+      assert {1, []} =
+               Directory.record_batch_with_quiet([
+                 {"q_flush", DateTime.add(flushed, -1, :second)}
+               ])
+    end
+
+    test "joint: a touch after the flush gets a window; a touch before it does not" do
+      {:ok, a} = Directory.resolve("q_joint_after")
+      {:ok, b} = Directory.resolve("q_joint_before")
+      fa = DateTime.add(a.last_active_at, 5, :second)
+      fb = DateTime.add(b.last_active_at, 5, :second)
+
+      assert {2, quiet} =
+               Directory.record_flush_and_touch_batch_with_quiet([
+                 {"q_joint_after", fa, DateTime.add(fa, 1, :second)},
+                 {"q_joint_before", fb, DateTime.add(fb, -1, :second)}
+               ])
+
+      assert DateTime.compare(window(quiet, "q_joint_after"), DateTime.add(fa, 31, :second)) ==
+               :eq
+
+      assert window(quiet, "q_joint_before") == nil,
+             "a touch that preceded the flush leaves the shard clean, so the next touch must land"
+    end
+  end
+
   # Finding #12: `status` was in no index, so every status='active'-filtered query
   # (laggards/count_laggards every reconcile + rollout sweep; shards_at_version on revert)
   # sequentially scanned the whole shards table — linear in fleet size (millions at target

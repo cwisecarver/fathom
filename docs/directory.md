@@ -38,6 +38,18 @@ round-trip in front of every query — latency on the hot path, and a Postgres o
   after a **cutover** (the revert write-age guard) and the first after a recorded **flush** (the
   loss-window report's dirty test). So `last_active_at` can trail by up to 30 s inside an
   active period, while "used since cutover" and "dirty since flush" stay exact.
+- **The Recorder applies the same window before shipping** (expert review 2026-10-21 #19). The
+  1 s drain empties the buffer, so a shard checked out continuously (the HTTP Hrana path, one
+  checkout per stream) used to ship a row every second for the guard to reject. The batch UPDATE and
+  INSERT now return each written row's stored stamps, and for a row whose `last_active_at` is past
+  both `last_flushed_at` and `cutover_at`, the Recorder keeps `{shard_id, coordinator,
+  last_active_at + granularity}` (node clock). A touch from the same coordinator before that instant,
+  with nothing buffered and no flush buffered, is not buffered at all. The edges are unchanged: a new
+  coordinator (every post-cutover touch) never matches, `record_flush/1` deletes the window, a
+  buffered flush disables it, and a guard-rejected row gets no window, since its stored stamp is
+  unknown. In-process probe (`test/fathom/directory_recorder_hotspot_test.exs`, 1000 busy shards,
+  60 s, 10 touches per shard per second): 983 rows/s shipped for 2000 written before, 50 rows/s for
+  3000 written after (shipped/written 29.5x to 1.0x).
 - **A Postgres outage drops a *flush*, never a *checkout*.** The `record/1` ETS insert already
   succeeded, so the request never blocked on or failed from Postgres; and a *failed batch*
   **re-buffers** the drained touches (`:ets.insert_new`, so a fresher touch already back in the

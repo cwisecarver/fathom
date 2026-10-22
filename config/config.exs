@@ -143,8 +143,10 @@ config :fathom, Oban,
   repo: Fathom.Repo,
   # Every executing job holds a Fathom.Repo connection for its Postgres work, so this sum (25) is a
   # floor on repo pool demand before the endpoint, the pollers, and the near-hot-path
-  # HranaAuth.Revocations reads are counted. RAISING THESE MEANS RAISING `POOL_SIZE` in
-  # config/runtime.exs, which is sized against them (expert review 2026-07-24 #21).
+  # HranaAuth.Revocations reads are counted (expert review 2026-07-24 #21). The prod `POOL_SIZE`
+  # default is computed from it (sum + 10, config/runtime.exs), and a boot guard refuses a pool at
+  # or under it (expert review 2026-10-21 #11) — so raising these raises the default pool, and a
+  # node with an explicit POOL_SIZE must be re-checked.
   queues: [migrations: 10, retirement: 5, rebalance: 3, tenants: 3, tokens: 3, erasure: 1],
   plugins: [
     {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},
