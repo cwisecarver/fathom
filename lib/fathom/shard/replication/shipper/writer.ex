@@ -54,6 +54,7 @@ defmodule Fathom.Shard.Replication.Shipper.Writer do
   """
 
   alias Fathom.Shard.Replication.Budget
+  alias Fathom.Shard.Replication.Priority
 
   @doc """
   Start a writer for `sock`, reporting failures to `shipper`.
@@ -64,7 +65,13 @@ defmodule Fathom.Shard.Replication.Shipper.Writer do
   normal exit does not propagate, which is what makes `stop/1` safe.
   """
   @spec start_link(:gen_tcp.socket(), pid()) :: pid()
-  def start_link(sock, shipper), do: spawn_link(fn -> loop(sock, shipper) end)
+  def start_link(sock, shipper) do
+    spawn_link(fn ->
+      # A per-link hub, like its Shipper (expert review 2026-10-21 r7 #12, `Priority`).
+      Priority.adopt(:hub)
+      loop(sock, shipper)
+    end)
+  end
 
   @doc """
   Queue `iodata` for sending. Returns immediately; a failure is reported to the shipper.

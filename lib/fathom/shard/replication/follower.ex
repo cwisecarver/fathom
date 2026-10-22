@@ -41,6 +41,7 @@ defmodule Fathom.Shard.Replication.Follower do
 
   alias Exqlite.Sqlite3
   alias Fathom.Shard.Replication.FollowerLog
+  alias Fathom.Shard.Replication.Priority
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Shard.Replication.Protocol
 
@@ -849,6 +850,9 @@ defmodule Fathom.Shard.Replication.Follower do
   @worker_stop_ms 5_000
 
   defp serve(sock, name) do
+    # The per-connection reader is a per-link hub (expert review 2026-10-21 r7 #12, `Priority`).
+    Priority.adopt(:hub)
+
     conn = %{
       sock: sock,
       name: name,
@@ -996,6 +1000,9 @@ defmodule Fathom.Shard.Replication.Follower do
     # `spawn_opt(fn -> ...)` makes initial_call `{:erlang, :apply, 2}`, invisible to role attribution;
     # the label is what `chaos.sh repl-cpu` reads (expert review 2026-10-20 #26).
     Process.set_label(:replication_follower_worker)
+    # A per-link hub (expert review 2026-10-21 r7 #12, `Priority`). Its offset-0 absorb push tasks
+    # are spawned processes and stay `normal`: they hold a dirty thread for whole checkpoints.
+    Priority.adopt(:hub)
     Protocol.adopt_binding(binding)
     worker_loop(sock, name, reader, closed, %{}, %{})
   end

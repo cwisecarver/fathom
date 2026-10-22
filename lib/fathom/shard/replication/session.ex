@@ -39,6 +39,7 @@ defmodule Fathom.Shard.Replication.Session do
   alias Fathom.Shard.Replication
   alias Fathom.Shard.Replication.LagGauge
   alias Fathom.Shard.Replication.Primary
+  alias Fathom.Shard.Replication.Priority
   alias Fathom.Shard.Replication.Protocol, as: ReplProtocol
   alias Fathom.Shard.Replication.Protocol.Push
   alias Fathom.Shard.Replication.Protocol.SeedBegin
@@ -282,6 +283,11 @@ defmodule Fathom.Shard.Replication.Session do
   @impl true
   def init(opts) do
     coordinator = Keyword.fetch!(opts, :coordinator)
+
+    # `:high` only under REPLICATION_PROCESS_PRIORITY=all (expert review 2026-10-21 r7 #12). Its seed
+    # tasks and threshold-checkpoint task are spawned and stay `normal`; the deferred-sync task is
+    # given the Session's priority explicitly (`maybe_start_wal_sync/3`).
+    Priority.adopt(:session)
 
     # The cached epoch must never outlive the ownership it describes. Monitoring the coordinator
     # means a steal — which stops it — also stops this session, so the next commit starts a fresh
@@ -653,17 +659,22 @@ defmodule Fathom.Shard.Replication.Session do
         {:error, reason, held} -> {fn -> {:error, reason} end, held}
       end
 
+    # At the Session's own priority (expert review 2026-10-21 r7 #12): a `:high` Session gated on a
+    # `normal` fdatasync would only move its dirty-IO queue wait into this task.
     {pid, mref} =
-      spawn_monitor(fn ->
-        result =
-          try do
-            job.()
-          catch
-            kind, reason -> {:error, {:datasync, {kind, reason}}}
-          end
+      :erlang.spawn_opt(
+        fn ->
+          result =
+            try do
+              job.()
+            catch
+              kind, reason -> {:error, {:datasync, {kind, reason}}}
+            end
 
-        send(parent, {:wal_synced, token, result})
-      end)
+          send(parent, {:wal_synced, token, result})
+        end,
+        [:monitor, priority: Priority.for_role(:session)]
+      )
 
     %{
       state
