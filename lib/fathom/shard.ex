@@ -140,6 +140,12 @@ defmodule Fathom.Shard do
 
   @default_shutdown_ms 60_000
 
+  # Process-dictionary keys through which the flush/drop-flush route reaches the duration events
+  # (expert review 2026-10-21 r7 #2): the route is decided deep in the upload path, in the same
+  # (flush or drop task) process that emits the duration.
+  @flush_route_key :fathom_shard_flush_route
+  @drop_route_key :fathom_shard_drop_route
+
   # Overrides `use GenServer`'s generated child_spec to attach the shutdown budget
   # (config-tunable: bigger shards / slower links warrant more).
   @doc false
@@ -3892,6 +3898,11 @@ defmodule Fathom.Shard do
 
   defp flush_and_reconcile(state) do
     started = System.monotonic_time()
+    # The scan route this flush takes is decided deep inside `snapshot_and_upload/3`;
+    # `emit_flush_route/2` leaves it in this (flush task) process's dictionary so the duration
+    # event below can carry it (expert review 2026-10-21 r7 #2). Cleared first: a stale value from
+    # an earlier flush in the same process must not mislabel one that never reached a route.
+    Process.delete(@flush_route_key)
 
     result =
       case snapshot_and_upload(state) do
@@ -3909,7 +3920,11 @@ defmodule Fathom.Shard do
     :telemetry.execute(
       [:fathom, :shard, :flush],
       %{duration: System.monotonic_time() - started},
-      %{shard_id: state.id, outcome: flush_outcome(result)}
+      %{
+        shard_id: state.id,
+        outcome: flush_outcome(result),
+        route: Process.delete(@flush_route_key) || :none
+      }
     )
 
     result
@@ -4144,18 +4159,33 @@ defmodule Fathom.Shard do
   # `release_lease` DELETE is a node-wide degradation left as a follow-up (a stranded lock is still
   # reclaimed by this node's next same-incarnation open, so the local checkout recovers regardless).
   # Brownout behavior is validated on the chaos rig before push (AGENTS.md).
+  #
+  # DROP-FLUSH DURATION (expert review 2026-10-21 r7 #2). The idle drop is prod's main durability
+  # producer (`SHARD_IDLE_MS` < `SHARD_FLUSH_INTERVAL_MS`), and only its route was counted. The
+  # task hands back the route `emit_drop_route/2` recorded in its own dictionary; a timed-out or
+  # crashed task reports `:unknown`.
   defp bounded_upload_for_drop(state) do
-    task = Task.async(fn -> upload_for_drop(state) end)
+    started = System.monotonic_time()
+    task = Task.async(fn -> {upload_for_drop(state), Process.get(@drop_route_key)} end)
 
-    case Task.yield(task, settle_yield_ms()) || Task.shutdown(task) do
-      {:ok, result} ->
-        result
+    {result, route} =
+      case Task.yield(task, settle_yield_ms()) || Task.shutdown(task) do
+        {:ok, {result, route}} ->
+          {result, route || :unknown}
 
-      # Timed out (nil) or the task exited (`{:exit, _}`): abandon the upload and keep local. Matches
-      # settle_flush_task/1's `_` clause — do not narrow to `nil`, which drops `{:exit, _}` on the floor.
-      _ ->
-        {:error, :drop_flush_timeout}
-    end
+        # Timed out (nil) or the task exited (`{:exit, _}`): abandon the upload and keep local. Matches
+        # settle_flush_task/1's `_` clause — do not narrow to `nil`, which drops `{:exit, _}` on the floor.
+        _ ->
+          {{:error, :drop_flush_timeout}, :unknown}
+      end
+
+    :telemetry.execute(
+      [:fathom, :shard, :drop_flush],
+      %{duration: System.monotonic_time() - started},
+      %{shard_id: state.id, route: route, outcome: flush_outcome(result)}
+    )
+
+    result
   end
 
   # Which route the drop-flush took. Exists so the #3 routing decision is TESTABLE: both routes are
@@ -4164,6 +4194,8 @@ defmodule Fathom.Shard do
   # pre-fix this path really did upload the live file rather than falling through to the snapshot
   # as the audit assumed. Without a route signal that difference is unobservable from a test.
   defp emit_drop_route(state, route) do
+    Process.put(@drop_route_key, route)
+
     :telemetry.execute(
       [:fathom, :shard, :drop_flush, :route],
       %{count: 1},
@@ -5135,14 +5167,14 @@ defmodule Fathom.Shard do
     end
   end
 
-  defp upload_flush_object(state, path, pre) do
+  defp upload_flush_object(state, path, pre, extra_opts \\ []) do
     state.id
     |> Storage.flush(
       path,
       state.etag,
       Position.snapshot_position(state, pre),
       Position.lineage_arg(state),
-      flush_intent_opts(state.path, fn -> recheck_before_put(state) end)
+      flush_intent_opts(state.path, fn -> recheck_before_put(state) end) ++ extra_opts
     )
     |> guard_pre_touch(state)
   end
@@ -5180,19 +5212,22 @@ defmodule Fathom.Shard do
   #     to `quick_check` on either route, per "WHAT THIS GATE CANNOT SEE".)
   #   * THE STAMP STILL UNDER-CLAIMS. `pre` was read before the pin; the uploaded state is at least
   #     that (empty WAL at `pre` => every commit up to it is in the main file).
-  #   * WHAT IT COSTS. The pin holds a read mark across the PUT, so a checkpoint cannot make
-  #     progress for that long; on a shard that was idle a moment ago that only delays WAL
-  #     truncation. The upload is the live file's size, not its VACUUMed size (free pages included).
-  #     Since the fully-backfilled case (#11) this route also runs on shards with LIVE writers, and
-  #     there the cost is real (expert review 2026-10-21 rv6 F9): no checkpoint can backfill past
-  #     the pin's mark, and the log cannot restart while the pin holds a read lock, so every commit
-  #     made during the PUT appends to the `-wal` and stays there until the pin is released. The
-  #     WAL therefore grows by (write rate x PUT duration); a 100 MB shard PUT at 50 MB/s under a
-  #     tenant writing 5 MB/s adds ~10 MB of WAL that the next checkpoint backfills. The VACUUM
-  #     route does not have this cost during the PUT (its read ends when `VACUUM INTO` returns), but
-  #     it pays the same block for the length of the VACUUM. Not bounded here: a WAL-size gate read
-  #     at route time says nothing about the growth during the PUT, which is what costs. If a rig
-  #     shows WAL growth from this, bound the route by the `.db` size (a proxy for PUT duration).
+  #   * WHAT IT COSTS. While the pin is held no checkpoint can backfill past its mark (a pin on
+  #     read-lock 0 blocks every backfill) and the log cannot restart, so every commit made
+  #     meanwhile stays in the `-wal`: the WAL grows by (write rate x pin duration). Since the
+  #     fully-backfilled case (#11) this route also runs on shards with LIVE writers, where that is
+  #     real (expert review 2026-10-21 rv6 F9: a 100 MB shard PUT at 50 MB/s under a tenant writing
+  #     5 MB/s adds ~10 MB of WAL). So the pin is held only while the main file's bytes are READ
+  #     (expert review 2026-10-21 r7 #23): on an encoding backend (prod's zstd) the S3 client calls
+  #     `:body_captured` once the compressed body and its digests are in its own temp and its
+  #     stat-before/stat-after guard has passed, and that releases the pin; the intent fsync and the
+  #     PUT (tens to hundreds of ms on real S3) then run unpinned, streaming from the temp. Probe
+  #     (`FlushPinReleasedAfterCaptureTest`): a PASSIVE during the PUT backfilled 0 of 24 frames
+  #     with the pin held, all of them after the fix. With encoding `:none` (and on `Storage.Local`,
+  #     which copies the live file) the PUT body IS the live file, so the pin is still held through
+  #     it and the cost above stands there. The VACUUM route pays the same block, but only for the
+  #     length of the VACUUM. The upload is the live file's size, not its VACUUMed size (free pages
+  #     included).
   #
   # A FULLY BACKFILLED WAL COUNTS AS FOLDED (expert review 2026-10-21 #11). The route used to need
   # an absent/zero-length `-wal`, which a shard holding a stream open never has (a completed
@@ -5234,7 +5269,7 @@ defmodule Fathom.Shard do
       result =
         Fathom.Shard.Replication.Session.with_flush_pin(
           state.path,
-          fn _pin ->
+          fn _pin, release ->
             pin_held_hook(state)
 
             # A mostly-free file takes the VACUUM route, which compacts it (expert review
@@ -5253,7 +5288,7 @@ defmodule Fathom.Shard do
                      ),
                    :ok <- after_snapshot_hook(state),
                    :ok <- recheck_before_put(state) do
-                upload_flush_object(state, state.path, pre)
+                upload_flush_object(state, state.path, pre, body_captured: release)
               end
             else
               :fallback
@@ -5311,6 +5346,8 @@ defmodule Fathom.Shard do
   end
 
   defp emit_flush_route(state, route) do
+    Process.put(@flush_route_key, route)
+
     :telemetry.execute(
       [:fathom, :shard, :flush, :route],
       %{count: 1},

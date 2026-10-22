@@ -534,7 +534,7 @@ defmodule Fathom.Shard.Storage.S3 do
     # inside the streaming upload's callback where a reader would miss it.
     {header, carried} = carried_lineage_header(shard_id, expected_etag, lineage)
 
-    with_body(local_path, fn body_path, size, integrity, md5_hex, enc_headers ->
+    with_body(local_path, opts, fn body_path, size, integrity, md5_hex, enc_headers ->
       # The caller's chance to record "I am about to PUT bytes hashing to md5_hex" durably, BEFORE
       # the object can change (expert review 2026-10-10 #6). A caller that cannot record it must
       # not stop the flush — the recording only buys a crash-recovery adoption.
@@ -623,7 +623,13 @@ defmodule Fathom.Shard.Storage.S3 do
   #
   # The 5 GiB single-PUT ceiling (#37) is checked against the body actually uploaded, which is the
   # compressed size when encoding is on — compression genuinely raises that ceiling.
-  defp with_body(local_path, fun) do
+  #
+  # `:body_captured` (flush option, expert review 2026-10-21 r7 #23): called once the ENCODED body
+  # is complete in its temp and the stat-before/stat-after guard has passed, i.e. once nothing more
+  # is read from `local_path`. The pinned-live flush releases its read pin there instead of holding
+  # it across the intent fsync and the PUT. Never called for `:none`, whose PUT streams from
+  # `local_path` itself.
+  defp with_body(local_path, opts \\ [], fun) do
     case Codec.encoding() do
       :none ->
         with {:ok, size, md5, md5_hex} <- stat_and_md5(local_path) do
@@ -665,6 +671,8 @@ defmodule Fathom.Shard.Storage.S3 do
             with :ok <- after_compress(local_path),
                  :ok <- source_unchanged(local_path, psize, pmtime),
                  :ok <- check_single_put(size) do
+              if captured = Keyword.get(opts, :body_captured), do: captured.()
+
               fun.(
                 tmp,
                 size,
