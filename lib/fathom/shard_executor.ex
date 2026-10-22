@@ -640,16 +640,22 @@ defmodule Fathom.ShardExecutor do
 
   @control_prefixes ~w(begin commit end rollback savepoint release pragma)
 
-  # Expert review 2026-10-20-2027 #1: the transaction-control subset of `@control_prefixes` (no
-  # PRAGMA, whose assignments can be durable). Such a statement changes no row, so it reports
+  # Expert review 2026-10-20-2027 #1: the statements whose counters are always 0 / nil: the
+  # transaction-control subset of `@control_prefixes`, plus PRAGMA (see the r7 #21 note below). Such a statement changes no row, so it reports
   # 0 affected rows / no rowid. SQLite's `sqlite3_changes()` / `last_insert_rowid()` keep the
   # PREVIOUS write's values across it, so before this the wire said "BEGIN changed 3 rows" after
   # an INSERT of 3, and the statement paid two extra dirty dispatches to read them. (sqld's own
   # value for BEGIN-after-write could not be verified offline; 0/nil is the only sensible report
   # for a statement that modifies nothing.)
+  #
+  # Expert review 2026-10-21 r7 #21: PRAGMAs are INCLUDED for the counters (not for durability). A
+  # PRAGMA never sets `sqlite3_changes()`, so after a write it reported the previous request's
+  # affected rows and rowid on the wire and paid the two getter dispatches (Django's first
+  # statement on a pooled handle, `PRAGMA foreign_keys = ON`). Durability is unaffected: `wrote?/4`
+  # decides every pragma (`control_statement?` / `durable_pragma_statement?`) before it looks at
+  # `changes`, so a durable assignment (`user_version`, …) still dirties the shard.
   defp txn_control?(head) do
-    Enum.any?(@control_prefixes, &String.starts_with?(head, &1)) and
-      not String.starts_with?(head, "pragma")
+    Enum.any?(@control_prefixes, &String.starts_with?(head, &1))
   end
 
   # Header-writing pragma ASSIGNMENTS are durable file mutations that report

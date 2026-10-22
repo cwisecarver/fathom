@@ -121,13 +121,13 @@ defmodule Fathom.Shard.Connection do
   end
 
   defp open_handle_ensuring_dir(path, scope, true = _tenant?, dir) do
-    case open_handle(path, scope) do
+    case open_handle(path, scope, tenant_nomutex?()) do
       {:error, _} = err ->
         if Fathom.FS.dir?(dir) do
           err
         else
           File.mkdir_p!(dir)
-          open_handle(path, scope)
+          open_handle(path, scope, tenant_nomutex?())
         end
 
       ok ->
@@ -135,7 +135,25 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  defp open_handle_ensuring_dir(path, scope, false, _dir), do: open_handle(path, scope)
+  defp open_handle_ensuring_dir(path, scope, false, _dir), do: open_handle(path, scope, false)
+
+  # TENANT HANDLES MAY OPEN `NOMUTEX` (expert review 2026-10-21 r7 #16), behind `:tenant_nomutex`
+  # (env `TENANT_NOMUTEX`), default OFF. exqlite builds SQLite THREADSAFE=1 and opens FULLMUTEX, so
+  # every `sqlite3_column_*` call in `make_cell` enters and leaves a recursive mutex: 25-43% of a
+  # multi-row step on macOS (~18 ns per cell), and 19% of execute-only on Linux (+5% on
+  # `wire_server_rows_per_s`, where encode dominates). The mutex is redundant here: exqlite already
+  # serializes every access with `connection_acquire_lock`, and a fathom handle has one owner at a
+  # time (ordered hand-offs by message passing). Left OFF until the NIF audit of the calls that
+  # DO NOT take that lock (`bind_*`, `interrupt`/`cancel`, `set_progress_handler_steps`) against
+  # the watchdog cancel, the pooled close and the shrink side process is done; see the r7 #16
+  # progress notes. Only tenant handles: snapshot, migrator and the Session `:memory:` handles keep
+  # the default.
+  defp tenant_nomutex?, do: Application.get_env(:fathom, :tenant_nomutex, false) == true
+
+  defp rw_mode(true), do: [:readwrite, :create, :nomutex]
+  defp rw_mode(false), do: [:readwrite, :create]
+  defp ro_mode(true), do: [:readonly, :nomutex]
+  defp ro_mode(false), do: :readonly
 
   # --- live-connection gauge (perf review 2026-10-14 #16, gauge half) ---------------------------
   #
@@ -232,8 +250,8 @@ defmodule Fathom.Shard.Connection do
   # the engine rather than on a defeatable pragma. There is nothing to lose by creating it: a
   # shard with no stored object has no data for the `:ro` caller to read either way, and the
   # `:rw` path would have created the same file on its first open.
-  defp open_handle(path, :ro) do
-    case readonly_open(path) do
+  defp open_handle(path, :ro, nomutex?) do
+    case readonly_open(path, nomutex?) do
       {:ok, conn} ->
         {:ok, conn, :readonly}
 
@@ -246,27 +264,31 @@ defmodule Fathom.Shard.Connection do
             "PRAGMA query_only"
         )
 
-        with {:ok, conn} <- Sqlite3.open(path), do: {:ok, conn, :readwrite}
+        with {:ok, conn} <- Sqlite3.open(path, mode: rw_mode(nomutex?)),
+             do: {:ok, conn, :readwrite}
     end
   end
 
-  defp open_handle(path, _scope) do
-    with {:ok, conn} <- Sqlite3.open(path), do: {:ok, conn, :readwrite}
+  defp open_handle(path, _scope, nomutex?) do
+    with {:ok, conn} <- Sqlite3.open(path, mode: rw_mode(nomutex?)), do: {:ok, conn, :readwrite}
   end
 
-  defp readonly_open(path) do
-    case Sqlite3.open(path, mode: :readonly) do
-      {:ok, conn} -> {:ok, conn}
-      {:error, _} = err -> if Fathom.FS.exists?(path), do: err, else: create_then_readonly(path)
+  defp readonly_open(path, nomutex?) do
+    case Sqlite3.open(path, mode: ro_mode(nomutex?)) do
+      {:ok, conn} ->
+        {:ok, conn}
+
+      {:error, _} = err ->
+        if Fathom.FS.exists?(path), do: err, else: create_then_readonly(path, nomutex?)
     end
   end
 
   # Open read-write purely to bring the file into existence, close it, and re-open read-only.
   # A zero-length file is a valid empty SQLite database, so the second open succeeds.
-  defp create_then_readonly(path) do
-    with {:ok, conn} <- Sqlite3.open(path),
+  defp create_then_readonly(path, nomutex?) do
+    with {:ok, conn} <- Sqlite3.open(path, mode: rw_mode(nomutex?)),
          :ok <- Sqlite3.close(conn) do
-      Sqlite3.open(path, mode: :readonly)
+      Sqlite3.open(path, mode: ro_mode(nomutex?))
     end
   end
 
@@ -673,18 +695,42 @@ defmodule Fathom.Shard.Connection do
   # 2026-10-21 #7): the value must equal the one the handle's pragma guard pinned at open, or the
   # batch is refused and the handle replaced (see `pinned_pragmas/1`).
   defp reconfigure_for_reuse(conn, deferred_sync?) do
-    with :ok <- Sqlite3.execute(conn, rw_reuse_sql(deferred_sync?)) do
+    with :ok <- exec_reuse_batch(conn, deferred_sync?) do
       if "max_page_count" in Application.get_env(:fathom, :tenant_pragma_allow, []),
         do: maybe_max_page_count(conn),
         else: :ok
     end
   end
 
+  # Expert review 2026-10-21 r7 #13a. `PRAGMA foreign_keys=ON` (and `query_only=ON`) emit OP_Expire
+  # UNCONDITIONALLY, even when the value does not change, so every reuse made every cached
+  # statement the handle carries re-parse and re-plan at its next step (29-column read 4.4 ->
+  # 21.5 us). The extension's `fathom_fk_on()` goes through `sqlite3_db_config`, which expires only
+  # when the flag changes. It leads the batch as a scalar beside the schema-reload read, replacing
+  # the PRAGMA. Any failure of that batch takes the PRAGMA batch.
+  defp exec_reuse_batch(conn, deferred_sync?) do
+    if fk_via_extension?() do
+      # ANY failure of the function batch takes the PRAGMA batch (idempotent; the function leads,
+      # so nothing else has run): "no such function" for an extension-less handle, and the abort
+      # SQLite raises when the flag really CHANGES (a stream had turned foreign keys OFF), which
+      # expires the very statement that is running.
+      case Sqlite3.execute(conn, rw_reuse_sql(deferred_sync?, true)) do
+        :ok -> :ok
+        {:error, _} -> Sqlite3.execute(conn, rw_reuse_sql(deferred_sync?, false))
+      end
+    else
+      Sqlite3.execute(conn, rw_reuse_sql(deferred_sync?, false))
+    end
+  end
+
+  defp fk_via_extension?,
+    do: Application.get_env(:fathom, :foreign_keys, true) and Fathom.Shard.Extension.available?()
+
   # Built from config (booleans and integers fathom owns, never tenant input), mirroring
   # `maybe_foreign_keys/1` and `maybe_cache_size/1` exactly.
-  defp rw_reuse_sql(deferred_sync?) do
+  defp rw_reuse_sql(deferred_sync?, fk_fun?) do
     fk =
-      if Application.get_env(:fathom, :foreign_keys, true),
+      if Application.get_env(:fathom, :foreign_keys, true) and not fk_fun?,
         do: [";PRAGMA foreign_keys=ON"],
         else: []
 
@@ -694,8 +740,16 @@ defmodule Fathom.Shard.Connection do
         kb -> [";PRAGMA cache_size=-#{kb}"]
       end
 
+    # The scalar subquery reads sqlite_schema (the schema reload, "RELOAD THE SCHEMA" below) even
+    # when the table is empty; `LIMIT 0` would never evaluate the function.
+    lead =
+      if fk_fun?,
+        do: "SELECT fathom_fk_on(), (SELECT 1 FROM sqlite_schema LIMIT 1)",
+        else: "SELECT 1 FROM sqlite_schema LIMIT 0"
+
     IO.iodata_to_binary([
-      "SELECT 1 FROM sqlite_schema LIMIT 0;PRAGMA synchronous=",
+      lead,
+      ";PRAGMA synchronous=",
       if(deferred_sync?, do: "NORMAL", else: "FULL"),
       fk,
       cache
@@ -985,7 +1039,7 @@ defmodule Fathom.Shard.Connection do
           # this cannot be done any earlier.
           {columns, cols_encoded} =
             if refresh_columns?,
-              do: refreshed_columns(conn, stmt, sql, columns, cols_encoded),
+              do: refreshed_columns(conn, stmt, sql, columns, cols_encoded, refresh_columns?),
               else: {columns, cols_encoded}
 
           # `sqlite3_changes()` is a dirty-NIF dispatch. `ShardExecutor.wrote?/2` ignores it for a
@@ -1544,14 +1598,14 @@ defmodule Fathom.Shard.Connection do
   # Re-read the column list now that the statement has stepped, and correct the cache entry so the
   # next execution takes the ordinary hit path. Falls back to the pre-step list if the read fails —
   # degrading to the old (possibly stale) answer rather than failing a query that already succeeded.
-  defp refreshed_columns(conn, stmt, sql, fallback, fallback_encoded) do
+  defp refreshed_columns(conn, stmt, sql, fallback, fallback_encoded, gen) do
     case Sqlite3.columns(conn, stmt) do
       {:ok, cols} ->
         key = {__MODULE__, :stmt_cache, conn}
         encoded = encode_cols(cols)
 
         case Process.get(key) do
-          {seq, %{^sql => {^stmt, stamp, gen, bytes, packed}} = cache} ->
+          {seq, %{^sql => {^stmt, stamp, _old_gen, bytes, packed}} = cache} ->
             {canonical, _cols, _enc} = decoded(conn, stmt, packed, sql)
             entry = {stmt, stamp, gen, bytes, pack(cols, encoded)}
             Process.put(key, {seq, Map.put(cache, canonical, entry)})
@@ -1661,39 +1715,29 @@ defmodule Fathom.Shard.Connection do
 
         {:ok, stmt, cols, enc, false}
 
-      # Hit, but the schema moved since this entry was prepared. Re-prepare AND tell the caller to
-      # re-read the columns AFTER the statement has stepped.
+      # Hit, but the schema generation moved since this entry was prepared. Keep the statement and
+      # tell the caller (the flag carries the generation read ABOVE, before any step) to re-read the
+      # columns AFTER the step (expert review 2026-10-21 r7 #18).
       #
-      # Both cheaper ideas were tried and measured wrong:
+      # `SchemaGen` is node-global, so most bumps are another shard's DDL that did not touch this
+      # statement's schema; the old branch released, re-prepared, re-read the columns and re-measured
+      # memused for EVERY cached statement on EVERY connection (5-8 dirty dispatches and a parse
+      # each). A statement whose own schema DID move recompiles itself at step (exqlite prepares
+      # with prepare_v3, so SQLITE_SCHEMA re-prepares transparently; pinned by the 2026-08-26 #7
+      # test), so the explicit re-prepare bought nothing.
       #
-      #   * `Sqlite3.columns/2` on the cached statement — `prepare_v2` recompiles LAZILY at the next
-      #     `sqlite3_step`, so the column names before stepping are still the pre-DDL ones.
-      #   * A fresh `Sqlite3.prepare/2` on this connection — ALSO returns the stale names, because
-      #     this connection's in-memory schema is itself stale until something makes it re-read.
-      #     Measured: a brand-new connection to the same file returned `["id", "x", "y"]` while a
-      #     fresh prepare on the DDL-unaware connection returned `["id", "x"]`.
+      # Cheaper-still ideas that are wrong, measured earlier:
       #
-      # SQLite settles it at step (SQLITE_SCHEMA → automatic re-prepare), so the correct columns
-      # only exist after execution. The re-prepare is still worth doing — it drops a statement
-      # compiled against a schema this connection has since left behind — but the authoritative
-      # read happens in `do_query/4`.
+      #   * `Sqlite3.columns/2` on the cached statement BEFORE the step — the recompile happens
+      #     lazily at `sqlite3_step`, so the names are still the pre-DDL ones.
+      #   * A fresh `Sqlite3.prepare/2` — also returns stale names: this connection's in-memory
+      #     schema is itself stale until a step re-reads it.
+      #
+      # The entry is deliberately NOT re-stamped here: if the step then fails, the entry stays
+      # stale and the next hit refreshes again. `refreshed_columns/6` re-stamps it with `gen`.
       %{^sql => {stmt, _stamp, _older_gen, _bytes, packed}} ->
-        {canonical, _cols, _enc} = decoded(conn, stmt, packed, sql)
-        Sqlite3.release(conn, stmt)
-        drop_decoded(conn, stmt)
-
-        with {:ok, fresh} <- prepare_retrying(conn, canonical, deadline_at),
-             {:ok, cols} <- Sqlite3.columns(conn, fresh) do
-          bytes = stmt_bytes(conn, canonical)
-          # Re-read: measuring ran a statement through this same cache.
-          {seq, cache} = Process.get(key, {seq, cache})
-          enc = encode_cols(cols)
-          entry = {fresh, seq + 1, gen, bytes, pack(cols, enc)}
-          Process.put(key, {seq + 1, Map.put(cache, canonical, entry)})
-          put_decoded(conn, fresh, {canonical, cols, enc})
-
-          {:ok, fresh, cols, enc, true}
-        end
+        {_canonical, cols, enc} = decoded(conn, stmt, packed, sql)
+        {:ok, stmt, cols, enc, gen}
 
       _ ->
         with {:ok, stmt} <- prepare_retrying(conn, sql, deadline_at),
@@ -2388,9 +2432,8 @@ defmodule Fathom.Shard.Connection do
   Exact-text keys only: `describe("X")` and `execute("X;")` are two entries (parked, #16b — no
   trailing-`;` aliasing).
 
-  One case needs care: a hit whose `SchemaGen` moved (`refresh?`). `cached_stmt/3` re-prepares and
-  re-stamps the entry with the CURRENT generation, trusting the caller to re-read the columns after
-  the statement steps (which describe never does). Left alone, the next execute would take the
+  One case needs care: a hit whose `SchemaGen` moved (`refresh?`). `cached_stmt/3` keeps the statement and
+  leaves the column list for the caller to re-read after a step (which describe never does). Left alone, the next execute would take the
   ordinary hit path and report the stale pre-DDL column list. So describe re-marks that entry with
   a generation that never matches (-1): the next execute takes the refresh branch again, and the
   describe answer is the fresh prepare's columns, exactly as the uncached describe returned.
@@ -2402,9 +2445,8 @@ defmodule Fathom.Shard.Connection do
       {:ok, stmt, cols, _enc, false} ->
         {:ok, describe_result(stmt, cols)}
 
-      {:ok, stmt, cols, _enc, true} ->
-        mark_stale(conn, sql)
-        {:ok, describe_result(stmt, cols)}
+      {:ok, _stmt, _cols, _enc, gen} when is_integer(gen) ->
+        reprepare_for_describe(conn, sql)
 
       {:error, _} = err ->
         err
@@ -2423,20 +2465,30 @@ defmodule Fathom.Shard.Connection do
     %{params: List.duplicate(nil, count), cols: cols}
   end
 
-  # Re-mark `sql`'s entry with a generation no `SchemaGen.current/0` ever equals, so the next
-  # `cached_stmt/3` hit takes the refresh branch (the column list is re-read after the step).
-  defp mark_stale(conn, sql) do
+  # A describe hit whose `SchemaGen` moved. `cached_stmt/3` no longer re-prepares on that hit (the
+  # execute path re-reads the columns after its step, expert review 2026-10-21 r7 #18), but a
+  # describe never steps, so it re-prepares here — exactly what the uncached describe returned —
+  # and re-marks the entry with a generation no `SchemaGen.current/0` ever equals (-1), so the
+  # next EXECUTE takes the refresh branch again instead of trusting these columns.
+  defp reprepare_for_describe(conn, sql) do
     key = {__MODULE__, :stmt_cache, conn}
+    {seq, cache} = Process.get(key, {0, %{}})
 
-    case Process.get(key) do
-      {seq, %{^sql => {stmt, stamp, _gen, bytes, packed}} = cache} ->
-        # Re-put under the CANONICAL key, never the caller's sub-binary (see `cached_stmt/3`).
-        {canonical, _cols, _enc} = decoded(conn, stmt, packed, sql)
-        Process.put(key, {seq, Map.put(cache, canonical, {stmt, stamp, -1, bytes, packed})})
-        :ok
-
-      _ ->
-        :ok
+    with %{^sql => {old, _stamp, _gen, bytes, packed}} <- cache,
+         {canonical, _cols, _enc} = decoded(conn, old, packed, sql),
+         _ = Sqlite3.release(conn, old),
+         _ = drop_decoded(conn, old),
+         {:ok, fresh} <- prepare_retrying(conn, canonical, nil),
+         {:ok, cols} <- Sqlite3.columns(conn, fresh) do
+      enc = encode_cols(cols)
+      {seq, cache} = Process.get(key, {seq, cache})
+      entry = {fresh, seq + 1, -1, bytes, pack(cols, enc)}
+      Process.put(key, {seq + 1, Map.put(cache, canonical, entry)})
+      put_decoded(conn, fresh, {canonical, cols, enc})
+      {:ok, describe_result(fresh, cols)}
+    else
+      {:error, _} = err -> err
+      _ -> {:error, :describe_failed}
     end
   end
 
@@ -2512,6 +2564,7 @@ defmodule Fathom.Shard.Connection do
   """
   # The `:ro` reuse batch: schema reload, then re-assert read-only. See `reset_for_reuse/2`.
   @ro_reuse_sql "SELECT 1 FROM sqlite_schema LIMIT 0;PRAGMA query_only=ON"
+  @ro_check_sql "SELECT fathom_require_query_only(), (SELECT 1 FROM sqlite_schema LIMIT 1)"
 
   @spec reset_for_reuse(reference(), :ro | :rw, keyword()) :: :ok | {:error, term()}
   def reset_for_reuse(conn, scope, opts \\ []) when scope in [:ro, :rw] do
@@ -2531,7 +2584,21 @@ defmodule Fathom.Shard.Connection do
       # `opts[:deferred_sync?]` picks the `:rw` sync mode, exactly as `open/2`'s option does.
       if scope == :rw,
         do: reconfigure_for_reuse(conn, Keyword.get(opts, :deferred_sync?, false)),
-        else: Sqlite3.execute(conn, @ro_reuse_sql)
+        else: ro_reuse(conn)
+    end
+  end
+
+  # `:ro`: the schema reload plus a CHECK that `query_only` is still ON, which does not expire the
+  # carried statements; only a handle that lost it pays the assignment (expert review 2026-10-21
+  # r7 #13a). A missing extension or a failed check takes the assignment too.
+  defp ro_reuse(conn) do
+    if Fathom.Shard.Extension.available?() do
+      case Sqlite3.execute(conn, @ro_check_sql) do
+        :ok -> :ok
+        {:error, _} -> Sqlite3.execute(conn, @ro_reuse_sql)
+      end
+    else
+      Sqlite3.execute(conn, @ro_reuse_sql)
     end
   end
 
@@ -2582,15 +2649,19 @@ defmodule Fathom.Shard.Connection do
 
   # Expert review 2026-10-20-2027 #18: the pooled-stream CLOSE used to pay two dirty dispatches
   # for two facts about the handle — the temp-schema probe (a `step`) and `rollback_if_open/1`'s
-  # `transaction_status`. Both are readable in ONE step of a cached statement: the extension's
-  # `fathom_conn_state()` carries the autocommit flag, and the EXISTS column is the temp probe.
-  # (The reuse-side `transaction_status` in `reset_for_reuse/2` is NOT touched: expert review
-  # 2026-10-17 #31 tried dropping it and one-shot got 12% slower, unexplained.)
-  @checkin_probe_sql "SELECT fathom_conn_state(), EXISTS(SELECT 1 FROM temp.sqlite_schema)"
+  # `transaction_status`. `fathom_conn_state()` carries the autocommit flag AND (expert review
+  # 2026-10-21 r7 #14) a "temp database opened" byte. The temp-schema probe runs only when that byte
+  # is set: running `... FROM temp.sqlite_schema` OPENS the temp btree/pager (+~95 KiB, +60% on a
+  # 159 KiB handle), and the old fused `EXISTS(SELECT 1 FROM temp.sqlite_schema)` column did so on
+  # every pooled close. (The reuse-side `transaction_status` in `reset_for_reuse/2` is NOT touched:
+  # expert review 2026-10-17 #31 tried dropping it and one-shot got 12% slower, unexplained.)
+  @checkin_probe_sql "SELECT fathom_conn_state()"
 
   @doc """
   `{temp_schema_empty?, autocommit?}` for a handle about to be pooled, in ONE dirty dispatch when
-  the extension is loaded (expert review 2026-10-20-2027 #18). Same answers as
+  the extension is loaded and the handle never opened its temp database (expert review
+  2026-10-20-2027 #18, 2026-10-21 r7 #14; a handle with an open temp database pays one more step).
+  Same answers as
   `temp_schema_empty?/1` + `autocommit?/1`, and the same failure direction: a handle whose temp
   schema cannot be read is not poolable (`false`), an unreadable autocommit flag counts as `true`.
   Falls back to the two separate calls when the fused statement is unavailable. Like
@@ -2600,9 +2671,12 @@ defmodule Fathom.Shard.Connection do
   def checkin_probe(conn) do
     with {:ok, stmt, _cols, _enc, _refresh} <- cached_stmt(conn, @checkin_probe_sql),
          # One row, so the chunk size is immaterial (`@multi_step_chunk` is defined further down).
-         {:done, [[<<_changes::unsigned-little-64, _rowid::signed-little-64, ac>>, exists]]} <-
+         {:done, [[<<_changes::unsigned-little-64, _rowid::signed-little-64, ac, temp_open>>]]} <-
            Sqlite3.multi_step(conn, stmt, 2) do
-      {exists == 0, ac == 1}
+      # Temp never opened => it holds nothing. Opened (even if since emptied) => ask it.
+      if temp_open == 0,
+        do: {true, ac == 1},
+        else: {temp_schema_empty?(conn), ac == 1}
     else
       _ -> {temp_schema_empty?(conn), autocommit?(conn)}
     end
@@ -2687,13 +2761,13 @@ defmodule Fathom.Shard.Connection do
   defp timeout_ms, do: Application.get_env(:fathom, :query_timeout_ms)
 
   # One step of the extension's `fathom_conn_state()` (native/fathom_udf `scalars::conn_state_blob`):
-  # <<changes::u64-le, last_insert_rowid::i64-le, autocommit::u8>>. `:error` (extension not loaded,
+  # <<changes::u64-le, last_insert_rowid::i64-le, autocommit::u8, temp_open::u8>>. `:error` (extension not loaded,
   # or any unexpected shape) sends the caller to the three separate NIF calls, so behaviour is
   # identical wherever the extension is absent. Rides the ordinary statement cache.
   defp fetch_conn_state(conn) do
     with {:ok, stmt, _cols, _enc, _refresh} <- cached_stmt(conn, "SELECT fathom_conn_state()") do
       case Sqlite3.multi_step(conn, stmt, @multi_step_chunk) do
-        {:done, [[<<changes::unsigned-little-64, rowid::signed-little-64, ac>>]]} ->
+        {:done, [[<<changes::unsigned-little-64, rowid::signed-little-64, ac, _::binary>>]]} ->
           {:ok, changes, rowid, ac == 1}
 
         _ ->

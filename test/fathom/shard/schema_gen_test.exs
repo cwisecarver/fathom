@@ -136,6 +136,36 @@ defmodule Fathom.Shard.SchemaGenTest do
            "an empty SELECT * still reported the pre-DDL columns"
   end
 
+  # Expert review 2026-10-21 r7 #18: the stale-hit branch keeps the statement and re-reads the
+  # columns AFTER the step, so a step that FAILS (table dropped by a sibling) must leave the entry
+  # stale. Re-stamping it up front would make the next hit, after the table is recreated wider,
+  # trust the pre-DDL column list again.
+  test "a failed step on a stale entry does not freeze the old column list" do
+    path = Path.join(System.tmp_dir!(), "schemagen_err_#{System.unique_integer([:positive])}.db")
+    {:ok, a} = Connection.open(path)
+    {:ok, b} = Connection.open(path)
+
+    on_exit(fn ->
+      Connection.close(a)
+      Connection.close(b)
+      for s <- ["", "-wal", "-shm"], do: File.rm(path <> s)
+    end)
+
+    :ok = Connection.exec(a, "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT)")
+    assert {:ok, %{columns: ["id", "x"]}} = Connection.query(b, "SELECT * FROM t", [])
+
+    :ok = Connection.exec(a, "DROP TABLE t")
+    Fathom.Shard.SchemaGen.bump()
+    assert {:error, _} = Connection.query(b, "SELECT * FROM t", [])
+
+    :ok = Connection.exec(a, "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT, y TEXT)")
+    :ok = Connection.exec(a, "INSERT INTO t VALUES (1, 'h', 'w')")
+    Fathom.Shard.SchemaGen.bump()
+
+    assert {:ok, %{columns: ["id", "x", "y"], rows: [[1, "h", "w"]]}} =
+             Connection.query(b, "SELECT * FROM t", [])
+  end
+
   # DDL INSIDE AN EXPLICIT TRANSACTION (expert review 2026-10-01 perf #9, verified 2026-10-04). The
   # executor bumped the generation at the ALTER, BEFORE the COMMIT. A sibling reading in that window
   # cached the still-committed column list under the NEW generation, and the COMMIT bumped nothing,

@@ -142,13 +142,22 @@ pub fn cot(x: f64) -> f64 {
 
 /// `_sqlite_bitxor(x, y)`.
 /// Wire form of `fathom_conn_state()` (expert review 2026-10-17 #6): `changes` (u64 LE),
-/// `last_insert_rowid` (i64 LE), then one byte, 1 when the connection is in autocommit mode.
-/// Fathom.Shard.Connection decodes exactly this 17-byte layout.
-pub fn conn_state_blob(changes: u64, last_insert_rowid: i64, autocommit: bool) -> Vec<u8> {
-    let mut b = Vec::with_capacity(17);
+/// `last_insert_rowid` (i64 LE), one byte that is 1 when the connection is in autocommit mode, and
+/// one byte that is 1 when the connection's TEMP database has been opened (expert review
+/// 2026-10-21 r7 #14: the pooled-checkin probe runs its `temp.sqlite_schema` EXISTS, which itself
+/// opens the temp pager, only when this is set). Fathom.Shard.Connection decodes this 18-byte
+/// layout; readers that do not need the last byte match `ac, _::binary`.
+pub fn conn_state_blob(
+    changes: u64,
+    last_insert_rowid: i64,
+    autocommit: bool,
+    temp_open: bool,
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(18);
     b.extend_from_slice(&changes.to_le_bytes());
     b.extend_from_slice(&last_insert_rowid.to_le_bytes());
     b.push(autocommit as u8);
+    b.push(temp_open as u8);
     b
 }
 
@@ -332,14 +341,16 @@ mod tests {
 
     #[test]
     fn conn_state_blob_layout() {
-        let b = conn_state_blob(3, -2, true);
-        assert_eq!(b.len(), 17);
+        let b = conn_state_blob(3, -2, true, true);
+        assert_eq!(b.len(), 18);
         assert_eq!(&b[0..8], &3u64.to_le_bytes());
         assert_eq!(&b[8..16], &(-2i64).to_le_bytes());
         assert_eq!(b[16], 1);
-        assert_eq!(conn_state_blob(0, 0, false)[16], 0);
+        assert_eq!(b[17], 1);
+        assert_eq!(conn_state_blob(0, 0, false, false)[16], 0);
+        assert_eq!(conn_state_blob(0, 0, true, false)[17], 0);
         assert_eq!(
-            &conn_state_blob(u64::MAX, i64::MIN, false)[0..8],
+            &conn_state_blob(u64::MAX, i64::MIN, false, false)[0..8],
             &u64::MAX.to_le_bytes()
         );
     }

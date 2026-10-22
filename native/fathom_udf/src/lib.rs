@@ -436,10 +436,18 @@ fn register_misc(db: &Connection, det: FunctionFlags, nondet: FunctionFlags) -> 
         // SAFETY: `get_connection` is unsafe only because the handle could be sent to another
         // thread; it is used for three reads on this thread and dropped.
         let conn = unsafe { ctx.get_connection() }?;
+        // `sqlite3_db_filename(db, "temp")` is NULL until the temp database's btree exists (made
+        // lazily by the first TEMP object or the first statement that touches the `temp` schema)
+        // and an empty string afterwards. Asking does not open anything (expert review 2026-10-21
+        // r7 #14).
+        let temp_open = unsafe {
+            !ffi::sqlite3_db_filename(conn.handle(), c"temp".as_ptr()).is_null()
+        };
         Ok(scalars::conn_state_blob(
             conn.changes(),
             conn.last_insert_rowid(),
             conn.is_autocommit(),
+            temp_open,
         ))
     })?;
 
@@ -483,6 +491,57 @@ fn register_misc(db: &Connection, det: FunctionFlags, nondet: FunctionFlags) -> 
         let conn = unsafe { ctx.get_connection() }?;
         let db = unsafe { conn.handle() };
         Ok(unsafe { stmt_status(db, ffi::SQLITE_STMTSTATUS_REPREPARE, want.as_deref()) })
+    })?;
+
+    // `fathom_fk_on()` (expert review 2026-10-21 r7 #13a): turn foreign-key enforcement ON through
+    // `sqlite3_db_config(SQLITE_DBCONFIG_ENABLE_FKEY)`, which expires the connection's prepared
+    // statements only when the flag actually CHANGES. `PRAGMA foreign_keys = ON` emits OP_Expire
+    // unconditionally, so fathom's pooled-reuse batch (and Django's own per-connection pragma)
+    // made every carried cached statement re-parse and re-plan at its next step (a 29-column read
+    // 4.4 -> 21.5 us). Returns the enforcement state afterwards (1). A tenant calling it gets
+    // what the allowed `PRAGMA foreign_keys = ON` gives them; it cannot turn enforcement off.
+    db.create_scalar_function("fathom_fk_on", 0, nondet, |ctx| {
+        // SAFETY: the calling connection, used on this thread while SQLite holds its mutex.
+        let conn = unsafe { ctx.get_connection() }?;
+        let db = unsafe { conn.handle() };
+        let mut now: std::os::raw::c_int = 0;
+        let rc = unsafe {
+            ffi::sqlite3_db_config(
+                db,
+                ffi::SQLITE_DBCONFIG_ENABLE_FKEY,
+                1 as std::os::raw::c_int,
+                &mut now as *mut std::os::raw::c_int,
+            )
+        };
+        if rc != ffi::SQLITE_OK {
+            return Err(Error::UserFunctionError(
+                format!("sqlite3_db_config(ENABLE_FKEY) failed: {rc}").into(),
+            ));
+        }
+        Ok(now as i64)
+    })?;
+
+    // `fathom_require_query_only()` (r7 #13a): 1 when the connection cannot write: either
+    // `PRAGMA query_only` is ON or the main database was opened READ-ONLY
+    // (`sqlite3_db_readonly`), an error when neither holds. A `:ro` pooled reuse asserts
+    // read-only-ness; `PRAGMA query_only=ON` expires every cached statement even when the value
+    // does not change, so the batch only checks, and the caller falls back to the assignment when
+    // this errors (a handle that is physically read-write and lost the pragma). A handle opened
+    // `SQLITE_OPEN_READONLY` cannot write whatever the pragma says, so it passes. Reports only what
+    // `PRAGMA query_only` / the open mode already tell the tenant.
+    db.create_scalar_function("fathom_require_query_only", 0, nondet, |ctx| {
+        let conn = unsafe { ctx.get_connection() }?;
+        let ro = unsafe { ffi::sqlite3_db_readonly(conn.handle(), c"main".as_ptr()) } == 1;
+        let on: i64 = if ro {
+            1
+        } else {
+            conn.query_row("PRAGMA query_only", [], |r| r.get(0))?
+        };
+        if on == 1 {
+            Ok(1i64)
+        } else {
+            Err(Error::UserFunctionError("connection is not read-only".into()))
+        }
     })?;
 
     // `fathom_cache_used()` (expert review 2026-10-21 #15): the bytes of page cache THIS connection

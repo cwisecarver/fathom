@@ -602,6 +602,15 @@ case env_bool.("SHARD_LOAD") do
     config :fathom, :shard_load, on?
 end
 
+# Tenant handles open SQLite NOMUTEX (expert review 2026-10-21 r7 #16): skips a recursive mutex
+# enter/leave on every sqlite3_column_* call (19% of execute-only on Linux, ~5% of a wire row
+# metric). Default OFF; TENANT_NOMUTEX=true|1 turns it on. See Fathom.Shard.Connection and the r7
+# progress notes before flipping it: the audit of the exqlite NIFs that bypass its own lock is open.
+case env_bool.("TENANT_NOMUTEX") do
+  nil -> :ok
+  on? -> config :fathom, :tenant_nomutex, on?
+end
+
 # Migrate-on-touch mode (expert review #40): how a checkout handles a shard behind the fleet HEAD
 # after a release. `off` (default) — the hourly reconcile converges the cold tail (stale-schema
 # window up to the cron; expand-contract makes serving vN-1 correct). `async` — enqueue the shard's
