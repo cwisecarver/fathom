@@ -845,13 +845,36 @@ defmodule Fathom.ShardExecutor do
         Session.commit(shard_id, Shard.db_path(shard_id) <> "-wal", pid, sync: sync?)
 
       sync? and ships_now?(conn, head, wrote?, autocommit) ->
-        case WalSync.sync(Shard.db_path(shard_id) <> "-wal") do
-          :ok -> :ok
-          {:error, reason} -> {:error, {:wal_sync_failed, reason}}
-        end
+        fallback_sync(shard_id, pid)
 
       true ->
         :ok
+    end
+  end
+
+  # The replication-off fallback sync (rv6 F6). It honours and sets the same coordinator-keyed
+  # poison as the Session: a shard whose fdatasync failed acks nothing more until it is reopened,
+  # whichever path saw the failure. An open failure ran no sync, so it fails only this write.
+  # The fd is fresh (no Session holds one here), so it can miss an error a checkpoint consumed
+  # (rv6 F1); this path exists only for a runtime replication-off flip, and the next reuse of the
+  # handle reopens it FULL.
+  defp fallback_sync(shard_id, coordinator) do
+    case WalSync.poisoned(coordinator) do
+      nil ->
+        case WalSync.sync(Shard.db_path(shard_id) <> "-wal") do
+          :ok ->
+            :ok
+
+          {:error, {:open, _} = reason} ->
+            {:error, {:wal_sync_failed, reason}}
+
+          {:error, reason} ->
+            WalSync.poison(coordinator, reason)
+            {:error, {:wal_sync_failed, reason}}
+        end
+
+      reason ->
+        {:error, {:wal_sync_failed, {:poisoned, reason}}}
     end
   end
 
@@ -1173,11 +1196,22 @@ defmodule Fathom.ShardExecutor do
         # QUORUM SHIP + OWNERSHIP GATE (expert review 2026-10-12 #4). A script used to be acked as
         # soon as it was locally committed: it never reached `Session.commit`, so with A2 on it was
         # neither shipped to a follower quorum nor gated by `ack_if_owned` (a zombie owner acked it).
-        # A script is presumed to write (`wrote? = true`). If it left a transaction open
-        # (`autocommit?` false) `ships_now?/3` declines and the COMMIT ships it, because
-        # `mark_txn_write` above recorded the write; a script that committed ships here. Same error
-        # mapping as `execute/2`: the local commit already happened, the client asked for a
-        # quorum-durable write and did not get one, so it gets the 503.
+        # A script is presumed to write (`wrote? = true`). Same error mapping as `execute/2`: the
+        # local commit already happened, the client asked for a quorum-durable write and did not
+        # get one, so it gets the 503.
+        #
+        # SHIPPED WHATEVER THE FINAL AUTOCOMMIT STATE (expert review 2026-10-21 rv6 F4). This used
+        # to pass `nil`, so `ships_now?/4` read SQLite's flag AFTER the whole script and declined
+        # whenever the script ENDED inside a transaction. But the end state says nothing about
+        # the middle: `INSERT ...; BEGIN;` commits the INSERT and then opens a transaction, and was
+        # acked with no quorum ship and, on a deferred-sync handle, no fdatasync. A later ROLLBACK
+        # is not a commit boundary, so nothing ever covered it. Shipping here is safe while a
+        # transaction is open: the Session ships only the COMMITTED extent (the wal-index
+        # `mxFrame`, which SQLite publishes only at a commit, or the walk's last commit frame), it
+        # reads the files directly and takes no SQLite lock, and its checkpoint is PASSIVE behind a
+        # read pin. A script that committed nothing ships nothing new and costs one round, which
+        # is fine for a migration-rare request. `mark_txn_write` above still makes the COMMIT that
+        # closes an open transaction ship its frames.
         case maybe_replicate(
                shard_id,
                pid,
@@ -1185,7 +1219,7 @@ defmodule Fathom.ShardExecutor do
                sql,
                true,
                Session.enabled?(),
-               nil,
+               true,
                deferred_sync?(opts)
              ) do
           :ok -> :ok

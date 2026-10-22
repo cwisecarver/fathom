@@ -344,6 +344,150 @@ defmodule Fathom.Shard.ReplicationDeferredSyncTest do
     end
   end
 
+  # Expert review 2026-10-21 rv6 F1. `WalSync.sync/1` opened the `-wal` BY PATH every round. On
+  # Linux a write-back error is reported once per open file (errseq_t): once a checkpoint's fd
+  # consumed it, a FRESH fd's fdatasync returns :ok, the poison never fires, and an acked commit is
+  # lost on power loss. macOS cannot reproduce errseq, so these pin the MECHANISM: one long-lived fd
+  # per WAL inode, retired with a last sync, and checkpoint IOERRs feeding the poison.
+  describe "the long-lived sync fd (rv6 F1)" do
+    defp session!(id) do
+      [{pid, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+      pid
+    end
+
+    # A stand-in io-server fd whose fdatasync fails with EIO (the `:file` request protocol).
+    defp failing_fd do
+      spawn(fn ->
+        receive do
+          {:file_request, from, ref, :datasync} -> send(from, {:file_reply, ref, {:error, :eio}})
+        end
+
+        receive do
+          {:file_request, from, ref, :close} -> send(from, {:file_reply, ref, :ok})
+        end
+      end)
+    end
+
+    test "every round syncs through the same fd while the WAL inode is unchanged", ctx do
+      followers = replicate!(ctx.root)
+      {coordinator, conn, wal} = primary!(ctx.id, followers)
+
+      insert!(conn, 1)
+      assert :ok = Session.commit(ctx.id, wal, coordinator, sync: true)
+      %{fd: fd, inode: inode} = :sys.get_state(session!(ctx.id)).wal_sync_fd
+      assert inode == File.stat!(wal).inode
+
+      for k <- 2..4 do
+        insert!(conn, k)
+        assert :ok = Session.commit(ctx.id, wal, coordinator, sync: true)
+
+        assert %{fd: ^fd} = :sys.get_state(session!(ctx.id)).wal_sync_fd,
+               "a round reopened the WAL: a fresh fd misses an error another fd consumed"
+      end
+    end
+
+    test "an inode change retires the old fd with a last sync, and its failure poisons", ctx do
+      followers = replicate!(ctx.root)
+      {coordinator, conn, wal} = primary!(ctx.id, followers)
+      insert!(conn, 1)
+      assert :ok = Session.commit(ctx.id, wal, coordinator, sync: true)
+
+      # The held fd now describes an inode the path no longer names, and its last sync fails.
+      old = failing_fd()
+      ref = Process.monitor(old)
+
+      :sys.replace_state(session!(ctx.id), fn st ->
+        %{st | wal_sync_fd: %{fd: old, inode: -1}}
+      end)
+
+      insert!(conn, 2)
+
+      assert {:error, {:wal_sync_failed, {:datasync, :eio}}} =
+               Session.commit(ctx.id, wal, coordinator, sync: true)
+
+      assert_receive {:DOWN, ^ref, :process, ^old, _}, 1_000
+
+      insert!(conn, 3)
+
+      assert {:error, {:wal_sync_failed, {:poisoned, {:datasync, :eio}}}} =
+               Session.commit(ctx.id, wal, coordinator, sync: true)
+    end
+
+    test "the quiet-shard fd release retires the sync fd, and a failed last sync poisons", ctx do
+      followers = replicate!(ctx.root)
+      {coordinator, conn, wal} = primary!(ctx.id, followers)
+      insert!(conn, 1)
+      assert :ok = Session.commit(ctx.id, wal, coordinator, sync: true)
+
+      session = session!(ctx.id)
+      old = failing_fd()
+      :sys.replace_state(session, fn st -> %{st | wal_sync_fd: %{st.wal_sync_fd | fd: old}} end)
+      send(session, {:release_wal_fds, :sys.get_state(session).commits})
+
+      assert %{wal_sync_fd: nil, wal_sync_poison: {:datasync, :eio}} = :sys.get_state(session)
+    end
+
+    test "a checkpoint IOERR poisons a deferred-sync Session", ctx do
+      followers = replicate!(ctx.root)
+      {coordinator, conn, wal} = primary!(ctx.id, followers)
+      insert!(conn, 1)
+      assert :ok = Session.commit(ctx.id, wal, coordinator, sync: true)
+
+      ioerr = {:error, "disk I/O error"}
+      assert WalSync.io_error?(ioerr)
+      refute WalSync.io_error?({:error, "database is locked"})
+
+      Application.put_env(:fathom, :replication_deferred_wal_sync, true)
+      send(session!(ctx.id), {:checkpoint_io_error, ioerr})
+      insert!(conn, 2)
+
+      assert {:error, {:wal_sync_failed, {:poisoned, {:checkpoint, ^ioerr}}}} =
+               Session.commit(ctx.id, wal, coordinator, sync: true)
+    end
+
+    test "a checkpoint IOERR does not poison with the deferred sync off", ctx do
+      followers = replicate!(ctx.root)
+      {coordinator, conn, wal} = primary!(ctx.id, followers)
+      insert!(conn, 1)
+      assert :ok = Session.commit(ctx.id, wal, coordinator)
+
+      Application.put_env(:fathom, :replication_deferred_wal_sync, false)
+      send(session!(ctx.id), {:checkpoint_io_error, {:error, "disk I/O error"}})
+      insert!(conn, 2)
+      assert :ok = Session.commit(ctx.id, wal, coordinator)
+    end
+  end
+
+  # Expert review 2026-10-21 rv6 F6. The poison lived only in the Session's state: a Session that
+  # crashed or was stopped under the SAME coordinator came back clean and acked again, and the
+  # replication-off fallback never poisoned at all. It is now keyed by the coordinator pid.
+  describe "the poison outlives the Session (rv6 F6)" do
+    test "a Session restarted under the same coordinator still refuses", ctx do
+      followers = replicate!(ctx.root)
+      {coordinator, conn, wal} = primary!(ctx.id, followers)
+      seam!({:error, {:datasync, :eio}})
+      insert!(conn, 1)
+
+      assert {:error, {:wal_sync_failed, {:datasync, :eio}}} =
+               Session.commit(ctx.id, wal, coordinator, sync: true)
+
+      [{old, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, ctx.id)
+      ref = Process.monitor(old)
+      Session.stop(ctx.id)
+      assert_receive {:DOWN, ^ref, :process, ^old, _}, 2_000
+
+      seam!(:ok)
+      insert!(conn, 2)
+
+      assert {:error, {:wal_sync_failed, {:poisoned, {:datasync, :eio}}}} =
+               Session.commit(ctx.id, wal, coordinator, sync: true),
+             "a restarted Session forgot the failed fdatasync and acked"
+
+      [{new, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, ctx.id)
+      assert new != old, "fixture: the Session was not actually restarted"
+    end
+  end
+
   describe "through ShardExecutor" do
     defp run(h, sql), do: ShardExecutor.execute(h, %Stmt{sql: sql, args: []})
 
@@ -407,6 +551,33 @@ defmodule Fathom.Shard.ReplicationDeferredSyncTest do
                run(h, "INSERT INTO t VALUES (1)")
 
       assert_received {:wal_sync_called, _, _}
+
+      # rv6 F6: the fallback poisons too. A later sync that succeeds cannot vouch for the pages.
+      seam!(:ok)
+
+      assert {:error, %Filo.Error{code: "FILO_WAL_SYNC_FAILED"}} =
+               run(h, "INSERT INTO t VALUES (2)"),
+             "the replication-off fallback acked after a failed fdatasync"
+    end
+
+    # rv6 F6: a poison the Session set must also stop the replication-off fallback.
+    test "the fallback refuses a shard the Session poisoned", ctx do
+      followers = replicate!(ctx.root)
+      Application.put_env(:fathom, :replication_deferred_wal_sync, true)
+      h = stream!(ctx.id, followers)
+      {:ok, _} = run(h, "CREATE TABLE t (k INTEGER PRIMARY KEY)")
+
+      seam!({:error, {:datasync, :eio}})
+
+      assert {:error, %Filo.Error{code: "FILO_WAL_SYNC_FAILED"}} =
+               run(h, "INSERT INTO t VALUES (1)")
+
+      Application.put_env(:fathom, :replication_enabled, false)
+      seam!(:ok)
+
+      assert {:error, %Filo.Error{code: "FILO_WAL_SYNC_FAILED"}} =
+               run(h, "INSERT INTO t VALUES (2)"),
+             "the fallback acked on a shard whose Session saw a failed fdatasync"
     end
   end
 end

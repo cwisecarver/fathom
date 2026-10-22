@@ -401,7 +401,14 @@ defmodule Fathom.Shard.Replication.Session do
        # failed fdatasync: once set, every tenant round on this Session fails (see `WalSync`'s
        # moduledoc for why one failure must fail every later ack).
        wal_sync: nil,
-       wal_sync_poison: nil
+       # Seeded from the coordinator-keyed poison (rv6 F6): a Session restarted under the same
+       # coordinator after a failed fdatasync must not start acking again.
+       wal_sync_poison: WalSync.poisoned(coordinator),
+       # The long-lived fd every round's fdatasync goes through, `WalSync.held()` (expert review
+       # 2026-10-21 rv6 F1): a fresh fd per round misses a write-back error another fd consumed.
+       # Opened at the first deferred round on a WAL inode, retired (synced, then closed) on an
+       # inode change and by the quiet-shard fd release.
+       wal_sync_fd: nil
      }}
   end
 
@@ -626,15 +633,26 @@ defmodule Fathom.Shard.Replication.Session do
   # same reason as the seed tasks: nothing the sync does may take down the shard's serialization
   # point. The body cannot raise past its `try`, so the result message always arrives unless the
   # process is killed; a kill surfaces as DOWN, which poisons (an unknown outcome is a failure).
+  #
+  # The fd is resolved HERE, in the Session, before the spawn (rv6 F1): it must outlive the task.
+  # An open failure, or a failed last sync of a retired inode, is delivered through the same
+  # task message as a sync result, so `apply_wal_sync/2` decides it exactly like one (an open
+  # error fails the round, a datasync error poisons).
   defp maybe_start_wal_sync(%{wal_sync_poison: nil, wal_sync: nil} = state, wal_path, true) do
     parent = self()
     token = make_ref()
+
+    {job, held} =
+      case WalSync.hold(wal_path, state.wal_sync_fd) do
+        {:ok, held} -> {fn -> WalSync.sync_held(wal_path, held) end, held}
+        {:error, reason, held} -> {fn -> {:error, reason} end, held}
+      end
 
     {pid, mref} =
       spawn_monitor(fn ->
         result =
           try do
-            WalSync.sync(wal_path)
+            job.()
           catch
             kind, reason -> {:error, {:datasync, {kind, reason}}}
           end
@@ -642,7 +660,11 @@ defmodule Fathom.Shard.Replication.Session do
         send(parent, {:wal_synced, token, result})
       end)
 
-    %{state | wal_sync: %{token: token, pid: pid, mref: mref, started: System.monotonic_time()}}
+    %{
+      state
+      | wal_sync: %{token: token, pid: pid, mref: mref, started: System.monotonic_time()},
+        wal_sync_fd: held
+    }
   end
 
   defp maybe_start_wal_sync(state, _wal_path, _start?), do: state
@@ -686,15 +708,36 @@ defmodule Fathom.Shard.Replication.Session do
       # A sync that FAILED, or a result nothing here expects: POISON (fail-safe; see `WalSync`).
       other ->
         reason = poison_reason(other)
-
-        Logger.error(
-          "shard #{state.shard_id}: WAL fdatasync failed (#{inspect(reason)}); refusing every " <>
-            "further write ack on this shard until it is reopened"
-        )
-
-        {{:error, {:wal_sync_failed, reason}}, %{state | wal_sync_poison: reason}}
+        {{:error, {:wal_sync_failed, reason}}, poison(state, reason)}
     end
   end
+
+  # Refuse every later tenant ack on this shard. The FIRST reason is kept: it names the cause. Also
+  # recorded against the coordinator, so it outlives this Session (rv6 F6).
+  defp poison(%{wal_sync_poison: nil} = state, reason) do
+    WalSync.poison(state.coordinator, reason)
+
+    Logger.error(
+      "shard #{state.shard_id}: WAL fdatasync failed (#{inspect(reason)}); refusing every " <>
+        "further write ack on this shard until it is reopened"
+    )
+
+    %{state | wal_sync_poison: reason}
+  end
+
+  defp poison(state, _reason), do: state
+
+  # The quiet-shard fd release also retires the sync fd (rv6 F1; why the last sync makes that safe
+  # is in `WalSync.retire/1`). Not while a sync is in flight: it uses the fd, and closing it under
+  # the task would turn its result into a spurious poison. The next release retries.
+  defp retire_sync_fd(%{wal_sync: nil, wal_sync_fd: held} = state) when held != nil do
+    case WalSync.retire(held) do
+      :ok -> %{state | wal_sync_fd: nil}
+      {:error, reason} -> poison(%{state | wal_sync_fd: nil}, reason)
+    end
+  end
+
+  defp retire_sync_fd(state), do: state
 
   defp poison_reason({:error, reason}), do: reason
   defp poison_reason(other), do: {:unexpected, other}
@@ -709,6 +752,12 @@ defmodule Fathom.Shard.Replication.Session do
   # through unchanged: that is the flag-off path, at the cost of two map reads.
   defp gate_on_wal_sync(reply, pre, state, deadline) do
     {own, state} = settle_wal_sync(state, deadline)
+
+    # The replication-off fallback poisons the coordinator, not this Session (rv6 F6).
+    state =
+      if state.wal_sync_poison == nil,
+        do: %{state | wal_sync_poison: WalSync.poisoned(state.coordinator)},
+        else: state
 
     # The failure this round itself saw comes first (it names the cause); the poison catches every
     # round after it.
@@ -1014,8 +1063,10 @@ defmodule Fathom.Shard.Replication.Session do
   # from the wal-index or the backward walk — exactly as a fresh Session's first commit does. No
   # position, `seen` or follower record is touched, so nothing about what was shipped or acked
   # changes; only a stale cursor (a walk-length hint) is dropped.
-  def handle_info({:release_wal_fds, at}, %{commits: at} = state),
-    do: {:noreply, %{state | wal_fd: Wal.close_held(state.wal_fd), fd_release_ref: nil}}
+  def handle_info({:release_wal_fds, at}, %{commits: at} = state) do
+    state = retire_sync_fd(state)
+    {:noreply, %{state | wal_fd: Wal.close_held(state.wal_fd), fd_release_ref: nil}}
+  end
 
   # A commit ran since the timer was armed: the shard is busy, look again one interval later.
   def handle_info({:release_wal_fds, _at}, state),
@@ -1107,6 +1158,20 @@ defmodule Fathom.Shard.Replication.Session do
     {:noreply, state}
   end
 
+  # A checkpoint of this WAL failed with SQLITE_IOERR (expert review 2026-10-21 rv6 F1): this
+  # Session's threshold checkpoint, or the coordinator's flush checkpoint. A checkpoint fsyncs the
+  # WAL before backfilling, so the error may be the write-back failure of a deferred commit's
+  # frames, now consumed by the checkpoint's fd and invisible to the next round's fdatasync. Poison.
+  #
+  # Only with the deferred sync configured. Under FULL every acked frame was fsynced by its own
+  # COMMIT, which reported its own error, so a later checkpoint error cannot un-ack anything, and
+  # poisoning there would turn a transient checkpoint error into a shard-wide write outage.
+  def handle_info({:checkpoint_io_error, reason}, state) do
+    if WalSync.configured?(),
+      do: {:noreply, poison(state, {:checkpoint, reason})},
+      else: {:noreply, state}
+  end
+
   def handle_info({:DOWN, ref, :process, _pid, reason}, state),
     do: {:noreply, apply_seed_down(state, ref, reason)}
 
@@ -1128,14 +1193,20 @@ defmodule Fathom.Shard.Replication.Session do
     # process dies, but closing explicitly keeps the fd's lifetime tied to the session's rather
     # than to GC — at a million shards an fd per open session is not a rounding error.
     _ = Wal.close_held(Map.get(state, :wal_fd))
+    close_sync_fd(state)
     unregister(state)
   end
 
   def terminate(_reason, state) do
     LagGauge.mark(self(), false)
     _ = Wal.close_held(Map.get(state, :wal_fd))
+    close_sync_fd(state)
     unregister(state)
   end
+
+  # No last sync here: a Session stops with its coordinator, and a poison does not outlive that.
+  defp close_sync_fd(%{wal_sync_fd: %{fd: fd}}), do: :file.close(fd)
+  defp close_sync_fd(_state), do: :ok
 
   # The quiet-shard fd release (#2, `handle_info({:release_wal_fds, _}, _)`). Armed whenever a held
   # fd exists and no timer is; carries the commit count at arm time so the fire can tell quiet from
@@ -2284,8 +2355,14 @@ defmodule Fathom.Shard.Replication.Session do
       {:skipped, :skipped_small}
     else
       case with_pin(db_path, fn -> covered_passive(conn, session, wal, opts) end) do
-        :skipped -> {:skipped, :error}
-        verdict -> verdict
+        :skipped ->
+          {:skipped, :error}
+
+        {result, _outcome} = verdict ->
+          # rv6 F1: the coordinator's checkpoint fsyncs this WAL through ITS fd, so an IOERR it
+          # consumed is one the Session's next fdatasync will not see. Tell the Session.
+          if WalSync.io_error?(result), do: send(session, {:checkpoint_io_error, result})
+          verdict
       end
     end
   catch
@@ -2609,7 +2686,10 @@ defmodule Fathom.Shard.Replication.Session do
                 # `replication_unshipped_checkpoint_test.exs` can hold a checkpoint open and show
                 # the commit's reply (and the next commit's ship) do not wait for it. Unset in prod.
                 if hook = Application.get_env(:fathom, :replication_checkpoint_hook), do: hook.()
-                checkpoint(wal_path)
+                result = checkpoint(wal_path)
+                # rv6 F1: an IOERR here may have consumed a deferred commit's write-back error.
+                if WalSync.io_error?(result), do: send(parent, {:checkpoint_io_error, result})
+                result
               after
                 release_pin(pin)
                 Fathom.Shard.checkin(coordinator, ref)
