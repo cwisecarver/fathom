@@ -2397,7 +2397,8 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   @doc """
-  Run `fun.(pin_conn)` while a read snapshot is pinned on `db_path` (expert review 2026-10-20 #28).
+  Run `fun.(pin_conn, release)` while a read snapshot is pinned on `db_path` (expert review
+  2026-10-20 #28).
 
   The pin is a read transaction on its own handle, so no checkpoint can backfill into the
   `.db` while it is held (the checkpointer takes read-lock 0 exclusively to write pages, and
@@ -2409,12 +2410,25 @@ defmodule Fathom.Shard.Replication.Session do
   and the last close must run SQLite's close-time checkpoint and unlink `-wal`/`-shm` exactly as
   the flush's old snapshot connection did. A `:ro` handle leaves a zero-length `-wal` and a stale
   `-shm` behind (`PoolGraceTest` pins the unlink).
+
+  `release` (expert review 2026-10-21 r7 #23) ends the pin EARLY, once `fun` no longer needs the
+  main file frozen: an encoding backend has captured the body in its own temp before the PUT, and
+  holding the pin through the PUT only stops every checkpoint for the PUT's duration. Idempotent;
+  the pin is released on return regardless.
   """
-  @spec with_flush_pin(Path.t(), (reference() -> result), keyword()) :: result | :skipped
+  @spec with_flush_pin(Path.t(), (reference(), (-> :ok) -> result), keyword()) ::
+          result | :skipped
         when result: var
-  def with_flush_pin(db_path, fun, opts \\ []) when is_function(fun, 1) do
+  def with_flush_pin(db_path, fun, opts \\ []) when is_function(fun, 2) do
     with {:ok, _} <- Fathom.FS.stat(db_path),
          {:ok, pin} <- Connection.open(db_path) do
+      released = :atomics.new(1, [])
+
+      release = fn ->
+        if :atomics.compare_exchange(released, 1, 0, 1) == :ok, do: release_pin(pin)
+        :ok
+      end
+
       try do
         # `:before_pin` runs on this handle BEFORE its read transaction begins (expert review
         # 2026-10-21 #11: the replication-off flush's PASSIVE, moved ahead of the pin so the pin
@@ -2422,11 +2436,11 @@ defmodule Fathom.Shard.Replication.Session do
         if before = opts[:before_pin], do: before.(pin)
 
         case pin_snapshot(pin) do
-          :ok -> fun.(pin)
+          :ok -> fun.(pin, release)
           {:error, _} -> :skipped
         end
       after
-        release_pin(pin)
+        release.()
       end
     else
       _ -> :skipped
