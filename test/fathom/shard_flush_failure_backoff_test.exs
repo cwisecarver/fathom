@@ -50,15 +50,33 @@ defmodule Fathom.ShardFlushFailureBackoffTest do
     test_pid = self()
     handler = "fbackoff-#{shard}"
 
+    # The handler must accept EVERY shape of this event. Two emitters in `Fathom.Shard` (the
+    # dirty-but-file-GONE drop and `keep_local_release_lease/3`) send `%{count: 1}` with no
+    # `:consecutive`, and in a full suite leftover coordinators from earlier tests hit them while this
+    # test runs (70-140 per run). The handler used to pattern-match `%{consecutive: n}` in its head,
+    # so one such event from ANY shard raised a FunctionClauseError, `:telemetry` detached the
+    # handler, and every later attempt went unobserved: "no retry within 5 s" although the
+    # coordinator retried on time (full runs, seeds 610028 and 703096). The foreign event below,
+    # fired right after attaching, pins that: a strict handler fails all three tests.
     :telemetry.attach(
       handler,
       [:fathom, :shard, :flush, :failed],
-      fn _e, %{consecutive: n}, %{shard_id: id}, _ ->
-        if id == shard,
-          do: send(test_pid, {:flush_failed, n, System.monotonic_time(:millisecond)})
+      fn _e, measurements, metadata, _ ->
+        case {measurements, metadata} do
+          {%{consecutive: n}, %{shard_id: ^shard}} ->
+            send(test_pid, {:flush_failed, n, System.monotonic_time(:millisecond)})
+
+          _ ->
+            :ok
+        end
       end,
       nil
     )
+
+    :telemetry.execute([:fathom, :shard, :flush, :failed], %{count: 1}, %{
+      shard_id: "#{shard}_other",
+      reason: :local_file_missing
+    })
 
     on_exit(fn ->
       :telemetry.detach(handler)
@@ -153,10 +171,13 @@ defmodule Fathom.ShardFlushFailureBackoffTest do
         # Heal the store: the next retry lands, the shard goes clean, and the counter resets.
         Application.delete_env(:fathom, :storage_fault)
 
-        assert_eventually(fn ->
-          state = :sys.get_state(coordinator)
-          state.flush_failures == 0 and not Shard.dirty?(coordinator)
-        end)
+        assert_eventually(
+          fn ->
+            state = :sys.get_state(coordinator)
+            state.flush_failures == 0 and not Shard.dirty?(coordinator)
+          end,
+          fn -> heal_diagnosis(coordinator) end
+        )
       end
     end
   end
@@ -187,19 +208,41 @@ defmodule Fathom.ShardFlushFailureBackoffTest do
   end
 
   # No sleeps: poll the coordinator with a bounded number of mailbox round trips.
-  defp assert_eventually(fun, tries \\ 100) do
+  defp assert_eventually(fun, diagnose, tries \\ 100) do
     cond do
       fun.() ->
         :ok
 
       tries == 0 ->
-        flunk("condition never held after the store healed")
+        flunk("condition never held after the store healed: " <> diagnose.())
 
       true ->
         receive do
         after
-          50 -> assert_eventually(fun, tries - 1)
+          50 -> assert_eventually(fun, diagnose, tries - 1)
         end
     end
+  end
+
+  # This shape failed once in a full run (seed 139252) with three on-time failures and then no heal,
+  # and is NOT explained by the handler fix above. The drop at teardown then logged "marked dirty but
+  # the local file is GONE", so the file may have vanished mid-test (which reschedules a FULL
+  # interval), or the retry may have been deferred behind a renew/flush task. Name it next time.
+  defp heal_diagnosis(coordinator) do
+    s = :sys.get_state(coordinator)
+    left = if is_reference(s.flush_timer), do: Process.read_timer(s.flush_timer)
+
+    inspect(
+      %{
+        flush_failures: s.flush_failures,
+        dirty: Shard.dirty?(coordinator),
+        local_file_exists: File.exists?(s.path),
+        flush_task: s.flush_task != nil,
+        renew_task: s.renew_task != nil,
+        flush_timer_left_ms: left,
+        flush_timer_slow?: s.flush_timer_slow?
+      },
+      limit: :infinity
+    )
   end
 end
