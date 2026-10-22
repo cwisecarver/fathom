@@ -525,7 +525,7 @@ defmodule Fathom.BenchTest do
     # full test VM the allocator delta swung to 338 vs 354 KiB (the keystone read heavier), so it
     # would be a flake. It is measured standalone by `mix fathom.bench --only served,served_django`.
     d = Fathom.Bench.served_django(served_n: 4, trials: 1)
-    assert is_float(d.total_kb) and d.total_kb > 20 and d.total_kb < 5_000
+    assert d.total_kb > 20 and d.total_kb < 5_000
   end
 
   # expert review 2026-10-19 #12. A warm-stream SELECT 1 over the WebSocket path; the metric

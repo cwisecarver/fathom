@@ -213,6 +213,15 @@ defmodule Fathom.Bench.Gate do
     # The libSQL Rust SDK request shape over HTTP (expert review 2026-10-21 #3). Watch-only.
     {:hrana_sdk_write_rt_us, :higher_worse, :watch},
     {:hrana_sdk_read_rt_us, :higher_worse, :watch},
+    # Flush routes (expert review 2026-10-21 r7 #2): the pinned-off VACUUM route, the drop-time
+    # flush, and the VACUUM route through the real Storage.S3 client + codec. Watch-only, new series.
+    {:flush_vacuum_p50_us, :higher_worse, :watch},
+    {:drop_flush_p50_us, :higher_worse, :watch},
+    {:flush_stub_p50_us, :higher_worse, :watch},
+    # Django pooled-request shape and pooled-handle density (expert review 2026-10-21 r7 #1).
+    # Watch-only, new series.
+    {:hrana_django_request_rt_us, :higher_worse, :watch},
+    {:served_pooled_kb_per_shard, :higher_worse, :watch},
     # THE TAIL, gated from 2026-08-03 (expert review #41.5). Every metric above is a p50, and
     # `delta/4` is a pure ratio — which AGENTS.md forbids in as many words ("Assert an absolute
     # floor, not only a ratio… The ratio holds while throughput collapses"). A change that leaves
