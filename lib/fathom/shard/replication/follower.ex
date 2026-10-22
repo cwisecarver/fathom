@@ -367,6 +367,38 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
+  @doc """
+  `forget/2`, but only when this follower holds something of `shard_id`: a resident row, or a
+  `.db` or `-wal` on disk. Otherwise `:ok` with no lock and no unlinks.
+
+  For the BULK tombstone loads (expert review 2026-10-21 r7 #22). `Tombstones` learns every
+  lifetime deletion at boot, and since the lazy follower boot (2026-10-21 #5) nothing is resident
+  then, so an unconditional `forget/2` per id cost a lock plus 6 ENOENT unlinks for a replica that
+  almost never exists: 100k lifetime deletions measured 13.5 s on macOS, inside the `Tombstones`
+  GenServer, every boot on every node. The check is two raw stats and an ETS read.
+
+  Why skipping is safe: a replica is its `.db` + `-wal` (the tenant's data) plus the row. When
+  neither file exists and no row is resident there is nothing to erase, and nothing can bring one
+  back for a tombstoned id: a push needs a row (`state_of/2` refuses to derive one for a tombstoned
+  shard), `begin_seed/3` refuses it, and `finish_seed/3` re-checks the tombstone under the seed's
+  lock. What is left unerased in that case is at most a sidecar (`.lineage`, `.ordinal`,
+  `.position`, `.torn`: a number, no tenant data) stranded by a crash inside an earlier forget.
+  """
+  @spec forget_if_present(atom(), String.t()) :: :ok
+  def forget_if_present(name \\ __MODULE__, shard_id) do
+    if replica_present?(name, shard_id), do: forget(name, shard_id), else: :ok
+  end
+
+  defp replica_present?(name, shard_id) do
+    :ets.member(table(name), shard_id) or replica_files?(name, shard_id)
+  rescue
+    # No follower table, or an id that cannot name a file: there is no replica of it here.
+    ArgumentError -> false
+  end
+
+  defp replica_files?(name, shard_id),
+    do: Fathom.FS.exists?(db_path(name, shard_id)) or Fathom.FS.exists?(wal_path(name, shard_id))
+
   defp forget_lock_wait_ms,
     do: Application.get_env(:fathom, :replication_forget_lock_wait_ms, 2_000)
 
@@ -2416,7 +2448,12 @@ defmodule Fathom.Shard.Replication.Follower do
       # in `handle_continue` (expert review 2026-10-21 rv6 F11 corrected the old claim that it was
       # loaded when the Follower starts). An id it has not loaded yet is erased when it is learned,
       # through `Tombstones`' erase hook, which calls `forget/2` once this Follower is running.
-      forget(name, shard_id)
+      #
+      # Only when there is something to erase (expert review 2026-10-21 r7 #22): this runs on every
+      # `state_of/2` of a tombstoned id with no resident row (a straggling push, an ask), and the
+      # forget it ran cost 6 unlinks of files that, after the first erase, never exist. No row is
+      # resident here (`rederive_locked/2` only gets here without one), and the lock is held.
+      if replica_files?(name, shard_id), do: forget(name, shard_id)
       false
     else
       recover_live_shard(tab, name, shard_id)
