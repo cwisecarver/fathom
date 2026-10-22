@@ -175,6 +175,70 @@ defmodule Fathom.Shard.NifDispatchTest do
       end
     end
 
+    # Expert review 2026-10-21 r7 #21. A PRAGMA never sets `sqlite3_changes()`, so a PRAGMA after
+    # a write inherited the previous statement's counters on the wire ("PRAGMA foreign_keys = ON
+    # changed 3 rows, rowid 13") and paid the `changes` + `last_insert_rowid` dispatches to read
+    # them. Invariant: a PRAGMA (assignment or query) reports 0 / nil and costs its `multi_step`;
+    # a DURABLE pragma still dirties the shard (classification is decided before `changes > 0`).
+    test "a PRAGMA after a write reports 0 / nil and costs 1 dispatch", %{conn: conn} do
+      write = stmt("INSERT OR REPLACE INTO kv VALUES (11, 'x')")
+      assert {:ok, %StmtResult{affected_row_count: 1}} = ShardExecutor.execute(conn, write)
+
+      for sql <- ["PRAGMA foreign_keys = ON", "PRAGMA user_version = 7"] do
+        # Warm so the count is the steady state.
+        {:ok, _} = ShardExecutor.execute(conn, stmt(sql))
+        {:ok, _} = ShardExecutor.execute(conn, write)
+
+        {res, total, by_fun} = count(fn -> ShardExecutor.execute(conn, stmt(sql)) end)
+
+        assert {:ok, %StmtResult{affected_row_count: 0, last_insert_rowid: nil}} = res,
+               "#{sql} leaked the previous write's counters"
+
+        assert {sql, total, by_fun} == {sql, 1, %{multi_step: 1}}
+        {:ok, _} = ShardExecutor.execute(conn, write)
+      end
+    end
+
+    # Expert review 2026-10-21 r7 #18. `SchemaGen` is node-global, so ANOTHER shard's DDL moves
+    # the generation for every cached statement on this connection even though this shard's schema
+    # cookie did not. The stale-hit branch used to release + re-prepare + `columns` + memused-probe
+    # (5-8 dirty dispatches and a parse per statement). SQLite's prepare_v3 statements recompile
+    # themselves at step when THEIR schema moved, so the branch now keeps the statement and only
+    # re-reads the columns after the step: `multi_step` + `columns` = 2. The same-shard pin
+    # (2026-08-26 #7) proves the post-step read is still right when the schema DID change.
+    test "another shard's DDL costs a cached statement 2 dispatches, not a re-prepare", %{
+      conn: conn
+    } do
+      other = "test_nifd_other_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        for base <- [
+              Path.join(Fathom.Shard.data_dir(), "#{other}.db"),
+              Path.join(Fathom.Shard.Storage.Local.dir(), "#{other}.db")
+            ],
+            suffix <- ["", "-wal", "-shm"],
+            do: File.rm(base <> suffix)
+      end)
+
+      {:ok, a} = ShardExecutor.open(other)
+      on_exit(fn -> ShardExecutor.close(a) end)
+
+      select = stmt("SELECT k, v FROM kv WHERE k = 1")
+      {:ok, _} = ShardExecutor.execute(conn, select)
+      {:ok, _} = ShardExecutor.execute(conn, select)
+
+      {:ok, _} = ShardExecutor.execute(a, stmt("CREATE TABLE unrelated (x)"))
+
+      {res, total, by_fun} = count(fn -> ShardExecutor.execute(conn, select) end)
+
+      assert {:ok, %StmtResult{cols: [_, _]}} = res
+      assert {total, by_fun} == {2, %{multi_step: 1, columns: 1}}
+
+      # The refresh is one-shot: the next execution is the ordinary 1-dispatch hit.
+      {_, total, _} = count(fn -> ShardExecutor.execute(conn, select) end)
+      assert total == 1
+    end
+
     test "INSERT ... RETURNING keeps affected_row_count and last_insert_rowid", %{conn: conn} do
       assert {:ok,
               %StmtResult{

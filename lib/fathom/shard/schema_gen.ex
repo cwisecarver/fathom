@@ -32,7 +32,10 @@ defmodule Fathom.Shard.SchemaGen do
   The cost of over-invalidation is small and one-sided: a DDL on shard A makes shard B's next
   statement re-read its column list. DDL is rare — `:block_tenant_ddl` exists to refuse it from
   tenants entirely, and the migration engine drains a shard before running any — and the recovery
-  is a `Sqlite3.columns/2` call, not a re-prepare.
+  is one extra `Sqlite3.columns/2` call after the statement's next step (expert review 2026-10-21
+  r7 #18; it used to be release + re-prepare + columns + a memused probe, 5-8 dispatches and a
+  parse per cached statement). SQLite recompiles a statement whose own schema moved at step, so
+  the statement itself is kept.
 
   ## Why ETS and not `:persistent_term`
 

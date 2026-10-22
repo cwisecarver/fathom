@@ -159,6 +159,7 @@ tenant-controllable signal, so it presumes the Hrana trust boundary is enforced.
 | Var | Default | What it does | Safety consequence |
 |---|---|---|---|
 | `REBALANCER_ENABLED` | off | Runs the (singleton) rebalance control loop. | Do NOT enable on a data path open to untrusted callers (a tenant could drive a shard hot to induce a handoff blip). |
+| `TENANT_NOMUTEX` | off | Opens tenant SQLite handles `NOMUTEX`, skipping the recursive mutex enter/leave exqlite's `FULLMUTEX` default pays on every `sqlite3_column_*` call. | Expert review 2026-10-21 r7 #16. Measured on Linux: 19% of execute-only time, +5% on `wire_server_rows_per_s`, below the 10% flip bar. **Leave off** until the audit of the exqlite NIFs that bypass its own connection lock (`bind_*`, `interrupt`/`cancel`, progress handler) against fathom's cross-process touches (watchdog cancel, pooled close, shrink side process) is done. Only tenant handles; snapshot/migrator/Session handles keep the default. |
 | `LOAD_REPORTER` | off | Publishes this node's hot set to Postgres (needs `SHARD_LOAD`). | — |
 | `COMMAND_POLLER` | off | Acts on handoff warm/drain commands addressed to this node. | — |
 | `LB_BACKENDS` | unset | The LB backend set (`node=addr,...`) the policy picks targets from. | Must match the real LB membership, or handoffs target a wrong/missing node. |
