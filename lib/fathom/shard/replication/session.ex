@@ -1017,7 +1017,7 @@ defmodule Fathom.Shard.Replication.Session do
     # reply", not by reading.
     advanced? = match?(%{offset: ^next}, Map.get(state.inflight, from))
     state = state |> settle_late_ack(from, next) |> forget_inflight(from)
-    {:noreply, if(advanced?, do: maybe_chase(state), else: state)}
+    {:noreply, if(advanced?, do: maybe_chase(state, from), else: state)}
   end
 
   def handle_info({:repl_reply, from, {:reject, _shard, reason, follower_offset}}, state) do
@@ -3895,8 +3895,20 @@ defmodule Fathom.Shard.Replication.Session do
   # queueing behind all of them. Only inside a catch-up episode (`catchup_chase`, set by the fired
   # timer's cycle) and only on an ack that ADVANCED a follower, so it cannot spin: each round sends a
   # bounded push, and the next one waits for that push's ack.
-  defp maybe_chase(%{catchup_chase: true} = state) do
-    if catch_up_need(state) == :short do
+  #
+  # ONLY THE ACKING FOLLOWER'S OWN SHORTFALL, AND NEVER UNDER BACKOFF (expert review 2026-10-21 rv7
+  # F1). This used to chase whenever the GLOBAL `catch_up_need/1` was `:short`. With a dead or
+  # refusing follower that is `:short` forever, so once an episode set `catchup_chase` every late
+  # ack from a HEALTHY straggler (N > Q leaves one per commit) cancelled the backoff/cap timer and
+  # fired `:catch_up` at 0: one catch-up cycle per tenant commit against a peer the backoff
+  # (`retry_delay_ms/2`, 2026-08-20 #25) had parked at the cap — measured 13 cycles in 20 commits
+  # with 3 live + 1 dead follower at Q=2 (0 before #8). Now the chase fires only when (a) no refusal
+  # is outstanding (`catchup_fails == 0`, so the armed delay is the base interval, not a backoff or
+  # the `:disconnected` cap) and (b) the follower whose ack this is is ITSELF still short and free —
+  # the far-behind laggard #8 exists for. A straggler whose ack made it current, or a different
+  # follower being short, leaves the armed timer alone.
+  defp maybe_chase(%{catchup_chase: true, catchup_fails: 0} = state, from) do
+    if chase_short?(state, from) do
       if state.catchup_ref, do: Process.cancel_timer(state.catchup_ref)
 
       %{
@@ -3909,7 +3921,15 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  defp maybe_chase(state), do: state
+  defp maybe_chase(state, _from), do: state
+
+  # `catch_up_need/1`'s `:short` test, for one follower.
+  defp chase_short?(%{seen: [{gen, salt, extent} | _]} = state, shipper) do
+    not Map.has_key?(state.seeding, shipper) and not holds?(state, shipper, gen, salt, extent) and
+      not in_flight?(state, shipper, System.monotonic_time(:millisecond))
+  end
+
+  defp chase_short?(_state, _shipper), do: false
 
   # Every place that disarms the catch-up timer goes through here so the node-level gauge flag
   # (`LagGauge`, expert review 2026-10-17 #2) cannot drift from `catchup_ref`. `terminate/2` clears

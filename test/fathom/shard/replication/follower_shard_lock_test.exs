@@ -232,9 +232,55 @@ defmodule Fathom.Shard.Replication.FollowerShardLockTest do
 
     refute File.exists?(stale), "a dead seed's temp survived the follower start"
     refute File.exists?(legacy), "a pre-upgrade fixed-name temp survived the follower start"
-    assert File.exists?(fresh), "a possibly-live seed's temp was reaped"
+
+    # Expert review 2026-10-21 rv7 F3: this used to assert the FRESH flat-directory temp survived.
+    # Since r7 #10 no seed writes there, so a flat `.seeding` name is from a pre-upgrade VM and
+    # cannot be live — and the boot listing is the only one the flat directory gets, so an
+    # age-gated survivor was stranded forever. The age gate still protects the subdirectory.
+    refute File.exists?(fresh), "a fresh pre-upgrade temp in the flat directory was stranded"
     refute File.exists?(sub_stale), "a dead seed's temp in the seed-temp directory survived"
     assert File.exists?(sub_fresh), "a possibly-live seed's temp was reaped"
+  end
+
+  test "forget_if_present waits out a held shard lock: a seed install under it is erased", ctx do
+    # Expert review 2026-10-21 rv7 F2. SYMPTOM: the bulk tombstone hook checked presence WITHOUT the
+    # shard lock. A `finish_seed/3` holding the lock, past its tombstone re-check but before its
+    # rename, has no `.db` on disk yet: the hook saw "absent", skipped, and the rename then installed
+    # the deleted tenant's replica, which survived until the next boot. INVARIANT: once
+    # `forget_if_present/2` returns, nothing installed under a lock held at the time survives.
+    %{name: name, id: id} = ctx
+    test = self()
+
+    # Stand-in for `finish_seed/3`: holds the lock, installs only when told.
+    seeder =
+      spawn_link(fn ->
+        {:ok, lock} = Follower.lock_shard(name, id, 1_000)
+        send(test, :locked)
+
+        receive do
+          :install -> :ok
+        end
+
+        File.write!(Follower.db_path(name, id), "tenant data")
+        File.write!(Follower.wal_path(name, id), "wal")
+        Follower.unlock_shard(name, lock)
+        send(test, :installed)
+      end)
+
+    assert_receive :locked
+    refute File.exists?(Follower.db_path(name, id)), "precondition: nothing on disk yet"
+
+    forget = Task.async(fn -> Follower.forget_if_present(name, id) end)
+    # Pre-fix this returned at once ("absent"); fixed, it is waiting on the seeder's lock.
+    early = Task.yield(forget, 100)
+    send(seeder, :install)
+    assert_receive :installed
+    assert {:ok, :ok} = early || Task.yield(forget, 5_000)
+
+    refute File.exists?(Follower.db_path(name, id)),
+           "a deleted tenant's replica installed under a held lock survived forget_if_present"
+
+    refute File.exists?(Follower.wal_path(name, id))
   end
 
   test "single-connection operation is unchanged: a push during this connection's own seed applies",
