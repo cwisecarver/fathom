@@ -77,6 +77,13 @@ defmodule Fathom.Shards do
   # two agree rather than trusting this comment.
   @default_shard_shutdown_ms 60_000
 
+  # Per-shard admission single-flight (expert review 2026-10-21 r7 #6, see `admit/3`). A follower
+  # waits this long for the leader's admission, which is bounded by the eviction budget (2 s) plus
+  # the novelty read, the limiter call and an optional template fork; past it the follower admits
+  # by itself. Rejoins bound the re-resolve loop when a leader finishes or dies before sharing.
+  @admit_flight_wait_ms 15_000
+  @admit_flight_rejoins 3
+
   @typedoc """
   A held checkout: the coordinator, the ref that identifies THIS checkout, and the local file path.
 
@@ -1204,12 +1211,71 @@ defmodule Fathom.Shards do
                 {:error, held}
 
               true ->
-                shard_id |> start_if_capacity() |> note_start(shard_id, refusal_cache?)
+                admit(shard_id, refusal_cache?, @admit_flight_rejoins)
             end
 
           {:error, :unavailable} = unavailable ->
             unavailable
         end
+    end
+  end
+
+  # ONE ADMISSION PER COLD SHARD (expert review 2026-10-21 r7 #6). K concurrent first requests for
+  # one cold id used to run `start_if_capacity/1` K times: K evictions at the cap (measured: K=16
+  # evicted 16 tenants to admit one shard), K `NovelLimiter` tokens, K directory reads, K fork
+  # attempts; only `start/1` deduped, after all of it. Now the first caller leads and the rest take
+  # its result (`Fathom.Shards.AdmissionFlight`), so a refusal is inherited for that attempt.
+  #
+  # A follower whose leader finished before the result could be shared (or died) re-resolves from
+  # the Registry: the coordinator the leader started is normally there. `rejoins` bounds that loop;
+  # a follower that runs out of it, or out of `@admit_flight_wait_ms`, admits by itself as before
+  # (`start/1` still dedups), so the flight can delay an admission but never wedge one.
+  defp admit(shard_id, refusal_cache?, rejoins) do
+    case Fathom.Shards.AdmissionFlight.join(shard_id, @admit_flight_wait_ms) do
+      :leader ->
+        result =
+          try do
+            shard_id |> start_if_capacity() |> note_start(shard_id, refusal_cache?)
+          rescue
+            e ->
+              Fathom.Shards.AdmissionFlight.finish(shard_id, :retry)
+              reraise e, __STACKTRACE__
+          catch
+            kind, reason ->
+              Fathom.Shards.AdmissionFlight.finish(shard_id, :retry)
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          end
+
+        Fathom.Shards.AdmissionFlight.finish(shard_id, result)
+        result
+
+      {:shared, :retry} ->
+        readmit(shard_id, refusal_cache?, rejoins)
+
+      {:shared, result} ->
+        note_start(result, shard_id, refusal_cache?)
+
+      :retry ->
+        readmit(shard_id, refusal_cache?, rejoins)
+
+      :timeout ->
+        shard_id |> start_if_capacity() |> note_start(shard_id, refusal_cache?)
+    end
+  end
+
+  defp readmit(shard_id, refusal_cache?, rejoins) do
+    case registry_lookup(shard_id, true) do
+      {:ok, [{pid, _}]} ->
+        {:ok, pid}
+
+      {:ok, []} when rejoins > 0 ->
+        admit(shard_id, refusal_cache?, rejoins - 1)
+
+      {:ok, []} ->
+        shard_id |> start_if_capacity() |> note_start(shard_id, refusal_cache?)
+
+      {:error, :unavailable} = unavailable ->
+        unavailable
     end
   end
 
@@ -1434,6 +1500,8 @@ defmodule Fathom.Shards do
   # the node is genuinely hot and refusing is correct — bounding the probe keeps the
   # at-capacity path from doing O(open-shards) drain calls on a saturated node.
   @max_evict_probes 16
+  # Adopt-then-walk rounds when a walk meets only in-flight claims (expert review 2026-10-21 r7 #7).
+  @make_room_rounds 3
 
   # Evict the least-recently-used *idle* shard to free a slot, returning whether one was
   # freed. Off when `:evict_idle_at_capacity` is false (hard cap). `evict/2` is the atomic
@@ -1455,42 +1523,121 @@ defmodule Fathom.Shards do
     if Fathom.Shards.Lru.enabled?() do
       deadline = System.monotonic_time(:millisecond) + evict_budget_ms()
 
-      Fathom.Shards.Lru.lru_order(@max_evict_probes)
-      |> Enum.filter(&shard_open?/1)
-      |> prefer_clean()
-      |> Enum.reduce_while(false, fn shard_id, _ ->
-        remaining = deadline - System.monotonic_time(:millisecond)
-
-        cond do
-          # Budget spent: stop probing and refuse fast (503) rather than block the checkout
-          # stream on another tenant's slow flush. Any coordinator we already told to drain
-          # frees its slot in the background; the LB's retry finds the room.
-          remaining <= 0 ->
-            {:halt, false}
-
-          true ->
-            case evict(shard_id, remaining) do
-              :ok ->
-                :telemetry.execute([:fathom, :shards, :evicted], %{count: 1}, %{
-                  shard_id: shard_id
-                })
-
-                {:halt, true}
-
-              # Accepted the drain but its terminate (S3 flush) didn't finish within the
-              # remaining budget: it's stopping in the background, so stop probing and 503
-              # fast — the freed slot shows up on the next admission attempt.
-              {:error, :exit_timeout} ->
-                {:halt, false}
-
-              # Busy (connections checked out) or a drain failure — leave it, try the next.
-              _ ->
-                {:cont, false}
-            end
-        end
-      end)
+      # At the cap is the deepest "near the cap" there is: wake the pre-evictor now, not only after
+      # the next successful admission, so a burst that starts on a full node has offers to adopt.
+      maybe_pre_evict()
+      make_room(deadline, @make_room_rounds)
     else
       false
+    end
+  end
+
+  # Adopt, else walk. A walk that found nothing but CLAIMED candidates raced an eviction already in
+  # flight (typically a pre-evictor batch that claimed the LRU front between our listing and our
+  # probes; measured: 1-2 of 160 admissions refused `:node_at_capacity` with 16 idle shards all
+  # "claimed"). Those claims are slots on their way, so adopt again rather than refuse; bounded by
+  # `@make_room_rounds` (defined with `@max_evict_probes`).
+
+  defp make_room(deadline, rounds) do
+    adopted_slot?(deadline) or
+      case walk_for_room(deadline) do
+        :claimed when rounds > 0 -> make_room(deadline, rounds - 1)
+        found -> found == true
+      end
+  end
+
+  # THE SLOT HAND-OFF (expert review 2026-10-21 r7 #7, user default Q2: an admission may wait for a
+  # slot another process is freeing). With the background pre-evictor draining victims, an admission
+  # that still found the node at the cap used to skip those victims (claimed) and drain one of its
+  # own, paying a whole drop inline while slots were already on their way: measured K=16 concurrent
+  # admissions, 25 ms release/pull, 69-82 of 160 admissions evicted inline even with the pre-evictor
+  # running. Now it first adopts ONE in-flight pre-eviction (`Lru.adopt_slot/0`, a CAS, so no two
+  # admissions count the same slot) and waits, within the same budget, for that victim's exit. A
+  # slot lost (the victim turned busy) or an offer whose coordinator is already gone falls back to
+  # the walk. No `evicted` event: the pre-evictor already reported that victim as `pre_evicted`.
+  defp adopted_slot?(deadline) do
+    case Fathom.Shards.Lru.adopt_slot() do
+      {:ok, shard_id, coordinator, ref} ->
+        remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+        freed? =
+          receive do
+            {:DOWN, ^ref, :process, ^coordinator, :noproc} ->
+              # Stale offer (its evictor was killed): drop it, it frees nothing for us.
+              Fathom.Shards.Lru.withdraw_slot(shard_id, true)
+              false
+
+            {:DOWN, ^ref, :process, ^coordinator, reason} ->
+              drain_down_result(reason) == :ok
+
+            {:slot_lost, ^ref} ->
+              false
+          after
+            remaining -> false
+          end
+
+        :erlang.demonitor(ref, [:flush])
+        :erlang.unalias(ref)
+        flush_slot_lost(ref)
+        freed?
+
+      :none ->
+        false
+    end
+  end
+
+  defp flush_slot_lost(ref) do
+    receive do
+      {:slot_lost, ^ref} -> :ok
+    after
+      0 -> :ok
+    end
+  end
+
+  # The adoption spent part of the budget; the walk's first probe sees what remains. `true` when it
+  # freed a slot, `:claimed` when every candidate it could not take was being evicted by someone
+  # else, `false` otherwise.
+  defp walk_for_room(deadline) do
+    Fathom.Shards.Lru.lru_order(@max_evict_probes)
+    |> Enum.filter(&shard_open?/1)
+    |> prefer_clean()
+    |> Enum.reduce_while(:none, fn shard_id, acc ->
+      remaining = deadline - System.monotonic_time(:millisecond)
+
+      cond do
+        # Budget spent: stop probing and refuse fast (503) rather than block the checkout
+        # stream on another tenant's slow flush. Any coordinator we already told to drain
+        # frees its slot in the background; the LB's retry finds the room.
+        remaining <= 0 ->
+          {:halt, false}
+
+        true ->
+          case evict(shard_id, remaining) do
+            :ok ->
+              :telemetry.execute([:fathom, :shards, :evicted], %{count: 1}, %{
+                shard_id: shard_id
+              })
+
+              {:halt, true}
+
+            # Accepted the drain but its terminate (S3 flush) didn't finish within the
+            # remaining budget: it's stopping in the background, so stop probing and 503
+            # fast — the freed slot shows up on the next admission attempt.
+            {:error, :exit_timeout} ->
+              {:halt, false}
+
+            {:error, :claimed} ->
+              {:cont, if(acc == :other, do: :other, else: :claimed)}
+
+            # Busy (connections checked out) or a drain failure — leave it, try the next.
+            _ ->
+              {:cont, :other}
+          end
+      end
+    end)
+    |> case do
+      result when result in [true, :claimed] -> result
+      _ -> false
     end
   end
 
@@ -1516,8 +1663,12 @@ defmodule Fathom.Shards do
   # probe is already dropping is `{:error, :claimed}`. Both route the inline path to its next
   # candidate. Public for the test.
   @doc false
-  @spec evict(String.t(), non_neg_integer()) :: :ok | {:error, term()}
-  def evict(shard_id, budget_ms) do
+  #
+  # `offer?` (the pre-evictor only, expert review 2026-10-21 r7 #7): publish the slot this drain
+  # will free so an admission at the cap can adopt it (`Lru.offer_slot/2`) instead of draining a
+  # victim of its own. An inline admission's victim is never offered: its slot is already spoken for.
+  @spec evict(String.t(), non_neg_integer(), boolean()) :: :ok | {:error, term()}
+  def evict(shard_id, budget_ms, offer? \\ false) do
     case registry_lookup(shard_id) do
       {:error, :unavailable} = unavailable ->
         unavailable
@@ -1548,9 +1699,15 @@ defmodule Fathom.Shards do
         task =
           Task.Supervisor.async_nolink(Fathom.TaskSupervisor, fn ->
             if Fathom.Shards.Lru.claim_eviction(shard_id) do
+              if offer?, do: Fathom.Shards.Lru.offer_slot(shard_id, pid)
+
               try do
-                evict_claimed(pid, budget_ms)
+                outcome = evict_claimed(pid, budget_ms)
+                if offer?, do: Fathom.Shards.Lru.withdraw_slot(shard_id, outcome == :ok)
+                outcome
               after
+                # A no-op after the line above; it tells an adopter on a raise.
+                if offer?, do: Fathom.Shards.Lru.withdraw_slot(shard_id, false)
                 Fathom.Shards.Lru.release_eviction(shard_id)
               end
             else
@@ -1609,7 +1766,15 @@ defmodule Fathom.Shards do
   @pre_evict_budget_ms 30_000
   # Victims drained at once per pass: each is an independent coordinator stop (its own DELETE), so a
   # burst of admissions is not refilled one round trip at a time.
-  @pre_evict_concurrency 8
+  #
+  # SCALED WITH THE DEFICIT (expert review 2026-10-21 r7 #7, user default Q3: up to 32). A fixed 8
+  # drained about 8 / (drop latency) victims a second, ~300/s at a 25 ms DELETE, so a concurrent
+  # admission burst outran it and every admission fell back to an inline eviction (measured K=16:
+  # 160 of 160 inline before rv6 F10's claims, 69 of 160 after). A pass now drains
+  # `min(excess, 32)` at once, `drain_all`'s shape (it uses 64). Dirty victims stay at the old 8,
+  # and below the FlushGate cap, since each one flushes before it drops.
+  @pre_evict_concurrency 32
+  @pre_evict_dirty_concurrency 8
   # Skip candidates used within this long (expert review 2026-10-21 rv6 F10). Dropping a shard a
   # client touched a moment ago mostly buys an immediate cold reopen: evict-before-checkout churn.
   # The inline path ignores it; it needs room now. `:pre_evict_min_idle_ms`, 0 disables.
@@ -1668,15 +1833,31 @@ defmodule Fathom.Shards do
 
     with true <- excess > 0,
          [_ | _] = victims <-
-           Fathom.Shards.Lru.lru_order(@max_evict_probes)
+           Fathom.Shards.Lru.lru_order(
+             max(@max_evict_probes, 2 * min(excess, @pre_evict_concurrency))
+           )
            |> Enum.filter(&shard_open?/1)
            |> Enum.reject(&Fathom.Shards.Lru.touched_within?(&1, min_idle_ms))
-           |> prefer_clean()
-           |> Enum.take(excess),
+           |> pre_evict_victims(min(excess, @pre_evict_concurrency)),
          freed when freed > 0 <- pre_evict_batch(victims) do
       pre_evict_pass(low)
     else
       _ -> :ok
+    end
+  end
+
+  # Up to `n` victims, clean before dirty, at most `pre_evict_dirty_limit/0` of them dirty (each
+  # dirty victim flushes, so it takes a FlushGate slot that tenants' own flushes also need).
+  defp pre_evict_victims(candidates, n) do
+    {clean, dirty} = Enum.split_with(candidates, &clean?/1)
+    clean = Enum.take(clean, n)
+    clean ++ Enum.take(dirty, min(n - length(clean), pre_evict_dirty_limit()))
+  end
+
+  defp pre_evict_dirty_limit do
+    case Fathom.Shard.FlushGate.cap() do
+      nil -> @pre_evict_dirty_concurrency
+      cap -> max(1, min(@pre_evict_dirty_concurrency, cap - 1))
     end
   end
 
@@ -1686,7 +1867,7 @@ defmodule Fathom.Shards do
   defp pre_evict_batch(victims) do
     Fathom.TaskSupervisor
     |> Task.Supervisor.async_stream_nolink(victims, &pre_evict_one/1,
-      max_concurrency: @pre_evict_concurrency,
+      max_concurrency: length(victims),
       timeout: @pre_evict_budget_ms + @evict_probe_grace_ms + 1_000,
       on_timeout: :kill_task,
       ordered: false
@@ -1694,8 +1875,11 @@ defmodule Fathom.Shards do
     |> Enum.count(&match?({:ok, true}, &1))
   end
 
+  # Only a CLEAN victim's slot is offered: it frees after a drop with no flush. A dirty victim's
+  # flush + PUT can outlast an admission's 2 s budget, and an admission that adopted it would then
+  # refuse where the walk would have found a clean victim.
   defp pre_evict_one(shard_id) do
-    case evict(shard_id, @pre_evict_budget_ms) do
+    case evict(shard_id, @pre_evict_budget_ms, clean?(shard_id)) do
       :ok ->
         :telemetry.execute([:fathom, :shards, :pre_evicted], %{count: 1}, %{shard_id: shard_id})
         true

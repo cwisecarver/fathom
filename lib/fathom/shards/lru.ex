@@ -51,6 +51,7 @@ defmodule Fathom.Shards.Lru do
   # one freed slot, so an admission could land one shard over the soft cap. A claim held by a dead
   # process is free, so a probe killed mid-eviction cannot pin a shard as unevictable.
   @evicting_table __MODULE__.Evicting
+  @offered_table __MODULE__.Offered
 
   # The authority on whether a shard is actually OPEN. `lru_order/1` consults it because the ETS
   # rows here are released only from `Fathom.Shard.terminate/2` — see `ghost?/1`.
@@ -272,6 +273,13 @@ defmodule Fathom.Shards.Lru do
             :ets.delete(@order_table, key)
             collect_idle(next, limit, acc, live?)
 
+          # Already being evicted (expert review 2026-10-21 r7 #7): not a candidate for anyone
+          # else, and not charged against the limit, so a walk behind a pre-evictor batch that
+          # claimed the whole LRU front still finds victims instead of refusing. The key stays:
+          # if that drain aborts (busy), the shard is a candidate again.
+          eviction_claimed?(id) ->
+            collect_idle(next, limit, acc, live?)
+
           true ->
             collect_idle(next, limit - 1, [id | acc], live?)
         end
@@ -354,6 +362,14 @@ defmodule Fathom.Shards.Lru do
     ArgumentError -> true
   end
 
+  # A claim held by a dead owner is takeable (`claim_eviction/1`), so it does not hide the shard.
+  defp eviction_claimed?(shard_id) do
+    case :ets.lookup(@evicting_table, shard_id) do
+      [{_, owner}] -> owner == self() or Process.alive?(owner)
+      [] -> false
+    end
+  end
+
   @doc "Release the calling process's eviction claim on `shard_id`."
   @spec release_eviction(String.t()) :: :ok
   def release_eviction(shard_id) do
@@ -363,12 +379,84 @@ defmodule Fathom.Shards.Lru do
     ArgumentError -> :ok
   end
 
+  # --- slot hand-off (expert review 2026-10-21 r7 #7, user default Q2) ---------------------------
+  #
+  # A background pre-eviction OFFERS the slot its victim will free: `{shard_id, coordinator, nil}`.
+  # An admission at the cap ADOPTS one (a CAS of `nil` to its own monitor-alias ref) and waits for
+  # that coordinator's exit instead of claiming and draining a victim of its own. One offer, one
+  # adopter: the CAS is what keeps two admissions from counting one freed slot (the rv6 F10 rule).
+
+  @doc "Offer the slot `coordinator` (being pre-evicted by the caller) will free."
+  @spec offer_slot(String.t(), pid()) :: :ok
+  def offer_slot(shard_id, coordinator) do
+    :ets.insert(@offered_table, {shard_id, coordinator, nil})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc """
+  End an offer. When the drain did NOT free the slot (`freed?` false: the victim turned busy, the
+  drain failed or timed out), an adopter is told at once with `{:slot_lost, ref}` rather than left
+  waiting out its budget for an exit that is not coming. Idempotent (`take`).
+  """
+  @spec withdraw_slot(String.t(), boolean()) :: :ok
+  def withdraw_slot(shard_id, freed?) do
+    case :ets.take(@offered_table, shard_id) do
+      [{_, _, ref}] when is_reference(ref) and not freed? -> send(ref, {:slot_lost, ref})
+      _ -> :ok
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc """
+  Adopt one offered slot: `{:ok, shard_id, coordinator, ref}` where `ref` monitors `coordinator` and is also
+  the alias a `{:slot_lost, ref}` arrives on, or `:none`. The caller must `:erlang.demonitor/2` and
+  `:erlang.unalias/1` the ref when done. An offer whose coordinator is already gone is stale (the
+  slot it freed may be anyone's by now) and is dropped, not adopted.
+  """
+  @spec adopt_slot() :: {:ok, String.t(), pid(), reference()} | :none
+  def adopt_slot do
+    @offered_table
+    |> :ets.select([{{:"$1", :"$2", nil}, [], [{{:"$1", :"$2"}}]}], 8)
+    |> case do
+      {offers, _cont} -> adopt_first(offers)
+      :"$end_of_table" -> :none
+    end
+  rescue
+    ArgumentError -> :none
+  end
+
+  defp adopt_first([]), do: :none
+
+  defp adopt_first([{shard_id, coordinator} | rest]) do
+    ref = :erlang.monitor(:process, coordinator, [{:alias, :explicit_unalias}])
+
+    adopted? =
+      :ets.select_replace(@offered_table, [
+        {{shard_id, coordinator, nil}, [],
+         [{{{:const, shard_id}, {:const, coordinator}, {:const, ref}}}]}
+      ]) == 1
+
+    if adopted? do
+      {:ok, shard_id, coordinator, ref}
+    else
+      :erlang.demonitor(ref, [:flush])
+      :erlang.unalias(ref)
+      adopt_first(rest)
+    end
+  end
+
   @doc false
   def reset do
     :ets.delete_all_objects(@table)
     :ets.delete_all_objects(@busy_table)
     :ets.delete_all_objects(@order_table)
     :ets.delete_all_objects(@evicting_table)
+    :ets.delete_all_objects(@offered_table)
   end
 
   @impl true
@@ -379,6 +467,7 @@ defmodule Fathom.Shards.Lru do
     :ets.new(@table, opts)
     :ets.new(@busy_table, opts)
     :ets.new(@evicting_table, opts)
+    :ets.new(@offered_table, opts)
 
     :ets.new(@order_table, [
       :ordered_set,
