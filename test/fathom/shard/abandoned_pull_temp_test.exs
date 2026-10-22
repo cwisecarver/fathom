@@ -99,7 +99,7 @@ defmodule Fathom.Shard.AbandonedPullTempTest do
     path: path,
     dir: dir
   } do
-    unrecorded = Materializer.pull_temp(path) <> ".dl.424242"
+    unrecorded = Materializer.pull_temp(path) <> ".dl.2"
     File.write!(unrecorded, "partial body")
 
     task =

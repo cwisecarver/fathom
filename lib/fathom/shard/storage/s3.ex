@@ -1523,13 +1523,26 @@ defmodule Fathom.Shard.Storage.S3 do
   # (expert review 2026-10-20 #14)
   @transient_statuses [500, 502, 503, 504]
 
+  # Every streaming temp a `download(_, local_path)` can create: one deterministic name per attempt
+  # (expert review 2026-10-21 r7 #4), so `Materializer.rm_pull_temp/1` unlinks exactly these
+  # instead of globbing the fleet-sized data dir (`Path.wildcard` = a full `readdir`).
+  @doc false
+  @spec download_temps(Path.t()) :: [Path.t()]
+  def download_temps(local_path), do: for(n <- 1..@download_attempts, do: dl_temp(local_path, n))
+
+  defp dl_temp(local_path, attempt), do: "#{local_path}.dl.#{attempt}"
+
   defp download(url, local_path, headers \\ [], opts \\ []) do
     Storage.ensure_dir(Path.dirname(local_path))
     do_download(url, local_path, headers, opts, @download_attempts)
   end
 
   defp do_download(url, local_path, headers, opts, attempts_left) do
-    tmp = "#{local_path}.dl.#{System.unique_integer([:positive])}"
+    # Deterministic per attempt (not unique_integer): the temp is `File.open`ed a moment BEFORE it
+    # is recorded in the process dictionary, so a kill in that window strands it; a name derivable
+    # from `local_path` lets the abandon path remove it without a directory scan. `[:write]`
+    # truncates a stale file of the same name. Callers pass a path only one download writes to.
+    tmp = dl_temp(local_path, @download_attempts - attempts_left + 1)
     # The temp file/fd is created LAZILY on the first 200 data chunk (review 2026-07-23
     # #15b): a 304/404 has no body, and the eager open cost every (since-removed)
     # warm-follower revalidation a create/open/close/rm disk cycle per 304 — pure churn

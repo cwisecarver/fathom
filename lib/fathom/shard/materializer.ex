@@ -251,7 +251,7 @@ defmodule Fathom.Shard.Materializer do
       end
 
     result = Task.shutdown(task, :brutal_kill)
-    Enum.each(tmps, &File.rm/1)
+    Enum.each(tmps, &Fathom.FS.rm/1)
     result
   end
 
@@ -262,6 +262,6 @@ defmodule Fathom.Shard.Materializer do
   # runs after that pull has finished or been killed, so the glob cannot take a live download.
   defp rm_pull_temp(path) do
     Enum.each(["", "-wal", "-shm"], &Fathom.FS.rm(pull_temp(path) <> &1))
-    Enum.each(Path.wildcard(pull_temp(path) <> ".dl.*"), &File.rm/1)
+    Enum.each(Fathom.Shard.Storage.S3.download_temps(pull_temp(path)), &Fathom.FS.rm/1)
   end
 end

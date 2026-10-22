@@ -72,6 +72,48 @@ defmodule Fathom.FSBypassTest do
            "shard lifecycle routed file ops through file_server_2: #{inspect(reqs, limit: 20)}"
   end
 
+  # Expert review 2026-10-21 r7 #4 / #20. Symptom: every failed/held/refused cold open ran
+  # `Path.wildcard(<pull>.dl.*)` (a full readdir of the fleet-sized data dir, one file_server_2
+  # request per call) and `Storage.ensure_dir` used non-raw `File.dir?`. The guard above filters on
+  # the shard id so neither was visible; these count ALL requests under the data dir.
+  describe "abandoned pull and ensure_dir" do
+    @describetag :tmp_dir
+
+    test "abandon_pull removes every .dl temp with no file_server_2 request (no dir scan)",
+         %{tmp_dir: dir} do
+      path = Path.join(dir, "victim.db")
+      pull = Fathom.Shard.Materializer.pull_temp(path)
+      temps = Fathom.Shard.Storage.S3.download_temps(pull)
+      assert length(temps) == 3
+      for t <- temps, do: File.write!(t, "x")
+      File.write!(Path.join(dir, "bystander.db"), "x")
+
+      task = Task.async(fn -> :ok end)
+      _ = Task.await(task)
+
+      reqs =
+        fs_requests_touching(
+          "",
+          fn -> :ok = Fathom.Shard.Materializer.abandon_pull(task, path) end,
+          dir
+        )
+
+      assert reqs == [], "abandon_pull hit file_server_2: #{inspect(reqs, limit: 20)}"
+      for t <- temps, do: refute(File.exists?(t))
+      assert File.exists?(Path.join(dir, "bystander.db"))
+    end
+
+    test "Storage.ensure_dir on an existing dir makes no file_server_2 request", %{tmp_dir: dir} do
+      reqs =
+        fs_requests_touching("", fn -> :ok = Fathom.Shard.Storage.ensure_dir(dir) end, dir)
+
+      assert reqs == []
+      new = Path.join(dir, "a/b")
+      assert :ok = Fathom.Shard.Storage.ensure_dir(new)
+      assert File.dir?(new)
+    end
+  end
+
   describe "Fathom.FS matches File.* semantics" do
     @describetag :tmp_dir
 

@@ -185,11 +185,11 @@ defmodule Fathom.Shard.Storage.Codec do
       end)
     rescue
       e ->
-        File.rm(tmp)
+        Fathom.FS.rm(tmp)
         {:error, e}
     catch
       {:decode_failed, reason} ->
-        File.rm(tmp)
+        Fathom.FS.rm(tmp)
         {:error, reason}
     after
       release(dctx)

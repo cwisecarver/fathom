@@ -1494,7 +1494,7 @@ defmodule Fathom.Shard.Storage do
   """
   @spec ensure_dir(Path.t()) :: :ok
   def ensure_dir(dir) do
-    unless File.dir?(dir), do: File.mkdir_p!(dir)
+    unless Fathom.FS.dir?(dir), do: File.mkdir_p!(dir)
     :ok
   end
 
