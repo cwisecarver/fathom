@@ -87,7 +87,15 @@ defmodule Fathom.Shard.Replication.FollowerShardLockTest do
     :ok = Follower.seed(name, id, 1, 0, 0, 0)
   end
 
-  defp seeding_temps(dir), do: dir |> File.ls!() |> Enum.filter(&(&1 =~ ".seeding"))
+  # Seed temps live in the `.seed-temps` subdirectory since expert review 2026-10-21 r7 #10; the
+  # flat directory is listed too, so a temp written in the old place still counts.
+  defp seeding_temps(dir) do
+    for d <- [dir, Path.join(dir, ".seed-temps")],
+        {:ok, names} <- [File.ls(d)],
+        name <- names,
+        name =~ ".seeding",
+        do: name
+  end
 
   test "a push on another connection cannot land in the middle of a seed", ctx do
     %{name: name, id: id} = ctx
@@ -207,9 +215,15 @@ defmodule Fathom.Shard.Replication.FollowerShardLockTest do
     stale = Path.join(dir, "victim.db.seeding.123")
     legacy = Path.join(dir, "victim.db-wal.seeding")
     fresh = Path.join(dir, "victim.db.seeding.456")
-    for p <- [stale, legacy, fresh], do: File.write!(p, "partial")
+    # Where seed temps live since expert review 2026-10-21 r7 #10; the flat-directory names above
+    # are what a node upgraded from before it still holds, reaped by the one boot listing.
+    sub = Path.join(dir, ".seed-temps")
+    File.mkdir_p!(sub)
+    sub_stale = Path.join(sub, "victim.db-wal.seeding.789")
+    sub_fresh = Path.join(sub, "victim.db-wal.seeding.790")
+    for p <- [stale, legacy, fresh, sub_stale, sub_fresh], do: File.write!(p, "partial")
     an_hour_ago = System.os_time(:second) - 3_600
-    for p <- [stale, legacy], do: File.touch!(p, an_hour_ago)
+    for p <- [stale, legacy, sub_stale], do: File.touch!(p, an_hour_ago)
 
     pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
     # The reap runs after the listener, in `handle_continue(:boot_housekeeping)` (expert review
@@ -219,6 +233,8 @@ defmodule Fathom.Shard.Replication.FollowerShardLockTest do
     refute File.exists?(stale), "a dead seed's temp survived the follower start"
     refute File.exists?(legacy), "a pre-upgrade fixed-name temp survived the follower start"
     assert File.exists?(fresh), "a possibly-live seed's temp was reaped"
+    refute File.exists?(sub_stale), "a dead seed's temp in the seed-temp directory survived"
+    assert File.exists?(sub_fresh), "a possibly-live seed's temp was reaped"
   end
 
   test "single-connection operation is unchanged: a push during this connection's own seed applies",

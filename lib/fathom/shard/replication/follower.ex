@@ -136,6 +136,10 @@ defmodule Fathom.Shard.Replication.Follower do
   @default_lock_wait_ms 50
   @default_lock_max_ms 180_000
 
+  # The seed-temp subdirectory of the replica dir (expert review 2026-10-21 r7 #10); see
+  # `seed_temp_dir/1`.
+  @seed_temp_subdir ".seed-temps"
+
   @typedoc "Proof of holding a shard's lock, handed back to `unlock_shard/2`."
   @type lock_token :: {:held, {String.t(), pid(), integer()}} | :reentrant
 
@@ -560,6 +564,7 @@ defmodule Fathom.Shard.Replication.Follower do
     name = Keyword.get(opts, :name, __MODULE__)
     dir = Keyword.get(opts, :dir) || default_dir()
     File.mkdir_p!(dir)
+    File.mkdir_p!(Path.join(dir, @seed_temp_subdir))
 
     # `write_concurrency` because every connection handler writes its own shards' rows; the
     # GenServer owns the table only so the state dies with it.
@@ -646,11 +651,23 @@ defmodule Fathom.Shard.Replication.Follower do
   # After the listener: a directory listing, no per-replica derive. Runs in this GenServer, which
   # nothing on the push/ask/promote path waits on (they use the ETS tables directly), so it delays
   # only `port/1` and the timers. Tests sync on it with `:sys.get_state/1`.
+  #
+  # The ONE full listing of the replica directory this follower makes (expert review 2026-10-21 r7
+  # #10): the tombstone erase needs every `.db`, and seed temps from before the subdirectory move sat
+  # in the flat directory. It is raw (no `file_server_2` hop, so no other process's file call queues
+  # behind it) and runs in a short-lived process, so the O(replicas) name list and its garbage die
+  # with that process instead of growing this GenServer's heap.
   def handle_continue(:boot_housekeeping, state) do
-    dir = dir(state.name)
-    entries = list_dir(dir)
-    reap_stale_seed_temps(dir, entries)
-    erase_tombstoned_replicas(state.name, entries)
+    name = state.name
+    dir = dir(name)
+
+    in_side_process(fn ->
+      entries = list_dir(dir)
+      reap_stale_seed_temps(dir, entries)
+      erase_tombstoned_replicas(name, entries)
+    end)
+
+    reap_seed_temp_dir(name)
     {:noreply, state}
   end
 
@@ -676,9 +693,11 @@ defmodule Fathom.Shard.Replication.Follower do
   # PERIODIC SEED-TEMP SWEEP (expert review 2026-10-10 #19). Since 8162cf3 seed temps are unique per
   # seed, so a worker killed in `close_connection/1` leaves files nothing replaces; the boot reaper
   # alone let them accumulate for the life of the node. Same age gate, run on a timer.
+  #
+  # Lists ONLY the seed-temp subdirectory (expert review 2026-10-21 r7 #10), never the replica
+  # directory: the sweep's cost is now the number of temps (usually zero), not the number of replicas.
   def handle_info(:reap_seed_temps, state) do
-    dir = dir(state.name)
-    reap_stale_seed_temps(dir, list_dir(dir))
+    reap_seed_temp_dir(state.name)
     schedule_seed_temp_reap()
     {:noreply, state}
   end
@@ -1722,10 +1741,11 @@ defmodule Fathom.Shard.Replication.Follower do
   # overtaken holder alive — so each seed's files must be its own, and the paths ride in its state.
   defp open_seed_temps(name, seeds, %Protocol.SeedBegin{} = b, lock) do
     tag = Integer.to_string(System.unique_integer([:positive]))
-    db_temp = seeding_path(db_path(name, b.shard_id), tag)
-    wal_temp = seeding_path(wal_path(name, b.shard_id), tag)
+    db_temp = seeding_path(name, db_path(name, b.shard_id), tag)
+    wal_temp = seeding_path(name, wal_path(name, b.shard_id), tag)
 
-    with {:ok, db_fd} <- :file.open(db_temp, [:write, :raw, :binary]),
+    with :ok <- ensure_seed_temp_dir(name),
+         {:ok, db_fd} <- :file.open(db_temp, [:write, :raw, :binary]),
          {:ok, wal_fd} <- open_or_close(wal_temp, db_fd) do
       Map.put(seeds, b.shard_id, %{
         name: name,
@@ -2183,7 +2203,36 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   @seeding_marker ".seeding"
-  defp seeding_path(path, tag), do: path <> @seeding_marker <> "." <> tag
+
+  # SEED TEMPS LIVE IN THEIR OWN SUBDIRECTORY (expert review 2026-10-21 r7 #10). They used to sit
+  # beside the replicas as `<dir>/<id>.db.seeding.<tag>`, so the periodic reaper, whose only job is
+  # to find a handful of them, had to list the WHOLE replica directory (~5 entries per followed
+  # shard) through `file_server_2`: 200k entries measured 135 ms, +95 MB transient heap in this
+  # GenServer, and a concurrent non-raw file call blocked 91.5 ms behind it, every 5 minutes, growing
+  # linearly with the replicas this node follows. Now the reaper lists only this subdirectory.
+  #
+  # The install `rename/2` from here into `<dir>` stays atomic: a subdirectory of the same directory
+  # is on the same filesystem (it is created here, never mounted over). The name starts with a dot
+  # and carries no `.db`/`.seeding`, so neither the tombstone erase's `.db` filter nor the boot
+  # reaper's legacy `.seeding` match can mistake the directory itself for a replica or a temp.
+  # (`@seed_temp_subdir` is defined at the top of the module: `init/1` creates it.)
+  @doc false
+  # Where this follower's in-flight seed temps live. Public for the tests.
+  @spec seed_temp_dir(atom()) :: Path.t()
+  def seed_temp_dir(name \\ __MODULE__), do: Path.join(dir(name), @seed_temp_subdir)
+
+  # Created by `init/1`; re-created here (one raw mkdir per seed, which is rare) so a directory
+  # removed underneath a running follower refuses nothing.
+  defp ensure_seed_temp_dir(name) do
+    case :prim_file.make_dir(seed_temp_dir(name)) do
+      :ok -> :ok
+      {:error, :eexist} -> :ok
+      {:error, _} = err -> err
+    end
+  end
+
+  defp seeding_path(name, path, tag),
+    do: Path.join(seed_temp_dir(name), Path.basename(path) <> @seeding_marker <> "." <> tag)
 
   # THE BOOT REAPER for seed temps (expert review 2026-10-08 #5 tier c). Unique names mean a seed
   # whose worker was killed (`close_connection/1`'s `@worker_stop_ms`), or whose follower died under
@@ -2193,6 +2242,8 @@ defmodule Fathom.Shard.Replication.Follower do
   # keep its files: a live seed writes a chunk at least every few seconds, and the Session abandons
   # one after `@default_seed_expiry_ms` (120 s), so a temp untouched for `@stale_seed_temp_s` is
   # dead. Matches the pre-unique `<shard>.db.seeding` name too, so an upgrade does not strand those.
+  # Run over `seed_temp_dir/1` at boot and every `seed_temp_reap_ms`, and over the flat replica
+  # directory once at boot for temps written there before the subdirectory (r7 #10).
   @stale_seed_temp_s 15 * 60
 
   defp reap_stale_seed_temps(dir, entries) do
@@ -2213,10 +2264,31 @@ defmodule Fathom.Shard.Replication.Follower do
       do: Logger.info("replication follower reaped #{reaped} stale seed temp(s) in #{dir}")
   end
 
+  defp reap_seed_temp_dir(name) do
+    temps = seed_temp_dir(name)
+    reap_stale_seed_temps(temps, list_dir(temps))
+  end
+
+  # RAW (expert review 2026-10-21 r7 #10): `File.ls/1` is a `file_server_2` call that builds the
+  # whole name list in that shared process and copies it to the caller; `:prim_file` does the
+  # readdir in the calling process.
   defp list_dir(dir) do
-    case File.ls(dir) do
-      {:ok, entries} -> entries
+    case :prim_file.list_dir(dir) do
+      {:ok, entries} -> Enum.map(entries, &IO.chardata_to_string/1)
       {:error, _} -> []
+    end
+  end
+
+  # Runs `fun` in a monitored side process and waits for it, so whatever it allocates is freed when
+  # it exits rather than left on this GenServer's heap. No timeout, deliberately: the listing is
+  # O(replicas), nothing on the push/ask/promote path waits on this GenServer, and a timeout here
+  # would only crash the listener. A crash in `fun` exits this process, as the inline call did.
+  defp in_side_process(fun) do
+    {pid, ref} = spawn_monitor(fn -> exit({:done, fun.()}) end)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, {:done, result}} -> result
+      {:DOWN, ^ref, :process, ^pid, reason} -> exit(reason)
     end
   end
 

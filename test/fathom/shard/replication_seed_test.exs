@@ -1360,7 +1360,10 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     # No `.seeding` temp should outlive a successful seed on any follower.
     for {name, _} <- followers do
       leftovers =
-        Follower.dir(name) |> File.ls!() |> Enum.filter(&String.ends_with?(&1, ".seeding"))
+        for d <- [Follower.dir(name), Follower.seed_temp_dir(name)],
+            entry <- File.ls!(d),
+            String.contains?(entry, ".seeding"),
+            do: entry
 
       assert leftovers == [], "#{name} leaked seed temps: #{inspect(leftovers)}"
     end

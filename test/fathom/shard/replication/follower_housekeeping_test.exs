@@ -85,9 +85,10 @@ defmodule Fathom.Shard.Replication.FollowerHousekeepingTest do
 
   describe "periodic seed-temp sweep (#19)" do
     test "a stale seed temp left by a killed worker is reaped without a restart", ctx do
-      %{name: name, dir: dir, id: id} = ctx
-      stale = Path.join(dir, "#{id}.db.seeding.12345")
-      fresh = Path.join(dir, "#{id}.db.seeding.67890")
+      %{name: name, id: id} = ctx
+      temps = Follower.seed_temp_dir(name)
+      stale = Path.join(temps, "#{id}.db.seeding.12345")
+      fresh = Path.join(temps, "#{id}.db.seeding.67890")
       File.write!(stale, "half a seed")
       File.write!(fresh, "a live seed")
       :ok = File.touch(stale, System.os_time(:second) - 3_600)
@@ -98,6 +99,83 @@ defmodule Fathom.Shard.Replication.FollowerHousekeepingTest do
 
       refute File.exists?(stale), "a dead seed's temp survived the periodic sweep"
       assert File.exists?(fresh), "the sweep removed a seed still being written"
+    end
+
+    # THE SWEEP NEVER LISTS THE REPLICA DIRECTORY (expert review 2026-10-21 r7 #10). Its only job is
+    # to find a handful of seed temps, yet it ran `File.ls` over the whole flat replica directory
+    # (~5 entries per followed shard) through `file_server_2` every 5 minutes: 200k entries cost
+    # 135 ms and +95 MB of transient heap, and every other non-raw file call on the node queued
+    # behind it. Pinned by tracing which directories the follower lists during one sweep.
+    test "the periodic sweep lists only the seed-temp subdirectory", ctx do
+      %{name: name, dir: dir, id: id} = ctx
+      # A replica beside the temps, so a listing of `dir` would have something to find.
+      File.write!(Follower.db_path(name, id), "db")
+      pid = Process.whereis(name)
+      _ = :sys.get_state(pid)
+
+      listed = trace_listings(pid, fn -> send(pid, :reap_seed_temps) end)
+
+      refute Enum.any?(listed, &(Path.expand(&1) == Path.expand(dir))),
+             "the periodic seed-temp sweep listed the whole replica directory: #{inspect(listed)}"
+
+      assert Enum.any?(listed, &(Path.expand(&1) == Path.expand(Follower.seed_temp_dir(name)))),
+             "fixture: the sweep listed nothing, so the refutation above proves nothing"
+    end
+
+    test "a seed's temps are written in the seed-temp subdirectory, not beside the replicas",
+         ctx do
+      %{name: name, dir: dir, id: id} = ctx
+
+      seeds =
+        Follower.begin_seed(name, %{}, %Protocol.SeedBegin{
+          shard_id: id,
+          epoch: 1,
+          wal_gen: 0,
+          salt1: 0,
+          wal_offset: 0,
+          db_size: 4,
+          wal_size: 0,
+          lineage: 1
+        })
+
+      seed = Map.fetch!(seeds, id)
+      assert Path.dirname(seed.db_temp) == Follower.seed_temp_dir(name)
+      assert Path.dirname(seed.wal_temp) == Follower.seed_temp_dir(name)
+      refute Enum.any?(File.ls!(dir), &String.contains?(&1, ".seeding"))
+
+      # And the install renames them into the replica directory.
+      seeds = Follower.write_chunk(seeds, id, :db, 0, "abcd")
+      assert {{:ok, 0}, %{}} = Follower.finish_seed(name, seeds, id)
+      assert File.read!(Follower.db_path(name, id)) == "abcd"
+      assert File.ls!(Follower.seed_temp_dir(name)) == []
+    end
+  end
+
+  # Every directory `pid` lists while `fun` runs, raw (`:prim_file`) or through `file_server_2`
+  # (`:file`), synchronised on `pid` having handled what `fun` sent it.
+  defp trace_listings(pid, fun) do
+    mfas = [{:prim_file, :list_dir, 1}, {:file, :list_dir, 1}]
+    for mfa <- mfas, do: :erlang.trace_pattern(mfa, true, [:local])
+    :erlang.trace(pid, true, [:call])
+
+    try do
+      fun.()
+      _ = :sys.get_state(pid)
+    after
+      :erlang.trace(pid, false, [:call])
+      for mfa <- mfas, do: :erlang.trace_pattern(mfa, false, [:local])
+    end
+
+    ref = :erlang.trace_delivered(pid)
+    assert_receive {:trace_delivered, ^pid, ^ref}, 5_000
+    collect_listings([])
+  end
+
+  defp collect_listings(acc) do
+    receive do
+      {:trace, _pid, :call, {_m, :list_dir, [d]}} -> collect_listings([to_string(d) | acc])
+    after
+      0 -> acc
     end
   end
 
