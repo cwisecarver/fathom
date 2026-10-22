@@ -3227,11 +3227,15 @@ defmodule Fathom.Shard.Replication.Follower do
   defp apply_write(name, %Protocol.Push{} = push, new_state, :append) do
     # ONE stat per append push (perf review 2026-10-14 #22): the precondition's size check and the
     # held-fd inode check both read the same path, so the info is taken once here and handed down.
-    stat = :file.read_file_info(wal_path(name, push.shard_id), [:raw])
+    # The path too, built and validated once per push, not twice (expert review 2026-10-21 r7 #25;
+    # `wal_path/2` keeps its shard-id assertion, which is a security control). POSIX times: only
+    # size and inode are read, and the default `:local` converts three timestamps per stat.
+    path = wal_path(name, push.shard_id)
+    stat = :file.read_file_info(path, [:raw, {:time, :posix}])
 
     case append_precondition(name, push.shard_id, push.offset, stat) do
       :ok ->
-        do_apply_write(name, push, new_state, :append, stat)
+        do_apply_write(name, push, new_state, :append, path, stat)
 
       :not_followed ->
         Protocol.encode_reject(push.shard_id, :unknown_shard, 0)
@@ -3251,9 +3255,11 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
-  defp apply_write(name, push, new_state, mode), do: do_apply_write(name, push, new_state, mode)
+  defp apply_write(name, push, new_state, mode),
+    do: do_apply_write(name, push, new_state, mode, wal_path(name, push.shard_id), nil)
 
-  # `stat` is `:file.read_file_info(path, [:raw])`; absent or unreadable counts as an empty WAL, as
+  # `stat` is `:file.read_file_info(path, [:raw, {:time, :posix}])`; absent or unreadable counts as
+  # an empty WAL, as
   # `wal_bytes/1` did. Size is element 1 of the raw `file_info` record.
   defp append_precondition(name, shard_id, offset, stat) do
     cond do
@@ -3266,11 +3272,7 @@ defmodule Fathom.Shard.Replication.Follower do
   defp stat_size({:ok, info}), do: elem(info, 1)
   defp stat_size(_), do: 0
 
-  defp do_apply_write(name, push, new_state, mode, stat \\ nil)
-
-  defp do_apply_write(name, %Protocol.Push{} = push, new_state, mode, stat) do
-    path = wal_path(name, push.shard_id)
-
+  defp do_apply_write(name, %Protocol.Push{} = push, new_state, mode, path, stat) do
     written =
       if mode == :append,
         do: write_held(path, push.offset, push.payload, stat),
@@ -3413,7 +3415,7 @@ defmodule Fathom.Shard.Replication.Follower do
 
         with {:ok, inode} <- expected,
              {:ok, fd} <- :file.open(path, [:read, :write, :raw, :binary]),
-             {:ok, info} <- :file.read_file_info(fd),
+             {:ok, info} <- :file.read_file_info(fd, [{:time, :posix}]),
              :ok <- same_inode(fd, inode, elem(info, 11)) do
           held = evict_oldest(held)
           {:ok, fd, Map.put(held, path, {fd, elem(info, 11), System.monotonic_time()})}
