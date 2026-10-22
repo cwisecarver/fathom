@@ -1666,8 +1666,11 @@ defmodule Fathom.Shard.Replication.Follower do
       case disk_free(name) do
         # Cannot read the volume — fail OPEN (as the removed WarmFollower did). Refusing to
         # replicate because a stat failed would turn an observability gap into a durability one.
-        :error -> true
-        {:ok, free} -> free - reserved_bytes(name) >= disk_free_floor_bytes()
+        :error ->
+          true
+
+        {:ok, free, free_inodes} ->
+          free - reserved_bytes(name) >= disk_free_floor_bytes() and inodes_ok?(free_inodes)
       end
 
     unless ok?, do: release_reservation(name, b.shard_id)
@@ -1736,19 +1739,46 @@ defmodule Fathom.Shard.Replication.Follower do
     ArgumentError -> :error
   end
 
+  # Bytes from `:disksup`, inodes from `df -Pi` (expert review 2026-10-21 r7 #24), read in parallel
+  # under one deadline. Each is independent: an unreadable inode count is `nil` (the inode floor is
+  # then skipped, fail-open like the byte check) and never costs the byte answer.
   defp read_disk_free(dir) do
-    task = Task.async(fn -> Fathom.Admin.Measurements.disk_info(dir) end)
+    bytes = Task.async(fn -> Fathom.Admin.Measurements.disk_info(dir) end)
+    inodes = Task.async(fn -> Fathom.Admin.Measurements.inode_info(dir) end)
 
-    case Task.yield(task, @disk_timeout_ms) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {:ok, %{free_bytes: free}}} -> {:ok, free}
+    [bytes_result, inodes_result] =
+      for {task, result} <- Task.yield_many([bytes, inodes], @disk_timeout_ms) do
+        result || Task.shutdown(task, :brutal_kill)
+      end
+
+    free_inodes =
+      case inodes_result do
+        {:ok, {:ok, %{free_inodes: n}}} -> n
+        _ -> nil
+      end
+
+    case bytes_result do
+      {:ok, {:ok, %{free_bytes: free}}} -> {:ok, free, free_inodes}
       _ -> :error
     end
   end
 
+  # INODE FLOOR (expert review 2026-10-21 r7 #24). A replica is 5 files, three of them sidecars under
+  # 64 bytes, so a follower of small tenants runs out of inodes (ext4: one per 16 KiB by default)
+  # while the byte floor still reads healthy, and every seed and sidecar write then fails ENOSPC.
+  # Refusing a new seed below this many free inodes is the same back-pressure as the byte floor. No
+  # per-seed reservation, unlike bytes: a seed creates at most ~5 files, which concurrent seeds cannot
+  # make matter against a floor of tens of thousands.
+  defp inodes_ok?(nil), do: true
+  defp inodes_ok?(free_inodes), do: free_inodes >= disk_free_floor_inodes()
+
+  defp disk_free_floor_inodes,
+    do: Application.get_env(:fathom, :replication_disk_free_floor_inodes, 50_000)
+
   defp refuse_seed(name, seeds, %Protocol.SeedBegin{} = b) do
     Logger.warning(
       "replication follower REFUSING to seed #{b.shard_id}: the replica volume (#{dir(name)}) is " <>
-        "below its free-space floor. That shard's RPO stays at its stored object — the pre-A2 " <>
+        "below its free-space floor (bytes or inodes). That shard's RPO stays at its stored object — the pre-A2 " <>
         "behaviour — which is correct; a full volume would instead break THIS node's own tenants, " <>
         "whose flushes and cold-open pulls all need the same disk. Raise " <>
         "REPLICATION_DISK_FREE_FLOOR_BYTES, give REPLICATION_DIR its own volume, or add space."

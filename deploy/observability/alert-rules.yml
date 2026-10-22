@@ -416,6 +416,18 @@ groups:
           description: "Durability is about to stop on this node: pulls and VACUUM INTO will fail while writes are still acked. Free space or drain the node NOW."
           runbook: docs/runbooks/operations.md#runbook-node-disk-full-shard_data_dir
 
+      # Expert review 2026-10-21 r7 #24: an A2 replica is 5 files (3 sidecars under 64 bytes), so a
+      # follower of small tenants runs out of inodes before bytes, and the byte alerts above stay
+      # quiet while every new file fails ENOSPC. Absent (no series) where df reports no inode table.
+      - alert: FathomInodesFillingUp
+        expr: fathom_node_disk_inodes_used_ratio > 0.85
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Inodes on {{ $labels.dir }} on {{ $labels.node }} are {{ $value | humanizePercentage }} used"
+          description: "The volume holding fathom's {{ $labels.dir }} directory is running out of inodes, not bytes. At 100% every new file fails ENOSPC (seeds, sidecars, pulls, snapshots) while the byte gauge still reads healthy. A2 follower seeds are refused first, below :replication_disk_free_floor_inodes (default 50,000 free). Re-create the filesystem with more inodes (mkfs -i) or a smaller tenant-per-volume count."
+          runbook: docs/runbooks/operations.md#runbook-node-disk-full-shard_data_dir
+
       - alert: FathomReplicationNoQuorumSlack
         # Phase 2 A2. Connected followers == the write quorum exactly: every commit still
         # succeeds, and losing one more follower fails every write on this node with
