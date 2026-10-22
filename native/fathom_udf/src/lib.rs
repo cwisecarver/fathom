@@ -461,7 +461,28 @@ fn register_misc(db: &Connection, det: FunctionFlags, nondet: FunctionFlags) -> 
         // statement-list walks while SQLite holds its mutex for the duration of this call.
         let conn = unsafe { ctx.get_connection() }?;
         let db = unsafe { conn.handle() };
-        Ok(unsafe { stmt_memused(db, want.as_deref()) })
+        Ok(unsafe { stmt_status(db, ffi::SQLITE_STMTSTATUS_MEMUSED, want.as_deref()) })
+    })?;
+
+    // `fathom_stmt_reprepares(sql)` (expert review 2026-10-21 r7 #1): how many times SQLite has
+    // transparently re-prepared the statement on THIS connection whose text is exactly `sql`
+    // (`sqlite3_stmt_status(SQLITE_STMTSTATUS_REPREPARE)`: a schema-cookie change, or an
+    // authorizer/pragma that invalidates it, makes the first step after it call
+    // `sqlite3_prepare` again INSIDE `sqlite3_step`). NULL if none is prepared; with a NULL
+    // argument, the sum over every statement. exqlite exposes no statement-status call and the
+    // re-prepare happens inside the step dispatch, so no dispatch counter can see it. The counter
+    // lives as long as the statement, so a pooled handle's carried cache shows its history. Same
+    // lookup and the same scope as `fathom_stmt_memused`: the calling connection's own statements.
+    db.create_scalar_function("fathom_stmt_reprepares", 1, nondet, |ctx| {
+        let want: Option<Vec<u8>> = match ctx.get_raw(0) {
+            ValueRef::Null => None,
+            ValueRef::Text(t) => Some(t.to_vec()),
+            _ => return Err(Error::InvalidFunctionParameterType(0, Type::Text)),
+        };
+        // SAFETY: as `fathom_stmt_memused` above.
+        let conn = unsafe { ctx.get_connection() }?;
+        let db = unsafe { conn.handle() };
+        Ok(unsafe { stmt_status(db, ffi::SQLITE_STMTSTATUS_REPREPARE, want.as_deref()) })
     })?;
 
     // `fathom_cache_used()` (expert review 2026-10-21 #15): the bytes of page cache THIS connection
@@ -480,18 +501,19 @@ fn register_misc(db: &Connection, det: FunctionFlags, nondet: FunctionFlags) -> 
     Ok(())
 }
 
-/// Walk the connection's prepared-statement list (`sqlite3_next_stmt`) for `fathom_stmt_memused`.
-/// `Some(sql)`: the MEMUSED of the first statement whose text is byte-equal to `sql`, else `None`.
+/// Walk the connection's prepared-statement list (`sqlite3_next_stmt`) for `fathom_stmt_memused`
+/// and `fathom_stmt_reprepares`; `op` is the `SQLITE_STMTSTATUS_*` counter to read (never reset).
+/// `Some(sql)`: the counter of the first statement whose text is byte-equal to `sql`, else `None`.
 /// `None`: the sum over every statement, including the one running this function.
 ///
 /// # Safety
 ///
 /// `db` must be the live handle of the connection executing the calling statement.
-unsafe fn stmt_memused(db: *mut ffi::sqlite3, want: Option<&[u8]>) -> Option<i64> {
+unsafe fn stmt_status(db: *mut ffi::sqlite3, op: i32, want: Option<&[u8]>) -> Option<i64> {
     let mut total: i64 = 0;
     let mut stmt = ffi::sqlite3_next_stmt(db, std::ptr::null_mut());
     while !stmt.is_null() {
-        let used = ffi::sqlite3_stmt_status(stmt, ffi::SQLITE_STMTSTATUS_MEMUSED, 0) as i64;
+        let used = ffi::sqlite3_stmt_status(stmt, op, 0) as i64;
         match want {
             None => total += used,
             Some(sql) => {

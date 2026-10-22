@@ -609,4 +609,47 @@ defmodule Fathom.BenchTest do
     assert is_float(us), "the listener/client did not come up - this measured nothing"
     assert us > 10 and us < 20_000, "wide round trip #{us}us outside the order-of-magnitude band"
   end
+
+  # r7 #2. Each flush-route arm asserts its OWN route inside the harness, so these guards only pin an
+  # order-of-magnitude floor/ceiling; the discrimination is the next test.
+  test "flush route arms (vacuum, drop, stub) report plausible numbers on their own routes" do
+    for {name, us} <- [
+          flush_vacuum_p50_us: Fathom.Bench.flush_vacuum_p50(trials: 2, flush_rows: 500),
+          drop_flush_p50_us: Fathom.Bench.drop_flush_p50(trials: 2, flush_rows: 500),
+          flush_stub_p50_us: Fathom.Bench.StorageIO.flush_stub(trials: 2, flush_rows: 500)
+        ] do
+      assert is_float(us), "#{name} returned #{inspect(us)}"
+      assert us > 100 and us < 5_000_000, "#{name} #{us}us outside the plausibility band"
+    end
+  end
+
+  # r7 #1. Both arms assert their own preconditions (pool hits, reply shapes) inside the harness and
+  # raise, so a number here means the pooled-reuse path really ran.
+  test "the Django pooled request and pooled-density arms report plausible numbers" do
+    us = Fathom.Bench.hrana_django_request_rt_us(hrana_rt_samples: 10)
+    assert is_float(us), "the listener/client did not come up - this measured nothing"
+    assert us > 50 and us < 200_000, "django request #{us}us outside the order-of-magnitude band"
+
+    kb = Fathom.Bench.served_pooled(served_n: 4, trials: 1, served_rows: 50)
+    assert is_float(kb)
+    assert kb > 20 and kb < 10_000, "served_pooled #{kb} KiB/shard outside the plausibility band"
+  end
+
+  # r7 #2 discrimination: `flush_p50_us` is documented as the pinned-live route and asserts it. With
+  # the pinned route disabled the same trials take the VACUUM route, and the arm must RAISE rather
+  # than silently change series. (Measured 2026-10-21: the 5 trials reported 5 x :vacuum.)
+  test "flush_p50_us raises when its trials leave the pinned-live route" do
+    prev = Application.get_env(:fathom, :flush_pinned_live_upload)
+    Application.put_env(:fathom, :flush_pinned_live_upload, false)
+
+    try do
+      assert_raise RuntimeError, ~r/pinned_live/, fn ->
+        Fathom.Bench.flush_p50(trials: 2, flush_rows: 500)
+      end
+    after
+      if is_nil(prev),
+        do: Application.delete_env(:fathom, :flush_pinned_live_upload),
+        else: Application.put_env(:fathom, :flush_pinned_live_upload, prev)
+    end
+  end
 end

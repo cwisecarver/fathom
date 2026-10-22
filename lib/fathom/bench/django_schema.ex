@@ -84,6 +84,39 @@ defmodule Fathom.Bench.DjangoSchema do
   @spec probe_table() :: String.t()
   def probe_table, do: "app_model_1"
 
+  @wide_cols 29
+
+  @doc "The 29-column table added by `build!(path, wide: true)` (the Django request arm)."
+  @spec wide_table() :: String.t()
+  def wide_table, do: "app_wide"
+
+  @doc """
+  A Django-shaped point SELECT over `app_wide`: every one of its #{@wide_cols} columns, each as a
+  qualified `"app_wide"."col"`, one `?` for the id, `LIMIT 21` (what `.get()` emits).
+  """
+  @spec wide_select_sql() :: String.t()
+  def wide_select_sql do
+    cols = Enum.map_join(wide_columns(), ", ", &~s("app_wide"."#{&1}"))
+    ~s(SELECT #{cols} FROM "app_wide" WHERE "app_wide"."id" = ? LIMIT 21)
+  end
+
+  @doc """
+  A Django-shaped three-way join (`select_related`): `app_wide` -> `auth_user` -> `app_model_1`,
+  36 selected columns (the 29 wide ones, 3 from the user, 4 from the model), one `?`.
+  """
+  @spec join_sql() :: String.t()
+  def join_sql do
+    wide = Enum.map_join(wide_columns(), ", ", &~s("app_wide"."#{&1}"))
+
+    ~s|SELECT #{wide}, "auth_user"."username", "auth_user"."email", "auth_user"."is_active", | <>
+      ~s|"app_model_1"."name", "app_model_1"."status", "app_model_1"."amount", "app_model_1"."notes" | <>
+      ~s|FROM "app_wide" INNER JOIN "auth_user" ON ("app_wide"."owner_id" = "auth_user"."id") | <>
+      ~s|INNER JOIN "app_model_1" ON ("app_model_1"."owner_id" = "auth_user"."id") | <>
+      ~s|WHERE "app_wide"."id" = ? LIMIT 21|
+  end
+
+  defp wide_columns, do: ["id", "owner_id" | Enum.map(1..(@wide_cols - 2), &"f#{&1}")]
+
   @doc """
   Creates the schema in the SQLite file at `path` (using its own connection, closed before this
   returns) and seeds `app_model_1` with `rows` rows. Returns the counted `%{tables, indexes}` so the
@@ -124,6 +157,8 @@ defmodule Fathom.Bench.DjangoSchema do
           )
       end
 
+      if Keyword.get(opts, :wide, false), do: build_wide!(conn, rows)
+
       {:ok, _} = Connection.query(conn, "COMMIT", [])
 
       count = fn type ->
@@ -141,6 +176,36 @@ defmodule Fathom.Bench.DjangoSchema do
     after
       Connection.close(conn)
     end
+  end
+
+  # The 29-column model of the Django request arm (opt-in: `served_django` keeps its table count).
+  defp build_wide!(conn, rows) do
+    fields = Enum.map_join(1..(@wide_cols - 2), ", ", &"f#{&1} varchar(40) NOT NULL")
+
+    {:ok, _} =
+      Connection.query(
+        conn,
+        "CREATE TABLE app_wide (id integer NOT NULL PRIMARY KEY AUTOINCREMENT, " <>
+          "owner_id integer NOT NULL REFERENCES auth_user (id), #{fields})",
+        []
+      )
+
+    {:ok, _} =
+      Connection.query(conn, "CREATE INDEX app_wide_owner_id_idx ON app_wide (owner_id)", [])
+
+    names = Enum.map_join(1..(@wide_cols - 2), ", ", &"f#{&1}")
+    marks = Enum.map_join(1..(@wide_cols - 2), ", ", fn _ -> "'v'" end)
+
+    for _ <- 1..rows do
+      {:ok, _} =
+        Connection.query(
+          conn,
+          "INSERT INTO app_wide (owner_id, #{names}) VALUES (1, #{marks})",
+          []
+        )
+    end
+
+    :ok
   end
 
   # One generated Django model: an auto id, two datetimes, a name, a FK, a status, a decimal, text
