@@ -68,6 +68,13 @@ idle tenants drop slightly before strictly necessary. It is off for a cap that c
 the headroom (≤ 32 with the minimum), or with `:pre_evict_headroom` 0. It reports
 `[:fathom,:shards,:pre_evicted]`.
 
+**One admission per cold shard** (expert review 2026-10-21 r7 #6). Concurrent first requests for
+the same cold shard share ONE admission (`Fathom.Shards.AdmissionFlight`): the first leads, the
+rest wait for its result and take it as their own, refusal included. Before, each ran the whole
+admission, so K requests for one cold tenant at the cap evicted K tenants (measured: 16 for K=16)
+and spent K novel-rate tokens. A follower that waits past 15 s admits by itself. Victims are
+claimed (`Lru.claim_eviction/1`, rv6 F10), so two admitters never count one freed slot twice.
+
 **2. `Fathom.Shards.NovelLimiter` — rate-limit how fast *unseen* ids mint new shards.** Gated
 `:novel_shard_rate` (off by default; `NOVEL_SHARD_RATE` in prod). Over budget ⇒ **429**, refused
 **before** any novel work runs (the S3 lock PUT + the Postgres directory row). Crucially, **existing

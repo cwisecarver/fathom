@@ -984,6 +984,9 @@ defmodule Fathom.Application do
       Fathom.Shards.MigrationGate,
       # Short negative cache for "held by another node" on cold checkouts (expert review 2026-10-14 N4).
       Fathom.Shards.HeldCache,
+      # Per-shard cold-admission single-flight tables (expert review 2026-10-21 r7 #6). Before the
+      # shard supervisor so the first cold open can lead a flight.
+      Fathom.Shards.AdmissionFlight,
       # Owns the per-shard write-counter ETS table (the dirty-flag signal, off the coordinator
       # mailbox — finding #27). Always on (a data-loss invariant), before the shard supervisor.
       Fathom.Shard.WriteCounter,

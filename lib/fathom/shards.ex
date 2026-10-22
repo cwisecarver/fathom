@@ -77,6 +77,13 @@ defmodule Fathom.Shards do
   # two agree rather than trusting this comment.
   @default_shard_shutdown_ms 60_000
 
+  # Per-shard admission single-flight (expert review 2026-10-21 r7 #6, see `admit/3`). A follower
+  # waits this long for the leader's admission, which is bounded by the eviction budget (2 s) plus
+  # the novelty read, the limiter call and an optional template fork; past it the follower admits
+  # by itself. Rejoins bound the re-resolve loop when a leader finishes or dies before sharing.
+  @admit_flight_wait_ms 15_000
+  @admit_flight_rejoins 3
+
   @typedoc """
   A held checkout: the coordinator, the ref that identifies THIS checkout, and the local file path.
 
@@ -1204,12 +1211,71 @@ defmodule Fathom.Shards do
                 {:error, held}
 
               true ->
-                shard_id |> start_if_capacity() |> note_start(shard_id, refusal_cache?)
+                admit(shard_id, refusal_cache?, @admit_flight_rejoins)
             end
 
           {:error, :unavailable} = unavailable ->
             unavailable
         end
+    end
+  end
+
+  # ONE ADMISSION PER COLD SHARD (expert review 2026-10-21 r7 #6). K concurrent first requests for
+  # one cold id used to run `start_if_capacity/1` K times: K evictions at the cap (measured: K=16
+  # evicted 16 tenants to admit one shard), K `NovelLimiter` tokens, K directory reads, K fork
+  # attempts; only `start/1` deduped, after all of it. Now the first caller leads and the rest take
+  # its result (`Fathom.Shards.AdmissionFlight`), so a refusal is inherited for that attempt.
+  #
+  # A follower whose leader finished before the result could be shared (or died) re-resolves from
+  # the Registry: the coordinator the leader started is normally there. `rejoins` bounds that loop;
+  # a follower that runs out of it, or out of `@admit_flight_wait_ms`, admits by itself as before
+  # (`start/1` still dedups), so the flight can delay an admission but never wedge one.
+  defp admit(shard_id, refusal_cache?, rejoins) do
+    case Fathom.Shards.AdmissionFlight.join(shard_id, @admit_flight_wait_ms) do
+      :leader ->
+        result =
+          try do
+            shard_id |> start_if_capacity() |> note_start(shard_id, refusal_cache?)
+          rescue
+            e ->
+              Fathom.Shards.AdmissionFlight.finish(shard_id, :retry)
+              reraise e, __STACKTRACE__
+          catch
+            kind, reason ->
+              Fathom.Shards.AdmissionFlight.finish(shard_id, :retry)
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          end
+
+        Fathom.Shards.AdmissionFlight.finish(shard_id, result)
+        result
+
+      {:shared, :retry} ->
+        readmit(shard_id, refusal_cache?, rejoins)
+
+      {:shared, result} ->
+        note_start(result, shard_id, refusal_cache?)
+
+      :retry ->
+        readmit(shard_id, refusal_cache?, rejoins)
+
+      :timeout ->
+        shard_id |> start_if_capacity() |> note_start(shard_id, refusal_cache?)
+    end
+  end
+
+  defp readmit(shard_id, refusal_cache?, rejoins) do
+    case registry_lookup(shard_id, true) do
+      {:ok, [{pid, _}]} ->
+        {:ok, pid}
+
+      {:ok, []} when rejoins > 0 ->
+        admit(shard_id, refusal_cache?, rejoins - 1)
+
+      {:ok, []} ->
+        shard_id |> start_if_capacity() |> note_start(shard_id, refusal_cache?)
+
+      {:error, :unavailable} = unavailable ->
+        unavailable
     end
   end
 
