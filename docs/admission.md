@@ -68,6 +68,21 @@ idle tenants drop slightly before strictly necessary. It is off for a cap that c
 the headroom (≤ 32 with the minimum), or with `:pre_evict_headroom` 0. It reports
 `[:fathom,:shards,:pre_evicted]`.
 
+Under **concurrent** admissions that alone bought nothing (expert review 2026-10-21 r7 #7): with
+K=16 admissions in flight the same probe measured p50 52-54 ms with the pre-evictor on, and half
+the admissions still evicted inline. Three changes, measured together at p50 29-30 ms (uncapped
+27-28) and 3-16 inline evictions of 160:
+- **Slot hand-off.** A pre-evictor drain of a clean victim *offers* the slot it will free. An
+  admission at the cap first *adopts* one offer (a CAS, so one slot serves one admission) and waits
+  for that victim's exit within its 2 s budget, instead of draining a victim of its own. A slot
+  that does not free (the victim took a connection) is reported at once and the admission walks
+  the LRU as before. An admission at the cap also wakes the pre-evictor.
+- **Parallelism scales with the deficit**: up to 32 victims per pass (8 before), of which at most 8
+  dirty, and below the FlushGate cap, since each dirty victim flushes before it drops.
+- **A claimed shard is not a candidate**: the LRU probe skips shards another process is already
+  evicting without counting them against its 16 probes, and a walk that met only such claims
+  adopts again instead of refusing `node_at_capacity` with idle shards right behind them.
+
 **One admission per cold shard** (expert review 2026-10-21 r7 #6). Concurrent first requests for
 the same cold shard share ONE admission (`Fathom.Shards.AdmissionFlight`): the first leads, the
 rest wait for its result and take it as their own, refusal included. Before, each ran the whole
