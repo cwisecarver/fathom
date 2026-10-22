@@ -1131,6 +1131,11 @@ defmodule Fathom.Shard do
         # [:fathom, :shard, :flush, :failed] telemetry, and ESCALATE to Logger.error past a
         # threshold so it's alertable. Reset to 0 on any durable flush.
         flush_failures: 0,
+        # The short retry delay the last TRANSIENT flush failure armed (`schedule_flush_after_failure/2`),
+        # or nil: no failure streak, or the last failure was permanent. `defer_flush/1` re-arms at it,
+        # so a retry tick that lands behind an in-flight renew / lapse revalidation keeps its short
+        # delay instead of falling back to the full interval (flush backoff deferral, 2026-10-22).
+        flush_retry_ms: nil,
         draining: false,
         drain_timer: nil,
         drain_reply_to: nil,
@@ -5083,7 +5088,7 @@ defmodule Fathom.Shard do
       "shard #{state.id}: durability flush recovered after #{state.flush_failures} consecutive failure(s)"
     )
 
-    %{state | flush_failures: 0}
+    %{state | flush_failures: 0, flush_retry_ms: nil}
   end
 
   defp flush_failure_alert_threshold,
@@ -6472,10 +6477,11 @@ defmodule Fathom.Shard do
     interval = flush_interval_ms()
 
     if permanent_flush_failure?(reason) or not (is_integer(interval) and interval > 0) do
-      schedule_flush(state)
+      schedule_flush(%{state | flush_retry_ms: nil})
     else
       doublings = min(max(state.flush_failures - 1, 0), 20)
-      schedule_flush_backoff(state, min(flush_backoff_ms() * Bitwise.bsl(1, doublings), interval))
+      delay = min(flush_backoff_ms() * Bitwise.bsl(1, doublings), interval)
+      schedule_flush_backoff(%{state | flush_retry_ms: delay}, delay)
     end
   end
 
@@ -6485,7 +6491,17 @@ defmodule Fathom.Shard do
 
   # A flush deferred behind another lease-touching operation (lapse revalidation, legacy renew): the
   # normal interval, unless a `:flush_now` caller is parked, which must not wait a whole interval
-  # (expert review 2026-10-13 #25).
+  # (expert review 2026-10-13 #25), or the deferred tick is a transient-failure RETRY.
+  #
+  # FLUSH BACKOFF DEFERRAL (found 2026-10-22, expert review 2026-10-19 #2 follow-up): neither the
+  # renew result nor the lapse verdict re-sends `:durability_flush`, so a backoff retry tick that
+  # landed while one was in flight went `schedule_flush/1` and waited a FULL interval — silently
+  # undoing the short retry for that cycle (an S3 503 then cost up to two intervals of object RPO
+  # again). Re-arm at the retry's own delay instead. Still deferred, never run past the guard: the
+  # re-armed tick re-checks the in-flight renew / revalidation like any other.
+  defp defer_flush(%{flush_waiters: [], flush_retry_ms: ms} = state) when is_integer(ms),
+    do: schedule_flush_backoff(state, ms)
+
   defp defer_flush(%{flush_waiters: []} = state), do: schedule_flush(state)
   defp defer_flush(state), do: schedule_flush_backoff(state)
 

@@ -182,6 +182,70 @@ defmodule Fathom.ShardFlushFailureBackoffTest do
     end
   end
 
+  # FLUSH BACKOFF DEFERRAL (found 2026-10-22, expert review 2026-10-19 #2 follow-up). A backoff retry
+  # tick that lands while a lease-touching operation is in flight — the legacy `renew_task`, or the
+  # heartbeat-mode lapse revalidation task — is deferred, and `defer_flush/1` re-armed it at the
+  # FULL interval (60 s here) whenever no `:flush_now` waiter was parked. Neither the renew result
+  # nor the lapse verdict re-sends `:durability_flush`, so the short retry was silently undone for
+  # that cycle. The invariant: a deferred transient-failure retry stays on the short backoff.
+  #
+  # The in-flight operation is a stand-in `%Task{}` installed with `:sys.replace_state/2`, which is
+  # exactly the state a real one produces for the guard (it matches only on `%Task{}` / non-nil);
+  # a real renew / `check_lease` GET is too short to land a tick inside deterministically. It is
+  # removed before healing, and a real one already in flight is left alone (same guard verdict).
+  for {mode, field} <- [legacy: :renew_task, heartbeat: :lapse_revalidate_pending] do
+    describe "retry tick deferred behind #{field} (#{mode})" do
+      setup do: set_mode!(unquote(mode))
+
+      test "keeps the short backoff instead of the full interval", %{shard: shard} do
+        field = unquote(field)
+        seed!(shard)
+        {:ok, coordinator} = Shards.ensure(shard)
+        assert_mode!(coordinator, unquote(mode))
+
+        Application.put_env(:fathom, :storage_fault, :flush)
+        capture_log(fn -> [{1, _}] = collect_attempts(coordinator, 1) end)
+
+        fake = %Task{ref: make_ref(), pid: nil, owner: coordinator, mfa: {__MODULE__, :fake, 0}}
+
+        :sys.replace_state(coordinator, fn st ->
+          if match?(%Task{}, Map.fetch!(st, field)), do: st, else: Map.put(st, field, fake)
+        end)
+
+        # The retry tick, landing while the operation is in flight (the armed backoff timer may
+        # beat it here; it defers the same way).
+        send(coordinator, :durability_flush)
+        st = :sys.get_state(coordinator)
+        assert match?(%Task{}, Map.fetch!(st, field)), "the in-flight operation was not in place"
+        assert st.flush_failures >= 1 and st.flush_waiters == []
+
+        left = is_reference(st.flush_timer) && Process.read_timer(st.flush_timer)
+
+        assert is_integer(left) and left <= 10 * @backoff_ms,
+               "deferred retry re-armed at #{inspect(left)} ms, not the #{@backoff_ms} ms backoff " <>
+                 "(the full interval is #{@interval_ms} ms)"
+
+        # The operation completes and the store heals: the re-armed retry lands the shard clean.
+        :sys.replace_state(coordinator, fn st ->
+          if Map.fetch!(st, field) == fake, do: Map.put(st, field, mode_idle(field)), else: st
+        end)
+
+        Application.delete_env(:fathom, :storage_fault)
+
+        assert_eventually(
+          fn ->
+            state = :sys.get_state(coordinator)
+            state.flush_failures == 0 and not Shard.dirty?(coordinator)
+          end,
+          fn -> heal_diagnosis(coordinator) end
+        )
+      end
+    end
+  end
+
+  defp mode_idle(:renew_task), do: nil
+  defp mode_idle(:lapse_revalidate_pending), do: false
+
   describe "ownership unconfirmed (heartbeat alive, deadline lapsed)" do
     setup do: set_mode!(:heartbeat)
 
