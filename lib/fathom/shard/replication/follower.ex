@@ -706,7 +706,7 @@ defmodule Fathom.Shard.Replication.Follower do
 
     in_side_process(fn ->
       entries = list_dir(dir)
-      reap_stale_seed_temps(dir, entries)
+      reap_legacy_seed_temps(dir, entries)
       erase_tombstoned_replicas(name, entries)
     end)
 
@@ -2321,8 +2321,8 @@ defmodule Fathom.Shard.Replication.Follower do
   # keep its files: a live seed writes a chunk at least every few seconds, and the Session abandons
   # one after `@default_seed_expiry_ms` (120 s), so a temp untouched for `@stale_seed_temp_s` is
   # dead. Matches the pre-unique `<shard>.db.seeding` name too, so an upgrade does not strand those.
-  # Run over `seed_temp_dir/1` at boot and every `seed_temp_reap_ms`, and over the flat replica
-  # directory once at boot for temps written there before the subdirectory (r7 #10).
+  # Run over `seed_temp_dir/1` at boot and every `seed_temp_reap_ms`. The flat replica directory's
+  # pre-subdirectory temps (r7 #10) are reaped once at boot, ungated: `reap_legacy_seed_temps/2`.
   @stale_seed_temp_s 15 * 60
 
   defp reap_stale_seed_temps(dir, entries) do
@@ -2341,6 +2341,22 @@ defmodule Fathom.Shard.Replication.Follower do
 
     if reaped > 0,
       do: Logger.info("replication follower reaped #{reaped} stale seed temp(s) in #{dir}")
+  end
+
+  # THE FLAT DIRECTORY IS REAPED WITHOUT THE AGE GATE (expert review 2026-10-21 rv7 F3). Since r7
+  # #10 every seed writes its temps under `seed_temp_dir/1`, so a `.seeding` name in the flat replica
+  # directory was written by a pre-upgrade build — a VM that is gone, whose seed cannot still be
+  # streaming (the age gate exists for a live seed surviving a Follower restart within ONE VM, and
+  # that seed writes into the subdirectory). Age-gating it here left any such temp younger than
+  # `@stale_seed_temp_s` at the upgrade boot stranded for good: nothing lists this directory again.
+  defp reap_legacy_seed_temps(dir, entries) do
+    reaped =
+      entries
+      |> Enum.filter(&String.contains?(&1, @seeding_marker))
+      |> Enum.count(&(Fathom.FS.rm(Path.join(dir, &1)) == :ok))
+
+    if reaped > 0,
+      do: Logger.info("replication follower reaped #{reaped} pre-upgrade seed temp(s) in #{dir}")
   end
 
   defp reap_seed_temp_dir(name) do

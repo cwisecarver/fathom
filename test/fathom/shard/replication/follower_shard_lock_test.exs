@@ -233,7 +233,11 @@ defmodule Fathom.Shard.Replication.FollowerShardLockTest do
     refute File.exists?(stale), "a dead seed's temp survived the follower start"
     refute File.exists?(legacy), "a pre-upgrade fixed-name temp survived the follower start"
 
-    assert File.exists?(fresh), "a possibly-live seed's temp was reaped"
+    # Expert review 2026-10-21 rv7 F3: this used to assert the FRESH flat-directory temp survived.
+    # Since r7 #10 no seed writes there, so a flat `.seeding` name is from a pre-upgrade VM and
+    # cannot be live — and the boot listing is the only one the flat directory gets, so an
+    # age-gated survivor was stranded forever. The age gate still protects the subdirectory.
+    refute File.exists?(fresh), "a fresh pre-upgrade temp in the flat directory was stranded"
     refute File.exists?(sub_stale), "a dead seed's temp in the seed-temp directory survived"
     assert File.exists?(sub_fresh), "a possibly-live seed's temp was reaped"
   end
