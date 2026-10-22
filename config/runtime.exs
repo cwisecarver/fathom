@@ -925,6 +925,22 @@ case env_bool.("REPLICATION_DEFERRED_WAL_SYNC") do
   v -> config :fathom, :replication_deferred_wal_sync, v
 end
 
+# REPLICATION-PATH SCHEDULING PRIORITY (expert review 2026-10-21 r7 #12): normal | hubs | all.
+# DEFAULT normal, i.e. unchanged, until the rig A/B (tpc-tail 1024, replication on, alternating
+# modes) shows commit_stage{stage=build} and commit_total p99 drop without tenant read p99 rising
+# 20% or more. `hubs` runs the Shipper, Writer, follower reader and workers at :high; `all` adds
+# every Session and its deferred-sync task. See `Fathom.Shard.Replication.Priority`. A value outside
+# the three refuses to boot.
+if v = System.get_env("REPLICATION_PROCESS_PRIORITY") do
+  case Fathom.Shard.Replication.Priority.parse(v) do
+    {:ok, mode} ->
+      config :fathom, :replication_process_priority, mode
+
+    :error ->
+      raise "REPLICATION_PROCESS_PRIORITY must be normal, hubs or all, got #{inspect(v)}"
+  end
+end
+
 # Let a cold open serve a local REPLICA when it is provably newer than the stored object — the
 # failover half of A2, and the only thing that actually turns node-loss RPO from ~300 s into ~0.
 #

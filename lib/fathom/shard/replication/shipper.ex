@@ -45,6 +45,7 @@ defmodule Fathom.Shard.Replication.Shipper do
   require Logger
 
   alias Fathom.Shard.Replication.Budget
+  alias Fathom.Shard.Replication.Priority
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Shipper.Writer
 
@@ -198,6 +199,10 @@ defmodule Fathom.Shard.Replication.Shipper do
   @impl true
   def init(opts) do
     name = Keyword.get(opts, :name)
+
+    # A per-link hub: `:high` under REPLICATION_PROCESS_PRIORITY=hubs|all (expert review 2026-10-21
+    # r7 #12). See `Fathom.Shard.Replication.Priority`.
+    Priority.adopt(:hub)
 
     # A FRESH counter per incarnation, and that is the point rather than initialisation hygiene.
     # A shipper killed with a full mailbox never runs the `Budget.release/2` calls its queued
