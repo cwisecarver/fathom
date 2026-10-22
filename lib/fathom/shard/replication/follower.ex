@@ -137,6 +137,10 @@ defmodule Fathom.Shard.Replication.Follower do
   @default_lock_wait_ms 50
   @default_lock_max_ms 180_000
 
+  # The seed-temp subdirectory of the replica dir (expert review 2026-10-21 r7 #10); see
+  # `seed_temp_dir/1`.
+  @seed_temp_subdir ".seed-temps"
+
   @typedoc "Proof of holding a shard's lock, handed back to `unlock_shard/2`."
   @type lock_token :: {:held, {String.t(), pid(), integer()}} | :reentrant
 
@@ -364,6 +368,38 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
+  @doc """
+  `forget/2`, but only when this follower holds something of `shard_id`: a resident row, or a
+  `.db` or `-wal` on disk. Otherwise `:ok` with no lock and no unlinks.
+
+  For the BULK tombstone loads (expert review 2026-10-21 r7 #22). `Tombstones` learns every
+  lifetime deletion at boot, and since the lazy follower boot (2026-10-21 #5) nothing is resident
+  then, so an unconditional `forget/2` per id cost a lock plus 6 ENOENT unlinks for a replica that
+  almost never exists: 100k lifetime deletions measured 13.5 s on macOS, inside the `Tombstones`
+  GenServer, every boot on every node. The check is two raw stats and an ETS read.
+
+  Why skipping is safe: a replica is its `.db` + `-wal` (the tenant's data) plus the row. When
+  neither file exists and no row is resident there is nothing to erase, and nothing can bring one
+  back for a tombstoned id: a push needs a row (`state_of/2` refuses to derive one for a tombstoned
+  shard), `begin_seed/3` refuses it, and `finish_seed/3` re-checks the tombstone under the seed's
+  lock. What is left unerased in that case is at most a sidecar (`.lineage`, `.ordinal`,
+  `.position`, `.torn`: a number, no tenant data) stranded by a crash inside an earlier forget.
+  """
+  @spec forget_if_present(atom(), String.t()) :: :ok
+  def forget_if_present(name \\ __MODULE__, shard_id) do
+    if replica_present?(name, shard_id), do: forget(name, shard_id), else: :ok
+  end
+
+  defp replica_present?(name, shard_id) do
+    :ets.member(table(name), shard_id) or replica_files?(name, shard_id)
+  rescue
+    # No follower table, or an id that cannot name a file: there is no replica of it here.
+    ArgumentError -> false
+  end
+
+  defp replica_files?(name, shard_id),
+    do: Fathom.FS.exists?(db_path(name, shard_id)) or Fathom.FS.exists?(wal_path(name, shard_id))
+
   defp forget_lock_wait_ms,
     do: Application.get_env(:fathom, :replication_forget_lock_wait_ms, 2_000)
 
@@ -561,6 +597,7 @@ defmodule Fathom.Shard.Replication.Follower do
     name = Keyword.get(opts, :name, __MODULE__)
     dir = Keyword.get(opts, :dir) || default_dir()
     File.mkdir_p!(dir)
+    File.mkdir_p!(Path.join(dir, @seed_temp_subdir))
 
     # `write_concurrency` because every connection handler writes its own shards' rows; the
     # GenServer owns the table only so the state dies with it.
@@ -647,11 +684,23 @@ defmodule Fathom.Shard.Replication.Follower do
   # After the listener: a directory listing, no per-replica derive. Runs in this GenServer, which
   # nothing on the push/ask/promote path waits on (they use the ETS tables directly), so it delays
   # only `port/1` and the timers. Tests sync on it with `:sys.get_state/1`.
+  #
+  # The ONE full listing of the replica directory this follower makes (expert review 2026-10-21 r7
+  # #10): the tombstone erase needs every `.db`, and seed temps from before the subdirectory move sat
+  # in the flat directory. It is raw (no `file_server_2` hop, so no other process's file call queues
+  # behind it) and runs in a short-lived process, so the O(replicas) name list and its garbage die
+  # with that process instead of growing this GenServer's heap.
   def handle_continue(:boot_housekeeping, state) do
-    dir = dir(state.name)
-    entries = list_dir(dir)
-    reap_stale_seed_temps(dir, entries)
-    erase_tombstoned_replicas(state.name, entries)
+    name = state.name
+    dir = dir(name)
+
+    in_side_process(fn ->
+      entries = list_dir(dir)
+      reap_stale_seed_temps(dir, entries)
+      erase_tombstoned_replicas(name, entries)
+    end)
+
+    reap_seed_temp_dir(name)
     {:noreply, state}
   end
 
@@ -677,9 +726,11 @@ defmodule Fathom.Shard.Replication.Follower do
   # PERIODIC SEED-TEMP SWEEP (expert review 2026-10-10 #19). Since 8162cf3 seed temps are unique per
   # seed, so a worker killed in `close_connection/1` leaves files nothing replaces; the boot reaper
   # alone let them accumulate for the life of the node. Same age gate, run on a timer.
+  #
+  # Lists ONLY the seed-temp subdirectory (expert review 2026-10-21 r7 #10), never the replica
+  # directory: the sweep's cost is now the number of temps (usually zero), not the number of replicas.
   def handle_info(:reap_seed_temps, state) do
-    dir = dir(state.name)
-    reap_stale_seed_temps(dir, list_dir(dir))
+    reap_seed_temp_dir(state.name)
     schedule_seed_temp_reap()
     {:noreply, state}
   end
@@ -1622,8 +1673,11 @@ defmodule Fathom.Shard.Replication.Follower do
       case disk_free(name) do
         # Cannot read the volume — fail OPEN (as the removed WarmFollower did). Refusing to
         # replicate because a stat failed would turn an observability gap into a durability one.
-        :error -> true
-        {:ok, free} -> free - reserved_bytes(name) >= disk_free_floor_bytes()
+        :error ->
+          true
+
+        {:ok, free, free_inodes} ->
+          free - reserved_bytes(name) >= disk_free_floor_bytes() and inodes_ok?(free_inodes)
       end
 
     unless ok?, do: release_reservation(name, b.shard_id)
@@ -1692,19 +1746,46 @@ defmodule Fathom.Shard.Replication.Follower do
     ArgumentError -> :error
   end
 
+  # Bytes from `:disksup`, inodes from `df -Pi` (expert review 2026-10-21 r7 #24), read in parallel
+  # under one deadline. Each is independent: an unreadable inode count is `nil` (the inode floor is
+  # then skipped, fail-open like the byte check) and never costs the byte answer.
   defp read_disk_free(dir) do
-    task = Task.async(fn -> Fathom.Admin.Measurements.disk_info(dir) end)
+    bytes = Task.async(fn -> Fathom.Admin.Measurements.disk_info(dir) end)
+    inodes = Task.async(fn -> Fathom.Admin.Measurements.inode_info(dir) end)
 
-    case Task.yield(task, @disk_timeout_ms) || Task.shutdown(task, :brutal_kill) do
-      {:ok, {:ok, %{free_bytes: free}}} -> {:ok, free}
+    [bytes_result, inodes_result] =
+      for {task, result} <- Task.yield_many([bytes, inodes], @disk_timeout_ms) do
+        result || Task.shutdown(task, :brutal_kill)
+      end
+
+    free_inodes =
+      case inodes_result do
+        {:ok, {:ok, %{free_inodes: n}}} -> n
+        _ -> nil
+      end
+
+    case bytes_result do
+      {:ok, {:ok, %{free_bytes: free}}} -> {:ok, free, free_inodes}
       _ -> :error
     end
   end
 
+  # INODE FLOOR (expert review 2026-10-21 r7 #24). A replica is 5 files, three of them sidecars under
+  # 64 bytes, so a follower of small tenants runs out of inodes (ext4: one per 16 KiB by default)
+  # while the byte floor still reads healthy, and every seed and sidecar write then fails ENOSPC.
+  # Refusing a new seed below this many free inodes is the same back-pressure as the byte floor. No
+  # per-seed reservation, unlike bytes: a seed creates at most ~5 files, which concurrent seeds cannot
+  # make matter against a floor of tens of thousands.
+  defp inodes_ok?(nil), do: true
+  defp inodes_ok?(free_inodes), do: free_inodes >= disk_free_floor_inodes()
+
+  defp disk_free_floor_inodes,
+    do: Application.get_env(:fathom, :replication_disk_free_floor_inodes, 50_000)
+
   defp refuse_seed(name, seeds, %Protocol.SeedBegin{} = b) do
     Logger.warning(
       "replication follower REFUSING to seed #{b.shard_id}: the replica volume (#{dir(name)}) is " <>
-        "below its free-space floor. That shard's RPO stays at its stored object — the pre-A2 " <>
+        "below its free-space floor (bytes or inodes). That shard's RPO stays at its stored object — the pre-A2 " <>
         "behaviour — which is correct; a full volume would instead break THIS node's own tenants, " <>
         "whose flushes and cold-open pulls all need the same disk. Raise " <>
         "REPLICATION_DISK_FREE_FLOOR_BYTES, give REPLICATION_DIR its own volume, or add space."
@@ -1729,10 +1810,11 @@ defmodule Fathom.Shard.Replication.Follower do
   # overtaken holder alive — so each seed's files must be its own, and the paths ride in its state.
   defp open_seed_temps(name, seeds, %Protocol.SeedBegin{} = b, lock) do
     tag = Integer.to_string(System.unique_integer([:positive]))
-    db_temp = seeding_path(db_path(name, b.shard_id), tag)
-    wal_temp = seeding_path(wal_path(name, b.shard_id), tag)
+    db_temp = seeding_path(name, db_path(name, b.shard_id), tag)
+    wal_temp = seeding_path(name, wal_path(name, b.shard_id), tag)
 
-    with {:ok, db_fd} <- :file.open(db_temp, [:write, :raw, :binary]),
+    with :ok <- ensure_seed_temp_dir(name),
+         {:ok, db_fd} <- :file.open(db_temp, [:write, :raw, :binary]),
          {:ok, wal_fd} <- open_or_close(wal_temp, db_fd) do
       Map.put(seeds, b.shard_id, %{
         name: name,
@@ -2190,7 +2272,36 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   @seeding_marker ".seeding"
-  defp seeding_path(path, tag), do: path <> @seeding_marker <> "." <> tag
+
+  # SEED TEMPS LIVE IN THEIR OWN SUBDIRECTORY (expert review 2026-10-21 r7 #10). They used to sit
+  # beside the replicas as `<dir>/<id>.db.seeding.<tag>`, so the periodic reaper, whose only job is
+  # to find a handful of them, had to list the WHOLE replica directory (~5 entries per followed
+  # shard) through `file_server_2`: 200k entries measured 135 ms, +95 MB transient heap in this
+  # GenServer, and a concurrent non-raw file call blocked 91.5 ms behind it, every 5 minutes, growing
+  # linearly with the replicas this node follows. Now the reaper lists only this subdirectory.
+  #
+  # The install `rename/2` from here into `<dir>` stays atomic: a subdirectory of the same directory
+  # is on the same filesystem (it is created here, never mounted over). The name starts with a dot
+  # and carries no `.db`/`.seeding`, so neither the tombstone erase's `.db` filter nor the boot
+  # reaper's legacy `.seeding` match can mistake the directory itself for a replica or a temp.
+  # (`@seed_temp_subdir` is defined at the top of the module: `init/1` creates it.)
+  @doc false
+  # Where this follower's in-flight seed temps live. Public for the tests.
+  @spec seed_temp_dir(atom()) :: Path.t()
+  def seed_temp_dir(name \\ __MODULE__), do: Path.join(dir(name), @seed_temp_subdir)
+
+  # Created by `init/1`; re-created here (one raw mkdir per seed, which is rare) so a directory
+  # removed underneath a running follower refuses nothing.
+  defp ensure_seed_temp_dir(name) do
+    case :prim_file.make_dir(seed_temp_dir(name)) do
+      :ok -> :ok
+      {:error, :eexist} -> :ok
+      {:error, _} = err -> err
+    end
+  end
+
+  defp seeding_path(name, path, tag),
+    do: Path.join(seed_temp_dir(name), Path.basename(path) <> @seeding_marker <> "." <> tag)
 
   # THE BOOT REAPER for seed temps (expert review 2026-10-08 #5 tier c). Unique names mean a seed
   # whose worker was killed (`close_connection/1`'s `@worker_stop_ms`), or whose follower died under
@@ -2200,6 +2311,8 @@ defmodule Fathom.Shard.Replication.Follower do
   # keep its files: a live seed writes a chunk at least every few seconds, and the Session abandons
   # one after `@default_seed_expiry_ms` (120 s), so a temp untouched for `@stale_seed_temp_s` is
   # dead. Matches the pre-unique `<shard>.db.seeding` name too, so an upgrade does not strand those.
+  # Run over `seed_temp_dir/1` at boot and every `seed_temp_reap_ms`, and over the flat replica
+  # directory once at boot for temps written there before the subdirectory (r7 #10).
   @stale_seed_temp_s 15 * 60
 
   defp reap_stale_seed_temps(dir, entries) do
@@ -2220,10 +2333,31 @@ defmodule Fathom.Shard.Replication.Follower do
       do: Logger.info("replication follower reaped #{reaped} stale seed temp(s) in #{dir}")
   end
 
+  defp reap_seed_temp_dir(name) do
+    temps = seed_temp_dir(name)
+    reap_stale_seed_temps(temps, list_dir(temps))
+  end
+
+  # RAW (expert review 2026-10-21 r7 #10): `File.ls/1` is a `file_server_2` call that builds the
+  # whole name list in that shared process and copies it to the caller; `:prim_file` does the
+  # readdir in the calling process.
   defp list_dir(dir) do
-    case File.ls(dir) do
-      {:ok, entries} -> entries
+    case :prim_file.list_dir(dir) do
+      {:ok, entries} -> Enum.map(entries, &IO.chardata_to_string/1)
       {:error, _} -> []
+    end
+  end
+
+  # Runs `fun` in a monitored side process and waits for it, so whatever it allocates is freed when
+  # it exits rather than left on this GenServer's heap. No timeout, deliberately: the listing is
+  # O(replicas), nothing on the push/ask/promote path waits on this GenServer, and a timeout here
+  # would only crash the listener. A crash in `fun` exits this process, as the inline call did.
+  defp in_side_process(fun) do
+    {pid, ref} = spawn_monitor(fn -> exit({:done, fun.()}) end)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, {:done, result}} -> result
+      {:DOWN, ^ref, :process, ^pid, reason} -> exit(reason)
     end
   end
 
@@ -2351,7 +2485,12 @@ defmodule Fathom.Shard.Replication.Follower do
       # in `handle_continue` (expert review 2026-10-21 rv6 F11 corrected the old claim that it was
       # loaded when the Follower starts). An id it has not loaded yet is erased when it is learned,
       # through `Tombstones`' erase hook, which calls `forget/2` once this Follower is running.
-      forget(name, shard_id)
+      #
+      # Only when there is something to erase (expert review 2026-10-21 r7 #22): this runs on every
+      # `state_of/2` of a tombstoned id with no resident row (a straggling push, an ask), and the
+      # forget it ran cost 6 unlinks of files that, after the first erase, never exist. No row is
+      # resident here (`rederive_locked/2` only gets here without one), and the lock is held.
+      if replica_files?(name, shard_id), do: forget(name, shard_id)
       false
     else
       recover_live_shard(tab, name, shard_id)
@@ -3095,11 +3234,15 @@ defmodule Fathom.Shard.Replication.Follower do
   defp apply_write(name, %Protocol.Push{} = push, new_state, :append) do
     # ONE stat per append push (perf review 2026-10-14 #22): the precondition's size check and the
     # held-fd inode check both read the same path, so the info is taken once here and handed down.
-    stat = :file.read_file_info(wal_path(name, push.shard_id), [:raw])
+    # The path too, built and validated once per push, not twice (expert review 2026-10-21 r7 #25;
+    # `wal_path/2` keeps its shard-id assertion, which is a security control). POSIX times: only
+    # size and inode are read, and the default `:local` converts three timestamps per stat.
+    path = wal_path(name, push.shard_id)
+    stat = :file.read_file_info(path, [:raw, {:time, :posix}])
 
     case append_precondition(name, push.shard_id, push.offset, stat) do
       :ok ->
-        do_apply_write(name, push, new_state, :append, stat)
+        do_apply_write(name, push, new_state, :append, path, stat)
 
       :not_followed ->
         Protocol.encode_reject(push.shard_id, :unknown_shard, 0)
@@ -3119,9 +3262,11 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
-  defp apply_write(name, push, new_state, mode), do: do_apply_write(name, push, new_state, mode)
+  defp apply_write(name, push, new_state, mode),
+    do: do_apply_write(name, push, new_state, mode, wal_path(name, push.shard_id), nil)
 
-  # `stat` is `:file.read_file_info(path, [:raw])`; absent or unreadable counts as an empty WAL, as
+  # `stat` is `:file.read_file_info(path, [:raw, {:time, :posix}])`; absent or unreadable counts as
+  # an empty WAL, as
   # `wal_bytes/1` did. Size is element 1 of the raw `file_info` record.
   defp append_precondition(name, shard_id, offset, stat) do
     cond do
@@ -3134,11 +3279,7 @@ defmodule Fathom.Shard.Replication.Follower do
   defp stat_size({:ok, info}), do: elem(info, 1)
   defp stat_size(_), do: 0
 
-  defp do_apply_write(name, push, new_state, mode, stat \\ nil)
-
-  defp do_apply_write(name, %Protocol.Push{} = push, new_state, mode, stat) do
-    path = wal_path(name, push.shard_id)
-
+  defp do_apply_write(name, %Protocol.Push{} = push, new_state, mode, path, stat) do
     written =
       if mode == :append,
         do: write_held(path, push.offset, push.payload, stat),
@@ -3281,7 +3422,7 @@ defmodule Fathom.Shard.Replication.Follower do
 
         with {:ok, inode} <- expected,
              {:ok, fd} <- :file.open(path, [:read, :write, :raw, :binary]),
-             {:ok, info} <- :file.read_file_info(fd),
+             {:ok, info} <- :file.read_file_info(fd, [{:time, :posix}]),
              :ok <- same_inode(fd, inode, elem(info, 11)) do
           held = evict_oldest(held)
           {:ok, fd, Map.put(held, path, {fd, elem(info, 11), System.monotonic_time()})}

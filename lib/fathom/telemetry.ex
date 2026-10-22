@@ -674,6 +674,21 @@ defmodule Fathom.Telemetry do
         tags: [:dir],
         description: "Used fraction of the volume holding this directory (1.0 = full)"
       ),
+      last_value("fathom.node.disk.free_inodes",
+        event_name: [:fathom, :node, :disk],
+        measurement: :free_inodes,
+        tags: [:dir],
+        description:
+          "Free inodes on the volume holding this directory (dir=data|replica). An A2 replica is " <>
+            "5 files, so small tenants exhaust inodes before bytes; absent where df reports none"
+      ),
+      last_value("fathom.node.disk.inodes_used_ratio",
+        event_name: [:fathom, :node, :disk],
+        measurement: :inodes_used_ratio,
+        tags: [:dir],
+        description:
+          "Used fraction of the inodes of the volume holding this directory (1.0 = full)"
+      ),
       last_value("fathom.replication.followers.connected",
         event_name: [:fathom, :replication, :followers],
         measurement: :connected,

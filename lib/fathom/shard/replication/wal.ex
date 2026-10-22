@@ -404,10 +404,13 @@ defmodule Fathom.Shard.Replication.Wal do
   # already uses for its own stats.
   # (`File.stat/2`'s spec does not admit `:raw`, and passing it made dialyzer drop `read/1`'s
   # return type and cascade through 100+ callers, so this reads the `file_info` record directly.)
+  # POSIX TIMES (expert review 2026-10-21 r7 #25): the default `time: :local` converts atime, mtime
+  # and ctime to local time on every stat (3 `universaltime_to_localtime` calls, which take the libc
+  # tz lock), and only size and inode are read here.
   @spec stat(Path.t()) ::
           {:ok, %{size: non_neg_integer(), inode: non_neg_integer()}} | {:error, :file.posix()}
   defp stat(path) do
-    case :file.read_file_info(path, [:raw]) do
+    case :file.read_file_info(path, [:raw, {:time, :posix}]) do
       {:ok, info} -> {:ok, %{size: file_info(info, :size), inode: file_info(info, :inode)}}
       {:error, _} = error -> error
     end

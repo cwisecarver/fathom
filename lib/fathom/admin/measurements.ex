@@ -365,18 +365,80 @@ defmodule Fathom.Admin.Measurements do
         {:ok, %{total_bytes: total, free_bytes: free}} <- [disk_info(path)] do
       if label == "data", do: put_data_free_bytes(free)
 
-      :telemetry.execute(
-        [:fathom, :node, :disk],
+      measurements =
         %{
           free_bytes: free,
           total_bytes: total,
           used_ratio: safe_ratio(total - free, total)
-        },
-        %{dir: label}
-      )
+        }
+        |> Map.merge(inode_measurements(path))
+
+      :telemetry.execute([:fathom, :node, :disk], measurements, %{dir: label})
     end
 
     :ok
+  end
+
+  # INODES, NOT ONLY BYTES (expert review 2026-10-21 r7 #24). An A2 replica is 5 files (`.db`,
+  # `-wal` and three sidecars of under 64 bytes), so a follower of small tenants exhausts ext4's
+  # inodes (16 KiB per inode by default) before its bytes: a replica averaging under ~80 KiB does.
+  # The volume then refuses every new file with ENOSPC while `used_ratio` reads healthy, the same
+  # misdirection the byte gauge exists to remove. Absent (not 0) when the inode count cannot be read
+  # or the filesystem has no fixed inode table (btrfs, ZFS report 0 total), so no alert fires on a
+  # number that means nothing.
+  defp inode_measurements(path) do
+    case inode_info(path) do
+      {:ok, %{total_inodes: total, free_inodes: free}} ->
+        %{
+          free_inodes: free,
+          total_inodes: total,
+          inodes_used_ratio: safe_ratio(total - free, total)
+        }
+
+      :error ->
+        %{}
+    end
+  end
+
+  @doc """
+  Free/total inodes for the filesystem holding `path` (expert review 2026-10-21 r7 #24), or
+  `:error` when they cannot be read or the filesystem has no fixed inode count.
+
+  `:disksup` reports bytes only and the BEAM has no `statvfs`, so this runs `df -Pi` (POSIX output,
+  inode columns) and reads the `IUsed`/`IFree` columns by their header names, which GNU (Linux:
+  `Inodes IUsed IFree`) and BSD (macOS: `iused ifree`) both print. Spawns one OS process: call it
+  from a poller or behind a cache, never per request. `:error` rather than a guess, for the same
+  reason as `disk_info/1`.
+  """
+  @spec inode_info(String.t()) ::
+          {:ok, %{total_inodes: non_neg_integer(), free_inodes: non_neg_integer()}} | :error
+  def inode_info(path) do
+    case System.cmd("df", ["-Pi", existing_ancestor(path)], stderr_to_stdout: true) do
+      {out, 0} -> parse_df_inodes(out)
+      _ -> :error
+    end
+  rescue
+    # No `df` on PATH (`System.cmd` raises `:enoent`), or anything else unreadable.
+    _ -> :error
+  end
+
+  @doc false
+  # The header-indexed `IUsed`/`IFree` columns of `df -Pi` output. Public for the test.
+  @spec parse_df_inodes(String.t()) ::
+          {:ok, %{total_inodes: non_neg_integer(), free_inodes: non_neg_integer()}} | :error
+  def parse_df_inodes(out) do
+    with [header, row | _] <- String.split(out, "\n", trim: true),
+         cols = header |> String.downcase() |> String.split(),
+         used_at when is_integer(used_at) <- Enum.find_index(cols, &(&1 == "iused")),
+         free_at when is_integer(free_at) <- Enum.find_index(cols, &(&1 == "ifree")),
+         fields = String.split(row),
+         {used, ""} when used >= 0 <- Integer.parse(Enum.at(fields, used_at, "")),
+         {free, ""} when free >= 0 <- Integer.parse(Enum.at(fields, free_at, "")),
+         total when total > 0 <- used + free do
+      {:ok, %{total_inodes: total, free_inodes: free}}
+    else
+      _ -> :error
+    end
   end
 
   # The data volume's free bytes as the poller last read them, for the flush preflight (expert review

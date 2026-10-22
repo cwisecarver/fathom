@@ -1360,7 +1360,10 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     # No `.seeding` temp should outlive a successful seed on any follower.
     for {name, _} <- followers do
       leftovers =
-        Follower.dir(name) |> File.ls!() |> Enum.filter(&String.ends_with?(&1, ".seeding"))
+        for d <- [Follower.dir(name), Follower.seed_temp_dir(name)],
+            entry <- File.ls!(d),
+            String.contains?(entry, ".seeding"),
+            do: entry
 
       assert leftovers == [], "#{name} leaked seed temps: #{inspect(leftovers)}"
     end
@@ -1766,6 +1769,51 @@ defmodule Fathom.Shard.ReplicationSeedTest do
              "the floor refused a seed on a volume with room, which would stop replication entirely"
 
       assert {:ok, ^port} = Follower.port(pid)
+    end
+
+    # INODES (expert review 2026-10-21 r7 #24). A replica is 5 files, three of them sidecars under
+    # 64 bytes, so a follower of small tenants exhausts inodes while bytes look healthy, and every
+    # new file then fails ENOSPC. The check saw bytes only.
+    test "a seed is refused when the volume is below the inode floor, though bytes are fine",
+         ctx do
+      %{root: root} = ctx
+      dir = Path.join(root, "inodes")
+      name = :"inode_f#{System.unique_integer([:positive])}"
+      start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
+
+      assert {:ok, %{free_inodes: free_inodes}} = Fathom.Admin.Measurements.inode_info(dir),
+             "precondition: this host's df reports inodes, or the floor has nothing to compare"
+
+      prev = Application.get_env(:fathom, :replication_disk_free_floor_inodes)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:fathom, :replication_disk_free_floor_inodes),
+          else: Application.put_env(:fathom, :replication_disk_free_floor_inodes, prev)
+      end)
+
+      # Bytes clear their floor; inodes cannot clear theirs.
+      Application.put_env(:fathom, :replication_disk_free_floor_bytes, 1)
+      Application.put_env(:fathom, :replication_disk_free_floor_inodes, free_inodes * 2 + 1)
+
+      begin = %Protocol.SeedBegin{
+        shard_id: "inode_starved",
+        epoch: 1,
+        wal_gen: 0,
+        salt1: 0,
+        wal_offset: 0,
+        db_size: 4096,
+        wal_size: 0
+      }
+
+      refute Map.has_key?(Follower.begin_seed(name, %{}, begin), "inode_starved"),
+             "the follower opened a seed on a volume below its inode floor"
+
+      # And the same begin passes once the inode floor is clearable (past the 1 s volume cache).
+      Application.put_env(:fathom, :replication_disk_free_floor_inodes, 1)
+      :ets.match_delete(Follower.locks(name), {{:disk, :_}, :_, :_})
+
+      assert %{failed: false} = Follower.begin_seed(name, %{}, begin)["inode_starved"]
     end
   end
 

@@ -86,7 +86,7 @@ defmodule Fathom.Tenants.Tombstones do
     # id against a data dir of millions of files would cost far more than a single listing.
     # An explicit `:on_new` (test seam) replaces both.
     on_new = Keyword.get(opts, :on_new, &on_tombstoned/1)
-    bulk_on_new = Keyword.get(opts, :on_new, &forget_replica/1)
+    bulk_on_new = Keyword.get(opts, :on_new, &forget_replica_if_present/1)
     sweeper = Keyword.get(opts, :sweeper, &sweep_local/0)
     retry_ms = Keyword.get(opts, :retry_ms, DenyList.initial_retry_ms())
 
@@ -283,6 +283,26 @@ defmodule Fathom.Tenants.Tombstones do
     if Process.whereis(follower) do
       follower.forget(follower, shard_id)
       Logger.info("tenant #{shard_id} is tombstoned — erased any A2 replica of it on this node")
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # THE BULK-LOAD HOOK (expert review 2026-10-21 r7 #22): a boot or daily load learns every LIFETIME
+  # deletion as new, and the unconditional `forget/2` above cost a lock and 6 ENOENT unlinks per id
+  # (13.5 s per 100k ids on macOS, in this GenServer, every boot), for replicas that almost never
+  # exist. `Follower.forget_if_present/2` erases exactly when a row or a `.db`/`-wal` is there.
+  #
+  # Not a no-op, which the review suggested: this hook is what erases a replica of an id this
+  # process loads AFTER the Follower's post-listen pass has run. Both start at boot and neither waits
+  # for the other (rv6 F11), so that pass may filter against a set that does not have the id yet.
+  defp forget_replica_if_present(shard_id) do
+    follower = Fathom.Shard.Replication.Follower
+
+    if Process.whereis(follower) do
+      follower.forget_if_present(follower, shard_id)
     end
 
     :ok
