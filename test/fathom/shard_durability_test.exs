@@ -1319,9 +1319,9 @@ defmodule Fathom.ShardDurabilityTest do
   end
 
   # Expert review #17: the flush timer is jittered so a mass re-home's phase-aligned timers drift
-  # apart instead of firing in lockstep. Pin that a scheduled delay stays within ±ratio of the
+  # apart instead of firing in lockstep. Pin that the first scheduled delay stays within the
   # interval (bounded, never 0/negative) and actually varies across coordinators.
-  test "the periodic flush timer is jittered within ±ratio and varies across coordinators" do
+  test "the first periodic flush timer is jittered within the interval and varies across coordinators" do
     prev_jitter = Application.get_env(:fathom, :shard_flush_jitter_ratio)
     prev_interval = Application.get_env(:fathom, :shard_flush_interval_ms)
     interval = 4_000
@@ -1379,16 +1379,16 @@ defmodule Fathom.ShardDurabilityTest do
 
     remaining = Enum.map(samples, fn {ms, _wide, _narrow} -> ms end)
 
-    # The drawn delay must land in [interval*(1-ratio), interval*(1+ratio)] = [2000, 6000].
-    for {ms, wide, narrow} <- samples do
+    # This is each coordinator's FIRST full-rate arm, which since expert review 2026-10-22 r8 #11
+    # is drawn uniformly over (0, interval] rather than ±ratio, so co-opened shards do not flush in
+    # lockstep. This test used to assert the ±ratio window [2000, 6000] for it; the ±ratio re-arm
+    # range is now pinned on the pure function in `Fathom.Shard.FlushJitterTest`.
+    for {ms, _wide, narrow} <- samples do
       assert is_integer(ms) and ms > 0,
              "a jittered delay must be positive (never fire immediately)"
 
-      assert ms + wide >= 2_000,
-             "drawn delay at most #{ms + wide}ms (#{ms} left + #{wide} elapsed) below the -50% floor"
-
-      assert ms + narrow <= 6_000,
-             "drawn delay at least #{ms + narrow}ms (#{ms} left + #{narrow} elapsed) above the +50% ceiling"
+      assert ms + narrow <= interval,
+             "first-arm delay at least #{ms + narrow}ms (#{ms} left + #{narrow} elapsed) above the interval"
     end
 
     assert Enum.uniq(remaining) |> length() >= 2,

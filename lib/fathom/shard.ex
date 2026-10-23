@@ -1062,6 +1062,10 @@ defmodule Fathom.Shard do
         # handler to tell "this shard is loafing and a write should speed it up" from "a flush is
         # already counting down and must not be restarted" (expert review 2026-08-24 #7).
         flush_timer_slow?: false,
+        # Has this coordinator armed its FIRST full-rate durability tick yet? That one is drawn
+        # over a whole interval instead of ±ratio (expert review 2026-10-22 r8 #11); see
+        # `flush_delay/3`.
+        flush_first_armed?: false,
         # Has ANY write landed while the current set of connections has been held? Sticky for the
         # life of the checkout, cleared when the last connection checks in (expert review
         # 2026-08-26 #4). This is what distinguishes a genuinely read-only held stream — the case
@@ -6427,26 +6431,62 @@ defmodule Fathom.Shard do
 
   # Arm the periodic durability flush. A non-positive interval disables it
   # (idle-only durability).
+  #
+  # THE FIRST FULL-RATE ARM OF A COORDINATOR'S LIFE is drawn over a whole interval (expert review
+  # 2026-10-22 r8 #11): see `flush_delay/3`. Every later arm keeps the ±ratio walk. The slow
+  # clean-poll arm (multiplier > 1) neither uses nor consumes it, since a read-only held stream
+  # never flushes anything and so cannot be part of a flush wave.
   defp do_schedule_flush(state, multiplier \\ 1) do
     state = cancel_flush(state)
 
     case flush_interval_ms() do
       interval when is_integer(interval) and interval > 0 ->
+        first? = multiplier == 1 and not state.flush_first_armed?
+        kind = if first?, do: :first, else: :rearm
+
         %{
           state
           | flush_timer:
               Process.send_after(
                 self(),
                 :durability_flush,
-                jitter_interval(interval * multiplier)
+                flush_delay(kind, interval * multiplier, flush_jitter_ratio())
               ),
-            flush_timer_slow?: multiplier > 1
+            flush_timer_slow?: multiplier > 1,
+            flush_first_armed?: state.flush_first_armed? or first?
         }
 
       _ ->
         state
     end
   end
+
+  @doc false
+  # The delay one durability-flush arm waits, given the base interval and the jitter ratio.
+  #
+  # `:rearm` is `jitter_interval/1`: base ± ratio·base, a random walk that decorrelates timers
+  # slowly (expert review #17).
+  #
+  # `:first` is uniform over (0, base] whenever jitter is on at all (expert review 2026-10-22 r8
+  # #11). Coordinators that open together (a fleet start, a rolling-deploy restart, a failover
+  # herd, every rig arm) used to draw their first tick from the same ±25% window, so they flushed
+  # in lockstep and the ±ratio walk took ~4 intervals to spread them (σ ≈ 0.14·interval·√k): a
+  # wave of up to ScanGate concurrent quick_check + snapshot scans on the dirty-IO threads that
+  # tenant statements use, every interval, for ~20 minutes after a deploy at 300 s. A first draw
+  # that spans a whole interval puts the phases uniform from the start; any width-1 window would,
+  # and (0, base] is the one that only ever makes the first flush EARLIER, so the first write's
+  # worst-case object RPO tightens from 1.25 to 1.0 intervals. A tick that lands on a clean shard
+  # uploads nothing, and one that lands before an idle drop leaves the drop flush clean, so the PUT
+  # count does not grow.
+  #
+  # Ratio 0 (deterministic tests) disables both draws: the base interval exactly.
+  @spec flush_delay(:first | :rearm, integer(), term()) :: integer()
+  def flush_delay(:first, base, ratio)
+      when is_integer(base) and base > 0 and is_number(ratio) and ratio > 0,
+      do: :rand.uniform(base)
+
+  def flush_delay(:first, base, _ratio), do: base
+  def flush_delay(:rearm, base, ratio), do: jitter_interval(base, ratio)
 
   # Reschedule after the node-wide flush cap (Fathom.Shard.FlushGate) refused a slot (#17): a short,
   # jittered backoff so the shard retries soon (it stayed dirty) without the backed-off shards
@@ -6510,18 +6550,15 @@ defmodule Fathom.Shard do
   # cold-open pulls. Spread each scheduled delay by ±ratio so the timers drift apart. Ratio 0
   # disables it (deterministic tests). :rand is per-process-seeded, so each coordinator picks
   # independently.
-  defp jitter_interval(base) when is_integer(base) and base > 0 do
-    case flush_jitter_ratio() do
-      ratio when is_number(ratio) and ratio > 0 ->
-        spread = round(base * min(ratio, 1.0))
-        if spread > 0, do: max(1, base - spread + :rand.uniform(2 * spread + 1) - 1), else: base
+  defp jitter_interval(base), do: jitter_interval(base, flush_jitter_ratio())
 
-      _ ->
-        base
-    end
+  defp jitter_interval(base, ratio)
+       when is_integer(base) and base > 0 and is_number(ratio) and ratio > 0 do
+    spread = round(base * min(ratio, 1.0))
+    if spread > 0, do: max(1, base - spread + :rand.uniform(2 * spread + 1) - 1), else: base
   end
 
-  defp jitter_interval(base), do: base
+  defp jitter_interval(base, _ratio), do: base
 
   defp cancel_flush(%{flush_timer: nil} = state), do: %{state | flush_timer_slow?: false}
 
