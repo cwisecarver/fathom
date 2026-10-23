@@ -248,6 +248,40 @@ defmodule Fathom.Shard.FlushSerializeTest do
     _ = path
   end
 
+  # Expert review 2026-10-22 r8 #25b: `snapshot_and_upload/3` now unlinks only the temp itself. Safe
+  # only because neither snapshot producer leaves a companion file; this pins that for both, by
+  # tracing every file the flush creates next to the shard while it runs.
+  for cap <- [0, 16 * 1024 * 1024] do
+    test "the snapshot producer (cap #{cap}) leaves no -wal/-shm/-journal beside its temp", %{
+      id: id,
+      path: path
+    } do
+      Application.put_env(:fathom, :flush_serialize_max_bytes, unquote(cap))
+      conn = seed_in_wal!(id, path, 300)
+      {:ok, coordinator} = Shards.ensure(id)
+
+      # Observe the directory from INSIDE the window: the after-snapshot hook runs between the
+      # snapshot and the PUT, while the temp (and anything the producer left beside it) exists.
+      test_pid = self()
+
+      Application.put_env(:fathom, :flush_after_snapshot_hook, fn _ ->
+        send(test_pid, {:siblings, Path.wildcard(path <> ".snap.*")})
+        :ok
+      end)
+
+      on_exit(fn -> Application.delete_env(:fathom, :flush_after_snapshot_hook) end)
+
+      send(coordinator, :durability_flush)
+      settle(coordinator)
+      ShardExecutor.close(conn)
+
+      assert_received {:siblings, files}
+      assert [temp] = files, "expected exactly the snapshot temp, got #{inspect(files)}"
+      refute String.ends_with?(temp, ["-wal", "-shm", "-journal"])
+      assert count_rows(object(id)) == 300
+    end
+  end
+
   describe "FLUSH_SERIALIZE_MAX_BYTES" do
     defp runtime_fathom(env) do
       prev = Map.new(env, fn {k, _} -> {k, System.get_env(k)} end)

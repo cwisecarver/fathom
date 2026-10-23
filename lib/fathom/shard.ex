@@ -5220,7 +5220,11 @@ defmodule Fathom.Shard do
           error
       end
     after
-      Enum.each(["", "-wal", "-shm"], &Fathom.FS.rm(temp <> &1))
+      # The temp only: neither producer leaves companions (expert review 2026-10-22 r8 #25b). The
+      # serialize route writes one raw file, and `VACUUM INTO` writes its target with no journal
+      # and no WAL (pinned by `flush_serialize_test`), so the `-wal`/`-shm` unlinks this used to do
+      # were two ENOENT syscalls per flush. `TempReaper` still sweeps any `.snap.*` a crash leaves.
+      _ = Fathom.FS.rm(temp)
     end
   end
 
