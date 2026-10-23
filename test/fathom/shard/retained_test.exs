@@ -28,6 +28,11 @@ defmodule Fathom.Shard.RetainedTest do
     prev_budget = Application.get_env(:fathom, :shard_retain_local_bytes)
     prev_idle = Application.get_env(:fathom, :shard_idle_ms)
     Application.put_env(:fathom, :shard_retain_local_bytes, 64 * 1024 * 1024)
+    # These fixtures are KiB-sized; the replication-off default floor (1 MiB, expert review
+    # 2026-10-22 r8 #26) would refuse them. The floor has its own tests (retained_reopen_test).
+    prev_floor = Application.get_env(:fathom, :shard_retain_min_bytes)
+    Application.put_env(:fathom, :shard_retain_min_bytes, 0)
+    on_exit(fn -> restore_env(:shard_retain_min_bytes, prev_floor) end)
     # Pin the idle timer high: an idle stop racing an assertion would answer for the coordinator.
     Application.put_env(:fathom, :shard_idle_ms, 600_000)
     forget_index!()
@@ -261,21 +266,27 @@ defmodule Fathom.Shard.RetainedTest do
     test "[#{mode}] a retained copy is never served when only the post-lease HEAD fails",
          %{id: id, path: path} do
       set_mode!(unquote(mode))
-      {sidecar, _store} = stage_moved_lineage!(id, path)
+      stage_moved_lineage!(id, path)
 
-      # The pre-lease evidence HEAD reads the copy's own etag (as if the peer's flush + release
-      # landed in the gap before our acquire, the #19 window); every later read times out.
+      # This fixture used to answer the FIRST etag read with the copy's own etag (the pre-lease
+      # evidence HEAD, as if the peer's flush + release landed in the #19 gap) and fail every later
+      # one. Since expert review 2026-10-22 r8 #26 a retained reopen issues NO pre-lease read, so the
+      # first read IS the post-lease authority check, and faking it "unchanged" would model a store
+      # that lies. The case is now simply: the one post-lease read fails. It must be exactly one
+      # read (the #26 saving), and the copy must still not be served.
       reads = :counters.new(1, [])
 
       faulty_storage!(id, fn ->
         :counters.add(reads, 1, 1)
-        if :counters.get(reads, 1) == 1, do: {:ok, sidecar}, else: {:error, :timeout}
+        {:error, :timeout}
       end)
 
       assert rows!(id) == [["new"], ["old"]],
              "the unverified retained copy (E1) was served on a failed post-lease check"
 
-      assert :counters.get(reads, 1) >= 2, "fixture: the post-lease check never read the etag"
+      assert :counters.get(reads, 1) == 1,
+             "a retained reopen read the object etag #{:counters.get(reads, 1)} times, not once"
+
       assert_opened_mode!(id, unquote(mode))
     end
 

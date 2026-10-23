@@ -517,6 +517,15 @@ if bytes = System.get_env("SHARD_RETAIN_LOCAL_BYTES") do
   config :fathom, :shard_retain_local_bytes, String.to_integer(bytes)
 end
 
+# Expert review 2026-10-22 r8 #26: the smallest `.db` worth retaining. Unset = 0 with replication on,
+# 1 MiB with it off (`Fathom.Shard.Retained.min_bytes/0` has the request arithmetic).
+if bytes = System.get_env("SHARD_RETAIN_MIN_BYTES") do
+  case Integer.parse(String.trim(bytes)) do
+    {n, ""} when n >= 0 -> config :fathom, :shard_retain_min_bytes, n
+    _ -> raise "SHARD_RETAIN_MIN_BYTES must be a non-negative integer, got: #{inspect(bytes)}"
+  end
+end
+
 # Perf review 2026-10-14 #4: how long an idle shard keeps its pooled SQLite handle after its last
 # stream closes (default 250 ms), so a serial client's next request reuses it. 0 = drain on close.
 if ms = System.get_env("POOL_DRAIN_GRACE_MS") do

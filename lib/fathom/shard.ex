@@ -622,7 +622,10 @@ defmodule Fathom.Shard do
     # handle_continue exits with a NON-{:shutdown, _} reason, release_lease never ran and
     # terminate/2 fell to the pre-open clause that has no lease to release. The lock survived,
     # and while this node's heartbeat stayed fresh every peer read {:held, us}.
-    fork_task = if file?, do: start_fork_evidence(shard_id, path)
+    #
+    # NOT for a claimed clean-retained copy (expert review 2026-10-22 r8 #26, user decision Q4 = B):
+    # see `retained_reopen?/1`. Its verdict is taken after the acquire instead (`open_after_acquire/10`).
+    fork_task = if file? and not retained_reopen?(path), do: start_fork_evidence(shard_id, path)
 
     pull_task = if file?, do: nil, else: Materializer.start_pull(shard_id, path)
 
@@ -737,7 +740,7 @@ defmodule Fathom.Shard do
     # forked flush 412s and self-fences rather than clobbering.
     warm? =
       file? and
-        not Fork.resolve(await_fork_evidence(fork_task, shard_id, path), shard_id, path, lease)
+        not Fork.resolve(fork_verdict(fork_task, shard_id, path, lease), shard_id, path, lease)
 
     pull_task = pull_task || if warm?, do: nil, else: Materializer.start_pull(shard_id, path)
 
@@ -851,6 +854,42 @@ defmodule Fathom.Shard do
   # before a refused acquire, so completing or aborting mid-flight are both safe.
   defp abandon_fork_check(nil), do: :ok
   defp abandon_fork_check(task), do: Task.shutdown(task, :brutal_kill)
+
+  # A RETAINED REOPEN SKIPS THE PRE-LEASE FORK HEAD (expert review 2026-10-22 r8 #26, user decision
+  # Q4 = B: retention will be used). A claimed clean-retained copy holds nothing the store lacks, and
+  # its provenance sidecar names the object it equals, so the pre-lease `Fork.evidence/2` HEAD could
+  # only answer what the post-lease check answers again under the lease — the authority for it
+  # since 10-20-2027 #22. The open paid fork HEAD + lock PUT + post-lease HEAD: 3 requests, ~2 RTT,
+  # one RTT slower than a small shard's cold reopen with replication off. Now: PUT, then the one
+  # HEAD (the open's shared head task when replicating).
+  #
+  # WHO DECIDES INSTEAD, per acquire outcome (`fork_verdict/4`):
+  #   * a fresh lock (no takeover, the normal case after the clean release that retained the copy):
+  #     `:match` here, so `revalidate_takeover/6` runs `post_lease_warm_check/4`, which compares the
+  #     store's etag UNDER the lease with the sidecar: equal serves; moved quarantines (a claimed copy
+  #     is deleted, not kept) and pulls; gone serves with a nil fence; unreachable discards and pulls
+  #     (a claimed copy is never served unverified). Every verdict the pre-lease HEAD could have
+  #     given lands on the same outcome there.
+  #   * a TAKEOVER (the lock was held or left by someone): the takeover re-checks trust the fork
+  #     verdict to have already quarantined a diverged copy (the legacy branch adopts the store's
+  #     etag for a warm file), so the evidence is gathered now, sequentially. Rare for a retained
+  #     copy, which exists only after this node released cleanly.
+  #
+  # Only when the sidecar holds a real etag: a missing, torn or "no object" sidecar keeps the
+  # ordinary path, whose verdicts for those cases differ.
+  defp retained_reopen?(path) do
+    Fathom.Shard.Retained.claimed?(path) and
+      match?({:ok, e} when is_binary(e), Provenance.read(path))
+  end
+
+  defp fork_verdict(%Task{} = task, shard_id, path, _lease),
+    do: await_fork_evidence(task, shard_id, path)
+
+  defp fork_verdict(nil, shard_id, path, lease) do
+    if lease[:took_over] == true,
+      do: await_fork_evidence(start_fork_evidence(shard_id, path), shard_id, path),
+      else: :match
+  end
 
   # Rescued like start_pull/2 (expert review 2026-08-01 #33): a raise in the storage HEAD must not
   # become an exit in the awaiting coordinator.

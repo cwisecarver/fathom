@@ -66,6 +66,26 @@ defmodule Fathom.Shard.Retained do
   def budget_bytes, do: Application.get_env(:fathom, :shard_retain_local_bytes, 0)
 
   @doc """
+  The smallest file worth retaining (expert review 2026-10-22 r8 #26). `:shard_retain_min_bytes`
+  (env `SHARD_RETAIN_MIN_BYTES`) wins when set. Unset, it follows the request arithmetic:
+
+    * replication ON: a retained reopen is lock PUT then one HEAD (2 RTT, no transfer); a cold
+      reopen is GET ∥ PUT then the same HEAD (2 RTT + transfer + decode + MD5 + fsync). Retention
+      wins at every size, so the floor is 0.
+    * replication OFF: a cold reopen is GET ∥ PUT (1 RTT + transfer); a retained one is PUT then
+      the post-lease etag HEAD (2 RTT). Retention only wins once the transfer and its local costs
+      exceed an RTT, about 1 MiB at real-S3 latency (unmeasured; the BENCH retained-reopen arm is
+      what measures it), so the floor is 1 MiB.
+  """
+  @spec min_bytes() :: non_neg_integer()
+  def min_bytes do
+    case Application.get_env(:fathom, :shard_retain_min_bytes) do
+      n when is_integer(n) and n >= 0 -> n
+      _ -> if Fathom.Shard.Replication.Fleet.replicating?(), do: 0, else: 1_048_576
+    end
+  end
+
+  @doc """
   True iff a local file exists that may hold writes the stored object lacks — i.e. it exists and is
   not marked clean-retained (claimed or not).
   """
@@ -112,9 +132,11 @@ defmodule Fathom.Shard.Retained do
   # required too, or the next open could not tell what the file is.
   defp retainable(path) do
     budget = budget_bytes()
+    floor = min_bytes()
 
     with true <- budget > 0,
-         {:ok, %File.Stat{size: bytes}} when bytes <= budget <- Fathom.FS.stat(path),
+         {:ok, %File.Stat{size: bytes}} when bytes <= budget and bytes >= floor <-
+           Fathom.FS.stat(path),
          true <- wal_empty?(path),
          true <- Fathom.FS.exists?(path <> ".etag") do
       {:ok, bytes}
