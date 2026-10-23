@@ -2079,6 +2079,18 @@ defmodule Fathom.Shard.Connection do
     %{json: json, protobuf: IO.iodata_to_binary(pb)}
   end
 
+  # ONE DIRTY `release` PER CACHED STATEMENT (expert review 2026-10-22 r8 #22), and that is not
+  # worth trading away. exqlite has no batch finalize (the upstream patch was declined, Q3=B), and
+  # the fallback, a lower statement-cache cap for pooled handles, was MEASURED AND REJECTED
+  # (2026-10-23, macOS, Django-shaped 13-column SELECT through `query/4`): a miss costs 31-46 us
+  # and 4 dirty dispatches (prepare, columns, the memused read, the step), a hit 3-4 us and 1;
+  # keeping a statement costs 5-7 us and 1 dispatch at close. A lower cap cannot remove releases:
+  # every prepared statement is released exactly once, at eviction or here, so it only MOVES them
+  # from this off-path close onto the tenant's request path (`evict_until_fits/5` releases inline)
+  # and adds a re-prepare for every access past the cap; LRU over a cycling working set larger than
+  # the cap misses on every access (64 statements over 53 cache slots: hit = miss, 39 us, 5
+  # dispatches). The only gain would be a shorter close chain for `closing_busy?/1`'s flush deferral,
+  # bounded at 64 releases. Do not lower the cap for this.
   defp release_cache(conn, {_seq, cache}) do
     Enum.each(cache, fn {_sql, {stmt, _stamp, _gen, _bytes, _packed}} ->
       Sqlite3.release(conn, stmt)
