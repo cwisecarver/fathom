@@ -184,9 +184,12 @@ defmodule Fathom.Bench.Gate do
     # A serial five-statement pooled request: the drain-grace hit plus the statement-cache carry
     # (perf review 2026-10-14 #4/#10). Watch-only until its band is measured, same rule as above.
     {:hrana_pooled_pipeline_rt_us, :higher_worse, :watch},
-    # WATCH-ONLY storage-IO metrics (expert review 2026-10-19 #7), new series: the flush codec on a
-    # ~20 MB realistic snapshot (`Fathom.Bench.StorageIO`). Watch-only until a band is measured.
-    {:flush_codec_ms_per_mb, :higher_worse, :watch},
+    # The flush codec on a ~20 MB realistic snapshot (`Fathom.Bench.StorageIO`; expert review
+    # 2026-10-19 #7). GATED from expert review 2026-10-22 r8 #3 (user decision Q9=A): the only gated
+    # flush metric, `flush_p50_us`, is ~60% the `Storage.Local` test double and never runs the
+    # codec, so a 20% regression in the prod codec passed the gate. Band over the last 12
+    # perf_history entries: 4.61-4.95 ms/MB (7% spread), well inside the 20% block threshold.
+    {:flush_codec_ms_per_mb, :higher_worse},
     {:pull_decode_ms_per_mb, :higher_worse, :watch},
     # The S3 client through the real Finch pool (expert review 2026-10-19 #3): HEAD and an
     # If-Match PUT against a loopback stub. Exposes the per-request Req `finch:` deprecation warn.
@@ -215,13 +218,46 @@ defmodule Fathom.Bench.Gate do
     {:hrana_sdk_read_rt_us, :higher_worse, :watch},
     # Flush routes (expert review 2026-10-21 r7 #2): the pinned-off VACUUM route, the drop-time
     # flush, and the VACUUM route through the real Storage.S3 client + codec. Watch-only, new series.
+    #
+    # r8 #3 / Q9=A: `flush_vacuum_p50_us` and `flush_stub_p50_us` are the prod-path flush costs and
+    # are to be GATED once they have ~5 steady same-host entries with a band under 20%. They stay
+    # watch-only until then (no band exists yet); promote them by deleting the `:watch` below.
     {:flush_vacuum_p50_us, :higher_worse, :watch},
     {:drop_flush_p50_us, :higher_worse, :watch},
     {:flush_stub_p50_us, :higher_worse, :watch},
+    # The VACUUM route on a ~32 MB shard (r8 #3): how the route scales with shard size, which r8 #9's
+    # serialize switch changes. New series, watch-only.
+    {:flush_vacuum_32mb_p50_us, :higher_worse, :watch},
     # Django pooled-request shape and pooled-handle density (expert review 2026-10-21 r7 #1).
     # Watch-only, new series.
     {:hrana_django_request_rt_us, :higher_worse, :watch},
     {:served_pooled_kb_per_shard, :higher_worse, :watch},
+    # r8 #1: ALLOCATOR-MODE-INDEPENDENT density readings. `served_kb_per_shard` / `served_repl_kb_per_shard`
+    # read `:erlang.memory(:total)`, which is carrier-granular and flips between two stable modes
+    # (A 193-205 / B 178-190 for served; the r7 "-7.3% win" and "+13.5% regression" were one flip).
+    # These read live BLOCK bytes (all allocators), their `driver_alloc` (SQLite) slice, and the
+    # per-process sum. Judge density changes by THESE; the gated totals above stay for continuity.
+    # New series, watch-only until a band exists.
+    {:served_blocks_kb_per_shard, :higher_worse, :watch},
+    {:served_sqlite_kb_per_shard, :higher_worse, :watch},
+    {:served_proc_kb_per_shard, :higher_worse, :watch},
+    {:served_repl_blocks_kb_per_shard, :higher_worse, :watch},
+    {:served_repl_sqlite_kb_per_shard, :higher_worse, :watch},
+    # r8 #2: the idle checked-in shard with prod's per-shard ETS state and heartbeat mode on.
+    # `idle_hibernated_frac` is higher-is-better (0.0 until r8 #12 makes the hibernate timer fire).
+    {:idle_kb_per_shard, :higher_worse, :watch},
+    {:idle_ets_b_per_shard, :higher_worse, :watch},
+    {:idle_hibernated_frac, :lower_worse, :watch},
+    # r8 #5: first commit after a coordinator reopen with A2 on, and its reset rounds (r8 #16/#17).
+    {:repl_first_commit_after_reopen_us, :higher_worse, :watch},
+    {:repl_first_commit_reset_rounds, :higher_worse, :watch},
+    # r8 #4 / Q7=A: fresh WebSocket per request (django-libsql at CONN_MAX_AGE=0). Promote after 3
+    # stable runs.
+    {:hrana_ws_connect_rt_us, :higher_worse, :watch},
+    # r8 Q4=B: reopen of a retained local copy (SHARD_RETAIN_LOCAL_BYTES > 0) and the S3 requests it
+    # issues, the baseline r8 #26 is measured against.
+    {:retained_reopen_stub_p50_us, :higher_worse, :watch},
+    {:retained_reopen_requests, :higher_worse, :watch},
     # THE TAIL, gated from 2026-08-03 (expert review #41.5). Every metric above is a p50, and
     # `delta/4` is a pure ratio — which AGENTS.md forbids in as many words ("Assert an absolute
     # floor, not only a ratio… The ratio holds while throughput collapses"). A change that leaves

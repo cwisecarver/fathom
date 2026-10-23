@@ -511,6 +511,77 @@ defmodule Fathom.BenchTest do
     assert is_float(total)
   end
 
+  # expert review 2026-10-22 r8 #1. The allocator-mode-independent readings: live block bytes, the
+  # SQLite (driver_alloc) slice and the per-process sum. The SQLite slice is the bulk of a served
+  # shard (~90%) and, unlike :erlang.memory(:total), must not depend on carrier layout.
+  test "served reports mode-independent block, sqlite and process readings" do
+    r = Fathom.Bench.served(served_n: 8, trials: 2)
+    IO.puts("served: #{inspect(r)}")
+
+    # sqlite_kb is the slice only this arm allocates. blocks_kb is a net over every allocator, so in
+    # a busy test VM an unrelated free can pull it below sqlite_kb; it is only bounded here.
+    assert r.sqlite_kb > 10 and r.sqlite_kb < 5_000
+    assert r.blocks_kb > -5_000 and r.blocks_kb < 5_000
+    assert is_float(r.proc_kb)
+  end
+
+  @tag timeout: 300_000
+  test "served_repl also reports block and sqlite readings" do
+    r = Fathom.Bench.served_repl(served_repl_n: 4, trials: 1)
+    assert r.sqlite_kb > 10 and is_float(r.blocks_kb)
+  end
+
+  # expert review 2026-10-22 r8 #2. The idle arm raises unless every coordinator is in heartbeat
+  # mode and the per-shard tables hold N rows; hibernation is REPORTED (0.0 until r8 #12), so only
+  # its range is asserted. ets_b is the bytes the per-shard ETS rows and counters cost: a
+  # write_concurrency counter regression (+~2.2 KB/shard measured) must fit under the ceiling's
+  # headroom only by a wide margin, so the ceiling is an order of magnitude, not a tight band.
+  @tag timeout: 300_000
+  test "idle_stats measures the idle heartbeat-mode coordinator with prod's ETS state on" do
+    r = Fathom.Bench.idle_stats(idle_n: 20, idle_wait_ms: 200)
+    IO.puts("idle_stats: #{inspect(r)}")
+    assert r.kb > 1 and r.kb < 200
+    assert r.ets_b > 500 and r.ets_b < 100_000
+    assert r.hibernated >= 0.0 and r.hibernated <= 1.0
+    refute Fathom.Shard.Heartbeat.running?(), "the arm left a Heartbeat running"
+  end
+
+  # expert review 2026-10-22 r8 #5.
+  @tag timeout: 300_000
+  test "repl_first_commit_stats times a first commit after a real coordinator reopen" do
+    r = Fathom.Bench.repl_first_commit_stats(repl_reopen_samples: 2)
+    IO.puts("repl_first_commit_stats: #{inspect(r)}")
+    assert r.p50_us > 50 and r.p50_us < 10_000_000
+    assert r.resets >= 0
+    refute Fathom.Shard.Replication.Fleet.replicating?(), "the arm left replication on"
+  end
+
+  # expert review 2026-10-22 r8 #3. The 32 MB variant raises if its shard is not really that big.
+  @tag timeout: 300_000
+  test "flush_vacuum_32_p50 refuses to report a small shard under the 32 MB name" do
+    assert_raise RuntimeError, ~r/measuring the wrong size/, fn ->
+      Fathom.Bench.flush_vacuum_32_p50(flush_32_rows: 100, trials: 1)
+    end
+  end
+
+  # expert review 2026-10-22 r8 #4 (Q7=A). Auth ran once per fresh connection and the pool is hit.
+  @tag timeout: 300_000
+  test "hrana_ws_connect_rt_us costs a fresh WebSocket per request, well above a warm stream" do
+    connect = Fathom.Bench.hrana_ws_connect_rt_us(hrana_ws_connect_samples: 20)
+    warm = Fathom.Bench.hrana_ws_rt_us(hrana_rt_samples: 50)
+    IO.puts("hrana_ws_connect_rt_us=#{connect} hrana_ws_rt_us=#{warm}")
+    assert connect > warm, "a connect-per-request must cost more than a warm stream"
+  end
+
+  # expert review 2026-10-22 r8 #26 / Q4=B: the baseline for the retained-reopen fix.
+  @tag timeout: 300_000
+  test "retained_reopen counts the S3 requests a retained reopen issues" do
+    r = Fathom.Bench.StorageIO.retained_reopen(retained_samples: 3)
+    IO.puts("retained_reopen: #{inspect(r)}")
+    assert r.p50_us > 0 and r.requests >= 1
+    assert Application.get_env(:fathom, :shard_retain_local_bytes, 0) == 0
+  end
+
   # expert review 2026-10-21 #18a. The Django-sized fixture really is wide (the arm itself raises
   # under 40 tables / 80 indexes), and a connection holding it costs clearly more than the 6-table
   # keystone one: every density number and PoolBudget's sizing assumed the keystone.

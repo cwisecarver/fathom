@@ -144,7 +144,12 @@ defmodule Fathom.Bench do
     :drop_flush,
     :flush_stub,
     :hrana_django,
-    :served_pooled
+    :served_pooled,
+    :idle,
+    :repl_reopen,
+    :flush_vacuum_32,
+    :hrana_ws_connect,
+    :retained_reopen
   ]
 
   @doc false
@@ -182,6 +187,12 @@ defmodule Fathom.Bench do
     # metric measures. See `served_repl/1`.
     repl = run_if(only, :served_repl, fn -> served_repl(opts) end)
 
+    idle = run_if(only, :idle, fn -> idle_stats(opts) end)
+    reopen = run_if(only, :repl_reopen, fn -> repl_first_commit_stats(opts) end)
+
+    retained =
+      run_if(only, :retained_reopen, fn -> Fathom.Bench.StorageIO.retained_reopen(opts) end)
+
     # One run, two metrics (HEAD and conditional PUT through the real S3 Finch pool, loopback stub).
     s3io = run_if(only, :s3_loopback, fn -> Fathom.Bench.StorageIO.s3_loopback(opts) end)
 
@@ -218,6 +229,12 @@ defmodule Fathom.Bench do
       # in the process heap — one combined number would hide that whole class of regression.
       served_kb_per_shard: served && served.total_kb,
       served_binary_kb_per_shard: served && served.binary_kb,
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-22 r8 #1): live-BLOCK bytes (allocator-mode
+      # independent), their SQLite (`driver_alloc`) slice, and the per-process sum. Read THESE, not
+      # the carrier-granular total above, when judging a density change. See `memory_snapshot/0`.
+      served_blocks_kb_per_shard: served && served.blocks_kb,
+      served_sqlite_kb_per_shard: served && served.sqlite_kb,
+      served_proc_kb_per_shard: served && served.proc_kb,
       # NEW SERIES (expert review 2026-10-20-2027 #7a): the same regime with 48 distinct wide
       # statements primed per shard, so the statement cache is populated. Watch-only.
       served_mix_kb_per_shard: served_mix && served_mix.total_kb,
@@ -239,6 +256,10 @@ defmodule Fathom.Bench do
       # NEW SERIES, WATCH-ONLY (expert review 2026-10-21 #29): the replication Session's own memory
       # per shard (Process.info), the number `served_repl_kb_per_shard` cannot isolate.
       repl_session_kb_per_shard: repl && repl.session_kb,
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-22 r8 #1): the allocator-mode-independent
+      # readings of the replicating served regime.
+      served_repl_blocks_kb_per_shard: repl && repl.blocks_kb,
+      served_repl_sqlite_kb_per_shard: repl && repl.sqlite_kb,
       # CONTENTION (#41.4). Every other metric here is serial, so a change that serialises the
       # ETS counters, the LRU, or the coordinator GenServer.call left all of them flat.
       concurrent_checkout_per_s: conc && conc.spread_per_s,
@@ -280,6 +301,8 @@ defmodule Fathom.Bench do
       # NEW SERIES, WATCH-ONLY (expert review 2026-10-21 r7 #2): the other flush routes prod runs.
       # `flush_p50_us` above is the pinned-live route only. Each asserts its own route.
       flush_vacuum_p50_us: run_if(only, :flush_vacuum, fn -> flush_vacuum_p50(opts) end),
+      flush_vacuum_32mb_p50_us:
+        run_if(only, :flush_vacuum_32, fn -> flush_vacuum_32_p50(opts) end),
       drop_flush_p50_us: run_if(only, :drop_flush, fn -> drop_flush_p50(opts) end),
       flush_stub_p50_us:
         run_if(only, :flush_stub, fn -> Fathom.Bench.StorageIO.flush_stub(opts) end),
@@ -298,6 +321,21 @@ defmodule Fathom.Bench do
       hrana_rt_observed_us: run_if(only, :hrana_observed, fn -> hrana_rt_observed_us(opts) end),
       observability_tick_us:
         run_if(only, :observability_tick, fn -> observability_tick_us(opts) end),
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-22 r8 #2): the IDLE checked-in shard with prod's
+      # per-shard ETS state and heartbeat mode on. Own scoped setup; see `idle_stats/1`. Placed here,
+      # after every density metric, because it starts Lru/WriteCounter/FlushWatermark itself.
+      idle_kb_per_shard: idle && idle.kb,
+      idle_ets_b_per_shard: idle && idle.ets_b,
+      idle_hibernated_frac: idle && idle.hibernated,
+      # NEW SERIES, WATCH-ONLY (expert review 2026-10-22 r8 #5): the first commit after a coordinator
+      # reopen with A2 replication on, and the reset rounds it paid.
+      repl_first_commit_after_reopen_us: reopen && reopen.p50_us,
+      repl_first_commit_reset_rounds: reopen && reopen.resets,
+      # NEW SERIES, WATCH-ONLY (r8 Q4=B, the baseline for #26): reopen of a retained local copy
+      # (`SHARD_RETAIN_LOCAL_BYTES > 0`) against the real S3 client + loopback stub, and the S3
+      # requests that reopen issued.
+      retained_reopen_stub_p50_us: retained && retained.p50_us,
+      retained_reopen_requests: retained && retained.requests,
       # WATCH-ONLY storage-IO metrics (expert review 2026-10-19 #7), each with its own scoped
       # setup in `Fathom.Bench.StorageIO`: a ~20 MB realistic snapshot through the flush codec.
       flush_codec_ms_per_mb:
@@ -312,6 +350,10 @@ defmodule Fathom.Bench do
       # WATCH-ONLY (expert review 2026-10-19 #12): the WebSocket round trip, the path django-libsql
       # uses. Every other wire metric is HTTP.
       hrana_ws_rt_us: run_if(only, :hrana_ws, fn -> hrana_ws_rt_us(opts) end),
+      # WATCH-ONLY (expert review 2026-10-22 r8 #4, Q7=A): a FRESH WebSocket per request, which is
+      # what django-libsql does at Django's default CONN_MAX_AGE=0.
+      hrana_ws_connect_rt_us:
+        run_if(only, :hrana_ws_connect, fn -> hrana_ws_connect_rt_us(opts) end),
       # HOT-SHARD CONTENTION, watch-only (expert review 2026-10-19 #5). Last for the same reason as
       # the two above: each starts the ShardLoad/ShardLatency/Lru tables in its own scoped setup.
       # Many streams on ONE shard through the executor (the per-statement counter keys), and one
@@ -1459,6 +1501,135 @@ defmodule Fathom.Bench do
     end
   end
 
+  @hrana_ws_connect_samples 100
+
+  @doc """
+  `hrana_ws_connect_rt_us` - median µs of one request that opens a FRESH WebSocket: connect,
+  upgrade, `hello` (which runs the auth callback), `open_stream`, one `SELECT 1`, close (expert
+  review 2026-10-22 r8 #4, user decision Q7=A). django-libsql speaks WebSocket only, and Django's
+  default `CONN_MAX_AGE=0` opens a connection per request, so this is the primary client's default
+  request shape. `hrana_django_request_rt_us` is the HTTP-SDK one-shot over keep-alive and costs
+  ~6x less (probe `ws_connect2.exs`, loopback: persistent WS execute 69 us, fresh WS per request
+  617 us, HTTP one-shot 105 us), so ~510 us/request of protocol cost was unmeasured. In prod the
+  LB adds an upstream connect per WebSocket on top.
+
+  Prod listener settings, Hrana auth REQUIRED, connection pool on (as prod). Loopback: the
+  software cost, not a network RTT.
+
+  Preconditions (raises otherwise): every reply is `[[1]]`, the auth callback ran exactly once per
+  connection (warm-up plus every sample), a missing token is refused, and the pool served at least
+  half the stream opens as a hit (REPORTED to stderr). WATCH-ONLY (new series).
+  """
+  @spec hrana_ws_connect_rt_us(keyword()) :: float()
+  def hrana_ws_connect_rt_us(opts \\ []) do
+    alias Fathom.Bench.HranaClient
+    alias Fathom.HranaAuth
+    alias Fathom.HranaAuth.Revocations
+
+    samples = Keyword.get(opts, :hrana_ws_connect_samples, @hrana_ws_connect_samples)
+    shard = "benchwsconnect"
+    keys = [:hrana_auth, :hrana_token_max_age, :hrana_token_secret, :connection_pool]
+    prev = Map.new(keys, &{&1, Application.get_env(:fathom, &1)})
+
+    setup(opts)
+    Application.put_env(:fathom, :shard_base_domain, nil)
+    Application.put_env(:fathom, :default_shard, nil)
+    {:ok, _} = Application.ensure_all_started(:bandit)
+    {:ok, _} = Application.ensure_all_started(:mint)
+    {:ok, _} = Application.ensure_all_started(:telemetry)
+
+    Application.put_env(:fathom, :hrana_auth, :required)
+    Application.put_env(:fathom, :hrana_token_max_age, 3_600)
+    Application.put_env(:fathom, :connection_pool, true)
+
+    if Application.get_env(:fathom, :hrana_token_secret) in [nil, ""],
+      do: Application.put_env(:fathom, :hrana_token_secret, String.duplicate("a", 64))
+
+    revocations =
+      case Revocations.start_link([]) do
+        {:ok, pid} -> pid
+        {:error, {:already_started, _}} -> nil
+      end
+
+    calls = :counters.new(1, [])
+    hits = :counters.new(2, [])
+    handler = "bench-ws-connect-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :shard, :pool_take],
+      fn _event, _m, %{result: result}, _ ->
+        :counters.add(hits, if(result == :hit, do: 1, else: 2), 1)
+      end,
+      nil
+    )
+
+    authorize = fn arg, tok ->
+      :counters.add(calls, 1, 1)
+      HranaAuth.authorize(arg, tok)
+    end
+
+    {:ok, sup, port} = HranaClient.start_listener(prod: true, authorize: authorize)
+
+    try do
+      token =
+        Phoenix.Token.sign(
+          Application.fetch_env!(:fathom, :hrana_token_secret),
+          "fathom hrana shard",
+          %{"s" => shard, "v" => 1, "e" => System.system_time(:second) + 3_600}
+        )
+
+      Revocations.put(shard, 1, nil)
+
+      unless match?({:error, %Filo.Error{status: 401}}, HranaAuth.authorize(shard, nil)) and
+               match?({:ok, {:rw, _}}, HranaAuth.authorize(shard, token)),
+             do:
+               raise(
+                 "hrana_ws_connect_rt_us: :required auth is not enforcing - measuring nothing"
+               )
+
+      one = fn ->
+        {:ok, c} = HranaClient.connect(port, shard, auth_token: token)
+        {:ok, c, %{rows: [[1]]}} = HranaClient.execute(c, "SELECT 1")
+        HranaClient.close(c)
+      end
+
+      # Untimed warm-up: loads the shard and the pool.
+      one.()
+      :counters.put(calls, 1, 0)
+      :counters.put(hits, 1, 0)
+      :counters.put(hits, 2, 0)
+
+      us = for _ <- 1..samples, do: elem(:timer.tc(one), 0)
+
+      authorized = :counters.get(calls, 1)
+
+      unless authorized == samples,
+        do:
+          raise(
+            "hrana_ws_connect_rt_us: auth ran #{authorized}x for #{samples} fresh connections - " <>
+              "it is not measuring a connect per request"
+          )
+
+      hit = :counters.get(hits, 1)
+      Logger.warning("bench info: hrana_ws_connect_rt_us pool hits #{hit}/#{samples}")
+
+      unless hit * 2 >= samples,
+        do:
+          raise(
+            "hrana_ws_connect_rt_us: only #{hit}/#{samples} pool hits - the pool is not reused"
+          )
+
+      p50(us)
+    after
+      :telemetry.detach(handler)
+      HranaClient.stop_listener(sup)
+      Fathom.Shards.drain(shard, 5_000)
+      if revocations, do: GenServer.stop(revocations)
+      Enum.each(keys, &restore_env(&1, Map.fetch!(prev, &1)))
+    end
+  end
+
   @doc """
   `hrana_ws_sparse_rt_us` - median µs of a `SELECT 1` over the Hrana WEBSOCKET path when each request
   follows an IDLE GAP (default 200 ms; `:hrana_sparse_gap_ms`), with Hrana auth REQUIRED and
@@ -1870,6 +2041,14 @@ defmodule Fathom.Bench do
   NOT `VACUUM INTO`. The trials assert that via `[:fathom, :shard, :flush, :route]`. The VACUUM
   route is `flush_vacuum_p50_us`, the drop flush `drop_flush_p50_us`, and the codec route
   `flush_stub_p50_us`. Series name kept for continuity.
+
+  **About 60% of this number is the `Storage.Local` test double, not production code** (expert
+  review 2026-10-22 r8 #3): SHA-256 of the remote object, MD5 of the source, `File.cp` + fsync +
+  rename, a `.pos` atomic write + fsync and a SHA-256 of the destination, none of which `Storage.S3`
+  runs. Its 40% same-host spread (7.5-10.4 ms over 12 entries) false-blocks unrelated commits and a
+  20% regression in the prod codec passes it. The prod-path flush costs are `flush_codec_ms_per_mb`
+  (gated since r8) and `flush_vacuum_p50_us` / `flush_stub_p50_us` (watch-only until ~5 steady
+  entries, see `Fathom.Bench.Gate`).
   """
   # No `| nil`, unlike the wire metrics: those return nil when the listener or client cannot start
   # (the metric is skipped, never faked), but this one is S3-free and local — there is nothing for
@@ -1946,8 +2125,24 @@ defmodule Fathom.Bench do
       {pid, ref, path} =
         Fathom.Bench.StorageIO.open_flush_shard(id, Keyword.get(opts, :flush_rows, 2_000))
 
+      # The 32 MB variant (r8 #3) must really be that size, or it re-measures the keystone series.
+      min_bytes = Keyword.get(opts, :min_db_bytes, 0)
+      size = Fathom.Bench.StorageIO.db_bytes(path)
+
+      if size < min_bytes,
+        do:
+          raise(
+            "flush_vacuum: shard is #{size} B, expected >= #{min_bytes} - measuring the wrong size"
+          )
+
       us =
-        Fathom.Bench.StorageIO.vacuum_route_flush_us(id, pid, path, trials, "flush_vacuum_p50_us")
+        Fathom.Bench.StorageIO.vacuum_route_flush_us(
+          id,
+          pid,
+          path,
+          trials,
+          Keyword.get(opts, :metric_name, "flush_vacuum_p50_us")
+        )
 
       Fathom.Shard.checkin(pid, ref)
       Shards.drain(id, 5_000)
@@ -1956,6 +2151,26 @@ defmodule Fathom.Bench do
       Shards.drain(id, 5_000)
       drop_db(Fathom.Shard.db_path(id))
     end
+  end
+
+  @flush_32_rows 43_000
+  @flush_32_min_bytes 28_000_000
+
+  @doc """
+  `flush_vacuum_32mb_p50_us` - `flush_vacuum_p50/1` on a ~32 MB shard (expert review 2026-10-22 r8
+  #3). The keystone series (1.5 MB) hides how the VACUUM route scales with shard size, which is
+  what r8 #9's `sqlite3_serialize` switch changes (probe: 50 ms VACUUM INTO vs 4.6 ms serialize at
+  32 MB). Fewer trials (default 3) because each flush is tens of ms. Precondition: the db file is
+  at least #{@flush_32_min_bytes} bytes. WATCH-ONLY (new series).
+  """
+  @spec flush_vacuum_32_p50(keyword()) :: float()
+  def flush_vacuum_32_p50(opts \\ []) do
+    opts
+    |> Keyword.put(:flush_rows, Keyword.get(opts, :flush_32_rows, @flush_32_rows))
+    |> Keyword.put(:min_db_bytes, @flush_32_min_bytes)
+    |> Keyword.put(:metric_name, "flush_vacuum_32mb_p50_us")
+    |> Keyword.update(:trials, 3, &min(&1, 3))
+    |> flush_vacuum_p50()
   end
 
   @doc """
@@ -2395,7 +2610,13 @@ defmodule Fathom.Bench do
   (db + `-wal` + `-shm`), so this is fd-bound long before it is interesting to push. It measures
   the per-shard SLOPE, not a density ceiling — `mix fathom.scale` owns the ceiling.
   """
-  @spec served(keyword()) :: %{total_kb: float(), binary_kb: float()}
+  @spec served(keyword()) :: %{
+          total_kb: float(),
+          binary_kb: float(),
+          blocks_kb: float(),
+          sqlite_kb: float(),
+          proc_kb: float()
+        }
   def served(opts \\ []) do
     setup(opts)
     n = Keyword.get(opts, :served_n, @served_n)
@@ -2407,6 +2628,7 @@ defmodule Fathom.Bench do
     results =
       times(trials, fn t ->
         collect_all()
+        before_mem = memory_snapshot()
         before_total = :erlang.memory(:total)
         before_bin = :erlang.memory(:binary)
 
@@ -2422,15 +2644,106 @@ defmodule Fathom.Bench do
         collect_all()
         total = :erlang.memory(:total) - before_total
         bin = :erlang.memory(:binary) - before_bin
+        det = memory_delta(before_mem, memory_snapshot(), Enum.map(handles, &elem(&1, 1)))
+        log_memory_delta("served", t, n, det)
 
         Enum.each(handles, &close_served_shard/1)
-        {total / n / 1024, bin / n / 1024}
+
+        {total / n / 1024, bin / n / 1024, det.blocks / n / 1024, det.sqlite / n / 1024,
+         det.proc / n / 1024}
       end)
 
     %{
       total_kb: results |> Enum.map(&elem(&1, 0)) |> median(),
-      binary_kb: results |> Enum.map(&elem(&1, 1)) |> median()
+      binary_kb: results |> Enum.map(&elem(&1, 1)) |> median(),
+      blocks_kb: results |> Enum.map(&elem(&1, 2)) |> median(),
+      sqlite_kb: results |> Enum.map(&elem(&1, 3)) |> median(),
+      proc_kb: results |> Enum.map(&elem(&1, 4)) |> median()
     }
+  end
+
+  # --- mode-independent memory reading (expert review 2026-10-22 r8 #1) -------------------------
+  #
+  # `:erlang.memory(:total)` is CARRIER-granular: it moves with how the allocators happened to
+  # carve carriers (mmap'd single-block vs multiblock) after whatever arm ran earlier in the VM.
+  # perf_history shows two stable modes for served / served_repl (A: 193-205 / 203-219, B:
+  # 178-190 / 233-251) and the r7 "-7.3% win" / "+13.5% regression" pair was ONE mode flip, not code.
+  # So alongside the (unchanged, still gated) total this reads LIVE BLOCK bytes, which count what was
+  # allocated and not how carriers were laid out:
+  #   * blocks - sum of live block bytes over every alloc_util allocator (heaps, ETS, binaries, NIF)
+  #   * sqlite - the `driver_alloc` slice of that: exqlite routes ALL SQLite allocations through
+  #     `enif_alloc` (driver_alloc), so this is sqlite3_memory_used's moral equivalent without a NIF
+  #   * proc   - Process.info(:memory) + refc binaries over the coordinators, plus this (caller)
+  #     process's delta, which owns every connection's statement cache in its dictionary
+  # `:erlang.memory/0` buckets are logged per trial so a future mode flip is attributable.
+  defp memory_snapshot do
+    # This process owns every connection's statement cache; collect it so its heap is comparable
+    # between the two snapshots (the delta went negative in a test process full of earlier garbage).
+    :erlang.garbage_collect()
+    {blocks, sqlite} = alloc_block_bytes()
+    {:memory, self_mem} = Process.info(self(), :memory)
+    %{blocks: blocks, sqlite: sqlite, self: self_mem, vm: Map.new(:erlang.memory())}
+  end
+
+  defp memory_delta(before, after_, pids) do
+    proc =
+      Enum.reduce(pids, 0, fn pid, acc ->
+        with {:memory, mem} <- Process.info(pid, :memory),
+             {:binary, bins} <- Process.info(pid, :binary) do
+          acc + mem + (bins |> Enum.map(&elem(&1, 1)) |> Enum.sum())
+        else
+          _ -> raise "memory reading: coordinator #{inspect(pid)} is gone - measuring nothing"
+        end
+      end)
+
+    d = %{
+      blocks: after_.blocks - before.blocks,
+      sqlite: after_.sqlite - before.sqlite,
+      proc: proc + (after_.self - before.self),
+      vm: Map.new(after_.vm, fn {k, v} -> {k, v - Map.get(before.vm, k, 0)} end)
+    }
+
+    # A reading of zero live bytes means the allocator statistics are off or nothing was opened.
+    # `blocks` is a net figure over EVERY allocator, so unrelated frees elsewhere in the VM (a process
+    # that exited mid-trial) can push it down; `sqlite` is the slice only this arm allocates.
+    if d.sqlite <= 0,
+      do: raise("memory reading: sqlite delta <= 0 (#{inspect(Map.delete(d, :vm))})")
+
+    d
+  end
+
+  defp alloc_block_bytes do
+    {sum_alloc_blocks(:erlang.system_info(:alloc_util_allocators)),
+     sum_alloc_blocks([:driver_alloc])}
+  end
+
+  # Live block bytes summed over the given alloc_util allocators (0 for a disabled one).
+  defp sum_alloc_blocks(allocators) do
+    Enum.reduce(allocators, 0, fn alloc, acc ->
+      case :erlang.system_info({:allocator_sizes, alloc}) do
+        instances when is_list(instances) ->
+          {_carriers, blocks} = Fathom.Admin.Measurements.sum_allocator_sizes(instances)
+          acc + blocks
+
+        _disabled ->
+          acc
+      end
+    end)
+  end
+
+  defp log_memory_delta(label, t, n, det) do
+    kb = fn bytes -> Float.round(bytes / n / 1024, 1) end
+
+    vm =
+      Map.new(Map.take(det.vm, [:total, :processes, :binary, :ets, :system]), fn {k, v} ->
+        {k, kb.(v)}
+      end)
+
+    # `warning`, not `info`: `mix fathom.bench` raises the Logger level to :warning to keep the run quiet.
+    Logger.warning(
+      "bench info: #{label} trial #{t} KiB/shard: blocks=#{kb.(det.blocks)} sqlite=#{kb.(det.sqlite)} " <>
+        "proc=#{kb.(det.proc)} erlang.memory=#{inspect(vm)}"
+    )
   end
 
   @doc """
@@ -2816,7 +3129,9 @@ defmodule Fathom.Bench do
   @spec served_repl(keyword()) :: %{
           total_kb: float(),
           follower_kb: float(),
-          session_kb: float()
+          session_kb: float(),
+          blocks_kb: float(),
+          sqlite_kb: float()
         }
   def served_repl(opts \\ []) do
     n = Keyword.get(opts, :served_repl_n, @served_repl_n)
@@ -2829,7 +3144,9 @@ defmodule Fathom.Bench do
       %{
         total_kb: results |> Enum.map(&elem(&1, 0)) |> median(),
         follower_kb: results |> Enum.map(&elem(&1, 1)) |> median(),
-        session_kb: results |> Enum.map(&elem(&1, 2)) |> median()
+        session_kb: results |> Enum.map(&elem(&1, 2)) |> median(),
+        blocks_kb: results |> Enum.map(&elem(&1, 3)) |> median(),
+        sqlite_kb: results |> Enum.map(&elem(&1, 4)) |> median()
       }
     end)
   end
@@ -2963,6 +3280,7 @@ defmodule Fathom.Bench do
       do: raise("served_repl: replication is not on — measuring nothing")
 
     collect_all()
+    before_mem = memory_snapshot()
     before_local = :erlang.memory(:total)
     before_remote = peer_call(peer, __MODULE__, :peer_memory_total, [])
 
@@ -2985,6 +3303,8 @@ defmodule Fathom.Bench do
 
     collect_all()
     local = :erlang.memory(:total) - before_local
+    det = memory_delta(before_mem, memory_snapshot(), Enum.map(handles, &elem(&1, 1)))
+    log_memory_delta("served_repl", t, n, det)
     remote = peer_call(peer, __MODULE__, :peer_memory_total, []) - before_remote
     session_kb = session_bytes!(ids) / n / 1024
 
@@ -2994,7 +3314,8 @@ defmodule Fathom.Bench do
       for name <- names, do: peer_call(peer, Follower, :forget, [name, id])
     end)
 
-    {local / n / 1024, remote / n / length(names) / 1024, session_kb}
+    {local / n / 1024, remote / n / length(names) / 1024, session_kb, det.blocks / n / 1024,
+     det.sqlite / n / 1024}
   end
 
   # Σ over the shards' replication Sessions of `Process.info(:memory)` (heap, stack, mailbox) plus
@@ -3031,8 +3352,15 @@ defmodule Fathom.Bench do
     {:ok, _} = Connection.query(conn, "CREATE TABLE IF NOT EXISTS repl_probe (a INTEGER)", [])
     {:ok, _} = Connection.query(conn, "INSERT INTO repl_probe VALUES (1)", [])
 
-    # The first commit finds the follower unseeded and answers with the seed; keep committing until
-    # a quorum acks (bounded — a stuck seed must fail loudly, not hang the bench).
+    commit_until_quorum!(id, path, pid, 10)
+
+    {id, pid, ref, conn}
+  end
+
+  # The first commit finds the follower unseeded and answers with the seed; keep committing until
+  # a quorum acks (bounded - a stuck seed must fail loudly, not hang the bench).
+  defp commit_until_quorum!(id, path, pid, pause_ms) do
+    alias Fathom.Shard.Replication.Session
     deadline = System.monotonic_time(:millisecond) + 10_000
 
     Stream.repeatedly(fn ->
@@ -3043,12 +3371,113 @@ defmodule Fathom.Bench do
         _ ->
           if System.monotonic_time(:millisecond) > deadline,
             do: raise("served_repl: shard #{id} never reached a replication quorum"),
-            else: Process.sleep(10)
+            else: Process.sleep(pause_ms)
       end
     end)
     |> Enum.find(&(&1 == :ok))
+  end
 
-    {id, pid, ref, conn}
+  @repl_reopen_samples 8
+
+  @doc """
+  `repl_first_commit_after_reopen_us` / `repl_first_commit_reset_rounds` - the FIRST commit after a
+  coordinator reopen with A2 replication ON (expert review 2026-10-22 r8 #5): the most expensive
+  replication path per tenant session. Each sample opens a shard, replicates it to quorum, drains it
+  (Session stopped, coordinator and local copy gone), reopens it and times a `Session.commit` of one
+  fresh INSERT until a quorum acks. The new Session starts with no follower state, so that commit
+  pays the lineage-bump reset round, the seed and the retry (r8 #16 removes the doomed reset round)
+  plus the Session warm-up (r8 #17's per-start `:memory:` registry open). `served_repl` only ever
+  measured a coordinator's first life.
+
+    * `p50_us` - median of #{@repl_reopen_samples} timed first commits (one untimed warm-up shard).
+    * `resets` - median count of `[:fathom, :replication, :commit_stage]` `:collect` rounds with
+      `reset: true` in that window (counted by telemetry because `quorum IMPOSSIBLE` is rate-limited
+      to 5 lines/s per node and cannot be counted from the log). Expect 1+ today; fewer after #16.
+
+  Preconditions (raises otherwise): replication is on, the reopened coordinator is a NEW pid, the
+  reopened file was pulled back with the shard's rows, and the commit reached quorum.
+  Own scoped topology (`with_replication/2`). WATCH-ONLY (new series).
+  """
+  @spec repl_first_commit_stats(keyword()) :: %{p50_us: float(), resets: float()}
+  def repl_first_commit_stats(opts \\ []) do
+    alias Fathom.Shard.Replication.{Fleet, Session}
+    samples = Keyword.get(opts, :repl_reopen_samples, @repl_reopen_samples)
+    rows = Keyword.get(opts, :served_rows, @served_rows)
+    setup_write_path()
+
+    with_replication(opts, fn peer, names ->
+      unless Fleet.replicating?(),
+        do: raise("repl_first_commit_after_reopen_us: replication is not on - measuring nothing")
+
+      {:ok, _} = Application.ensure_all_started(:telemetry)
+      resets = :counters.new(1, [])
+      handler = "bench-reopen-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:fathom, :replication, :commit_stage],
+        fn _e, _m, meta, _ ->
+          if meta.stage == :collect and meta.reset == true, do: :counters.add(resets, 1, 1)
+        end,
+        nil
+      )
+
+      try do
+        results =
+          for i <- 0..samples do
+            {id, pid, ref, conn} = open_repl_shard(1000, i, rows)
+
+            {:ok, %{rows: [[expected]]}} =
+              Connection.query(conn, "SELECT count(*) FROM ks_scalars", [])
+
+            :ok = Connection.close(conn)
+            Session.stop(id)
+
+            # The bench writes through a raw connection, which does not mark the shard dirty; without
+            # this the drain would drop the file unflushed and the reopen would find an empty shard.
+            Fathom.Shard.WriteCounter.bump(id)
+            Fathom.Shard.checkin(pid, ref)
+            :ok = Shards.drain(id, 5_000)
+
+            {:ok, pid2, ref2, path} = Shards.checkout(id)
+
+            if pid2 == pid,
+              do: raise("repl_first_commit_after_reopen_us: the coordinator was not reopened")
+
+            {:ok, conn2} = Connection.open(path)
+
+            {:ok, %{rows: [[count]]}} =
+              Connection.query(conn2, "SELECT count(*) FROM ks_scalars", [])
+
+            if expected == 0 or count != expected,
+              do:
+                raise(
+                  "repl_first_commit_after_reopen_us: reopened file has #{count}/#{expected} rows"
+                )
+
+            {:ok, _} = Connection.query(conn2, "INSERT INTO repl_probe VALUES (2)", [])
+            :counters.put(resets, 1, 0)
+            {us, :ok} = :timer.tc(fn -> commit_until_quorum!(id, path, pid2, 1) end)
+            r = :counters.get(resets, 1)
+
+            Connection.close(conn2)
+            Session.stop(id)
+            Fathom.Shard.checkin(pid2, ref2)
+            Shards.drain(id, 5_000)
+            for name <- names, do: peer_call(peer, Follower, :forget, [name, id])
+            {us, r}
+          end
+
+        timed = tl(results)
+
+        %{
+          p50_us: p50(Enum.map(timed, &elem(&1, 0))),
+          resets: median(Enum.map(timed, &elem(&1, 1)))
+        }
+      after
+        :telemetry.detach(handler)
+      end
+    end)
   end
 
   # --- write + auth wire metrics (expert review 2026-10-17 #8) ---------------
@@ -3368,6 +3797,180 @@ defmodule Fathom.Bench do
       restore_collector.()
     end
   end
+
+  @idle_n 200
+  @idle_wait_ms 35_000
+
+  @doc """
+  `idle_kb_per_shard` / `idle_ets_b_per_shard` / `idle_hibernated_frac` - the IDLE, checked-in shard
+  with prod's per-shard state switched on (expert review 2026-10-22 r8 #2). Every other density arm
+  holds a live checkout under a setup with `:shard_load` and the FlushWatermark off; prod has both on
+  and most open shards are idle, so ~1.2 KB/shard of ETS/counter rows plus the coordinator's own
+  heap were measured by nothing.
+
+  Own scoped setup (the shared `setup/1` is untouched): `:shard_load` and `:metrics_collector` on,
+  ShardLoad/ShardLatency/Lru/WriteCounter/FlushWatermark running, heartbeat mode (a `Heartbeat` is
+  started and every coordinator's `acquire_gen` is asserted non-nil), prod-shaped timers (flush
+  interval 300 s, idle stop 600 s, so `hibernate_after` is whatever `Fathom.Shard` derives from a
+  300 s interval). N shards are written through `ShardExecutor` and checked in, then the arm waits
+  up to #{@idle_wait_ms} ms for the coordinators to hibernate.
+
+    * `idle_kb_per_shard` - `Process.info(:memory)` + refc binaries over the coordinators, per shard.
+    * `idle_ets_b_per_shard` - BYTES per shard in the per-shard ETS tables (rows + indexes) plus the
+      NIF counter arrays those rows point at (`std_alloc` live-block delta around the opens, so a
+      `:write_concurrency` counter regression shows up here).
+    * `idle_hibernated_frac` - share of coordinators whose `current_function` is
+      `{:gen_server, :loop_hibernate, 4}`. REPORTED, not asserted: it is 0.0 on code where
+      `hibernate_after` (376 s at a 300 s flush) never fires before the idle stop (r8 #12), and 1.0
+      once that lands; a raise would make this arm unrunnable until then.
+
+  Preconditions (raises otherwise): every coordinator is in heartbeat mode, and the ShardLoad,
+  ShardLatency, WriteCounter and FlushWatermark tables each hold at least N rows. WATCH-ONLY.
+  """
+  @spec idle_stats(keyword()) :: %{kb: float(), ets_b: float(), hibernated: float()}
+  def idle_stats(opts \\ []) do
+    n = Keyword.get(opts, :idle_n, @idle_n)
+    wait_ms = Keyword.get(opts, :idle_wait_ms, @idle_wait_ms)
+
+    setup(opts)
+
+    restores = [
+      put_env_scoped(:shard_load, true),
+      put_env_scoped(:metrics_collector, true),
+      put_env_scoped(:shard_flush_interval_ms, 300_000),
+      put_env_scoped(:shard_idle_ms, 600_000)
+    ]
+
+    # Coordinators in heartbeat mode subscribe to the lapse topic; without the PubSub they log a
+    # warning per open and skip the subscription, which is not prod's per-coordinator state.
+    {:ok, _} = Application.ensure_all_started(:phoenix_pubsub)
+
+    pubsub =
+      case Phoenix.PubSub.Supervisor.start_link(name: Fathom.PubSub) do
+        {:ok, pid} ->
+          Process.unlink(pid)
+          pid
+
+        {:error, {:already_started, _}} ->
+          nil
+      end
+
+    owned =
+      for mod <- [
+            Fathom.Shard.WriteCounter,
+            Fathom.Admin.FlushWatermark,
+            Fathom.Shards.Lru,
+            Fathom.Shards.KnownShards,
+            Fathom.Shard.Heartbeat
+          ],
+          pid = start_owned(mod),
+          do: pid
+
+    ids = for i <- 1..n, do: "bench_idle_#{i}"
+
+    try do
+      unless Fathom.ShardLoad.enabled?(),
+        do: raise("idle_kb_per_shard: :shard_load is off - measuring the wrong topology")
+
+      unless Fathom.Shard.Heartbeat.running?(),
+        do: raise("idle_kb_per_shard: no Heartbeat - coordinators would open in legacy mode")
+
+      :erlang.garbage_collect()
+      counters_before = sum_alloc_blocks([:std_alloc])
+
+      pids =
+        for id <- ids do
+          {:ok, conn} = ShardExecutor.open(id)
+
+          {:ok, _} =
+            ShardExecutor.execute(conn, %Filo.Stmt{sql: "CREATE TABLE t (v INTEGER)", args: []})
+
+          {:ok, _} =
+            ShardExecutor.execute(conn, %Filo.Stmt{sql: "INSERT INTO t VALUES (1)", args: []})
+
+          :ok = ShardExecutor.close(conn)
+          [{pid, _}] = Registry.lookup(Fathom.ShardRegistry, id)
+
+          # Asked HERE, before the wait: a call to a hibernated process wakes it.
+          unless is_integer(Fathom.Shard.acquire_gen(pid)),
+            do: raise("idle_kb_per_shard: #{id} opened in legacy mode (acquire_gen nil)")
+
+          pid
+        end
+
+      for t <- [
+            Fathom.ShardLoad,
+            Fathom.ShardLatency,
+            Fathom.Shard.WriteCounter,
+            Fathom.Admin.FlushWatermark
+          ] do
+        size = :ets.info(t, :size)
+
+        unless is_integer(size) and size >= n,
+          do:
+            raise("idle_kb_per_shard: #{inspect(t)} has #{inspect(size)} rows, expected >= #{n}")
+      end
+
+      hibernated = await_hibernated(pids, System.monotonic_time(:millisecond) + wait_ms)
+      :erlang.garbage_collect()
+
+      counter_delta = sum_alloc_blocks([:std_alloc]) - counters_before
+
+      coord_bytes =
+        Enum.reduce(pids, 0, fn pid, acc ->
+          {:memory, mem} = Process.info(pid, :memory)
+          {:binary, bins} = Process.info(pid, :binary)
+          acc + mem + (bins |> Enum.map(&elem(&1, 1)) |> Enum.sum())
+        end)
+
+      owners =
+        Enum.flat_map(
+          owned ++ [Process.whereis(Fathom.ShardLoad), Process.whereis(Fathom.ShardLatency)],
+          &List.wrap/1
+        )
+
+      ets_bytes =
+        for t <- :ets.all(), :ets.info(t, :owner) in owners, reduce: 0 do
+          acc -> acc + :ets.info(t, :memory) * :erlang.system_info(:wordsize)
+        end
+
+      if coord_bytes <= 0 or ets_bytes <= 0,
+        do: raise("idle_kb_per_shard: zero coordinator/ETS bytes - measuring nothing")
+
+      %{
+        kb: coord_bytes / n / 1024,
+        ets_b: (ets_bytes + max(counter_delta, 0)) / n,
+        hibernated: hibernated / n
+      }
+    after
+      Enum.each(ids, &Shards.drain(&1, 5_000))
+      Enum.each(owned, &GenServer.stop/1)
+      if pubsub, do: Supervisor.stop(pubsub)
+      Enum.each(restores, & &1.())
+    end
+  end
+
+  # Polls until every pid is hibernated or the deadline passes; returns how many are.
+  defp await_hibernated(pids, deadline) do
+    count = Enum.count(pids, &hibernated?/1)
+
+    cond do
+      count == length(pids) ->
+        count
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        count
+
+      true ->
+        Process.sleep(500)
+        await_hibernated(pids, deadline)
+    end
+  end
+
+  defp hibernated?(pid),
+    do:
+      Process.info(pid, :current_function) ==
+        {:current_function, {:gen_server, :loop_hibernate, 4}}
 
   # Sets a :fathom env key and returns a function that puts the previous state back.
   defp put_env_scoped(key, value) do

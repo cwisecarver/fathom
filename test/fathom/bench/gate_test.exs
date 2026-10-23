@@ -15,7 +15,24 @@ defmodule Fathom.Bench.GateTest do
   # #3, #12). The "gated but never emitted" check reads the LAST perf_history line, which cannot
   # carry a key until `scripts/benchmark.sh` runs once on the new code; the orchestrator empties
   # this list at integration, after that run. Delete an entry once its key is in the history.
-  @not_yet_in_history []
+  # Round 8 (BENCH team): new watch-only series, in the history once the orchestrator runs
+  # scripts/benchmark.sh at integration. Empty this list then.
+  @not_yet_in_history [
+    :served_blocks_kb_per_shard,
+    :served_sqlite_kb_per_shard,
+    :served_proc_kb_per_shard,
+    :served_repl_blocks_kb_per_shard,
+    :served_repl_sqlite_kb_per_shard,
+    :idle_kb_per_shard,
+    :idle_ets_b_per_shard,
+    :idle_hibernated_frac,
+    :repl_first_commit_after_reopen_us,
+    :repl_first_commit_reset_rounds,
+    :flush_vacuum_32mb_p50_us,
+    :hrana_ws_connect_rt_us,
+    :retained_reopen_stub_p50_us,
+    :retained_reopen_requests
+  ]
 
   # Lives here, not in bench_test.exs, because that whole module is @moduletag :bench and excluded
   # from the default suite — which is how this drift survived unnoticed. This needs no bench run.
@@ -301,6 +318,18 @@ defmodule Fathom.Bench.GateTest do
                [],
              "the gate compares metrics the bench no longer emits; they will silently skip " <>
                "forever. Remove them, or rename the series (see copy_keystone_rows_per_s)."
+    end
+
+    # expert review 2026-10-22 r8 #3 (Q9=A): the prod codec is the only prod-path flush cost that
+    # can be gated today; the vacuum/stub routes wait for ~5 steady entries. Pinned by name so
+    # neither a silent un-gate of the codec nor a premature gate of the unbanded routes slips in.
+    test "the flush codec is gated; the unbanded flush routes stay watch-only" do
+      by_name = Map.new(Gate.metrics(), fn m -> {elem(m, 0), m} end)
+      assert tuple_size(by_name[:flush_codec_ms_per_mb]) == 2, "flush_codec_ms_per_mb must gate"
+
+      for name <- [:flush_vacuum_p50_us, :flush_stub_p50_us, :flush_vacuum_32mb_p50_us] do
+        assert {^name, _dir, :watch} = by_name[name]
+      end
     end
 
     test "the write path and per-stream open are gated by name" do

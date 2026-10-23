@@ -307,6 +307,118 @@ defmodule Fathom.Bench.StorageIO do
     end)
   end
 
+  @retained_samples 20
+  @retained_budget 64 * 1024 * 1024
+
+  @doc """
+  `retained_reopen_stub_p50_us` / `retained_reopen_requests` - reopen of a shard whose clean local
+  copy was RETAINED by an earlier drop (`SHARD_RETAIN_LOCAL_BYTES > 0`), against the real
+  `Storage.S3` client + Finch pool + loopback stub (expert review 2026-10-22 r8 #26, user decision
+  Q4=B: retention will be used, so this is the baseline the #26 fix is measured against).
+
+  A retained reopen should be the cheap open (no GET, no decode): the audit counts 3 S3 requests
+  (lease PUT, fork-evidence HEAD, post-lease warm check) for it today versus 2 for a cold reopen,
+  with the pre-lease HEAD's result never used. `requests` is the median S3 request count per timed
+  reopen, so the fix shows as a deterministic drop even where the loopback timing is noise.
+
+  Per sample: seed an object, cold-open it (pull), drain it (retained), then time the reopen
+  (`checkout` + connection open + first query). Preconditions (raises otherwise): the drain left the
+  `.retained` marker, the reopen consumed it WITHOUT replacing the file (same inode, so nothing was
+  pulled), the open's query worked, and at least one request went through the S3 pool.
+  WATCH-ONLY (new series).
+  """
+  @spec retained_reopen(keyword()) :: %{p50_us: float(), requests: float()}
+  def retained_reopen(opts \\ []) do
+    n = Keyword.get(opts, :retained_samples, @retained_samples)
+    me = self()
+    prev = Application.fetch_env(:fathom, :shard_retain_local_bytes)
+    Application.put_env(:fathom, :shard_retain_local_bytes, @retained_budget)
+
+    owner =
+      case Fathom.Shard.Retained.start_link([]) do
+        {:ok, pid} ->
+          Process.unlink(pid)
+          pid
+
+        {:error, {:already_started, _}} ->
+          nil
+      end
+
+    try do
+      with_stub_shards(fn stub ->
+        cycle = fn id ->
+          seed_stub_shard(id)
+          {pid, ref, conn, path} = open_query(id)
+          assert_pulled!("retained_reopen_stub_p50_us", path)
+          Connection.close(conn)
+          Fathom.Shard.checkin(pid, ref)
+          Shards.drain(id)
+
+          unless Fathom.FS.exists?(Fathom.Shard.Retained.marker(path)),
+            do:
+              raise(
+                "retained_reopen_stub_p50_us: the drain did not retain the local copy " <>
+                  "(budget #{@retained_budget}); this would measure a cold pull"
+              )
+
+          inode = File.stat!(path).inode
+          before = :counters.get(stub.counter, 1)
+          {us, {pid2, ref2, conn2, _}} = :timer.tc(fn -> open_query(id) end)
+          requests = :counters.get(stub.counter, 1) - before
+
+          if File.stat!(path).inode != inode,
+            do: raise("retained_reopen_stub_p50_us: the reopen replaced the file (it pulled)")
+
+          if Fathom.FS.exists?(Fathom.Shard.Retained.claimed_marker(path)),
+            do: raise("retained_reopen_stub_p50_us: the retained claim was not settled")
+
+          if requests < 1,
+            do: raise("retained_reopen_stub_p50_us: the reopen issued no S3 request")
+
+          Connection.close(conn2)
+          Fathom.Shard.checkin(pid2, ref2)
+          Shards.drain(id)
+          {us, requests}
+        end
+
+        # Untimed warm-up: module/NIF load and the first Finch connection.
+        cycle.(stub_id("rwarm"))
+        results = for i <- 1..n, do: cycle.(stub_id("ret#{i}"))
+
+        # The request count rides out of band: `with_stub_shards/1` is shared with the float-returning
+        # arms, and a map from this closure would make dialyzer infer the union as every caller's range.
+        send(me, {:retained_requests, median(Enum.map(results, &elem(&1, 1)))})
+        median(Enum.map(results, &elem(&1, 0)))
+      end)
+      |> then(fn p50_us ->
+        receive do
+          {:retained_requests, requests} -> %{p50_us: p50_us, requests: requests}
+        after
+          0 -> raise "retained_reopen: the request count was not recorded"
+        end
+      end)
+    after
+      if owner, do: GenServer.stop(owner)
+
+      case prev do
+        {:ok, v} -> Application.put_env(:fathom, :shard_retain_local_bytes, v)
+        :error -> Application.delete_env(:fathom, :shard_retain_local_bytes)
+      end
+    end
+  end
+
+  @doc false
+  # Bytes of a shard's `.db` plus its `-wal` (the flush snapshot reads both).
+  @spec db_bytes(Path.t()) :: non_neg_integer()
+  def db_bytes(path) do
+    Enum.reduce(["", "-wal"], 0, fn suffix, acc ->
+      case File.stat(path <> suffix) do
+        {:ok, %File.Stat{size: size}} -> acc + size
+        _ -> acc
+      end
+    end)
+  end
+
   @doc """
   `concurrent_cold_cycle_per_s` - cold checkout -> checkin -> drain cycles per second with
   #{@cold_cycle_workers} workers each cycling distinct shards, against the same real-S3-client +
