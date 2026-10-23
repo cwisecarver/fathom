@@ -1049,8 +1049,9 @@ defmodule Fathom.Shard do
         # waits on the chain (the next chain link, terminate's close_pool/1) waits on these too.
         side_closes: %{},
         # Close-chain links spawned and not yet finished (#22's depth gauge; see start_close/2).
-        # A `:counters` cell because the links decrement it from their own processes.
-        close_depth: :counters.new(1, []),
+        # A `:counters` cell because the links decrement it from their own processes. nil until
+        # the first link (expert review 2026-10-22 r8 #24a): see start_close/2.
+        close_depth: nil,
         # Has the open path's plain sidecar write been made durable yet? See sync_sidecar_once/1.
         sidecar_synced?: false,
         # The off-process first-write sidecar fsync (expert review 2026-10-17 #5); nil when none
@@ -3380,26 +3381,27 @@ defmodule Fathom.Shard do
     id = state.id
     prev = state.closing
     sides = Map.values(Map.get(state, :side_closes, %{}))
-    depth = Map.get(state, :close_depth)
-    if depth, do: :counters.add(depth, 1, 1)
+    # Created on the first link, not at open (expert review 2026-10-22 r8 #24a): most coordinators
+    # never spawn one, and the counter is ~154 B off-heap each.
+    depth = Map.get(state, :close_depth) || :counters.new(1, [])
+    state = %{state | close_depth: depth}
+    :counters.add(depth, 1, 1)
 
     try do
       pid = spawn(fn -> run_close(id, [prev | sides], conns, depth) end)
 
-      if depth do
-        :telemetry.execute(
-          [:fathom, :shard, :close_chain],
-          %{depth: :counters.get(depth, 1), side: length(sides)},
-          %{}
-        )
-      end
+      :telemetry.execute(
+        [:fathom, :shard, :close_chain],
+        %{depth: :counters.get(depth, 1), side: length(sides)},
+        %{}
+      )
 
       %{state | closing: pid}
     rescue
       # `spawn/1` raises `:system_limit` with a full process table (see the flush-task spawn): close
       # inline, the pre-#15 behaviour, rather than leak the handles.
       _ ->
-        if depth, do: :counters.sub(depth, 1, 1)
+        :counters.sub(depth, 1, 1)
         state = await_closing(state)
         Enum.each(conns, &Connection.close_pooled/1)
         state
