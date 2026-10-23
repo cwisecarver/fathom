@@ -81,6 +81,60 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
   # Expert review 2026-10-01 perf #27. The scheduler snapshotted its sample ONE SHARD AT A TIME,
   # each a HEAD + CopyObject plus two Postgres calls, so a fleet-singleton run managed roughly
   # 1/(2 RTT + copy) shards per second and an hourly cron at 1M tenants overran its own slot.
+  # Expert review 2026-10-22 r8 #25c. Symptom: `snapshot_one/1` ran `Directory.last_flushed_at/1` +
+  # `record_snapshot_attempt/1` + `record_snapshot/2` per shard: 3N + 1 `shards` round trips per
+  # run. The watermark now rides in the sampling select and the attempt stamp is one batched
+  # UPDATE: N + 2. Invariant pinned: round trips per run are at most N + 2, AND the stamps still
+  # land (attempt on every sampled shard, snapshot credited with the pre-copy flush watermark).
+  describe "postgres round trips" do
+    test "a run costs N + 2 shards queries, not 3N + 1, and still stamps every shard" do
+      n = 5
+      ids = for i <- 1..n, do: "snapschedq#{i}_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        for id <- ids do
+          Shards.drain(id, 2_000)
+
+          for dir <- [remote_dir(), Fathom.Shard.data_dir()],
+              suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
+              do: File.rm(Path.join(dir, id <> suffix))
+        end
+      end)
+
+      for id <- ids, do: seed(id, ["CREATE TABLE t (v INTEGER)", "INSERT INTO t VALUES (1)"])
+      flushed = Map.new(ids, &{&1, row(&1).last_flushed_at})
+
+      counter = :counters.new(1, [])
+      handler = "snapsched-queries-#{System.unique_integer([:positive])}"
+
+      # Task.async_stream workers run the per-shard stamps in OTHER processes, so count by source
+      # globally; this module is `async: false`, so no concurrent module adds `shards` queries.
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:fathom, :repo, :query],
+          fn _e, _m, meta, _c ->
+            if meta[:source] == "shards", do: :counters.add(counter, 1, 1)
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert {:ok, %{ok: ^n}} = ScheduleJob.run(50)
+      :telemetry.detach(handler)
+
+      assert :counters.get(counter, 1) <= n + 2,
+             "#{:counters.get(counter, 1)} shards queries for #{n} shards (was 3N + 1 = #{3 * n + 1})"
+
+      for id <- ids do
+        r = row(id)
+        assert r.last_snapshot_attempt_at != nil, "#{id} was not stamped as attempted"
+        assert r.last_snapshot_at == flushed[id], "#{id} not credited with its pre-copy watermark"
+      end
+    end
+  end
+
   describe "concurrency" do
     test "a run snapshots its sample concurrently, not one shard at a time" do
       ids = for i <- 1..6, do: "snapschedc#{i}_#{System.unique_integer([:positive])}"

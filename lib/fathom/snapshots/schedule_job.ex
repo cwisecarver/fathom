@@ -89,10 +89,17 @@ defmodule Fathom.Snapshots.ScheduleJob do
     # second and an hourly cron over a large fleet overran its own slot. A real per-shard timeout,
     # never `:infinity` (AGENTS.md: one wedged tenant once hung a whole sweep); a shard that times
     # out counts as an error and stays at the head of the rotation for the next run.
+    sample = Directory.sample_for_snapshot(n)
+
+    # Stamp the ATTEMPT for the whole batch in ONE statement, before any copy: the rotation orders
+    # by it, so a shard that fails (or whose task is timeout-killed) every time goes to the back
+    # instead of holding a slot forever (expert review 2026-10-10 #14). Postgres round trips per
+    # run: 3N -> N+2 (expert review 2026-10-22 r8 #25c).
+    Directory.record_snapshot_attempts(Enum.map(sample, & &1.shard_id))
+
     results =
-      n
-      |> Directory.sample_for_snapshot()
-      |> Task.async_stream(&snapshot_one(&1.shard_id),
+      sample
+      |> Task.async_stream(&snapshot_one(&1.shard_id, &1.last_flushed_at),
         max_concurrency: concurrency(),
         timeout: @snapshot_timeout_ms,
         on_timeout: :kill_task,
@@ -122,20 +129,14 @@ defmodule Fathom.Snapshots.ScheduleJob do
     {:ok, counts}
   end
 
-  defp snapshot_one(shard_id) do
-    # Capture the watermark the snapshot will reflect BEFORE the copy. `Snapshots.create` copies
-    # the live stored object, i.e. state as of the last flush that preceded the CopyObject, so the
-    # snapshot must be CREDITED with that flush's time — not wall-clock now(), which would mark a
-    # flush landing between the copy and the stamp as "already snapshotted" though its bytes are not
-    # in the snapshot (expert review 2026-08-31 #7). Reading it first stamps at-or-behind the
-    # captured state, so the failure direction is a redundant re-snapshot, never a silent gap.
-    watermark = Directory.last_flushed_at(shard_id) || DateTime.utc_now()
-
-    # Stamp the ATTEMPT first: the rotation orders by it, so a shard that fails (or whose task is
-    # timeout-killed) every time goes to the back instead of holding a slot forever
-    # (expert review 2026-10-10 #14).
-    Directory.record_snapshot_attempt(shard_id)
-
+  # `watermark` is the shard's `last_flushed_at` as read by the sampling query, i.e. BEFORE the copy.
+  # `Snapshots.create` copies the live stored object, i.e. state as of the last flush that preceded
+  # the CopyObject, so the snapshot must be CREDITED with that flush's time — not wall-clock now(),
+  # which would mark a flush landing between the copy and the stamp as "already snapshotted" though
+  # its bytes are not in the snapshot (expert review 2026-08-31 #7). Reading it first stamps
+  # at-or-behind the captured state, so the failure direction is a redundant re-snapshot, never a
+  # silent gap. (Sampling happens slightly earlier than the old per-shard read: still behind.)
+  defp snapshot_one(shard_id, watermark) do
     # `auto: true`, not `label: "auto"` (expert review 2026-08-20 #14). The marker is provenance,
     # and routing it through the operator-supplied label field is what let a manual snapshot forge
     # it — including by 40-char truncation.

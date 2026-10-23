@@ -570,7 +570,9 @@ defmodule Fathom.Directory do
   `last_flushed_at` being NULL means the shard has never flushed — there is no durable object to
   copy — so those are excluded rather than snapshotted into an error.
   """
-  @spec sample_for_snapshot(pos_integer()) :: [%{shard_id: String.t()}]
+  @spec sample_for_snapshot(pos_integer()) :: [
+          %{shard_id: String.t(), last_flushed_at: DateTime.t()}
+        ]
   def sample_for_snapshot(n) when is_integer(n) and n > 0 do
     from(s in Shard,
       where: s.status == "active",
@@ -578,9 +580,28 @@ defmodule Fathom.Directory do
       where: is_nil(s.last_snapshot_at) or s.last_flushed_at > s.last_snapshot_at,
       order_by: [asc_nulls_first: s.last_snapshot_attempt_at, asc_nulls_first: s.last_snapshot_at],
       limit: ^n,
-      select: %{shard_id: s.shard_id}
+      # `last_flushed_at` rides along (expert review 2026-10-22 r8 #25c): it is the watermark the
+      # scheduler credits the snapshot with, and a per-shard `last_flushed_at/1` read was one of
+      # three Postgres round trips per shard.
+      select: %{shard_id: s.shard_id, last_flushed_at: s.last_flushed_at}
     )
     |> Repo.all()
+  end
+
+  @doc """
+  Batch form of `record_snapshot_attempt/2`: one UPDATE for every id (expert review 2026-10-22 r8
+  #25c). Returns rows updated.
+  """
+  @spec record_snapshot_attempts([String.t()], DateTime.t()) :: non_neg_integer()
+  def record_snapshot_attempts(shard_ids, at \\ DateTime.utc_now())
+  def record_snapshot_attempts([], _at), do: 0
+
+  def record_snapshot_attempts(shard_ids, at) when is_list(shard_ids) do
+    {count, _} =
+      from(s in Shard, where: s.shard_id in ^shard_ids)
+      |> Repo.update_all(set: [last_snapshot_attempt_at: at, updated_at: DateTime.utc_now()])
+
+    count
   end
 
   @doc """
