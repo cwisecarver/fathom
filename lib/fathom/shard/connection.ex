@@ -295,12 +295,17 @@ defmodule Fathom.Shard.Connection do
   # A read-only handle takes only the connection-local pragmas. The file-level ones
   # (`journal_mode`, `wal_autocheckpoint`) describe writes this handle cannot perform, and
   # `max_page_count` is a growth cap on a connection that cannot grow the file.
+  #
+  # ONE BATCH after the extension (expert review 2026-10-22 r8 #18 step 1): `cache_size` rides the
+  # hardening batch, and `foreign_keys` is NOT set at all. FK enforcement runs only inside DML
+  # (INSERT/UPDATE/DELETE and the ON DELETE/UPDATE actions they fire), which a `:ro` handle cannot
+  # execute: SQLite refuses the write on a `mode: :readonly` handle, and the WAL-recovery fallback
+  # carries `query_only=ON`. So the pragma bought nothing and cost a dirty dispatch per `:ro` open.
+  # Fresh `:ro` open 13 -> 10 dispatches in the prod shape (`nif_dispatch_test.exs`).
   defp configure_readonly(conn, tenant?, guard_opts) do
     with :ok <- Sqlite3.set_busy_timeout(conn, 5000),
-         :ok <- maybe_foreign_keys(conn),
-         :ok <- maybe_cache_size(conn),
-         {:ok, ext} <- load_extension(conn, tenant?),
-         :ok <- maybe_harden(conn, tenant?, ext),
+         {:ok, ext} <- load_extension(conn),
+         :ok <- maybe_harden(conn, tenant?, ext, cache_size_sql()),
          :ok <- maybe_authorizer(conn, tenant?, ext, guard_opts) do
       {:ok, conn}
     end
@@ -308,8 +313,8 @@ defmodule Fathom.Shard.Connection do
 
   defp configure_readwrite(conn, tenant?, scope, guard_opts, wal?) do
     with :ok <- configure(conn, wal?, guard_opts[:deferred_sync?]),
-         {:ok, ext} <- load_extension(conn, tenant?),
-         :ok <- maybe_harden(conn, tenant?, ext),
+         {:ok, ext} <- load_extension(conn),
+         :ok <- maybe_harden(conn, tenant?, ext, []),
          :ok <- maybe_query_only(conn, scope),
          :ok <- maybe_authorizer(conn, tenant?, ext, guard_opts) do
       {:ok, conn}
@@ -336,10 +341,9 @@ defmodule Fathom.Shard.Connection do
   #
   # Returns `{:ok, :loaded | :skipped}`: `maybe_authorizer/3` needs to know which authorizer the
   # handle can carry.
-  defp load_extension(conn, tenant?) do
+  defp load_extension(conn) do
     case Fathom.Shard.Extension.load(conn) do
       :ok ->
-        if tenant?, do: :ok = arm_backstop(conn)
         {:ok, :loaded}
 
       :skipped ->
@@ -366,22 +370,19 @@ defmodule Fathom.Shard.Connection do
   # TENANT HANDLES ONLY (expert review 2026-10-08 #11), for the reason `query/4` gives: the deadline
   # bounds client SQL. Armed on every handle, it also cut off fathom's own `VACUUM INTO` snapshot and
   # `quick_check` — through `exec/2` too, which the watchdog never covered.
-  defp arm_backstop(conn) do
+  #
+  # It rides the LAST position of `maybe_harden/4`'s batch (expert review 2026-10-22 r8 #18 step 1)
+  # instead of its own `execute`: one dirty dispatch fewer per tenant open. Last, so that
+  # `sqlite3_exec` (which stops at the first error) has already applied every hardening statement
+  # when it reaches the backstop; see `maybe_harden/4` for how its failure stays non-fatal.
+  defp backstop_sql(:loaded) do
     case timeout_ms() do
-      ms when is_integer(ms) and ms > 0 ->
-        case Sqlite3.execute(conn, "SELECT fathom_backstop(#{ms})") do
-          :ok ->
-            :ok
-
-          {:error, reason} ->
-            Logger.warning("statement-deadline backstop not armed: #{inspect(reason)}")
-            :ok
-        end
-
-      _ ->
-        :ok
+      ms when is_integer(ms) and ms > 0 -> ["SELECT fathom_backstop(", Integer.to_string(ms), ")"]
+      _ -> nil
     end
   end
+
+  defp backstop_sql(:skipped), do: nil
 
   # Deny ATTACH/DETACH on any handle that runs client SQL. Without this, one statement —
   # `ATTACH DATABASE '<data_dir>/<victim>.db' AS v` — gave a tenant full read AND write
@@ -516,7 +517,10 @@ defmodule Fathom.Shard.Connection do
   # handles only — the coordinator's VACUUM-INTO snapshot and the migration replay run fathom's
   # own SQL and legitimately need the unhardened engine. A failure to apply them fails the OPEN
   # (like the extension re-disable), because the alternative is a tenant handle without the floor.
-  defp maybe_harden(_conn, false, _ext), do: :ok
+  #
+  # `lead` is SQL that must run on the handle whatever its kind, prepended to the batch (the `:ro`
+  # open's `cache_size`, expert review 2026-10-22 r8 #18 step 1); a non-tenant handle runs only it.
+  defp maybe_harden(conn, false, _ext, lead), do: exec_batch(conn, lead)
 
   # ONE batch (expert review 2026-10-19 #23): both are plain PRAGMAs, and `sqlite3_exec` stops at
   # the first error, which is what the two-step `with` did. Probe: two executes 11-17 us mean per
@@ -527,15 +531,40 @@ defmodule Fathom.Shard.Connection do
   # 2026-10-20 #2): a lock wait on a tenant handle gives up at once and `query/4`
   # retries it from the owner process instead of sleeping on a dirty-IO thread (see
   # `retry_busy/4`). Riding this batch keeps the open's dispatch count unchanged.
-  defp maybe_harden(conn, true, :loaded),
-    do:
-      Sqlite3.execute(
-        conn,
-        "PRAGMA trusted_schema=OFF;PRAGMA cell_size_check=ON;SELECT fathom_busy_yield(1)"
-      )
+  #
+  # The deadline backstop rides LAST (r8 #18 step 1). Its failure must stay non-fatal (see
+  # `backstop_sql/1`), but a failed batch cannot say which statement failed, so on an error the
+  # batch WITHOUT the backstop runs again: the hardening statements are idempotent, and if they
+  # succeed alone the backstop was the failure, which is logged and tolerated exactly as before.
+  # The re-run happens only on that failure path, never on a healthy open.
+  defp maybe_harden(conn, true, ext, lead) do
+    harden = [lead, ";PRAGMA trusted_schema=OFF;PRAGMA cell_size_check=ON", busy_yield_sql(ext)]
 
-  defp maybe_harden(conn, true, :skipped),
-    do: Sqlite3.execute(conn, "PRAGMA trusted_schema=OFF;PRAGMA cell_size_check=ON")
+    case backstop_sql(ext) do
+      nil ->
+        exec_batch(conn, harden)
+
+      backstop ->
+        with {:error, _} <- exec_batch(conn, [harden, ";", backstop]),
+             :ok <- exec_batch(conn, harden) do
+          Logger.warning("statement-deadline backstop not armed: fathom_backstop failed")
+          :ok
+        end
+    end
+  end
+
+  defp busy_yield_sql(:loaded), do: ";SELECT fathom_busy_yield(1)"
+  defp busy_yield_sql(:skipped), do: []
+
+  # Batch fragments here start with ";" (they are written to be APPENDED), so trim one at the
+  # start. An empty batch is no dispatch at all.
+  defp exec_batch(conn, iodata) do
+    case IO.iodata_to_binary(iodata) do
+      "" -> :ok
+      ";" <> sql -> Sqlite3.execute(conn, sql)
+      sql -> Sqlite3.execute(conn, sql)
+    end
+  end
 
   # This file's actual page size. Falls back to SQLite's default rather than raising: an
   # unreadable pragma must not stop a shard opening, and 4096 is the value that reproduces the
@@ -637,7 +666,8 @@ defmodule Fathom.Shard.Connection do
   #     query. The coordinator checkpoints PASSIVE after each durability snapshot, where no client
   #     waits. Raised, NOT disabled: at 0 a wedged coordinator would grow the WAL without bound.
   #   * `journal_size_limit`, `foreign_keys`, `cache_size`: see `journal_size_limit_sql/0`,
-  #     `maybe_foreign_keys/1` and `maybe_cache_size/1`.
+  #     and the two comments below ("SQLite defaults foreign_keys=OFF", "Make the per-connection page
+  #     cache").
   #
   # `deferred_sync?` (expert review 2026-10-21 #7, OFF by default): a tenant `:rw` handle on a
   # replicating node with `:replication_deferred_wal_sync` on runs `synchronous=NORMAL`, and the
@@ -727,7 +757,7 @@ defmodule Fathom.Shard.Connection do
     do: Application.get_env(:fathom, :foreign_keys, true) and Fathom.Shard.Extension.available?()
 
   # Built from config (booleans and integers fathom owns, never tenant input), mirroring
-  # `maybe_foreign_keys/1` and `maybe_cache_size/1` exactly.
+  # `foreign_keys_sql/0` and `cache_size_sql/0` exactly.
   defp rw_reuse_sql(deferred_sync?, fk_fun?) do
     fk =
       if Application.get_env(:fathom, :foreign_keys, true) and not fk_fun?,
@@ -764,11 +794,8 @@ defmodule Fathom.Shard.Connection do
   # Default it ON here, server-side, so on_delete=CASCADE/PROTECT and FK integrity hold regardless
   # of client init. A migration needing it off can still send `PRAGMA foreign_keys=OFF` for its own
   # stream (that overrides this connection's setting); set `:foreign_keys` false to flip the default.
-  defp maybe_foreign_keys(conn) do
-    if Application.get_env(:fathom, :foreign_keys, true),
-      do: Sqlite3.execute(conn, "PRAGMA foreign_keys=ON"),
-      else: :ok
-  end
+  # Applied by `foreign_keys_sql/0` in the `:rw` open batch; a `:ro` handle skips it (it cannot run
+  # the DML that FK enforcement governs, expert review 2026-10-22 r8 #18 step 1).
 
   # Enforce a per-shard size cap (expert review 2026-07-14 #19). "Limited dataset per shard" is
   # fathom's premise but was never enforced, so one runaway tenant (an app bug, an unbounded log
@@ -794,13 +821,8 @@ defmodule Fathom.Shard.Connection do
   # no measured number. It is a knob and a declared ceiling, not a reduction: lowering it trades RAM
   # for page re-reads on scan-heavy tenants, which is a deployment-shaped decision, not one to make
   # blind. Negative value = KiB (SQLite's own convention); a positive value would mean *pages*, so
-  # the sign is forced here rather than left to the operator.
-  defp maybe_cache_size(conn) do
-    case cache_size_kb() do
-      nil -> :ok
-      kb -> Sqlite3.execute(conn, "PRAGMA cache_size=-#{kb}")
-    end
-  end
+  # the sign is forced here rather than left to the operator. Applied by `cache_size_sql/0`, inside
+  # the `:rw` open batch and the `:ro` open's hardening batch.
 
   # Bound the WAL's on-disk high-water mark (expert review 2026-10-10 #30). Without it a WAL that
   # once grew (a long reader holding off the checkpoint, one large transaction) keeps that size on
@@ -2042,7 +2064,7 @@ defmodule Fathom.Shard.Connection do
       {true, {:error, _}} ->
         {:error, :query_timeout}
 
-      # The extension's backstop stopped it (see `arm_backstop/1`) while the watchdog's timer had
+      # The extension's backstop stopped it (see `backstop_sql/1`) while the watchdog's timer had
       # not fired: an interrupt, or a lock wait given up as SQLITE_BUSY, with the deadline already
       # past is the same timeout.
       {false, {:error, reason}} ->

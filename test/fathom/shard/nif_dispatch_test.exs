@@ -439,6 +439,65 @@ defmodule Fathom.Shard.NifDispatchTest do
       assert total == 18, "open dispatches: #{inspect(by_fun)}"
     end
 
+    # PROD SHAPE (expert review 2026-10-22 r8 #18): prod sets `:query_timeout_ms` (30 s), which arms
+    # the on-thread deadline backstop on every tenant handle. The test env leaves it unset, so the
+    # count above never paid it and could not see it folded into the hardening batch.
+    defp with_prod_deadline(fun) do
+      prev = Application.fetch_env(:fathom, :query_timeout_ms)
+      Application.put_env(:fathom, :query_timeout_ms, 30_000)
+
+      try do
+        fun.()
+      after
+        case prev do
+          {:ok, v} -> Application.put_env(:fathom, :query_timeout_ms, v)
+          :error -> Application.delete_env(:fathom, :query_timeout_ms)
+        end
+      end
+    end
+
+    test "prod shape: a tenant :rw open is 18 dirty dispatches with the backstop armed (was 19)",
+         %{path: path} do
+      {res, total, by_fun} =
+        with_prod_deadline(fn -> count(fn -> Connection.open(path, tenant?: true) end) end)
+
+      assert {:ok, conn} = res
+
+      # The backstop rides the hardening batch (r8 #18 step 1) instead of its own execute. Prove
+      # it was ARMED, not dropped: the extension answers the deadline it holds.
+      assert {:ok, %{rows: [[30_000]]}} =
+               Connection.query(conn, "SELECT fathom_backstop(0)", [], dml?: false)
+
+      Connection.close(conn)
+      assert total == 18, "open dispatches: #{inspect(by_fun)}"
+    end
+
+    test "prod shape: a tenant :ro open is 10 dirty dispatches (was 13)", %{path: path} do
+      {:ok, c0} = Connection.open(path)
+      Connection.close(c0)
+
+      {res, total, by_fun} =
+        with_prod_deadline(fn ->
+          count(fn -> Connection.open(path, tenant?: true, scope: :ro) end)
+        end)
+
+      assert {:ok, conn} = res
+      pragma = fn name -> Connection.query(conn, "PRAGMA #{name}", [], dml?: false) end
+
+      # r8 #18 step 1: `cache_size` rides the hardening batch, `foreign_keys` is not set (FK
+      # enforcement runs only in DML, which a read-only handle cannot execute), and the backstop
+      # rides last. Everything the batch carries took effect:
+      assert {:ok, %{rows: [[-2000]]}} = pragma.("cache_size")
+      assert {:ok, %{rows: [[0]]}} = pragma.("trusted_schema")
+      assert {:ok, %{rows: [[1]]}} = pragma.("cell_size_check")
+
+      assert {:ok, %{rows: [[30_000]]}} =
+               Connection.query(conn, "SELECT fathom_backstop(0)", [], dml?: false)
+
+      Connection.close(conn)
+      assert total == 10, "open dispatches: #{inspect(by_fun)}"
+    end
+
     test "the batched PRAGMAs all took effect", %{path: path} do
       {:ok, conn} = Connection.open(path, tenant?: true)
       pragma = fn name -> Connection.query(conn, "PRAGMA #{name}", [], dml?: false) end
