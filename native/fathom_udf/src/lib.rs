@@ -48,6 +48,7 @@ use rusqlite::types::{Type, Value, ValueRef};
 use rusqlite::{ffi, Connection, Error, Result};
 
 pub mod aggregates;
+pub mod auto;
 pub mod backstop;
 pub mod datetime;
 pub mod pragma_guard;
@@ -77,10 +78,33 @@ pub unsafe extern "C" fn sqlite3_fathomudf_init(
     Connection::extension_init2(db, pz_err_msg, p_api, register_all)
 }
 
-/// Returning `Ok(false)` makes this a per-connection extension rather than a persistent one:
-/// fathom loads it explicitly on every connection it opens, and a persistent auto-extension would
-/// also attach to connections fathom did not intend (and outlive the disable step above).
+/// The explicit, per-connection load: every function, AND the WAL hook and the backstop's handlers
+/// at once (exqlite's own handlers are already in place by the time anyone can call
+/// `load_extension`). Used when the auto-extension is not armed (an artifact predating it), and by
+/// callers that load it themselves (the A2 Session's registry connection).
+///
+/// Returning `Ok(false)` makes this a per-connection extension rather than a persistent one. The
+/// PROCESS-GLOBAL registration is a separate, deliberate step: see src/auto.rs (expert review
+/// 2026-10-22 r8 #14), whose module docs carry the security argument.
 fn register_all(db: Connection) -> Result<bool> {
+    let state = register_common(&db)?;
+    unsafe {
+        wal::install_hook(db.handle());
+        backstop::attach(db.handle(), state)?;
+    }
+    Ok(false)
+}
+
+/// The auto-extension init (src/auto.rs), run inside every `sqlite3_open` once armed: every
+/// function and the per-connection state, but NO hook or handler. `fathom_conn_init()` installs
+/// those from `Fathom.Shard.Connection`'s open batch.
+pub(crate) fn register_auto(db: Connection) -> Result<bool> {
+    register_common(&db)?;
+    Ok(false)
+}
+
+/// Everything both inits register. Returns the backstop state `fathom_conn_init` attaches.
+fn register_common(db: &Connection) -> Result<backstop::State> {
     // Pure and deterministic: safe in views, expression indexes and CHECK constraints.
     let det = FunctionFlags::SQLITE_UTF8
         | FunctionFlags::SQLITE_DETERMINISTIC
@@ -88,29 +112,79 @@ fn register_all(db: Connection) -> Result<bool> {
     // Pure but NOT deterministic — SQLite will refuse to index these, which is correct.
     let nondet = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS;
 
-    register_datetime(&db, det)?;
-    register_text(&db, det)?;
-    register_hashes(&db, det)?;
-    register_misc(&db, det, nondet)?;
-    register_aggregates(&db)?;
+    register_datetime(db, det)?;
+    register_text(db, det)?;
+    register_hashes(db, det)?;
+    register_misc(db, det, nondet)?;
+    register_aggregates(db)?;
 
-    // The Phase 2 A2 frame seam. NOT a UDF — it installs a commit hook, and because
-    // `sqlite3_wal_hook` and `wal_autocheckpoint` share one slot, it also takes over the
-    // checkpointing it displaces. See src/wal.rs; removing this line silently disables BOTH the
-    // hook and (harmlessly) restores SQLite's own autocheckpoint.
-    wal::install(&db)?;
+    // The Phase 2 A2 frame seam's registration function. The commit hook itself is installed by
+    // the caller (`register_all`) or by `fathom_conn_init()`, never here: `sqlite3_wal_hook` and
+    // `wal_autocheckpoint` share one slot, so its placement is load-bearing. See src/wal.rs.
+    wal::install_functions(db)?;
 
     // The statement-deadline backstop: a timeout enforced on the query's own thread, because a
-    // BEAM timer can fail to fire while the query runs. See src/backstop.rs.
-    backstop::install(&db)?;
+    // BEAM timer can fail to fire while the query runs. See src/backstop.rs. Setters and state
+    // only; the handlers go in with the hook.
+    let state = backstop::register(db)?;
 
     // The engine half of the tenant PRAGMA gate. Registers only the set-once
     // `fathom_pragma_guard(...)` setter; the authorizer itself is installed when fathom calls it,
     // on tenant handles only (an authorizer denies ATTACH, and VACUUM INTO is an ATTACH). See
     // src/pragma_guard.rs.
-    pragma_guard::install(&db)?;
+    pragma_guard::install(db)?;
 
-    Ok(false)
+    register_conn_init(db, state)?;
+    Ok(state)
+}
+
+/// `fathom_conn_init()` (expert review 2026-10-22 r8 #14): install this connection's WAL commit
+/// hook and the backstop's progress, busy and trace handlers. Returns 1.
+///
+/// `Fathom.Shard.Connection` runs it inside its open batch on every handle it opens, in the place
+/// `PRAGMA wal_autocheckpoint=4000` used to occupy (the hook re-implements that 4000-frame PASSIVE
+/// checkpoint, src/wal.rs), so nothing that runs after it can take the shared slot back. Idempotent:
+/// a second call re-installs the same callbacks with the same state, so a tenant calling it changes
+/// nothing. DIRECTONLY.
+///
+/// The function's user data is the state `backstop::register` just returned on this connection;
+/// both are registered together in `register_common`, so re-registering one re-registers the other
+/// (see `backstop::register` on why that pairing matters).
+fn register_conn_init(db: &Connection, state: backstop::State) -> Result<()> {
+    let name = std::ffi::CString::new("fathom_conn_init").expect("static name");
+    let rc = unsafe {
+        ffi::sqlite3_create_function_v2(
+            db.handle(),
+            name.as_ptr(),
+            0,
+            ffi::SQLITE_UTF8 | ffi::SQLITE_DIRECTONLY,
+            state,
+            Some(conn_init),
+            None,
+            None,
+            None,
+        )
+    };
+    if rc != ffi::SQLITE_OK {
+        return Err(Error::SqliteFailure(ffi::Error::new(rc), None));
+    }
+    Ok(())
+}
+
+unsafe extern "C" fn conn_init(
+    ctx: *mut ffi::sqlite3_context,
+    _argc: c_int,
+    _argv: *mut *mut ffi::sqlite3_value,
+) {
+    let db = ffi::sqlite3_context_db_handle(ctx);
+    wal::install_hook(db);
+    match backstop::attach(db, ffi::sqlite3_user_data(ctx)) {
+        Ok(()) => ffi::sqlite3_result_int64(ctx, 1),
+        Err(_) => {
+            let msg = c"fathom_conn_init: could not install the backstop handlers";
+            ffi::sqlite3_result_error(ctx, msg.as_ptr(), -1);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

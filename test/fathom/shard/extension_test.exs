@@ -88,6 +88,57 @@ defmodule Fathom.Shard.ExtensionTest do
     end
   end
 
+  # Expert review 2026-10-22 r8 #14: the UDFs arrive with `sqlite3_open` (a process-global
+  # auto-extension), and the functions that change NODE-GLOBAL state exist only on Extension's
+  # private control connection. A tenant must neither reach them nor find extension loading on.
+  describe "the process-global auto-extension" do
+    test "a tenant handle has the UDFs but none of the node-global control functions", %{
+      path: path
+    } do
+      assert Extension.open_mode() == :auto
+      conn = open!(path, tenant?: true)
+
+      assert {:ok, %{rows: [[2026]]}} =
+               Connection.query(conn, "SELECT django_date_extract('year','2026-08-05')", [])
+
+      for sql <- ["SELECT fathom_auto_extension(0)", "SELECT fathom_auto_extension(1)"] do
+        assert {:error, reason} = Connection.query(conn, sql, [])
+
+        assert inspect(reason) =~ "no such function",
+               "#{sql} reached a tenant: #{inspect(reason)}"
+      end
+    end
+
+    test "a raw exqlite handle gets the functions but NOT the WAL hook", %{path: path} do
+      # Replica connections and scratch handles are raw opens: they must keep SQLite's own
+      # autocheckpoint (1000 frames), not take the extension's hook (AGENTS.md: one slot).
+      assert Extension.open_mode() == :auto
+      {:ok, raw} = Sqlite3.open(path)
+      on_exit(fn -> Sqlite3.close(raw) end)
+      {:ok, stmt} = Sqlite3.prepare(raw, "PRAGMA wal_autocheckpoint")
+      assert {:ok, [[1000]]} = Sqlite3.fetch_all(raw, stmt)
+      Sqlite3.release(raw, stmt)
+    end
+
+    test "disabling by config disarms it; re-enabling re-arms it", %{path: path} do
+      Application.put_env(:fathom, :sqlite_extension, false)
+      assert Extension.open_mode() == :skipped
+      conn = open!(path)
+
+      assert {:error, reason} =
+               Connection.query(conn, "SELECT django_date_extract('year','2026-08-05')", [])
+
+      assert inspect(reason) =~ "no such function"
+
+      Application.delete_env(:fathom, :sqlite_extension)
+      assert Extension.open_mode() == :auto
+      conn2 = open!(path)
+
+      assert {:ok, %{rows: [[2026]]}} =
+               Connection.query(conn2, "SELECT django_date_extract('year','2026-08-05')", [])
+    end
+  end
+
   describe "load/1 contract" do
     test "returns :skipped and leaves the connection usable when disabled by config", %{
       path: path

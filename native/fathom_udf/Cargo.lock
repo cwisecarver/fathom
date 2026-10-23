@@ -147,6 +147,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "fancy-regex",
+ "libc",
  "md-5",
  "rand",
  "regex-syntax",

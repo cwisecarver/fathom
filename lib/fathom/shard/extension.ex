@@ -27,6 +27,16 @@ defmodule Fathom.Shard.Extension do
   `not authorized` (see `test/fathom/shard/extension_test.exs`, which asserts this directly rather
   than trusting the sequence).
 
+  ## Since the auto-extension (expert review 2026-10-22 r8 #14)
+
+  `Fathom.Shard.Connection` no longer calls `load/1` when `open_mode/0` answers `:auto`: the
+  functions arrive with `sqlite3_open` itself, so a `Connection.open` handle never has extension
+  loading enabled at all, not even for the length of a load. The capability is now turned on only
+  on the private control connection (`control/2`), which loads a separate entry point, runs one
+  fathom-authored statement and is closed. `native/fathom_udf/src/auto.rs` has the full argument;
+  `load/1` itself, and its enable -> load -> disable contract, are unchanged for the callers that
+  still use it (an artifact without the auto entry point, the A2 Session's registry connection).
+
   ## Configuration
 
     * `config :fathom, :sqlite_extension` —
@@ -57,9 +67,26 @@ defmodule Fathom.Shard.Extension do
   """
   @spec load(reference()) :: :ok | :skipped | {:error, term()}
   def load(conn) do
-    case path() do
-      nil -> :skipped
-      path -> do_load(conn, path)
+    case open_mode() do
+      :skipped -> :skipped
+      :auto -> attach_auto(conn)
+      _per_open_or_error -> do_load(conn, path())
+    end
+  end
+
+  # UNDER THE AUTO-EXTENSION (expert review 2026-10-22 r8 #14) a connection opened after arming
+  # already carries every function, and an explicit load would FAIL on it: SQLite refuses to
+  # replace a function while a statement is active ("unable to delete/modify user-function due to
+  # active statements"), and the `SELECT load_extension(...)` doing the replacing is one. Found by
+  # `replication_unshipped_checkpoint_test.exs`: the A2 Session's registry connection lost its
+  # registration, so the hook checkpointed a replicated WAL. So install what an explicit load would
+  # have added on top of the functions, the WAL hook and the backstop's handlers, with
+  # `fathom_conn_init()`: one dispatch, no `dlopen`, and loading never enabled. A connection opened
+  # BEFORE the arming has no such function, and takes the explicit load as before.
+  defp attach_auto(conn) do
+    case Sqlite3.execute(conn, "SELECT fathom_conn_init()") do
+      :ok -> :ok
+      {:error, _no_such_function} -> do_load(conn, path())
     end
   end
 
@@ -90,15 +117,155 @@ defmodule Fathom.Shard.Extension do
   # a parameter like any other — and AGENTS.md's "never interpolate values into SQL" applies to a
   # filesystem path with quotes in it exactly as it applies to tenant data. `Sqlite3.execute/2`
   # takes no bindings, hence prepare/bind/step.
-  defp load_statement(conn, path) do
+  defp load_statement(conn, path, entry \\ @entry_point) do
     with {:ok, stmt} <- Sqlite3.prepare(conn, "SELECT load_extension(?1, ?2)") do
       try do
-        with :ok <- Sqlite3.bind(stmt, [path, @entry_point]),
+        with :ok <- Sqlite3.bind(stmt, [path, entry]),
              {:row, _} <- Sqlite3.step(conn, stmt) do
           :ok
         else
           {:error, reason} -> {:error, reason}
           other -> {:error, {:unexpected_load_result, other}}
+        end
+      after
+        Sqlite3.release(conn, stmt)
+      end
+    end
+  end
+
+  # --- the process-global auto-extension (expert review 2026-10-22 r8 #14, Q1=A) ----------------
+  #
+  # `load/1` costs five dirty dispatches and a `dlopen`/`dlclose` per connection. Once ARMED, the
+  # extension's `auto_init` is registered with `sqlite3_auto_extension`, so SQLite registers the
+  # functions inside every `sqlite3_open` instead and `Fathom.Shard.Connection` skips `load/1`.
+  # native/fathom_udf/src/auto.rs carries the whole security argument; in short, no
+  # `Connection.open` handle ever has extension loading enabled any more, and the only connection
+  # that does is the private CONTROL connection below.
+
+  @armed_key {__MODULE__, :armed}
+  @control_entry "sqlite3_fathomudf_control_init"
+
+  @doc """
+  How `Fathom.Shard.Connection.open/2` gets the functions onto the handle it is ABOUT to open.
+  Call it before `sqlite3_open`: an auto-extension applies to connections opened after it is
+  registered.
+
+    * `:auto` — the auto-extension is armed for the configured artifact; the functions are already
+      there after `sqlite3_open`, and the caller installs the hook and handlers itself with
+      `SELECT fathom_conn_init()`.
+    * `:per_open` — the artifact predates the auto-extension: call `load/1` per connection, as before.
+    * `:skipped` — nothing to load (no artifact, or `:sqlite_extension` is `false`).
+    * `{:error, reason}` — the configured artifact cannot be loaded; the open must fail, exactly as
+      a failed `load/1` failed it.
+
+  The steady state is one `Application.get_env` and two `:persistent_term` reads. Arming, and
+  disarming after a config change to `false`, run once per change.
+  """
+  @spec open_mode() :: :auto | :per_open | :skipped | {:error, term()}
+  def open_mode do
+    armed = :persistent_term.get(@armed_key, nil)
+
+    case path() do
+      nil ->
+        if armed, do: disarm(armed)
+        :skipped
+
+      path ->
+        case armed do
+          {^path, mode} -> mode
+          other -> arm(path, other)
+        end
+    end
+  end
+
+  defp arm(path, previous) do
+    if previous, do: disarm(previous)
+
+    case control(path, &exec_row(&1, "SELECT fathom_auto_extension(1)", [])) do
+      {:ok, 1} ->
+        put_armed({path, :auto})
+        :auto
+
+      {:error, reason} ->
+        # The control entry point is missing from an artifact built before r8 #14, but the
+        # per-connection one may still load: serve it the old way rather than fail every open.
+        if loads_per_connection?(path) do
+          Logger.warning(
+            "fathom_udf at #{path} has no auto-extension entry point (#{inspect(reason)}); " <>
+              "loading it per connection. Rebuild the artifact (mix compile.fathom_udf)."
+          )
+
+          put_armed({path, :per_open})
+          :per_open
+        else
+          {:error, reason}
+        end
+    end
+  end
+
+  defp disarm({path, :auto}) do
+    _ = control(path, &exec_row(&1, "SELECT fathom_auto_extension(0)", []))
+    :persistent_term.erase(@armed_key)
+    :ok
+  end
+
+  defp disarm(_per_open) do
+    :persistent_term.erase(@armed_key)
+    :ok
+  end
+
+  # A `:persistent_term.put` triggers a global GC scan: bounded by config changes, never per open.
+  defp put_armed(value), do: :persistent_term.put(@armed_key, value)
+
+  defp loads_per_connection?(path) do
+    with {:ok, conn} <- Sqlite3.open(":memory:") do
+      try do
+        do_load(conn, path) == :ok
+      after
+        Sqlite3.close(conn)
+      end
+    end
+  end
+
+  @doc false
+  # Runs `fun.(conn)` on a private CONTROL connection: a fresh `:memory:` handle loaded with the
+  # artifact's control entry point, which registers the node-global control functions on it and
+  # nowhere else. Extension loading is enabled for the load only and disabled before `fun` runs, so
+  # even this handle never executes anything with the capability on; it is closed on the way out
+  # whatever happens. Never hand this handle to anyone.
+  @spec control(Path.t(), (reference() -> {:ok, term()} | {:error, term()})) ::
+          {:ok, term()} | {:error, term()}
+  def control(path, fun) do
+    with {:ok, conn} <- Sqlite3.open(":memory:") do
+      try do
+        with :ok <- Sqlite3.enable_load_extension(conn, true),
+             loaded <- load_statement(conn, path, @control_entry),
+             :ok <- disable(conn),
+             :ok <- loaded do
+          fun.(conn)
+        else
+          {:error, reason} ->
+            _ = disable(conn)
+            {:error, reason}
+        end
+      after
+        Sqlite3.close(conn)
+      end
+    end
+  end
+
+  @doc false
+  # One bound statement on a control connection, answering its single value.
+  @spec exec_row(reference(), String.t(), list()) :: {:ok, term()} | {:error, term()}
+  def exec_row(conn, sql, args) do
+    with {:ok, stmt} <- Sqlite3.prepare(conn, sql) do
+      try do
+        with :ok <- Sqlite3.bind(stmt, args),
+             {:row, [value]} <- Sqlite3.step(conn, stmt) do
+          {:ok, value}
+        else
+          {:error, reason} -> {:error, reason}
+          other -> {:error, {:unexpected_result, other}}
         end
       after
         Sqlite3.release(conn, stmt)

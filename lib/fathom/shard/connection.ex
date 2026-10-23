@@ -79,23 +79,30 @@ defmodule Fathom.Shard.Connection do
 
     wal? = Keyword.get(opts, :wal?, true)
 
-    case open_handle_ensuring_dir(path, scope, tenant?, dir) do
-      {:ok, conn, :readonly} ->
-        track_open(
-          close_on_error(conn, configure_readonly(conn, tenant?, guard_opts)),
-          tenant?,
-          path
-        )
+    # BEFORE `sqlite3_open` (expert review 2026-10-22 r8 #14): an armed auto-extension registers the
+    # functions inside the open itself, so the mode must be settled (armed on first use) first.
+    with mode when mode in [:auto, :per_open, :skipped] <- Fathom.Shard.Extension.open_mode() do
+      case open_handle_ensuring_dir(path, scope, tenant?, dir) do
+        {:ok, conn, :readonly} ->
+          track_open(
+            close_on_error(conn, configure_readonly(conn, tenant?, guard_opts, mode)),
+            tenant?,
+            path
+          )
 
-      {:ok, conn, :readwrite} ->
-        track_open(
-          close_on_error(conn, configure_readwrite(conn, tenant?, scope, guard_opts, wal?)),
-          tenant?,
-          path
-        )
+        {:ok, conn, :readwrite} ->
+          track_open(
+            close_on_error(
+              conn,
+              configure_readwrite(conn, tenant?, scope, guard_opts, wal?, mode)
+            ),
+            tenant?,
+            path
+          )
 
-      {:error, reason} ->
-        {:error, reason}
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
@@ -313,18 +320,21 @@ defmodule Fathom.Shard.Connection do
   # execute: SQLite refuses the write on a `mode: :readonly` handle, and the WAL-recovery fallback
   # carries `query_only=ON`. So the pragma bought nothing and cost a dirty dispatch per `:ro` open.
   # Fresh `:ro` open 13 -> 10 dispatches in the prod shape (`nif_dispatch_test.exs`).
-  defp configure_readonly(conn, tenant?, guard_opts) do
+  #
+  # Under the auto-extension (r8 #14) the same batch also runs `fathom_conn_init()`, which installs
+  # the backstop's handlers (and the WAL hook) that the per-connection load used to install.
+  defp configure_readonly(conn, tenant?, guard_opts, mode) do
     with :ok <- Sqlite3.set_busy_timeout(conn, 5000),
-         {:ok, ext} <- load_extension(conn),
-         :ok <- maybe_harden(conn, tenant?, ext, cache_size_sql()),
+         {:ok, ext} <- load_extension(conn, mode),
+         :ok <- maybe_harden(conn, tenant?, ext, [cache_size_sql(), conn_init_sql(mode)]),
          :ok <- maybe_authorizer(conn, tenant?, ext, guard_opts) do
       {:ok, conn}
     end
   end
 
-  defp configure_readwrite(conn, tenant?, scope, guard_opts, wal?) do
-    with :ok <- configure(conn, wal?, guard_opts[:deferred_sync?]),
-         {:ok, ext} <- load_extension(conn),
+  defp configure_readwrite(conn, tenant?, scope, guard_opts, wal?, mode) do
+    with :ok <- configure(conn, wal?, guard_opts[:deferred_sync?], mode),
+         {:ok, ext} <- load_extension(conn, mode),
          :ok <- maybe_harden(conn, tenant?, ext, []),
          :ok <- maybe_query_only(conn, scope),
          :ok <- maybe_authorizer(conn, tenant?, ext, guard_opts) do
@@ -352,7 +362,18 @@ defmodule Fathom.Shard.Connection do
   #
   # Returns `{:ok, :loaded | :skipped}`: `maybe_authorizer/3` needs to know which authorizer the
   # handle can carry.
-  defp load_extension(conn) do
+  #
+  # UNDER THE AUTO-EXTENSION (`mode == :auto`, expert review 2026-10-22 r8 #14) there is nothing to
+  # load: SQLite registered the functions inside `sqlite3_open`, and this handle never had extension
+  # loading enabled, so there is no window to close either (`native/fathom_udf/src/auto.rs` has the
+  # security argument). Five dirty dispatches and a `dlopen`/`dlclose` fewer per open. The hook and
+  # the backstop's handlers, which the load used to install, come from `fathom_conn_init()` in the
+  # open batch (`conn_init_sql/1`). Both orderings above still hold: the functions exist before the
+  # authorizer, and on every handle.
+  defp load_extension(_conn, :auto), do: {:ok, :loaded}
+  defp load_extension(_conn, :skipped), do: {:ok, :skipped}
+
+  defp load_extension(conn, :per_open) do
     case Fathom.Shard.Extension.load(conn) do
       :ok ->
         {:ok, :loaded}
@@ -564,6 +585,10 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
+  # Installs the WAL hook and the backstop's handlers on an auto-extension handle (see `rw_open_sql/2`).
+  defp conn_init_sql(:auto), do: ";SELECT fathom_conn_init()"
+  defp conn_init_sql(_mode), do: []
+
   defp busy_yield_sql(:loaded), do: ";SELECT fathom_busy_yield(1)"
   defp busy_yield_sql(:skipped), do: []
 
@@ -634,7 +659,7 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  defp configure(conn, wal?, deferred_sync?) do
+  defp configure(conn, wal?, deferred_sync?, mode) do
     with :ok <- if(wal?, do: enable_wal(conn), else: :ok),
          # NOT `PRAGMA busy_timeout` (expert review 2026-07-24 #1): the pragma routes to
          # sqlite3_busy_timeout(), which REPLACES exqlite's custom busy handler with SQLite's
@@ -657,7 +682,7 @@ defmodule Fathom.Shard.Connection do
          # row that gates the open) and `max_page_count` stays separate (it may need a page_size
          # read). Everything here still runs BEFORE `load_extension/2`, which is what the
          # wal_autocheckpoint / wal-hook slot ordering needs (AGENTS.md loud warning).
-         :ok <- Sqlite3.execute(conn, rw_open_sql(deferred_sync?)),
+         :ok <- Sqlite3.execute(conn, rw_open_sql(deferred_sync?, mode)),
          :ok <- maybe_max_page_count(conn) do
       :ok
     end
@@ -684,13 +709,26 @@ defmodule Fathom.Shard.Connection do
   # replicating node with `:replication_deferred_wal_sync` on runs `synchronous=NORMAL`, and the
   # A2 Session's per-round fdatasync takes the place of the per-commit one. NORMAL is NEVER set
   # without that deferred sync behind it; see `Fathom.Shard.Replication.WalSync`.
-  defp rw_open_sql(deferred_sync?) do
+  #
+  # THE WAL HOOK SLOT UNDER THE AUTO-EXTENSION (expert review 2026-10-22 r8 #14). With `mode ==
+  # :auto` no load follows this batch to install the extension's hook, so the batch installs it
+  # itself: `SELECT fathom_conn_init()` takes the place of `PRAGMA wal_autocheckpoint=4000`, and
+  # it MUST be one or the other, never both in the wrong order. AGENTS.md's loud warning:
+  # `sqlite3_wal_hook` and `wal_autocheckpoint` are ONE slot, so the pragma after the hook would
+  # evict it (silently disabling the A2 frame seam and its counters), and the hook after the pragma
+  # replaces SQLite's built-in checkpointer with one that re-implements the same 4000-frame PASSIVE
+  # checkpoint (native/fathom_udf/src/wal.rs). Nothing after this batch touches the slot.
+  # `wal_hook_test.exs` asserts both halves (the hook fires; the WAL still truncates).
+  defp rw_open_sql(deferred_sync?, mode) do
     sync = if deferred_sync?, do: "NORMAL", else: "FULL"
 
     IO.iodata_to_binary([
       "PRAGMA synchronous=",
       sync,
-      ";PRAGMA wal_autocheckpoint=4000",
+      if(mode == :auto,
+        do: ";SELECT fathom_conn_init()",
+        else: ";PRAGMA wal_autocheckpoint=4000"
+      ),
       journal_size_limit_sql(),
       foreign_keys_sql(),
       cache_size_sql()

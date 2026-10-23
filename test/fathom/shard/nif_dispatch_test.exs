@@ -33,6 +33,25 @@ defmodule Fathom.Shard.NifDispatchTest do
     {result, counts.total, counts.by_fun}
   end
 
+  # Runs `fun` with the process-global auto-extension DISARMED (expert review 2026-10-22 r8 #14),
+  # then re-arms it.
+  defp without_extension(fun) do
+    prev = Application.fetch_env(:fathom, :sqlite_extension)
+    Application.put_env(:fathom, :sqlite_extension, false)
+    :skipped = Fathom.Shard.Extension.open_mode()
+
+    try do
+      fun.()
+    after
+      case prev do
+        {:ok, v} -> Application.put_env(:fathom, :sqlite_extension, v)
+        :error -> Application.delete_env(:fathom, :sqlite_extension)
+      end
+
+      _ = Fathom.Shard.Extension.open_mode()
+    end
+  end
+
   describe "per-statement dispatches through the Hrana executor" do
     setup do
       shard = "test_nifd_#{System.unique_integer([:positive])}"
@@ -425,18 +444,26 @@ defmodule Fathom.Shard.NifDispatchTest do
     setup do
       path = Path.join(System.tmp_dir!(), "nifd_open_#{System.unique_integer([:positive])}.db")
       on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(path <> s) end)
+      # Arm the auto-extension OUTSIDE the counted window: the first open of a node arms it on a
+      # private control connection, once, and that is not a per-open cost.
+      assert Fathom.Shard.Extension.open_mode() == :auto, "the auto-extension did not arm"
       %{path: path}
     end
 
-    test "a tenant :rw open is 18 dirty dispatches (was 23)", %{path: path} do
+    test "a tenant :rw open is 13 dirty dispatches (was 23)", %{path: path} do
       {res, total, by_fun} = count(fn -> Connection.open(path, tenant?: true) end)
       assert {:ok, conn} = res
       Connection.close(conn)
 
       # The five fixed PRAGMAs are ONE execute, and since expert review 2026-10-19 #23 the two
-      # engine-hardening PRAGMAs (trusted_schema, cell_size_check) are one more. Was 19 before that;
-      # journal_mode, page_size and the extension's own setup are untouched.
-      assert total == 18, "open dispatches: #{inspect(by_fun)}"
+      # engine-hardening PRAGMAs (trusted_schema, cell_size_check) are one more. Was 19 before that.
+      # Since expert review 2026-10-22 r8 #14 the extension arrives with `sqlite3_open` (a
+      # process-global auto-extension): the per-open enable / load (prepare, step, release) /
+      # disable is gone, 18 -> 13.
+      assert total == 13, "open dispatches: #{inspect(by_fun)}"
+
+      refute Map.has_key?(by_fun, :enable_load_extension),
+             "a tenant open turned extension loading on: #{inspect(by_fun)}"
     end
 
     # PROD SHAPE (expert review 2026-10-22 r8 #18): prod sets `:query_timeout_ms` (30 s), which arms
@@ -456,7 +483,7 @@ defmodule Fathom.Shard.NifDispatchTest do
       end
     end
 
-    test "prod shape: a tenant :rw open is 18 dirty dispatches with the backstop armed (was 19)",
+    test "prod shape: a tenant :rw open is 13 dirty dispatches with the backstop armed (was 19)",
          %{path: path} do
       {res, total, by_fun} =
         with_prod_deadline(fn -> count(fn -> Connection.open(path, tenant?: true) end) end)
@@ -469,10 +496,11 @@ defmodule Fathom.Shard.NifDispatchTest do
                Connection.query(conn, "SELECT fathom_backstop(0)", [], dml?: false)
 
       Connection.close(conn)
-      assert total == 18, "open dispatches: #{inspect(by_fun)}"
+      # 18 after r8 #18 step 1; 13 after r8 #14 (no per-open extension load).
+      assert total == 13, "open dispatches: #{inspect(by_fun)}"
     end
 
-    test "prod shape: a tenant :ro open is 10 dirty dispatches (was 13)", %{path: path} do
+    test "prod shape: a tenant :ro open is 5 dirty dispatches (was 13)", %{path: path} do
       {:ok, c0} = Connection.open(path)
       Connection.close(c0)
 
@@ -495,7 +523,9 @@ defmodule Fathom.Shard.NifDispatchTest do
                Connection.query(conn, "SELECT fathom_backstop(0)", [], dml?: false)
 
       Connection.close(conn)
-      assert total == 10, "open dispatches: #{inspect(by_fun)}"
+      # 10 after r8 #18 step 1; 5 after r8 #14 (no per-open extension load).
+      assert total == 5, "open dispatches: #{inspect(by_fun)}"
+      refute Map.has_key?(by_fun, :enable_load_extension)
     end
 
     test "the batched PRAGMAs all took effect", %{path: path} do
@@ -504,7 +534,9 @@ defmodule Fathom.Shard.NifDispatchTest do
 
       assert {:ok, %{rows: [[2]]}} = pragma.("synchronous")
       # (wal_autocheckpoint reads back 0 on a tenant handle: the extension's own wal hook takes
-      # the same slot, which is why the batch must stay BEFORE load_extension.)
+      # the same slot. Under the auto-extension `fathom_conn_init()` installs it in the batch IN
+      # PLACE of `PRAGMA wal_autocheckpoint`, expert review 2026-10-22 r8 #14.)
+      assert {:ok, %{rows: [[0]]}} = pragma.("wal_autocheckpoint")
       assert {:ok, %{rows: [[67_108_864]]}} = pragma.("journal_size_limit")
       assert {:ok, %{rows: [[1]]}} = pragma.("foreign_keys")
       assert {:ok, %{rows: [[-2000]]}} = pragma.("cache_size")
@@ -582,7 +614,9 @@ defmodule Fathom.Shard.NifDispatchTest do
     end
 
     test "without the extension (a bare exqlite handle) it falls back to the 3 NIF calls" do
-      {:ok, bare} = Sqlite3.open(":memory:")
+      # Since the process-global auto-extension (expert review 2026-10-22 r8 #14) a bare exqlite
+      # handle opened while it is armed HAS the functions, so disarm it for this open.
+      {:ok, bare} = without_extension(fn -> Sqlite3.open(":memory:") end)
       :ok = Sqlite3.execute(bare, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
 
       assert {:ok, %{num_changes: 1, last_insert_rowid: 1, autocommit?: nil}} =

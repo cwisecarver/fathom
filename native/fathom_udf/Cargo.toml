@@ -50,6 +50,9 @@ fancy-regex = "0.19"
 regex-syntax = "0.8"
 uuid = { version = "1", features = ["v4", "v7"] }
 rand = "0.8"
+# `dladdr` + `dlopen`, to pin this library in memory once it is registered as a process-global
+# SQLite auto-extension (src/auto.rs, expert review 2026-10-22 r8 #14). Already in the tree.
+libc = "0.2"
 
 [dev-dependencies]
 # Only for reading tests/oracle/cases.jsonl — the differential table generated from Django's own

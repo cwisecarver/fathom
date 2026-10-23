@@ -325,8 +325,29 @@ unsafe extern "C" fn destroy(p: *mut c_void) {
     drop(Box::from_raw(p as *mut Backstop));
 }
 
-/// Install the hooks and the setter on this connection.
+/// Register the setters AND install the handlers on this connection: the explicit
+/// `load_extension` path, where the handlers can go in at once because exqlite has already
+/// installed its own.
 pub fn install(db: &Connection) -> Result<()> {
+    let state = register(db)?;
+    unsafe { attach(db.handle(), state) }
+}
+
+/// The per-connection state, opaque outside this module: what `attach` needs.
+pub type State = *mut c_void;
+
+/// Register the setters and the per-connection state, WITHOUT installing any handler.
+///
+/// The auto-extension path (src/auto.rs, expert review 2026-10-22 r8 #14) runs inside
+/// `sqlite3_open`, and exqlite installs ITS busy and progress handlers right after `sqlite3_open`
+/// returns, which would silently replace ours. So there the handlers are installed later, by
+/// `fathom_conn_init()` (lib.rs), which `Fathom.Shard.Connection` runs in its open batch.
+///
+/// The state is owned by `fathom_backstop` and freed when that function is destroyed: at close,
+/// or when it is REGISTERED AGAIN on the same connection. So `attach` must never run with a state
+/// whose `fathom_backstop` was since re-registered; every caller registers and then attaches the
+/// state it just got (or registers `fathom_conn_init` with it, see lib.rs).
+pub fn register(db: &Connection) -> Result<State> {
     let state = Box::into_raw(Box::new(Backstop {
         timeout_ns: AtomicU64::new(0),
         start_ns: AtomicU64::new(0),
@@ -406,26 +427,25 @@ pub fn install(db: &Connection) -> Result<()> {
         if rc != ffi::SQLITE_OK {
             return Err(Error::SqliteFailure(ffi::Error::new(rc), None));
         }
-
-        ffi::sqlite3_progress_handler(
-            handle,
-            CHECK_EVERY_OPS,
-            Some(on_progress),
-            state as *mut c_void,
-        );
-        ffi::sqlite3_busy_handler(handle, Some(on_busy), state as *mut c_void);
-
-        let rc = ffi::sqlite3_trace_v2(
-            handle,
-            ffi::SQLITE_TRACE_STMT as c_uint,
-            Some(on_trace),
-            state as *mut c_void,
-        );
-        if rc != ffi::SQLITE_OK {
-            return Err(Error::SqliteFailure(ffi::Error::new(rc), None));
-        }
     }
 
+    Ok(state as State)
+}
+
+/// Install the progress, busy and trace handlers with `state`.
+///
+/// # Safety
+///
+/// `db` must be a live handle and `state` the value `register` returned for it, with
+/// `fathom_backstop` not registered again since.
+pub unsafe fn attach(db: *mut ffi::sqlite3, state: State) -> Result<()> {
+    ffi::sqlite3_progress_handler(db, CHECK_EVERY_OPS, Some(on_progress), state);
+    ffi::sqlite3_busy_handler(db, Some(on_busy), state);
+
+    let rc = ffi::sqlite3_trace_v2(db, ffi::SQLITE_TRACE_STMT as c_uint, Some(on_trace), state);
+    if rc != ffi::SQLITE_OK {
+        return Err(Error::SqliteFailure(ffi::Error::new(rc), None));
+    }
     Ok(())
 }
 

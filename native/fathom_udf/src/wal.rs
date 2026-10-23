@@ -148,14 +148,35 @@ pub fn adjust(path: &[u8], delta: i64) -> (Vec<u8>, i64) {
 }
 
 /// Install the commit hook, the registration function, and (only when probing is enabled) the
-/// read-back functions.
+/// read-back functions: the explicit `load_extension` path.
 pub fn install(db: &Connection) -> Result<()> {
+    unsafe { install_hook(db.handle()) };
+    install_functions(db)
+}
+
+/// Install the commit hook on `db`, replacing whatever holds the slot (SQLite's own
+/// autocheckpoint hook, see the module docs).
+///
+/// NOT called from the auto-extension init (src/auto.rs, expert review 2026-10-22 r8 #14): that
+/// init runs inside `sqlite3_open`, before `Fathom.Shard.Connection` configures the handle, and
+/// AGENTS.md's loud warning applies — `sqlite3_wal_hook` and `wal_autocheckpoint` are ONE slot, so
+/// any later `PRAGMA wal_autocheckpoint` (and SQLite's own default autocheckpoint, armed at open)
+/// would evict this hook and silently disable the A2 frame seam. Instead `fathom_conn_init()`
+/// installs it from inside the open batch, in the place that pragma used to occupy. That also
+/// keeps raw `Sqlite3.open` handles (replica connections, scratch `:memory:`, `open_immutable`)
+/// out of the hook: they keep SQLite's own 1000-frame autocheckpoint, as before.
+///
+/// # Safety
+///
+/// `db` must be a live connection handle.
+pub unsafe fn install_hook(db: *mut ffi::sqlite3) {
     // Registered through the raw API rather than `Connection::wal_hook`, because that wrapper hides
     // the `sqlite3*` and the hook needs it to name the database it is about to checkpoint.
-    unsafe {
-        ffi::sqlite3_wal_hook(db.handle(), Some(on_commit), std::ptr::null_mut());
-    }
+    ffi::sqlite3_wal_hook(db, Some(on_commit), std::ptr::null_mut());
+}
 
+/// The registration function and the optional probes, without the hook.
+pub fn install_functions(db: &Connection) -> Result<()> {
     // `fathom_wal_replicated(path, delta)`. DIRECTONLY: never from a view, trigger or schema
     // object. Tenant handles are additionally denied it by `pragma_guard`'s authorizer — a tenant
     // able to unregister its own file would re-enable the unpinned checkpoint.
