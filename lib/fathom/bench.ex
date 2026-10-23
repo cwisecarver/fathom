@@ -3799,7 +3799,16 @@ defmodule Fathom.Bench do
   end
 
   @idle_n 200
-  @idle_wait_ms 35_000
+  # Prod's flush interval and idle stop (see `idle_stats/1`). With them `hibernate_after` is
+  # 30 s (r8 #12: min(376 s floor, idle / 2)); the wait covers that plus the open loop and must stay
+  # under the 60 s idle stop, or coordinators would drop before they are counted.
+  @idle_flush_interval_ms 300_000
+  @idle_stop_ms 60_000
+  @idle_wait_ms 45_000
+
+  @doc false
+  @spec idle_wait_ms() :: pos_integer()
+  def idle_wait_ms, do: @idle_wait_ms
 
   @doc """
   `idle_kb_per_shard` / `idle_ets_b_per_shard` / `idle_hibernated_frac` - the IDLE, checked-in shard
@@ -3811,8 +3820,8 @@ defmodule Fathom.Bench do
   Own scoped setup (the shared `setup/1` is untouched): `:shard_load` and `:metrics_collector` on,
   ShardLoad/ShardLatency/Lru/WriteCounter/FlushWatermark running, heartbeat mode (a `Heartbeat` is
   started and every coordinator's `acquire_gen` is asserted non-nil), prod-shaped timers (flush
-  interval 300 s, idle stop 600 s, so `hibernate_after` is whatever `Fathom.Shard` derives from a
-  300 s interval). N shards are written through `ShardExecutor` and checked in, then the arm waits
+  interval 300 s, idle stop 60 s - prod's, so `hibernate_after` is whatever `Fathom.Shard` derives
+  for prod: 30 s with r8 #12). N shards are written through `ShardExecutor` and checked in, then the arm waits
   up to #{@idle_wait_ms} ms for the coordinators to hibernate.
 
     * `idle_kb_per_shard` - `Process.info(:memory)` + refc binaries over the coordinators, per shard.
@@ -3820,14 +3829,23 @@ defmodule Fathom.Bench do
       NIF counter arrays those rows point at (`std_alloc` live-block delta around the opens, so a
       `:write_concurrency` counter regression shows up here).
     * `idle_hibernated_frac` - share of coordinators whose `current_function` is
-      `{:gen_server, :loop_hibernate, 4}`. REPORTED, not asserted: it is 0.0 on code where
-      `hibernate_after` (376 s at a 300 s flush) never fires before the idle stop (r8 #12), and 1.0
-      once that lands; a raise would make this arm unrunnable until then.
+      `{:gen_server, :loop_hibernate, 4}`. ~0.9 with r8 #12 (hibernate after 30 s; measured dev
+      0.88-0.92 vs 0.00 with #12 backed out, idle_kb 4.2 vs 9.0). Not 1.0, and correctly so: r8
+      #11 draws each coordinator's FIRST flush tick uniform over (0, 300 s], so ~10% of these
+      dirty shards take that tick inside the wait and restart their 30 s hibernate countdown -
+      prod's behaviour too. 0.0 without #12 (`hibernate_after` 376 s, past the idle stop). REPORTED, not asserted: a regression shows
+      as a drop to 0.0 here and a ~2.6 KB rise in `idle_kb_per_shard`. In prod an idle coordinator
+      lives 60 s and is hibernated for its second 30 s, so this is the hibernated half's footprint.
 
   Preconditions (raises otherwise): every coordinator is in heartbeat mode, and the ShardLoad,
   ShardLatency, WriteCounter and FlushWatermark tables each hold at least N rows. WATCH-ONLY.
   """
-  @spec idle_stats(keyword()) :: %{kb: float(), ets_b: float(), hibernated: float()}
+  @spec idle_stats(keyword()) :: %{
+          kb: float(),
+          ets_b: float(),
+          hibernated: float(),
+          hibernate_after_ms: pos_integer()
+        }
   def idle_stats(opts \\ []) do
     n = Keyword.get(opts, :idle_n, @idle_n)
     wait_ms = Keyword.get(opts, :idle_wait_ms, @idle_wait_ms)
@@ -3837,8 +3855,15 @@ defmodule Fathom.Bench do
     restores = [
       put_env_scoped(:shard_load, true),
       put_env_scoped(:metrics_collector, true),
-      put_env_scoped(:shard_flush_interval_ms, 300_000),
-      put_env_scoped(:shard_idle_ms, 600_000),
+      # PROD'S TIMERS, BOTH OF THEM: config/runtime.exs sets a 300 s flush interval in prod and
+      # leaves `:shard_idle_ms` at `Fathom.Shard`'s 60 s default (no deploy sets SHARD_IDLE_MS;
+      # only the rig's 20 s and sweep-only 900 s overrides exist). This arm used to pin a 600 s
+      # idle stop, which is not prod's shape AND is the one regime where r8 #12 does not apply
+      # (#12 caps `hibernate_after` only when interval > idle), so it reported 0.0 hibernated on
+      # code where every prod idle coordinator hibernates at 30 s. 60 s also outlasts the wait
+      # below, so no coordinator idle-stops mid-measurement.
+      put_env_scoped(:shard_flush_interval_ms, @idle_flush_interval_ms),
+      put_env_scoped(:shard_idle_ms, @idle_stop_ms),
       # Prod config turns replication on, but the bench starts no replication supervisor, so a
       # coordinator write raises "unknown registry: ...SessionRegistry" (the round-7 hrana_sdk_rt
       # crash, 1d7b73a4). This arm measures the idle coordinator, not A2.
@@ -3944,7 +3969,16 @@ defmodule Fathom.Bench do
       %{
         kb: coord_bytes / n / 1024,
         ets_b: (ets_bytes + max(counter_delta, 0)) / n,
-        hibernated: hibernated / n
+        hibernated: hibernated / n,
+        # The `hibernate_after` these coordinators were started with under the arm's timers - the
+        # arm's own shape check: 30 s under prod's timers with r8 #12, 376 s under the old 600 s
+        # idle stop that hid #12 (test/fathom/bench_test.exs pins it).
+        hibernate_after_ms:
+          Fathom.Shard.hibernate_after_ms(
+            Application.get_env(:fathom, :shard_flush_interval_ms),
+            Application.get_env(:fathom, :shard_flush_jitter_ratio, 0.25),
+            Application.get_env(:fathom, :shard_idle_ms)
+          )
       }
     after
       Enum.each(ids, &Shards.drain(&1, 5_000))

@@ -292,7 +292,7 @@ defmodule Mix.Tasks.Fathom.Bench do
       {"idle_ets_b_per_shard", metrics.idle_ets_b_per_shard,
        "B/shard (per-shard ETS rows + NIF counters, prod state on; watch-only)"},
       {"idle_hibernated_frac", metrics.idle_hibernated_frac,
-       "frac   (idle coordinators hibernated within 35 s; watch-only)"},
+       "frac   (idle coordinators hibernated within 45 s, prod timers; watch-only)"},
       {"repl_first_commit_after_reopen_us", metrics.repl_first_commit_after_reopen_us,
        "µs   (first commit after a coordinator reopen, A2 ON; watch-only)"},
       {"repl_first_commit_reset_rounds", metrics.repl_first_commit_reset_rounds,

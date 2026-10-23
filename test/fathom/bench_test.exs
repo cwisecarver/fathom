@@ -532,8 +532,8 @@ defmodule Fathom.BenchTest do
   end
 
   # expert review 2026-10-22 r8 #2. The idle arm raises unless every coordinator is in heartbeat
-  # mode and the per-shard tables hold N rows; hibernation is REPORTED (0.0 until r8 #12), so only
-  # its range is asserted. ets_b is the bytes the per-shard ETS rows and counters cost: a
+  # mode and the per-shard tables hold N rows; hibernation is REPORTED (a 30 s wait is too long
+  # for the suite), so only its range is asserted - plus the timers that make it observable. ets_b is the bytes the per-shard ETS rows and counters cost: a
   # write_concurrency counter regression (+~2.2 KB/shard measured) must fit under the ceiling's
   # headroom only by a wide margin, so the ceiling is an order of magnitude, not a tight band.
   @tag timeout: 300_000
@@ -543,6 +543,16 @@ defmodule Fathom.BenchTest do
     assert r.kb > 1 and r.kb < 200
     assert r.ets_b > 500 and r.ets_b < 100_000
     assert r.hibernated >= 0.0 and r.hibernated <= 1.0
+
+    # The arm runs PROD's timers (300 s flush, 60 s idle stop), the regime r8 #12 targets. It used
+    # to pin a 600 s idle stop - not prod's, and the one regime where #12 does not apply - so its
+    # coordinators got the 376 s floor and idle_hibernated_frac read 0.0 on every round-8 run.
+    assert r.hibernate_after_ms == 30_000,
+           "idle arm is not on prod's timers: hibernate_after #{r.hibernate_after_ms} ms"
+
+    assert r.hibernate_after_ms < Fathom.Bench.idle_wait_ms(),
+           "the arm's wait ends before its coordinators can hibernate"
+
     refute Fathom.Shard.Heartbeat.running?(), "the arm left a Heartbeat running"
   end
 
