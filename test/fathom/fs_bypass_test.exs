@@ -169,4 +169,174 @@ defmodule Fathom.FSBypassTest do
       assert reqs == []
     end
   end
+
+  # Expert review 2026-10-22 r8 #7. Symptom: `File.ls/1` / `Path.wildcard` on the fleet-sized data
+  # dir built the whole name list inside `file_server_2` (2.9 KB -> 69 MB per 120k entries, never
+  # reclaimed, every other non-raw file op stalled ~110 ms). Invariant: a listing makes NO request
+  # to that process.
+  describe "list_dir_isolated" do
+    @describetag :tmp_dir
+
+    test "returns the same names as File.ls, as binaries", %{tmp_dir: dir} do
+      for n <- ["a.db", "a.db-wal", "b.db.fenced.1", "sub"],
+          do: File.write!(Path.join(dir, n), "")
+
+      assert {:ok, names} = FS.list_dir_isolated(dir)
+      assert Enum.sort(names) == Enum.sort(File.ls!(dir))
+      assert Enum.all?(names, &is_binary/1)
+    end
+
+    test "missing dir is {:error, :enoent}; empty dir is {:ok, []}", %{tmp_dir: dir} do
+      assert {:error, :enoent} = FS.list_dir_isolated(Path.join(dir, "nope"))
+      assert {:ok, []} = FS.list_dir_isolated(dir)
+    end
+
+    test "makes no file_server_2 request", %{tmp_dir: dir} do
+      for i <- 1..200, do: File.write!(Path.join(dir, "t#{i}.db"), "")
+
+      reqs = fs_requests_touching("", fn -> {:ok, _} = FS.list_dir_isolated(dir) end, dir)
+
+      assert reqs == [], "list_dir_isolated hit file_server_2: #{inspect(reqs, limit: 5)}"
+    end
+
+    test "TempReaper.sweep and Tombstones.sweep_local list without file_server_2", %{tmp_dir: dir} do
+      prev = Application.get_env(:fathom, :shard_data_dir)
+      Application.put_env(:fathom, :shard_data_dir, dir)
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:fathom, :shard_data_dir, prev),
+          else: Application.delete_env(:fathom, :shard_data_dir)
+      end)
+
+      for i <- 1..50, do: File.write!(Path.join(dir, "ls#{i}.db"), "")
+      start_supervised!(Fathom.Shard.TempReaper)
+
+      reqs =
+        fs_requests_touching(
+          "",
+          fn ->
+            Fathom.Shard.TempReaper.sweep()
+            Fathom.Tenants.Tombstones.sweep_local()
+          end,
+          dir
+        )
+        |> Enum.filter(fn {:"$gen_call", _, req} ->
+          elem(req, 0) in [:list_dir, :list_dir_all]
+        end)
+
+      assert reqs == [], "a sweep listed the data dir through file_server_2: #{inspect(reqs)}"
+    end
+  end
+
+  describe "SqliteHeader reads raw" do
+    @describetag :tmp_dir
+
+    alias Fathom.Shard.SqliteHeader
+
+    test "user_version/free_pages parse a real file and make no file_server_2 request",
+         %{tmp_dir: dir} do
+      path = Path.join(dir, "hdr.db")
+      {:ok, conn} = Connection.open(path)
+      Connection.exec(conn, "CREATE TABLE t (v TEXT)")
+      Connection.exec(conn, "PRAGMA user_version = 7")
+      Connection.close(conn)
+
+      reqs =
+        fs_requests_touching(
+          "",
+          fn ->
+            assert {:ok, 7} = SqliteHeader.user_version(path)
+
+            assert {:ok, %{page_size: ps, page_count: pc, freelist: 0}} =
+                     SqliteHeader.free_pages(path)
+
+            assert ps > 0 and pc > 0
+          end,
+          dir
+        )
+
+      assert reqs == [], "SqliteHeader hit file_server_2: #{inspect(reqs, limit: 5)}"
+    end
+
+    test "error shapes: missing file, empty file, non-sqlite file", %{tmp_dir: dir} do
+      assert {:error, :enoent} = SqliteHeader.user_version(Path.join(dir, "nope"))
+      assert {:error, :enoent} = SqliteHeader.free_pages(Path.join(dir, "nope"))
+      empty = Path.join(dir, "empty")
+      File.write!(empty, "")
+      assert {:error, {:user_version_unreadable, _}} = SqliteHeader.user_version(empty)
+      assert {:error, {:free_pages_unreadable, _}} = SqliteHeader.free_pages(empty)
+      junk = Path.join(dir, "junk")
+      File.write!(junk, String.duplicate("x", 200))
+      assert {:error, {:user_version_unreadable, _}} = SqliteHeader.user_version(junk)
+      assert {:error, {:free_pages_unreadable, _}} = SqliteHeader.free_pages(junk)
+    end
+  end
+
+  # 120k-entry guard (30k open shards x 4 files; expert review 2026-10-22 r8 #7). Measured before
+  # the fix: one listing grew file_server_2 2.9 KB -> 69 MB (still 69 MB 2 s later) and a concurrent
+  # File.exists? stalled 107 ms; after: both flat. Order-of-magnitude ceilings, not exact figures.
+  describe "120k-entry data dir" do
+    @describetag :bench
+    @describetag :tmp_dir
+    @describetag timeout: 300_000
+
+    test "reaper, boot sweep and erase_local keep file_server_2 small and responsive",
+         %{tmp_dir: dir} do
+      prev = Application.get_env(:fathom, :shard_data_dir)
+      Application.put_env(:fathom, :shard_data_dir, dir)
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:fathom, :shard_data_dir, prev),
+          else: Application.delete_env(:fathom, :shard_data_dir)
+
+        :ets.delete(Fathom.Tenants.Tombstones, "benchvictim")
+      end)
+
+      for i <- 1..30_000, suffix <- [".db", ".db-wal", ".db-shm", ".db.etag"] do
+        File.write!(Path.join(dir, "bench#{i}#{suffix}"), "")
+      end
+
+      File.write!(Path.join(dir, "benchvictim.db"), "x")
+      File.write!(Path.join(dir, "benchvictim.db.fenced.1"), "x")
+      :ets.insert(Fathom.Tenants.Tombstones, {"benchvictim"})
+
+      fs = Process.whereis(:file_server_2)
+      :erlang.garbage_collect(fs)
+      {:memory, before} = Process.info(fs, :memory)
+
+      parent = self()
+
+      prober =
+        spawn_link(fn ->
+          probe = fn probe, max ->
+            receive do
+              :stop -> send(parent, {:probe_max, max})
+            after
+              0 ->
+                t0 = System.monotonic_time(:microsecond)
+                File.exists?(System.tmp_dir!())
+                probe.(probe, max(max, System.monotonic_time(:microsecond) - t0))
+            end
+          end
+
+          probe.(probe, 0)
+        end)
+
+      # the reaper's boot sweep (handle_continue) is part of the measured window
+      start_supervised!(Fathom.Shard.TempReaper)
+      Fathom.Shard.TempReaper.sweep()
+      Fathom.Tenants.Tombstones.sweep_local()
+      Fathom.Tenants.erase_local("benchvictim")
+
+      send(prober, :stop)
+      assert_receive {:probe_max, max_us}, 5_000
+      {:memory, aft} = Process.info(fs, :memory)
+
+      refute File.exists?(Path.join(dir, "benchvictim.db"))
+      assert aft - before < 1_000_000, "file_server_2 grew #{div(aft - before, 1024)} KiB"
+      assert max_us < 5_000, "a concurrent File.exists? stalled #{div(max_us, 1000)} ms"
+    end
+  end
 end

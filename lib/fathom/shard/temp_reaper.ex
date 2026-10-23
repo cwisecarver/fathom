@@ -150,7 +150,7 @@ defmodule Fathom.Shard.TempReaper do
     dir = Shard.data_dir()
 
     names =
-      case File.ls(dir) do
+      case Fathom.FS.list_dir_isolated(dir) do
         {:ok, names} -> names
         {:error, _} -> []
       end
@@ -181,7 +181,7 @@ defmodule Fathom.Shard.TempReaper do
     dir = scratch_dir()
     cutoff = System.system_time(:second) - div(@scratch_stale_after_ms, 1000)
 
-    case File.ls(dir) do
+    case Fathom.FS.list_dir_isolated(dir) do
       {:ok, names} ->
         Enum.count(names, fn name ->
           path = Path.join(dir, name)

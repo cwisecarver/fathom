@@ -222,7 +222,9 @@ defmodule Fathom.Tenants.Tombstones do
   @doc false
   @spec sweep_local() :: :ok
   def sweep_local do
-    case File.ls(Fathom.Shard.data_dir()) do
+    # Raw listing in a side process (expert review 2026-10-22 r8 #7): `File.ls` pinned ~69 MB in
+    # file_server_2 per 120k entries.
+    case Fathom.FS.list_dir_isolated(Fathom.Shard.data_dir()) do
       {:ok, names} ->
         names
         |> Enum.flat_map(fn name ->

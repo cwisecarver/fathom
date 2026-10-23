@@ -26,10 +26,10 @@ defmodule Fathom.Shard.SqliteHeader do
   """
   @spec user_version(Path.t()) :: {:ok, integer()} | {:error, term()}
   def user_version(path) do
-    case File.open(path, [:read, :binary], fn io -> :file.pread(io, 0, 64) end) do
-      {:ok, {:ok, <<"SQLite format 3\0", _::binary-size(44), v::signed-big-32>>}} -> {:ok, v}
-      {:ok, other} -> {:error, {:user_version_unreadable, other}}
-      {:error, reason} -> {:error, reason}
+    case pread(path, 64) do
+      {:ok, <<"SQLite format 3\0", _::binary-size(44), v::signed-big-32>>} -> {:ok, v}
+      {:error, reason} when is_atom(reason) -> {:error, reason}
+      other -> {:error, {:user_version_unreadable, other}}
     end
   end
 
@@ -44,18 +44,35 @@ defmodule Fathom.Shard.SqliteHeader do
            %{page_size: pos_integer(), page_count: non_neg_integer(), freelist: non_neg_integer()}}
           | {:error, term()}
   def free_pages(path) do
-    case File.open(path, [:read, :binary], fn io -> :file.pread(io, 0, 40) end) do
+    case pread(path, 40) do
       {:ok,
-       {:ok,
-        <<"SQLite format 3\0", ps::big-16, _::binary-size(10), count::big-32, _::binary-size(4),
-          free::big-32>>}} ->
+       <<"SQLite format 3\0", ps::big-16, _::binary-size(10), count::big-32, _::binary-size(4),
+         free::big-32>>} ->
         {:ok, %{page_size: if(ps == 1, do: 65_536, else: ps), page_count: count, freelist: free}}
 
-      {:ok, other} ->
-        {:error, {:free_pages_unreadable, other}}
-
-      {:error, reason} ->
+      {:error, reason} when is_atom(reason) ->
         {:error, reason}
+
+      other ->
+        {:error, {:free_pages_unreadable, other}}
+    end
+  end
+
+  # RAW open (expert review 2026-10-22 r8 #25a): `File.open/3` with a fun spawns an io-server and
+  # sends a request to `file_server_2`; this runs on every pinned and drop flush. A raw handle does
+  # open/pread/close in the calling process (46 vs 29 us; 16 concurrent x 200: 88 vs 36 ms).
+  # Returns `{:ok, bin}`, `:eof` (empty file) or `{:error, posix}`.
+  defp pread(path, n) do
+    case :file.open(IO.chardata_to_string(path), [:read, :raw, :binary]) do
+      {:ok, io} ->
+        try do
+          :file.pread(io, 0, n)
+        after
+          :file.close(io)
+        end
+
+      {:error, _} = err ->
+        err
     end
   end
 end

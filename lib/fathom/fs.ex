@@ -8,7 +8,8 @@ defmodule Fathom.FS do
   process. Semantics match `File.*` for the absolute paths fathom uses; return shapes are
   identical (`File.Stat` struct from `stat/1,2`).
 
-  Not wrapped: `mkdir_p`, `ls`, `cp`, `rm_rf` (no raw variant, and not on a per-open hot path).
+  Not wrapped: `mkdir_p`, `cp`, `rm_rf` (no raw variant, and not on a per-open hot path).
+  Listings of the fleet-sized data dir go through `list_dir_isolated/1`, never `File.ls/1`.
   """
 
   @spec exists?(Path.t()) :: boolean()
@@ -52,4 +53,36 @@ defmodule Fathom.FS do
 
   @spec write(Path.t(), iodata()) :: :ok | {:error, File.posix()}
   def write(path, data), do: :file.write_file(IO.chardata_to_string(path), data, [:raw])
+
+  @doc """
+  Lists `dir` with the raw `:prim_file.list_dir/1` in a short-lived monitored side process
+  (expert review 2026-10-22 r8 #7).
+
+  `File.ls/1` builds the whole name list inside `file_server_2` (measured: 2.9 KB -> 69 MB per
+  120k entries, never reclaimed, and every other non-raw file op on the node stalls ~110 ms behind
+  it). The raw readdir runs in the side process, so the scratch garbage it allocates dies with that
+  process rather than staying on the caller's heap; only the final name list is copied back. Returns
+  names as binaries. No timeout, deliberately (the callers are janitors/sweepers, and a timeout
+  would only crash them); a crash in the side process comes back as `{:error, reason}`.
+  """
+  @spec list_dir_isolated(Path.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def list_dir_isolated(dir) do
+    dir = IO.chardata_to_string(dir)
+
+    {pid, ref} =
+      spawn_monitor(fn ->
+        result =
+          case :prim_file.list_dir(dir) do
+            {:ok, entries} -> {:ok, Enum.map(entries, &IO.chardata_to_string/1)}
+            {:error, _} = err -> err
+          end
+
+        exit({:done, result})
+      end)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, {:done, result}} -> result
+      {:DOWN, ^ref, :process, ^pid, reason} -> {:error, reason}
+    end
+  end
 end

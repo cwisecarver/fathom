@@ -847,9 +847,25 @@ defmodule Fathom.Tenants do
   # a prior partial run or self-fence could have left — otherwise an erased tenant's data
   # lingers on local disk. The glob is anchored at `<id>.db` so it can't match a sibling id
   # (`<id>9.db` doesn't start with `<id>.db`).
+  #
+  # expert review 2026-10-22 r8 #7 (Q12=A): `Path.wildcard` listed the fleet-sized data dir through
+  # `file_server_2` (69 MB pinned per 120k entries) on EVERY node for EVERY tombstone. The listing
+  # is now raw in a side process and each file is removed raw; the erase of quarantine copies stays
+  # immediate (erasure outranks forensics).
   defp rm_local(id) do
-    base = Fathom.Shard.db_path(id)
-    for path <- Path.wildcard(base <> "*"), do: File.rm(path)
+    dir = Fathom.Shard.data_dir()
+    prefix = Path.basename(Fathom.Shard.db_path(id))
+
+    case Fathom.FS.list_dir_isolated(dir) do
+      {:ok, names} ->
+        for name <- names,
+            String.starts_with?(name, prefix),
+            do: Fathom.FS.rm(Path.join(dir, name))
+
+      {:error, _} ->
+        :ok
+    end
+
     :ok
   rescue
     _ -> :ok
