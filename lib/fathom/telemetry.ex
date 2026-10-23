@@ -862,6 +862,22 @@ defmodule Fathom.Telemetry do
         description:
           "Periodic-flush route (2026-10-20 #28) — :pinned_live uploads the live .db under a read pin when the WAL is folded (no VACUUM INTO), :vacuum is the snapshot route. A busy fleet that never takes :pinned_live is expected; an idle-dirty one that never does means the folded-WAL check is not firing"
       ),
+      # Expert review 2026-10-22 r8 #9: which primitive produced a :vacuum-route snapshot. Bounded
+      # two-value tag (:serialize | :vacuum).
+      counter("fathom.shard.flush.snapshot.count",
+        event_name: [:fathom, :shard, :flush, :snapshot],
+        tags: [:mode],
+        description:
+          "VACUUM-route snapshot primitive (r8 #9) — :serialize is the in-transaction page copy (images up to FLUSH_SERIALIZE_MAX_BYTES), :vacuum is VACUUM INTO (above the cap, mostly-free files, or the integrity gate off)"
+      ),
+      # Expert review 2026-10-22 r8 #15: which check the idle-drop :checkpoint route ran. Bounded
+      # two-value tag (:main_file | :checkpoint).
+      counter("fathom.shard.drop_flush.verify.count",
+        event_name: [:fathom, :shard, :drop_flush, :verify],
+        tags: [:mode],
+        description:
+          "Drop-flush check (r8 #15) — :main_file is an immutable quick_check of the .db when the WAL is already empty (no connection open), :checkpoint is the full open + TRUNCATE + quick_check"
+      ),
       counter("fathom.shard.flush.too_large.count",
         event_name: [:fathom, :shard, :flush, :too_large],
         description:

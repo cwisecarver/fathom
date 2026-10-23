@@ -424,7 +424,9 @@ defmodule Fathom.Shard.FlushPositionTest do
 
       inner = drop_body.("checkpoint_then_upload(state, pre) do")
 
-      checkpoint_at = :binary.match(inner, "checkpoint_and_verify(state.path)") |> elem(0)
+      # `checkpoint_and_verify(state)` since expert review 2026-10-22 r8 #15 (it takes the state to
+      # emit its verify mode); the call is still the checkpoint/check step.
+      checkpoint_at = :binary.match(inner, "checkpoint_and_verify(state)") |> elem(0)
       position_at = :binary.match(inner, "flush_position(state, pre)") |> elem(0)
 
       assert position_at > checkpoint_at,
