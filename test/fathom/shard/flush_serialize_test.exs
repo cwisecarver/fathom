@@ -10,7 +10,9 @@ defmodule Fathom.Shard.FlushSerializeTest do
     * the copy includes committed WAL frames the main file does not hold yet (a stream is held
       open so nothing folds the WAL), in BOTH lease modes, and the object is a valid database;
     * each fallback takes `VACUUM INTO` and still uploads everything;
-    * the integrity gate still refuses a corrupt live file before any copy is made.
+    * the integrity gate still refuses a corrupt live file, and nothing is uploaded;
+    * the gate checks the IMAGE (rv8 F1): `sqlite3_serialize` zero-fills a page it cannot read and
+      still succeeds, so a zeroed page in the copy must divert to `VACUUM INTO`, never be uploaded;
 
   The pinned-live route is switched off (`:flush_pinned_live_upload`) so every flush here takes the
   VACUUM route under test. Not async: telemetry handlers, app env, real shard files.
@@ -25,7 +27,8 @@ defmodule Fathom.Shard.FlushSerializeTest do
     :shard_idle_ms,
     :flush_pinned_live_upload,
     :flush_serialize_max_bytes,
-    :verify_flush_integrity
+    :verify_flush_integrity,
+    :flush_serialize_result_hook
   ]
 
   setup do
@@ -322,7 +325,9 @@ defmodule Fathom.Shard.FlushSerializeTest do
     end
   end
 
-  test "a corrupt live file is refused before any copy", %{id: id, path: path} do
+  # Was "refused before any copy": since rv8 F1 the gate runs on the copy, so a corrupt shard pays
+  # one capped page copy, fails the image check, and is refused by the fallback's live check.
+  test "a corrupt live file is refused and nothing is uploaded", %{id: id, path: path} do
     {:ok, conn} = ShardExecutor.open(id)
 
     {:ok, _} =
@@ -355,5 +360,53 @@ defmodule Fathom.Shard.FlushSerializeTest do
 
     refute_received {:snapshot, _}
     refute File.exists?(object(id)), "a corrupt live file was uploaded"
+  end
+
+  # Zero one page of `blob`, the way `sqlite3_serialize` fills a page whose read failed.
+  defp zero_page(blob, pgno) do
+    <<_::binary-size(16), ps_raw::16, _::binary>> = blob
+    ps = if ps_raw == 1, do: 65_536, else: ps_raw
+    off = (pgno - 1) * ps
+    <<head::binary-size(^off), _::binary-size(^ps), tail::binary>> = blob
+    head <> :binary.copy(<<0>>, ps) <> tail
+  end
+
+  # rv8 F1 (expert review 2026-10-22 r8 #9). SQLite's `sqlite3_serialize` memsets a page it fails to
+  # read (transient EIO, NOMEM) to zero and still returns the buffer. The old route checked the
+  # LIVE pages in the transaction and uploaded the image unchecked, so the zeroed page became the
+  # authoritative object. The hook stands in for the failed read: it zeroes the table's root page.
+  for mode <- [:legacy, :heartbeat] do
+    test "[#{mode}] a serialized image with a zeroed page is never uploaded; VACUUM INTO is", %{
+      id: id,
+      path: path
+    } do
+      set_mode!(unquote(mode))
+      {:ok, coordinator} = Shards.ensure(id)
+      assert_mode!(coordinator, unquote(mode))
+      conn = seed_in_wal!(id, path, 2_000)
+      test_pid = self()
+
+      Application.put_env(:fathom, :flush_serialize_result_hook, fn {:ok, blob} ->
+        # Page 2 is `t`'s root (the first CREATE TABLE), an interior page at 2,000 rows.
+        bad = zero_page(blob, 2)
+        send(test_pid, {:zeroed, bad})
+        {:ok, bad}
+      end)
+
+      flush!(id)
+      ShardExecutor.close(conn)
+
+      # Precondition: the image really was damaged in a way the gate can see.
+      assert_received {:zeroed, bad}
+      probe = path <> ".probe-zeroed"
+      File.write!(probe, bad)
+      on_exit(fn -> File.rm(probe) end)
+      assert {:error, _} = Shard.verify_integrity(probe), "fixture: the zeroed page is harmless"
+
+      refute_received {:snapshot, :serialize}
+      assert_received {:snapshot, :vacuum}
+      assert :ok = Shard.verify_integrity(object(id)), "the zero-filled image was uploaded"
+      assert count_rows(object(id)) == 2_000
+    end
   end
 end

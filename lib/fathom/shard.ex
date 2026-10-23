@@ -5835,14 +5835,9 @@ defmodule Fathom.Shard do
         try do
           apply_scan_mmap(conn)
 
-          if serialize_eligible?(verified?) do
-            serialize_or_vacuum(conn, temp, state, verified?)
-          else
-            with :ok <- if(verified?, do: :ok, else: Integrity.run_quick_check(conn)) do
-              emit_snapshot_mode(state, :vacuum)
-              do_snapshot(conn, temp, state.id)
-            end
-          end
+          if serialize_eligible?(),
+            do: serialize_or_vacuum(conn, temp, state, verified?),
+            else: vacuum_snapshot(conn, temp, state, verified?)
         after
           Connection.close(conn)
         end
@@ -5864,13 +5859,14 @@ defmodule Fathom.Shard do
   # 72 µs; 32 MB 50 ms vs 4.6 ms; 32 MB + 23 MB of un-checkpointed WAL 50-53 ms vs 4.8-8.2 ms, WAL
   # frames included (sums and `quick_check` of the copy verified).
   #
-  # ONE READ TRANSACTION: `BEGIN; quick_check; size; serialize; COMMIT`. The integrity gate now
-  # checks exactly the pages that are uploaded. Before, `quick_check` and `VACUUM INTO` were two
-  # autocommit reads of two different snapshots, and VACUUM rewrote the pages, so the gate never
-  # saw the uploaded state. The three guards above still hold: (a) the check runs on the LIVE
-  # connection (serialize copies bytes verbatim, so it repairs nothing the check would have to
-  # see); (b) it short-circuits before the copy; (c) is moot for serialize (no schema re-created)
-  # and still true for the VACUUM fallback, which runs on this same handle.
+  # ONE READ TRANSACTION: `BEGIN; size; serialize; COMMIT`, then `quick_check` of the written image
+  # (rv8 F1, below `serialize_or_vacuum/4`). The integrity gate checks exactly the bytes that are
+  # uploaded. Before, `quick_check` and `VACUUM INTO` were two autocommit reads of two different
+  # snapshots, and VACUUM rewrote the pages, so the gate never saw the uploaded state. The three
+  # guards above: (a) holds for the VACUUM fallback, and a page copy repairs nothing, so checking
+  # the copy sees what the live check would; (b) a corrupt shard pays one capped page copy before it
+  # is refused; (c) is moot for serialize (no schema re-created) and still true for the VACUUM
+  # fallback, which runs on this same handle.
   #
   # GATES, each falling back to today's `VACUUM INTO` (after the COMMIT: VACUUM cannot run inside
   # a transaction, so the fallback is exactly the old two-snapshot behaviour):
@@ -5880,9 +5876,9 @@ defmodule Fathom.Shard do
   #     at 8, so the transient worst case is 8 x 2 x 16 MiB = 256 MiB;
   #   * the file is mostly free (`compaction_worthwhile_counts?/3`, the same rule as the drop and
   #     pinned routes, on the counts read INSIDE the transaction): only VACUUM compacts;
-  #   * the integrity gate is off (`:verify_flush_integrity false`) and the caller did not verify:
-  #     VACUUM's own b-tree walk was then the only thing that would fail on garbage pages, and a
-  #     byte copy would upload them.
+  #   * the integrity gate is off (`:verify_flush_integrity false`), even when the caller verified:
+  #     the image check is that gate, and without it VACUUM's own b-tree walk is the only thing that
+  #     fails on an unreadable page, where serialize would upload it zero-filled (rv8 F1).
   #
   # COST, accepted with Q8 = A: the copy keeps b-tree slack and freelist pages VACUUM would repack,
   # so the compressed object is +2.4% (keystone) to +14% (32 MB after churn) larger; the codec
@@ -5894,23 +5890,52 @@ defmodule Fathom.Shard do
   # and `checkpoint_after_snapshot/3` still runs after the read transaction ended, on this handle.
   # The temp is written raw with no fsync, the same no-durability argument as `do_snapshot/3`'s
   # synchronous=OFF: it is read back in-process for the digest and the PUT and unlinked after.
-  defp serialize_eligible?(verified?),
-    do: serialize_max_bytes() > 0 and (verified? or Integrity.flush_gate_on?())
+  defp serialize_eligible?,
+    do: serialize_max_bytes() > 0 and Integrity.flush_gate_on?()
 
   defp serialize_max_bytes,
     do: Application.get_env(:fathom, :flush_serialize_max_bytes, 16 * 1024 * 1024)
+
+  # THE GATE CHECKS THE IMAGE, NOT THE LIVE PAGES (expert review 2026-10-22 r8 #9, rv8 F1).
+  # `sqlite3_serialize` does not fail on a page it cannot read: it `memset`s that page to zero and
+  # still returns the buffer (deps/exqlite/c_src/sqlite3.c, the `sqlite3PagerGet` loop in
+  # `sqlite3_serialize`). A transient EIO or a NOMEM on one page read during the copy therefore
+  # produced an image with a zeroed b-tree page that the in-transaction `quick_check` of the LIVE
+  # pages had already passed, and it was PUT as the authoritative object. `VACUUM INTO` fails the
+  # flush on the same error. So the check now runs on the written temp (an `immutable=1` handle,
+  # `Integrity.run_quick_check_main_file/2`: the image has page 1's WAL bytes `02 02` and no `-wal`,
+  # the same case the pinned-live route relies on), and the live-page check is gone from this route.
+  #
+  # WHY CHECKING ONLY THE IMAGE IS AT LEAST AS STRONG, so `quick_check` still runs once per flush:
+  # serialize is a byte copy of every page of the snapshot this read transaction sees (WAL overlay
+  # applied), not a rewrite. Each page it read is copied verbatim, so any damage `quick_check`
+  # would report on the live page is in the image at the same page number, and the page count is
+  # the same. Each page it could NOT read is zero in the image, which `quick_check` reports when the
+  # page matters (a b-tree, overflow or freelist-trunk page) and which is harmless when it does not
+  # (a freelist leaf). Guard (a) above is about `VACUUM INTO` REPAIRING structural damage; a page
+  # copy repairs nothing, so the copy is not the "clean-looking temp" that guard warns about.
+  # Guard (b) changes shape: a corrupt shard now pays one page copy (<= the serialize cap) before
+  # it is refused.
+  #
+  # ON IMAGE-CHECK FAILURE fall back to the old route, live `quick_check` (unless the caller
+  # verified) then `VACUUM INTO`: a corrupt live file is still refused there, and a transient read
+  # error either recurs (VACUUM fails the flush) or does not (a good object is uploaded). The temp is
+  # unlinked first, because `VACUUM INTO` refuses a non-empty target.
 
   defp serialize_or_vacuum(conn, temp, state, verified?) do
     case Connection.exec(conn, "BEGIN") do
       :ok ->
         copied =
           try do
-            with :ok <- if(verified?, do: :ok, else: Integrity.run_quick_check(conn)),
-                 {:ok, bytes, count, free, ps} <- snapshot_counts(conn) do
-              if bytes <= serialize_max_bytes() and
-                   not compaction_worthwhile_counts?(count, free, ps),
-                 do: serialize_main(conn),
-                 else: :vacuum
+            case snapshot_counts(conn) do
+              {:ok, bytes, count, free, ps} ->
+                if bytes <= serialize_max_bytes() and
+                     not compaction_worthwhile_counts?(count, free, ps),
+                   do: serialize_main(conn),
+                   else: :vacuum
+
+              {:error, _} = err ->
+                err
             end
           after
             # A read-only transaction: COMMIT and ROLLBACK are the same. Ignore "no transaction is
@@ -5920,22 +5945,10 @@ defmodule Fathom.Shard do
 
         case copied do
           {:ok, blob} ->
-            emit_snapshot_mode(state, :serialize)
-
-            case Fathom.FS.write(temp, blob) do
-              :ok ->
-                # The read transaction has ended, so this PASSIVE is the same one `do_snapshot/3`
-                # runs after its VACUUM (pinned + quorum-gated under A2).
-                Fathom.Shard.Replication.Session.checkpoint_after_snapshot(conn, state.id)
-                :ok
-
-              {:error, _} = err ->
-                err
-            end
+            write_and_check_image(conn, temp, state, verified?, blob)
 
           :vacuum ->
-            emit_snapshot_mode(state, :vacuum)
-            do_snapshot(conn, temp, state.id)
+            vacuum_snapshot(conn, temp, state, verified?)
 
           {:error, _} = err ->
             err
@@ -5944,6 +5957,37 @@ defmodule Fathom.Shard do
       {:error, reason} ->
         # "Could not check", never "corrupt": `verdict/1` classifies an unknown tag as unknown.
         Integrity.verdict({:error, {:snapshot_begin_failed, reason}})
+    end
+  end
+
+  defp write_and_check_image(conn, temp, state, verified?, blob) do
+    with :ok <- Fathom.FS.write(temp, blob) do
+      case Integrity.run_quick_check_main_file(temp, &apply_scan_mmap/1) do
+        :ok ->
+          emit_snapshot_mode(state, :serialize)
+          # The read transaction has ended, so this PASSIVE is the same one `do_snapshot/3` runs
+          # after its VACUUM (pinned + quorum-gated under A2).
+          Fathom.Shard.Replication.Session.checkpoint_after_snapshot(conn, state.id)
+          :ok
+
+        {:error, reason} ->
+          Logger.warning(
+            "shard #{state.id}: page-copy snapshot failed its integrity check " <>
+              "(#{inspect(reason, printable_limit: 300)}); using VACUUM INTO"
+          )
+
+          _ = Fathom.FS.rm(temp)
+          vacuum_snapshot(conn, temp, state, verified?)
+      end
+    end
+  end
+
+  # The pre-serialize route: live `quick_check` (skipped when the caller verified), then
+  # `VACUUM INTO`, on this same handle.
+  defp vacuum_snapshot(conn, temp, state, verified?) do
+    with :ok <- if(verified?, do: :ok, else: Integrity.run_quick_check(conn)) do
+      emit_snapshot_mode(state, :vacuum)
+      do_snapshot(conn, temp, state.id)
     end
   end
 
@@ -5968,8 +6012,16 @@ defmodule Fathom.Shard do
   end
 
   # `sqlite3_serialize` of `main` on this handle, inside the caller's read transaction.
+  # `:flush_serialize_result_hook` (tests only) rewrites the result, to stand in for SQLite's
+  # zero-filled unreadable page or a NULL buffer, which no test can provoke on demand.
   defp serialize_main(conn) do
-    case Exqlite.Sqlite3.serialize(conn, "main") do
+    result =
+      case Application.get_env(:fathom, :flush_serialize_result_hook) do
+        fun when is_function(fun, 1) -> fun.(Exqlite.Sqlite3.serialize(conn, "main"))
+        _ -> Exqlite.Sqlite3.serialize(conn, "main")
+      end
+
+    case result do
       {:ok, blob} when is_binary(blob) -> {:ok, blob}
       {:error, reason} -> {:error, {:serialize_failed, reason}}
     end
