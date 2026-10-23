@@ -208,12 +208,39 @@ defmodule Fathom.Shard do
 
   def hibernate_after_ms(_interval, _ratio), do: @hibernate_after_ms
 
+  # CAPPED AT HALF THE IDLE STOP WHEN THE INTERVAL IS LONGER (expert review 2026-10-22 r8 #12). The
+  # floor above made the value 376 s at prod's 300 s interval, while a clean idle coordinator (no
+  # timer armed, #10) idle-stops at `idle_ms` (60 s prod, 20 s rig): in the shipped configuration NO
+  # idle coordinator ever hibernated, reversing 07-24 #9's measured -33% retained heap (p6: 5,952 B
+  # idle vs 3,328 B hibernated, -2.6 KB per idle coordinator).
+  #
+  # The floor's job (#32) is to stop a DIRTY quiet coordinator hibernating just before each tick.
+  # When `interval > idle_ms` that race cannot happen for an idle shard: a dirty idle shard
+  # idle-stops (drop flush) before its next tick. A busy-but-quiet one (held stream) now hibernates
+  # after `idle_ms / 2` and is woken by its tick at most once per interval, i.e. after sleeping at
+  # least half of it — not the hibernate-then-immediately-wake pair #32 removed, which needed the
+  # two values to be nearly equal. Below that regime (`interval <= idle_ms`, e.g. the 5 s library
+  # default or a 30 s interval with the 60 s idle stop) the floor is untouched.
+  #
+  # The simpler of the review's two options, chosen deliberately: a state-driven `{:noreply, state,
+  # timeout}` would have to be returned from every handle_* clause that can leave the coordinator idle
+  # and clean, and one missed clause silently disables it again. `hibernate_after` is the gen_server
+  # loop's own receive timeout, reset by any message, so it needs no clause audit. Floored at 1 s so a
+  # test's tiny idle stop does not hibernate the coordinator between every message.
+  @doc false
+  @spec hibernate_after_ms(term(), term(), term()) :: pos_integer()
+  def hibernate_after_ms(interval, ratio, idle)
+      when is_integer(interval) and is_integer(idle) and idle > 0 and interval > idle,
+      do: min(hibernate_after_ms(interval, ratio), max(1_000, div(idle, 2)))
+
+  def hibernate_after_ms(interval, ratio, _idle), do: hibernate_after_ms(interval, ratio)
+
   @spec start_link(Fathom.ShardId.t()) :: GenServer.on_start()
   def start_link(shard_id) do
     GenServer.start_link(__MODULE__, shard_id,
       name: via(shard_id),
       spawn_opt: [fullsweep_after: 0],
-      hibernate_after: hibernate_after_ms(flush_interval_ms(), flush_jitter_ratio())
+      hibernate_after: hibernate_after_ms(flush_interval_ms(), flush_jitter_ratio(), idle_ms())
     )
   end
 
