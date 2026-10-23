@@ -711,6 +711,10 @@ defmodule Fathom.Shard.Replication.Follower do
     end)
 
     reap_seed_temp_dir(name)
+
+    # Prime seed admission's volume reading (expert review 2026-10-22 r8 #10) in the background,
+    # so the first seed begin after boot finds a value rather than reading one itself.
+    refresh_disk_async(locks(name), dir, System.monotonic_time(:millisecond))
     {:noreply, state}
   end
 
@@ -1571,6 +1575,22 @@ defmodule Fathom.Shard.Replication.Follower do
     # and the checks below read a state nothing else can move under them.
     id = b.shard_id
 
+    # HEADROOM BEFORE THE LOCK (expert review 2026-10-22 r8 #10). The volume check used to run
+    # inside `checked_begin/4`, i.e. holding this shard's lock, and on a cache miss it forked `df`
+    # and queued on the single `disksup` process: every push for this shard (and, since this runs
+    # in a per-connection worker, every shard hashed to it) waited behind the subprocess. It needs
+    # no lock: the reservation row is keyed by shard AND this process, so a concurrent begin for
+    # the same shard from another connection cannot overwrite it. And the reading itself no longer
+    # forks on this path at all (`disk_free/1`). Refused here, the begin answers exactly as the
+    # in-lock refusal did (the shard absent from `seeds`).
+    if reserve_headroom?(name, b) do
+      locked_begin(name, seeds, b, id)
+    else
+      refuse_seed(name, seeds, b)
+    end
+  end
+
+  defp locked_begin(name, seeds, b, id) do
     case lock_shard(name, id, lock_wait_ms()) do
       {:ok, lock} ->
         case checked_begin(name, seeds, b, lock) do
@@ -1584,6 +1604,8 @@ defmodule Fathom.Shard.Replication.Follower do
         end
 
       {:error, reason} ->
+        release_reservation(name, id)
+
         Logger.warning(
           "replication follower refusing to seed #{b.shard_id}: its replica is busy " <>
             "(#{inspect(reason)}) — another connection is mutating it"
@@ -1617,11 +1639,8 @@ defmodule Fathom.Shard.Replication.Follower do
 
         seeds
 
-      reserve_headroom?(name, b) ->
-        open_seed_temps(name, seeds, b, lock)
-
       true ->
-        refuse_seed(name, seeds, b)
+        open_seed_temps(name, seeds, b, lock)
     end
   end
 
@@ -1673,8 +1692,7 @@ defmodule Fathom.Shard.Replication.Follower do
   # pruned on the next read rather than leaking free space forever. Bytes a seed has already
   # written are counted twice (reservation AND the lower free space) — conservative by design.
   #
-  # The volume read is cached ~1 s and timeout-bounded: `:disksup` is a single process and a
-  # per-seed `:infinity` call let a wedged disksup stall every seeding worker.
+  # The volume read is cached and refreshed off this path; see `disk_free/1`.
   defp reserve_headroom?(name, %Protocol.SeedBegin{} = b) do
     incoming = (b.db_size || 0) + (b.wal_size || 0)
     reserve(name, b.shard_id, incoming)
@@ -1694,10 +1712,15 @@ defmodule Fathom.Shard.Replication.Follower do
     ok?
   end
 
-  # Reservation rows live in the lock table under `{:reserved, shard_id}` keys (a tuple, so they can
-  # never collide with a binary shard id's lock row); the disk-info cache under `{:disk, dir}`.
+  # Reservation rows live in the lock table under `{:reserved, shard_id, owner}` keys (a tuple, so
+  # they can never collide with a binary shard id's lock row); the disk-info cache under
+  # `{:disk, dir}` and its refresh claim under `{:disk_refresh, dir}`. The OWNER is in the key
+  # (expert review 2026-10-22 r8 #10) because the reservation is now taken before the shard lock:
+  # keyed by shard alone, a second connection's begin for the same shard would overwrite the
+  # first's row, and its release would then delete it.
   defp reserve(name, shard_id, bytes) do
-    :ets.insert(locks(name), {{:reserved, shard_id}, self(), bytes})
+    me = self()
+    :ets.insert(locks(name), {{:reserved, shard_id, me}, me, bytes})
   rescue
     ArgumentError -> :ok
   end
@@ -1705,7 +1728,7 @@ defmodule Fathom.Shard.Replication.Follower do
   @doc false
   @spec release_reservation(atom(), String.t()) :: :ok
   def release_reservation(name, shard_id) do
-    :ets.match_delete(locks(name), {{:reserved, shard_id}, self(), :_})
+    :ets.delete(locks(name), {:reserved, shard_id, self()})
     :ok
   rescue
     ArgumentError -> :ok
@@ -1717,7 +1740,7 @@ defmodule Fathom.Shard.Replication.Follower do
 
     :ets.foldl(
       fn
-        {{:reserved, _}, pid, bytes} = row, acc ->
+        {{:reserved, _, _}, pid, bytes} = row, acc ->
           if Process.alive?(pid) do
             acc + bytes
           else
@@ -1737,29 +1760,141 @@ defmodule Fathom.Shard.Replication.Follower do
 
   @disk_cache_ms 1_000
   @disk_timeout_ms 2_000
+  # A refresh claim older than this belongs to a refresher that died without releasing it (the read
+  # itself is bounded by `@disk_timeout_ms`), so the next reader may take it over.
+  @disk_claim_stale_ms 3 * @disk_timeout_ms
 
+  # READERS NEVER FORK (expert review 2026-10-22 r8 #10, decision Q10 = A). The reading is cached
+  # here, filled three ways: the node poller's 10 s `Measurements.disk/0` (`note_disk_reading/3`,
+  # one `df` for the gauge and this check), a refresh started at boot, and a background refresh
+  # when a reader finds it older than `@disk_cache_ms`. That refresh is SINGLE-FLIGHT (an
+  # `:ets.insert_new` claim) and the reader uses the value it already has, so a seed storm costs
+  # one `df` per second per volume instead of one (plus a queued `disksup` call) per seed begin,
+  # and no begin waits on a subprocess. Staleness is bounded by `@disk_cache_ms` plus one read
+  # (<= ~1-2 s, or `@disk_timeout_ms` more if `df` hangs). Live reservations are still subtracted
+  # on every check, so concurrent seeds still see each other; what a stale reading misses is only
+  # the last second of OTHER writes to the volume, and the cost of that is a seed admitted or
+  # refused one reading late near the floor. A refused seed keeps the shard at its stored object
+  # (the pre-A2 RPO), and an admitted one is still bounded by the next reading.
+  #
+  # Only with NO reading at all (the first begin after boot, before the boot refresh lands) does a
+  # reader read synchronously, one of them, and concurrent first readers wait for its answer.
   defp disk_free(name) do
     dir = dir(name)
     tab = locks(name)
     now = System.monotonic_time(:millisecond)
 
     case :ets.lookup(tab, {:disk, dir}) do
-      [{_, at, result}] when now - at < @disk_cache_ms ->
+      [{_, at, result}] ->
+        if now - at >= @disk_cache_ms, do: refresh_disk_async(tab, dir, now)
         result
 
-      _ ->
-        result = read_disk_free(dir)
-        :ets.insert(tab, {{:disk, dir}, now, result})
-        result
+      [] ->
+        first_disk_reading(tab, dir, now)
     end
   rescue
     ArgumentError -> :error
   end
 
-  # Bytes from `:disksup`, inodes from `df -Pi` (expert review 2026-10-21 r7 #24), read in parallel
-  # under one deadline. Each is independent: an unreadable inode count is `nil` (the inode floor is
-  # then skipped, fail-open like the byte check) and never costs the byte answer.
+  @doc false
+  # The node poller's reading of a replica volume (`Measurements.disk/0`): one `df` serves the gauge
+  # and this follower's seed admission. A row for a directory no follower uses is never read.
+  @spec note_disk_reading(
+          String.t(),
+          {:ok, non_neg_integer(), non_neg_integer() | nil} | :error,
+          atom()
+        ) :: :ok
+  def note_disk_reading(dir, result, name \\ __MODULE__) do
+    :ets.insert(locks(name), {{:disk, dir}, System.monotonic_time(:millisecond), result})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp refresh_disk_async(tab, dir, now) do
+    if claim_disk_refresh(tab, dir, now) do
+      spawn(fn -> store_disk_reading(tab, dir) end)
+    end
+
+    :ok
+  end
+
+  defp store_disk_reading(tab, dir) do
+    at = System.monotonic_time(:millisecond)
+    result = read_disk_free(dir)
+    :ets.insert(tab, {{:disk, dir}, at, result})
+    result
+  rescue
+    # The follower (and with it the table) stopped mid-read.
+    ArgumentError -> :error
+  after
+    release_disk_claim(tab, dir)
+  end
+
+  defp claim_disk_refresh(tab, dir, now) do
+    key = {:disk_refresh, dir}
+
+    :ets.insert_new(tab, {key, now}) or
+      case :ets.lookup(tab, key) do
+        [{_, at} = claim] when now - at > @disk_claim_stale_ms ->
+          :ets.delete_object(tab, claim)
+          :ets.insert_new(tab, {key, now})
+
+        _ ->
+          false
+      end
+  end
+
+  defp release_disk_claim(tab, dir) do
+    :ets.delete(tab, {:disk_refresh, dir})
+  rescue
+    ArgumentError -> true
+  end
+
+  defp first_disk_reading(tab, dir, now) do
+    if claim_disk_refresh(tab, dir, now),
+      do: store_disk_reading(tab, dir),
+      else: await_disk_reading(tab, dir, now + @disk_timeout_ms + 100)
+  end
+
+  # Another reader is taking the first reading. Fail OPEN (`:error`) if it does not land in time,
+  # as for an unreadable volume.
+  defp await_disk_reading(tab, dir, deadline) do
+    case :ets.lookup(tab, {:disk, dir}) do
+      [{_, _at, result}] ->
+        result
+
+      [] ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          :error
+        else
+          receive do
+          after
+            1 -> :ok
+          end
+
+          await_disk_reading(tab, dir, deadline)
+        end
+    end
+  end
+
+  # Bytes AND inodes from ONE `df` (`Measurements.volume_readings/1`, expert review 2026-10-22 r8
+  # #10), under `@disk_timeout_ms`. An unreadable inode count is `nil` (the inode floor is then
+  # skipped, fail-open like the byte check) and never costs the byte answer. When that combined read
+  # cannot answer, the old pair: bytes from `:disksup`, inodes from `df -Pi` (r7 #24).
   defp read_disk_free(dir) do
+    task = Task.async(fn -> Fathom.Admin.Measurements.volume_readings([dir]) end)
+
+    case Task.yield(task, @disk_timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, [{:ok, %{free_bytes: free, free_inodes: free_inodes}}]} -> {:ok, free, free_inodes}
+      # `df` answered something this parser does not read: try the pair.
+      {:ok, _unreadable} -> read_disk_free_pair(dir)
+      # Timed out or crashed: a second subprocess would not do better inside the same budget.
+      _ -> :error
+    end
+  end
+
+  defp read_disk_free_pair(dir) do
     bytes = Task.async(fn -> Fathom.Admin.Measurements.disk_info(dir) end)
     inodes = Task.async(fn -> Fathom.Admin.Measurements.inode_info(dir) end)
 

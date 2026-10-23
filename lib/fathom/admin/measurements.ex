@@ -374,6 +374,11 @@ defmodule Fathom.Admin.Measurements do
         {:ok, %{total_bytes: total, free_bytes: free} = r} <- [reading || per_dir_reading(path)] do
       if label == "data", do: put_data_free_bytes(free)
 
+      # The seed admission check on this node's follower reads this same reading (r8 #10 seed
+      # half), so a poll also refreshes its cache.
+      if label == "replica",
+        do: Fathom.Shard.Replication.Follower.note_disk_reading(path, {:ok, free, r.free_inodes})
+
       measurements =
         %{
           free_bytes: free,
