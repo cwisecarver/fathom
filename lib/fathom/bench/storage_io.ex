@@ -334,6 +334,13 @@ defmodule Fathom.Bench.StorageIO do
     prev = Application.fetch_env(:fathom, :shard_retain_local_bytes)
     Application.put_env(:fathom, :shard_retain_local_bytes, @retained_budget)
 
+    # r8 #26's size floor is 0 with replication on and 1 MiB with it off, and this arm's seed shard
+    # is far below 1 MiB: with the floor unpinned the arm raised "did not retain" whenever
+    # replication was off (every `mix test`, any dev run). The arm measures the retained reopen,
+    # not the floor, so it pins the floor to 0 for its duration.
+    prev_min = Application.fetch_env(:fathom, :shard_retain_min_bytes)
+    Application.put_env(:fathom, :shard_retain_min_bytes, 0)
+
     owner =
       case Fathom.Shard.Retained.start_link([]) do
         {:ok, pid} ->
@@ -403,6 +410,11 @@ defmodule Fathom.Bench.StorageIO do
       case prev do
         {:ok, v} -> Application.put_env(:fathom, :shard_retain_local_bytes, v)
         :error -> Application.delete_env(:fathom, :shard_retain_local_bytes)
+      end
+
+      case prev_min do
+        {:ok, v} -> Application.put_env(:fathom, :shard_retain_min_bytes, v)
+        :error -> Application.delete_env(:fathom, :shard_retain_min_bytes)
       end
     end
   end
