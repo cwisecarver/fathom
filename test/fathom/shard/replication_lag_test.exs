@@ -92,6 +92,13 @@ defmodule Fathom.Shard.ReplicationLagTest do
     {:ok, conn} = Connection.open(path)
     on_exit(fn -> Connection.close(conn) end)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
+
+    # These tests count the stage events of the FIRST commit's push round. A coordinator life's
+    # first Session now seeds instead of shipping that round (expert review 2026-10-22 r8 #16:
+    # on a fresh lineage every real follower refuses it); reading the epoch here consumes that
+    # "first Session" flag, so the commit ships as these tests (and their lineage-0 preseeded
+    # followers, which would accept the push) expect.
+    {:ok, _} = Fathom.Shard.epoch(coordinator)
     {coordinator, path}
   end
 

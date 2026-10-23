@@ -309,6 +309,11 @@ defmodule Fathom.Shard.Replication.Session do
        # coordinator's life in heartbeat mode). An integer gates the commit ack on
        # `Heartbeat.valid_for_write?/1`; `nil` (legacy mode, no heartbeat) leaves the ack ungated.
        acquire_gen: nil,
+       # True while this is the FIRST Session of a coordinator life that took a fresh replication
+       # lineage at open (`Fathom.Shard.epoch_first_session/1`, read with `epoch` in
+       # `with_epoch/1`), until its first tenant commit uses it. See `seed_first/4` (expert review
+       # 2026-10-22 r8 #16).
+       fresh_lineage: false,
        # The WAL the last push shipped from, and that WAL's monotone ordinal (expert review
        # 2026-08-26 #2). Cached together so the coordinator is asked only when the salt CHANGES —
        # a WAL recreate, which is rare — because this sits on the tenant's synchronous commit path
@@ -890,96 +895,165 @@ defmodule Fathom.Shard.Replication.Session do
           |> drain_late_replies(wal_path)
           |> await_stragglers_if_short(wal_path, deadline)
 
-        case ship(state, wal_path, state.epoch, deadline, mode) do
-          {:ok, new_state, rejects} ->
-            new_state = start_seeds(new_state, wal_path, rejects)
-
-            # A REFUSAL DRAINED HERE STILL COUNTS. A round that stopped at its quorum (or shipped
-            # fire-and-forget, `needed == 0`) returns before its laggards answer, and a refusal that
-            # lands before this drain used to be reconciled and then FORGOTTEN: `arm_if_rejected/2`
-            # saw only the round's own `rejects` (often `[]`), reset `catchup_fails` to 0, and the
-            # backoff the refusal should have deepened was erased. The same reply landing a moment
-            # later, in `handle_info/2`, is counted. With a dead follower that meant the rv7 F1
-            # chase gate (`catchup_fails == 0`) reopened depending on scheduling (CI run 39889287951,
-            # OTP 28), and a synchronous `:overloaded` refusal (`Shipper.push/2` sends it to self())
-            # was never counted at all. Same reply, same treatment, whenever it arrives.
-            {new_state, late_rejects} = drain_late_replies_counted(new_state, wal_path, [])
-
-            new_state
-            # A commit can SUCCEED on the quorum while a follower was refused by OUR OWN shipper.
-            # That follower is now behind with nothing scheduled to fix it, and the tenant saw
-            # `:ok` — so nothing anywhere looks wrong. This is the arm that matters.
-            |> arm_if_rejected(rejects ++ late_rejects)
-            # A follower the quorum did not need may still be short (expert review 2026-10-20 #3:
-            # the commit no longer waits for it). The catch-up timer makes it good off the reply path.
-            |> arm_if_short()
-            # Gate the ack on confirmed ownership (expert review 2026-09-05 #5) — a zombie that
-            # reached quorum on stale-epoch followers must not report a write durable. See
-            # `ack_if_owned/1`.
-            |> ack_if_owned()
-
-          # NOTHING TO SHIP IS NOT PROOF OF OWNERSHIP (expert review 2026-09-29 #7). Streams commit
-          # concurrently, and one call reads a WAL header that already covers another stream's
-          # frames and ships both. If THAT call's gate refused (a lapsed or zombie owner), the
-          # followers still advanced — and the second stream's commit then plans `:nothing` for
-          # every follower. It used to reply `:ok` straight away, so the first write was refused
-          # and the next was acked quorum-durable by a node that no longer owned the shard. The
-          # frames this commit is acking were shipped by someone; the ownership question is the same.
-          {:nothing, state} ->
-            ack_if_owned(state)
-
-          # Out of time mid-catch-up. Answered here rather than falling into the seed-and-retry
-          # clause below, because nothing about this is a seeding problem: the followers are known,
-          # seeded and progressing, just not fast enough. Running the seed dance would start no
-          # seeds, wait for none, and spend one more round of shipping past a deadline that has
-          # already expired.
-          {:error, {:no_quorum, :catching_up}, new_state, _rejects} ->
-            {:reply, {:error, {:no_quorum, :catching_up}}, new_state}
-
-          # `new_state` already has every rejecter's position corrected from what IT reported, so
-          # the next commit plans a catch-up delta from where each actually is.
-          #
-          # A follower answering :unknown_shard has never been seeded, which is not a fault to
-          # alert on but the signal to send it a base copy.
-          #
-          # This USED TO fail the commit outright and seed out of band, on the reasoning that a
-          # seed can be a whole database and blocking a tenant's write on a multi-megabyte transfer
-          # is the worst place to put that cost. The reasoning was sound; the consequence was not
-          # measured until the chaos rig ran it (2026-08-11): the FIRST write to every shard came
-          # back `FILO_NO_QUORUM`, i.e. an `OperationalError` on an unchanged Django app's first
-          # INSERT for that tenant, once per tenant, forever. Trading a guaranteed error for a
-          # bounded wait is the better side of that deal — and for the small shards fathom's whole
-          # thesis is about, the wait is milliseconds.
-          #
-          # Still bounded, and still fails honestly: `await_seeds/4` waits only for seeds THIS
-          # commit started, only until the caller's own deadline, and a shard too large to seed
-          # inside it fails exactly as it did before, having spent time it was going to spend
-          # anyway. Seeding remains write-gated — nothing seeds a shard nobody writes to, which is
-          # the storm the durability `dirty` flag exists to prevent.
-          #
-          # "THIS commit started" was the comment's promise and not the code's until expert review
-          # 2026-10-20 #6: `await_seeds` waited until NO seed was in flight, so a commit that missed
-          # its quorum while an earlier commit's large seed streamed (145 s+ on the rig) sat out its
-          # whole deadline behind a seed it could not use — and under #5(a)'s queue, every queued
-          # commit did the same. `prior` excludes those; their results still land in `handle_info/2`.
-          {:error, {:no_quorum, why}, new_state, rejects} ->
-            seeded_state = start_seeds(new_state, wal_path, rejects)
-
+        case seed_first(state, wal_path, deadline, mode) do
+          {:seeded, seeded_state} ->
             case await_seeds(seeded_state, deadline, wal_path, prior) do
               {:ok, ready_state} ->
-                retry_after_seed(ready_state, wal_path, deadline, why, mode)
+                retry_after_seed(ready_state, wal_path, deadline, :impossible, mode)
 
               {:timeout, waited_state} ->
-                {:reply, {:error, {:no_quorum, why}}, waited_state}
+                {:reply, {:error, {:no_quorum, :impossible}}, waited_state}
             end
 
-          # A read failure keeps what the earlier rounds learned (expert review 2026-10-20 #9):
-          # followers' advances, outstanding expectations and the reopened fd. Replying with the
-          # PRE-ship state discarded them, so late acks for pushes really in flight were rejected
-          # and the next commit re-planned from stale positions (`:offset_mismatch` rounds).
-          {:error, reason, failed_state} ->
-            {:reply, {:error, reason}, failed_state}
+          {:ship, state} ->
+            ship_and_settle(state, wal_path, deadline, mode, prior)
         end
+    end
+  end
+
+  # SEED FIRST ON A FRESH LINEAGE (expert review 2026-10-22 r8 #16). The first tenant commit of a
+  # coordinator life that took a fresh lineage at open used to ship a reset push to every follower
+  # whose answer was already known: a follower holds either nothing of this shard (`:unknown_shard`)
+  # or a LOWER lineage, which under `:replication_reseed` (default on) it refuses with a reseed
+  # request, i.e. `:unknown_shard` too. The commit then read up to 1 MiB of WAL, compressed and
+  # encoded it N times, waited a full quorum round for N refusals, logged `quorum IMPOSSIBLE` at
+  # warning, and only then started the seeds and re-shipped. Now it starts the seeds directly,
+  # exactly as that refusal would have (same `start_seeds/3`, same `await_seeds/4` bounded by this
+  # call's deadline, same `retry_after_seed/5`), for every CONNECTED shipper; a disconnected one
+  # would have answered `:disconnected` and is left to the retry's push, as before.
+  #
+  # Only when the guess cannot be wrong in a way that matters: the coordinator says this is its
+  # life's first Session on a fresh lineage (a Session restarted under the same coordinator is told
+  # false: its followers may already hold this lineage), reseed is on, and this Session has learned
+  # nothing about any follower yet. A wrong guess costs one unnecessary seed, never correctness.
+  #
+  # RPO: unchanged. The ack is the retry's, through `quorum_holds?/2` (acked positions, seeding
+  # followers excluded) and `ack_if_owned/1`, exactly as on the seed-after-refusal path; skipping a
+  # push whose every answer is a refusal removes no acknowledgment. The seeds keep the
+  # pin-before-header ordering (`SeedPin`) because they are started by the same `start_seeds/3`.
+  defp seed_first(%{fresh_lineage: true} = state, wal_path, _deadline, :checkpoint)
+       when map_size(state.followers) == 0 and map_size(state.seeding) == 0 do
+    state = %{state | fresh_lineage: false}
+
+    rejects =
+      for shipper <- shippers(), shipper_connected?(shipper), do: {shipper, :unknown_shard, 0}
+
+    with true <- rejects != [] and reseed_enabled?(),
+         {:ok, %{salt1: salt}} <- Wal.read(wal_path) do
+      # THE ORDINAL BEFORE THE SEED (rig 2026-10-14 B1; caught by `replication_seed_ordinal_test`
+      # on the first draft of this path). On the ship-first path the doomed push resolved
+      # `{wal_salt, wal_ordinal}` (`with_ordinal/2`) before any seed started, and the seed stamps
+      # the replica from that cache (`seed_ordinal/2`). Seeding first skipped it, so every replica
+      # of a write acked through this seed sat at `wal_ordinal: 0`, which `Promote.fresher?/2`
+      # refuses to rank: the write would be lost on failover. Resolve it here, from the same header
+      # read and the same coordinator call. An empty or unreadable WAL takes the old path.
+      {_ordinal, state} = with_ordinal(state, salt)
+      {:seeded, start_seeds(state, wal_path, rejects)}
+    else
+      _ -> {:ship, state}
+    end
+  end
+
+  defp seed_first(state, _wal_path, _deadline, _mode), do: {:ship, state}
+
+  defp shipper_connected?(shipper) do
+    Shipper.connected?(shipper)
+  catch
+    :exit, _ -> false
+  end
+
+  defp reseed_enabled?, do: Application.get_env(:fathom, :replication_reseed, true)
+
+  defp ship_and_settle(state, wal_path, deadline, mode, prior) do
+    case ship(state, wal_path, state.epoch, deadline, mode) do
+      {:ok, new_state, rejects} ->
+        new_state = start_seeds(new_state, wal_path, rejects)
+
+        # A REFUSAL DRAINED HERE STILL COUNTS. A round that stopped at its quorum (or shipped
+        # fire-and-forget, `needed == 0`) returns before its laggards answer, and a refusal that
+        # lands before this drain used to be reconciled and then FORGOTTEN: `arm_if_rejected/2`
+        # saw only the round's own `rejects` (often `[]`), reset `catchup_fails` to 0, and the
+        # backoff the refusal should have deepened was erased. The same reply landing a moment
+        # later, in `handle_info/2`, is counted. With a dead follower that meant the rv7 F1
+        # chase gate (`catchup_fails == 0`) reopened depending on scheduling (CI run 39889287951,
+        # OTP 28), and a synchronous `:overloaded` refusal (`Shipper.push/2` sends it to self())
+        # was never counted at all. Same reply, same treatment, whenever it arrives.
+        {new_state, late_rejects} = drain_late_replies_counted(new_state, wal_path, [])
+
+        new_state
+        # A commit can SUCCEED on the quorum while a follower was refused by OUR OWN shipper.
+        # That follower is now behind with nothing scheduled to fix it, and the tenant saw
+        # `:ok` — so nothing anywhere looks wrong. This is the arm that matters.
+        |> arm_if_rejected(rejects ++ late_rejects)
+        # A follower the quorum did not need may still be short (expert review 2026-10-20 #3:
+        # the commit no longer waits for it). The catch-up timer makes it good off the reply path.
+        |> arm_if_short()
+        # Gate the ack on confirmed ownership (expert review 2026-09-05 #5) — a zombie that
+        # reached quorum on stale-epoch followers must not report a write durable. See
+        # `ack_if_owned/1`.
+        |> ack_if_owned()
+
+      # NOTHING TO SHIP IS NOT PROOF OF OWNERSHIP (expert review 2026-09-29 #7). Streams commit
+      # concurrently, and one call reads a WAL header that already covers another stream's
+      # frames and ships both. If THAT call's gate refused (a lapsed or zombie owner), the
+      # followers still advanced — and the second stream's commit then plans `:nothing` for
+      # every follower. It used to reply `:ok` straight away, so the first write was refused
+      # and the next was acked quorum-durable by a node that no longer owned the shard. The
+      # frames this commit is acking were shipped by someone; the ownership question is the same.
+      {:nothing, state} ->
+        ack_if_owned(state)
+
+      # Out of time mid-catch-up. Answered here rather than falling into the seed-and-retry
+      # clause below, because nothing about this is a seeding problem: the followers are known,
+      # seeded and progressing, just not fast enough. Running the seed dance would start no
+      # seeds, wait for none, and spend one more round of shipping past a deadline that has
+      # already expired.
+      {:error, {:no_quorum, :catching_up}, new_state, _rejects} ->
+        {:reply, {:error, {:no_quorum, :catching_up}}, new_state}
+
+      # `new_state` already has every rejecter's position corrected from what IT reported, so
+      # the next commit plans a catch-up delta from where each actually is.
+      #
+      # A follower answering :unknown_shard has never been seeded, which is not a fault to
+      # alert on but the signal to send it a base copy.
+      #
+      # This USED TO fail the commit outright and seed out of band, on the reasoning that a
+      # seed can be a whole database and blocking a tenant's write on a multi-megabyte transfer
+      # is the worst place to put that cost. The reasoning was sound; the consequence was not
+      # measured until the chaos rig ran it (2026-08-11): the FIRST write to every shard came
+      # back `FILO_NO_QUORUM`, i.e. an `OperationalError` on an unchanged Django app's first
+      # INSERT for that tenant, once per tenant, forever. Trading a guaranteed error for a
+      # bounded wait is the better side of that deal — and for the small shards fathom's whole
+      # thesis is about, the wait is milliseconds.
+      #
+      # Still bounded, and still fails honestly: `await_seeds/4` waits only for seeds THIS
+      # commit started, only until the caller's own deadline, and a shard too large to seed
+      # inside it fails exactly as it did before, having spent time it was going to spend
+      # anyway. Seeding remains write-gated — nothing seeds a shard nobody writes to, which is
+      # the storm the durability `dirty` flag exists to prevent.
+      #
+      # "THIS commit started" was the comment's promise and not the code's until expert review
+      # 2026-10-20 #6: `await_seeds` waited until NO seed was in flight, so a commit that missed
+      # its quorum while an earlier commit's large seed streamed (145 s+ on the rig) sat out its
+      # whole deadline behind a seed it could not use — and under #5(a)'s queue, every queued
+      # commit did the same. `prior` excludes those; their results still land in `handle_info/2`.
+      {:error, {:no_quorum, why}, new_state, rejects} ->
+        seeded_state = start_seeds(new_state, wal_path, rejects)
+
+        case await_seeds(seeded_state, deadline, wal_path, prior) do
+          {:ok, ready_state} ->
+            retry_after_seed(ready_state, wal_path, deadline, why, mode)
+
+          {:timeout, waited_state} ->
+            {:reply, {:error, {:no_quorum, why}}, waited_state}
+        end
+
+      # A read failure keeps what the earlier rounds learned (expert review 2026-10-20 #9):
+      # followers' advances, outstanding expectations and the reopened fd. Replying with the
+      # PRE-ship state discarded them, so late acks for pushes really in flight were rejected
+      # and the next commit re-planned from stale positions (`:offset_mismatch` rounds).
+      {:error, reason, failed_state} ->
+        {:reply, {:error, reason}, failed_state}
     end
   end
 
@@ -1267,13 +1341,13 @@ defmodule Fathom.Shard.Replication.Session do
   defp with_epoch(%{epoch: e} = state) when is_integer(e), do: {:ok, state}
 
   defp with_epoch(state) do
-    case Fathom.Shard.epoch(state.coordinator) do
+    case Fathom.Shard.epoch_first_session(state.coordinator) do
       # The LINEAGE is read alongside the lock epoch and cached the same way (expert review
       # 2026-08-24 #12). They are different counters: the lock epoch resets to 1 on every clean
       # release, so it cannot order a replica against the stored object, whose position stamp
       # carries the monotonic lineage. A seed ships both. Read here rather than at seed time so it
       # costs one call per session, on the path that already pays one.
-      {:ok, epoch} ->
+      {:ok, epoch, fresh?} ->
         # All three reads are cached for the session's life, so none may cache a guess. A
         # coordinator that does not answer in time (busy in `await_closing`, or in an inline S3
         # HEAD) yields NOTHING cached: lineage 0 would silently disarm the follower lineage fence and
@@ -1281,7 +1355,14 @@ defmodule Fathom.Shard.Replication.Session do
         # (expert review 2026-10-12 #11). The commit is refused retryably; the next one re-reads.
         with {:ok, lineage} <- lineage_of(state),
              {:ok, acquire_gen} <- acquire_gen_of(state) do
-          {:ok, %{state | epoch: epoch, lineage: lineage, acquire_gen: acquire_gen}}
+          {:ok,
+           %{
+             state
+             | epoch: epoch,
+               lineage: lineage,
+               acquire_gen: acquire_gen,
+               fresh_lineage: fresh?
+           }}
         end
 
       {:error, reason} ->

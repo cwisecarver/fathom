@@ -197,7 +197,18 @@ defmodule Fathom.Shard.Replication do
             :log -> ""
           end
 
-        Logger.warning(
+        # Every reject `:unknown_shard` is the "seed me" answer, and the Session seeds each one
+        # (`start_seeds/3`) and retries inside the same commit: routine for a brand-new or reopened
+        # shard, so INFO, not the warning an operator reads as quorum loss (expert review
+        # 2026-10-22 r8 #16). Any other reason in the mix keeps the warning. The no_quorum
+        # telemetry counts both.
+        level =
+          if rejects != [] and Enum.all?(rejects, &match?({_from, :unknown_shard, _at}, &1)),
+            do: :info,
+            else: :warning
+
+        Logger.log(
+          level,
           "replication quorum IMPOSSIBLE for #{shard}: " <>
             inspect(Enum.map(rejects, fn {_from, reason, at} -> {reason, at} end)) <> extra
         )
