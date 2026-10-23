@@ -3156,9 +3156,15 @@ defmodule Fathom.Shard.Replication.Session do
         |> apply_seed_down(ref, reason)
         |> await_seeds(deadline, wal_path, prior)
 
+      # `forget_inflight/2` too, as every other late-ack consumer does (expert review 2026-10-22
+      # r8 #27): a mismatched ack is declined by `settle_late_ack/3`, but the follower HAS
+      # answered, so the expectation ends either way. Without it the entry outlived the reply and
+      # the follower read as mid-flight until `inflight_at` aged out
+      # (`replication_seed_wait_late_ack_test.exs`).
       {:repl_reply, from, {:ack, _shard, next}} ->
         state
         |> settle_late_ack(from, next)
+        |> forget_inflight(from)
         |> await_seeds(deadline, wal_path, prior)
 
       # A REJECT MUST BE RECONCILED, NOT DROPPED. The first draft of this fell through to the
