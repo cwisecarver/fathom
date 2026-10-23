@@ -204,7 +204,18 @@ defmodule Fathom.Shard.Connection do
 
   defp track_open(other, _tenant?, _path), do: other
 
-  defp live_key(conn), do: :erlang.ref_to_list(conn)
+  # INVARIANT: the key must NOT hold the resource (expert review 2026-10-17 #2, pinned by
+  # `connection_live_gauge_test.exs`'s orphan test).
+  #
+  # `term_to_binary/1`, not `ref_to_list/1` (expert review 2026-10-22 r8 #23). The charlist was 35
+  # cons cells, ~80 words per row, and `ref_to_list` cost ~690 ns, paid twice per handle. The
+  # external-format binary is a ~45-byte heap binary (~15 words per row, as small as the
+  # `List.to_string` form) and costs ~60 ns. It does not keep the resource alive: probed by holding
+  # `BEGIN EXCLUSIVE` on a handle whose only remaining trace was its key in an ETS table, after a
+  # GC a second writer took the lock (with the ref itself as the key it stayed "database is
+  # locked"). Encoding a magic ref only records it in the VM's weak magic-ref table, which the
+  # resource's destruction clears. Deterministic for one ref, distinct across refs.
+  defp live_key(conn), do: :erlang.term_to_binary(conn)
 
   defp track_close(conn) do
     if :ets.whereis(@live_table) != :undefined, do: :ets.delete(@live_table, live_key(conn))
