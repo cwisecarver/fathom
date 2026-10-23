@@ -323,6 +323,14 @@ defmodule Fathom.Shard.Connection do
   #
   # Under the auto-extension (r8 #14) the same batch also runs `fathom_conn_init()`, which installs
   # the backstop's handlers (and the WAL hook) that the per-connection load used to install.
+  defp configure_readonly(conn, tenant?, guard_opts, :auto) do
+    with :ok <- Sqlite3.set_busy_timeout(conn, 5000),
+         {:ok, guard} <- guard_install_sql(tenant?, guard_opts) do
+      maybe_harden(conn, tenant?, :loaded, [cache_size_sql(), conn_init_sql(:auto)], guard)
+      |> ok_conn(conn)
+    end
+  end
+
   defp configure_readonly(conn, tenant?, guard_opts, mode) do
     with :ok <- Sqlite3.set_busy_timeout(conn, 5000),
          {:ok, ext} <- load_extension(conn, mode),
@@ -345,14 +353,14 @@ defmodule Fathom.Shard.Connection do
     with :ok <- if(wal?, do: enable_wal(conn), else: :ok),
          # `set_busy_timeout`, not `PRAGMA busy_timeout`: see `configure/4`.
          :ok <- Sqlite3.set_busy_timeout(conn, 5000),
-         lead = [
-           rw_open_sql(guard_opts[:deferred_sync?], :auto),
-           max_page_count_sql(conn),
-           query_only_sql(scope)
-         ],
-         :ok <- maybe_harden(conn, tenant?, :loaded, lead),
-         :ok <- maybe_authorizer(conn, tenant?, :loaded, guard_opts) do
-      {:ok, conn}
+         {:ok, guard} <- guard_install_sql(tenant?, guard_opts) do
+      lead = [
+        rw_open_sql(guard_opts[:deferred_sync?], :auto),
+        max_page_count_sql(conn),
+        query_only_sql(scope)
+      ]
+
+      conn |> maybe_harden(tenant?, :loaded, lead, guard) |> ok_conn(conn)
     end
   end
 
@@ -363,6 +371,80 @@ defmodule Fathom.Shard.Connection do
          :ok <- maybe_query_only(conn, scope),
          :ok <- maybe_authorizer(conn, tenant?, ext, guard_opts) do
       {:ok, conn}
+    end
+  end
+
+  defp ok_conn(:ok, conn), do: {:ok, conn}
+  defp ok_conn({:error, reason}, _conn), do: {:error, reason}
+
+  # THE PRAGMA GUARD UNDER THE AUTO-EXTENSION (expert review 2026-10-22 r8 #18 step 3, Q2=A). The
+  # policy is node-global: `ensure_pragma_policy/0` pushes the four variants into the extension once
+  # (and again when an input changes), and the open installs its variant with
+  # `fathom_pragma_guard_install(<variant>)` as the LAST statement of the open batch, after every
+  # pragma fathom sets, exactly where `install_pragma_guard/2` ran. Three dispatches, the ~510-byte
+  # list build and the per-connection Rust parse (~2-3 KB of heap) fewer per tenant open. The
+  # semantics are `install_pragma_guard/2`'s: set-once, and a failure fails the OPEN (an unpushed
+  # variant is an error in the extension, never an empty policy). Non-tenant handles get none.
+  defp guard_install_sql(false, _guard_opts), do: {:ok, []}
+
+  defp guard_install_sql(true, guard_opts) do
+    with :ok <- ensure_pragma_policy() do
+      variant =
+        if(guard_opts[:block_user_version?], do: 1, else: 0) +
+          if(guard_opts[:deferred_sync?], do: 2, else: 0)
+
+      {:ok, [";SELECT fathom_pragma_guard_install(", Integer.to_string(variant), ")"]}
+    end
+  end
+
+  @policy_key {__MODULE__, :pragma_policy}
+
+  # The inputs every variant is built from (the same reads `install_pragma_guard/2` and
+  # `pinned_pragmas/1` make) plus the armed artifact, whose image holds the pushed table. A few
+  # `Application.get_env` reads per tenant open; the push itself happens once per change.
+  defp ensure_pragma_policy do
+    fingerprint =
+      {Fathom.Shard.Extension.armed_path(),
+       Application.get_env(:fathom, :tenant_pragma_allow, []), cache_size_kb(), temp_cap_pages()}
+
+    if :persistent_term.get(@policy_key, nil) == fingerprint,
+      do: :ok,
+      else: push_pragma_policy(fingerprint)
+  end
+
+  defp push_pragma_policy({path, _, _, _} = fingerprint) do
+    assignable = Fathom.ShardExecutor.tenant_pragma_assignable()
+
+    variants =
+      for block? <- [false, true], deferred? <- [false, true] do
+        names = if block?, do: assignable -- ["user_version"], else: assignable
+
+        {if(block?, do: 1, else: 0) + if(deferred?, do: 2, else: 0), Enum.join(names, ","),
+         pinned_pragmas(deferred?)}
+      end
+
+    result =
+      Fathom.Shard.Extension.control(path, fn conn ->
+        Enum.reduce_while(variants, {:ok, 0}, fn {v, names, pinned}, acc ->
+          case Fathom.Shard.Extension.exec_row(
+                 conn,
+                 "SELECT fathom_pragma_policy_set(?1, ?2, ?3)",
+                 [v, names, pinned]
+               ) do
+            {:ok, 1} -> {:cont, acc}
+            other -> {:halt, {:error, other}}
+          end
+        end)
+      end)
+
+    case result do
+      {:ok, _} ->
+        # A `:persistent_term.put` scans every process: bounded by config changes, not opens.
+        :persistent_term.put(@policy_key, fingerprint)
+        :ok
+
+      {:error, reason} ->
+        {:error, {:pragma_guard_not_installed, reason}}
     end
   end
 
@@ -393,8 +475,8 @@ defmodule Fathom.Shard.Connection do
   # security argument). Five dirty dispatches and a `dlopen`/`dlclose` fewer per open. The hook and
   # the backstop's handlers, which the load used to install, come from `fathom_conn_init()` in the
   # open batch (`conn_init_sql/1`). Both orderings above still hold: the functions exist before the
-  # authorizer, and on every handle.
-  defp load_extension(_conn, :auto), do: {:ok, :loaded}
+  # authorizer, and on every handle. (So the `:auto` clauses of `configure_readwrite/6` and
+  # `configure_readonly/4` never call this.)
   defp load_extension(_conn, :skipped), do: {:ok, :skipped}
 
   defp load_extension(conn, :per_open) do
@@ -578,7 +660,11 @@ defmodule Fathom.Shard.Connection do
   #
   # `lead` is SQL that must run on the handle whatever its kind, prepended to the batch (the `:ro`
   # open's `cache_size`, expert review 2026-10-22 r8 #18 step 1); a non-tenant handle runs only it.
-  defp maybe_harden(conn, false, _ext, lead), do: exec_batch(conn, lead)
+  defp maybe_harden(conn, tenant?, ext, lead), do: maybe_harden(conn, tenant?, ext, lead, [])
+
+  # `trail` runs LAST, after the backstop (the auto-extension open's pragma-guard install, r8 #18
+  # step 3), and is part of the re-run below.
+  defp maybe_harden(conn, false, _ext, lead, trail), do: exec_batch(conn, [lead, trail])
 
   # ONE batch (expert review 2026-10-19 #23): both are plain PRAGMAs, and `sqlite3_exec` stops at
   # the first error, which is what the two-step `with` did. Probe: two executes 11-17 us mean per
@@ -595,16 +681,16 @@ defmodule Fathom.Shard.Connection do
   # batch WITHOUT the backstop runs again: the hardening statements are idempotent, and if they
   # succeed alone the backstop was the failure, which is logged and tolerated exactly as before.
   # The re-run happens only on that failure path, never on a healthy open.
-  defp maybe_harden(conn, true, ext, lead) do
+  defp maybe_harden(conn, true, ext, lead, trail) do
     harden = [lead, ";PRAGMA trusted_schema=OFF;PRAGMA cell_size_check=ON", busy_yield_sql(ext)]
 
     case backstop_sql(ext) do
       nil ->
-        exec_batch(conn, harden)
+        exec_batch(conn, [harden, trail])
 
       backstop ->
-        with {:error, _} <- exec_batch(conn, [harden, ";", backstop]),
-             :ok <- exec_batch(conn, harden) do
+        with {:error, _} <- exec_batch(conn, [harden, ";", backstop, trail]),
+             :ok <- exec_batch(conn, [harden, trail]) do
           Logger.warning("statement-deadline backstop not armed: fathom_backstop failed")
           :ok
         end

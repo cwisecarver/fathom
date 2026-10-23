@@ -50,6 +50,25 @@
 //! assignment of an ALLOWED name is allowed (`PRAGMA main.foreign_keys=ON`, as Django may send); a
 //! pinned pair matches only with the schema it was pinned with.
 //!
+//! ## The node-global policy (expert review 2026-10-22 r8 #18 step 3, user decision Q2=A)
+//!
+//! The policy is the same for every tenant handle on the node apart from two booleans, yet each
+//! open used to rebuild a ~510-byte list in Elixir, bind it, and parse it here into two fresh
+//! `HashSet<String>`s (~40 allocations, ~2-3 KB of system-allocator heap per connection, invisible
+//! to the BEAM's memory accounting). Now `Fathom.Shard.Connection` pushes each of the four variants
+//! (bit 0 = `user_version` blocked, bit 1 = deferred sync) ONCE, at first use and whenever its
+//! inputs change, with `fathom_pragma_policy_set(variant, names, pinned)`; a tenant open installs
+//! the guard with `fathom_pragma_guard_install(variant)`, which shares the variant's `Arc<Policy>`.
+//!
+//! NODE-GLOBAL MUTABLE STATE, so the setter is the dangerous one: a tenant able to call it would
+//! widen the policy of every later tenant handle on the node. It is registered ONLY by the control
+//! entry point (src/auto.rs, `sqlite3_fathomudf_control_init`), which needs `load_extension`, which
+//! no tenant handle has; `extension_test.exs` asserts a tenant gets "no such function". The install
+//! is set-once per connection exactly like `fathom_pragma_guard`, and FAILS (the open fails) when
+//! no policy was pushed for the variant: fail closed, never an empty or default policy. A connection
+//! keeps the `Arc` it installed with, so a later push changes only handles opened after it, the same
+//! "read at open" rule the per-open parse had.
+//!
 //! ## Cost
 //!
 //! An authorizer runs at PREPARE time, once per action the statement contains (each column read,
@@ -60,7 +79,9 @@ use std::collections::HashSet;
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, RwLock};
+
+use rusqlite::functions::FunctionFlags;
 
 use rusqlite::{ffi, Connection, Error, Result};
 
@@ -183,8 +204,28 @@ pub fn replication_denies(
     }
 }
 
+/// The four node-global policy variants (see the module docs). `None` = never pushed.
+static POLICIES: RwLock<[Option<Arc<Policy>>; 4]> = RwLock::new([None, None, None, None]);
+
+/// Store `policy` as variant `variant` (0..=3). Pure bookkeeping, unit-tested.
+pub fn set_policy(variant: i64, policy: Policy) -> std::result::Result<(), &'static str> {
+    let i = usize::try_from(variant)
+        .ok()
+        .filter(|i| *i < 4)
+        .ok_or("variant must be 0..=3")?;
+    let mut table = POLICIES.write().map_err(|_| "policy table poisoned")?;
+    table[i] = Some(Arc::new(policy));
+    Ok(())
+}
+
+/// The current policy of `variant`, if one was pushed.
+pub fn variant_policy(variant: i64) -> Option<Arc<Policy>> {
+    let i = usize::try_from(variant).ok().filter(|i| *i < 4)?;
+    POLICIES.read().ok()?[i].clone()
+}
+
 struct Guard {
-    policy: OnceLock<Policy>,
+    policy: OnceLock<Arc<Policy>>,
     /// The connection this guard was installed on, for the replicated-file check. Set before the
     /// authorizer is installed, so `authorize` never sees it null.
     db: AtomicPtr<ffi::sqlite3>,
@@ -281,7 +322,38 @@ unsafe extern "C" fn install_guard(
         result_error(ctx, "fathom_pragma_guard: arguments must be UTF-8 text");
         return;
     };
-    if guard.policy.set(Policy::parse(&names, &pinned)).is_err() {
+    activate(ctx, guard_ptr, Arc::new(Policy::parse(&names, &pinned)));
+}
+
+/// `fathom_pragma_guard_install(variant)` (r8 #18 step 3): install the authorizer with the
+/// node-global policy `variant`. Same contract as `fathom_pragma_guard`: 1 when this call installed
+/// it, 0 when one already was; an error when no policy was pushed for the variant.
+unsafe extern "C" fn install_guard_variant(
+    ctx: *mut ffi::sqlite3_context,
+    argc: c_int,
+    argv: *mut *mut ffi::sqlite3_value,
+) {
+    let guard_ptr = ffi::sqlite3_user_data(ctx);
+    let guard = &*(guard_ptr as *const Guard);
+
+    if guard.policy.get().is_some() {
+        ffi::sqlite3_result_int64(ctx, 0);
+        return;
+    }
+    if argc != 1 || ffi::sqlite3_value_type(*argv) != ffi::SQLITE_INTEGER {
+        result_error(ctx, "fathom_pragma_guard_install: expected one integer variant");
+        return;
+    }
+    match variant_policy(ffi::sqlite3_value_int64(*argv)) {
+        Some(p) => activate(ctx, guard_ptr, p),
+        None => result_error(ctx, "fathom_pragma_guard_install: no policy pushed for this variant"),
+    }
+}
+
+/// Set the guard's policy (set-once), install the authorizer and the tenant limits.
+unsafe fn activate(ctx: *mut ffi::sqlite3_context, guard_ptr: *mut c_void, policy: Arc<Policy>) {
+    let guard = &*(guard_ptr as *const Guard);
+    if guard.policy.set(policy).is_err() {
         ffi::sqlite3_result_int64(ctx, 0);
         return;
     }
@@ -351,8 +423,39 @@ pub fn install(db: &Connection) -> Result<()> {
         if rc != ffi::SQLITE_OK {
             return Err(Error::SqliteFailure(ffi::Error::new(rc), None));
         }
+
+        // Shares the state; `fathom_pragma_guard`'s destructor frees it, so no destructor here.
+        let name = CString::new("fathom_pragma_guard_install").expect("static name");
+        let rc = ffi::sqlite3_create_function_v2(
+            db.handle(),
+            name.as_ptr(),
+            1,
+            ffi::SQLITE_UTF8 | ffi::SQLITE_DIRECTONLY,
+            state as *mut c_void,
+            Some(install_guard_variant),
+            None,
+            None,
+            None,
+        );
+        if rc != ffi::SQLITE_OK {
+            return Err(Error::SqliteFailure(ffi::Error::new(rc), None));
+        }
     }
     Ok(())
+}
+
+/// Register `fathom_pragma_policy_set(variant, names, pinned)` on a CONTROL connection only
+/// (src/auto.rs). Returns 1. See the module docs on why it must never reach a tenant handle.
+pub fn register_control(db: &Connection) -> Result<()> {
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY;
+    db.create_scalar_function("fathom_pragma_policy_set", 3, flags, |ctx| {
+        let variant: i64 = ctx.get(0)?;
+        let names: String = ctx.get(1)?;
+        let pinned: String = ctx.get(2)?;
+        set_policy(variant, Policy::parse(&names, &pinned))
+            .map(|()| 1i64)
+            .map_err(|e| Error::UserFunctionError(e.into()))
+    })
 }
 
 #[cfg(test)]
@@ -593,6 +696,35 @@ mod tests {
     // initialised when SQLite loads the .so, so they are proved end to end in
     // test/fathom/shard/connection_limits_test.exs. Here: the caps must stay below SQLite's
     // defaults, or the guard call would RAISE a limit (expert review 2026-10-10 #2).
+    #[test]
+    fn the_node_global_policy_table_holds_four_variants_and_refuses_others() {
+        assert!(set_policy(4, Policy::default()).is_err());
+        assert!(set_policy(-1, Policy::default()).is_err());
+        assert!(variant_policy(4).is_none());
+        // Variant 3 is used by no other test here.
+        set_policy(3, Policy::parse("foreign_keys", "synchronous=NORMAL")).unwrap();
+        let p = variant_policy(3).expect("pushed");
+        assert_eq!(
+            decide(ffi::SQLITE_PRAGMA, Some(b"foreign_keys"), Some(b"OFF"), None, &p),
+            ffi::SQLITE_OK
+        );
+        assert_eq!(
+            decide(ffi::SQLITE_PRAGMA, Some(b"synchronous"), Some(b"FULL"), None, &p),
+            ffi::SQLITE_DENY
+        );
+        // A later push replaces the variant for LATER installs; an Arc already taken is unchanged.
+        set_policy(3, Policy::parse("", "")).unwrap();
+        assert_eq!(
+            decide(ffi::SQLITE_PRAGMA, Some(b"foreign_keys"), Some(b"OFF"), None, &p),
+            ffi::SQLITE_OK
+        );
+        let q = variant_policy(3).unwrap();
+        assert_eq!(
+            decide(ffi::SQLITE_PRAGMA, Some(b"foreign_keys"), Some(b"OFF"), None, &q),
+            ffi::SQLITE_DENY
+        );
+    }
+
     #[test]
     fn limits_are_below_sqlite_defaults() {
         assert!(LIMIT_LENGTH < 1_000_000_000);

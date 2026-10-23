@@ -40,15 +40,16 @@
 //! `sqlite3_fathomudf_control_init` entry point, uses for one or two statements, disables and
 //! closes. It never runs tenant SQL and never leaves `Fathom.Shard.Extension`.
 //!
-//! The function that changes NODE-GLOBAL state (`fathom_auto_extension`) is registered ONLY by
-//! that control entry point: never by `auto_init`, never by the
-//! per-connection `sqlite3_fathomudf_init`. Reaching them requires `load_extension` with a chosen
-//! entry point, i.e. extension loading enabled, which no tenant handle has. So a tenant cannot
-//! re-arm, disarm or re-point the auto-extension from SQL.
+//! The functions that change NODE-GLOBAL state (`fathom_auto_extension`, and since r8 #18 step 3
+//! the pragma-guard policy setter `fathom_pragma_policy_set`) are registered ONLY by that control
+//! entry point: never by `auto_init`, never by the per-connection `sqlite3_fathomudf_init`.
+//! Reaching them requires `load_extension` with a chosen entry point, i.e. extension loading
+//! enabled, which no tenant handle has. So a tenant cannot re-arm, disarm or re-point the
+//! auto-extension, or widen the pragma policy, from SQL.
 //!
 //! What a tenant handle DOES get from `auto_init` is the same set of functions the per-open load
 //! gave it, plus `fathom_conn_init()` (re-installs the same hook and handlers with the same state:
-//! idempotent).
+//! idempotent) and `fathom_pragma_guard_install` (set-once, like `fathom_pragma_guard`).
 //! `test/fathom/shard/extension_test.exs` asserts from the tenant's side that `load_extension` is
 //! refused and that the control functions do not exist.
 //!
@@ -166,5 +167,7 @@ fn register_control(db: Connection) -> Result<bool> {
     db.create_scalar_function("fathom_auto_extension", 1, flags, |ctx| {
         auto_extension(ctx.get::<i64>(0)?)
     })?;
+    // The node-global pragma-guard policy setter (r8 #18 step 3): control connections ONLY.
+    crate::pragma_guard::register_control(&db)?;
     Ok(false)
 }

@@ -178,6 +178,15 @@ defmodule Fathom.Shard.Extension do
     end
   end
 
+  @doc "The artifact the auto-extension is armed for, or nil."
+  @spec armed_path() :: Path.t() | nil
+  def armed_path do
+    case :persistent_term.get(@armed_key, nil) do
+      {path, :auto} -> path
+      _ -> nil
+    end
+  end
+
   defp arm(path, previous) do
     if previous, do: disarm(previous)
 

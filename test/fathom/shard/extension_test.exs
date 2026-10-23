@@ -101,12 +101,33 @@ defmodule Fathom.Shard.ExtensionTest do
       assert {:ok, %{rows: [[2026]]}} =
                Connection.query(conn, "SELECT django_date_extract('year','2026-08-05')", [])
 
-      for sql <- ["SELECT fathom_auto_extension(0)", "SELECT fathom_auto_extension(1)"] do
+      # r8 #18 step 3: the node-global pragma-guard policy setter is a control function too; a
+      # tenant reaching it could widen every later tenant handle's policy on the node.
+      for sql <- [
+            "SELECT fathom_auto_extension(0)",
+            "SELECT fathom_auto_extension(1)",
+            "SELECT fathom_pragma_policy_set(0, 'writable_schema', '')"
+          ] do
         assert {:error, reason} = Connection.query(conn, sql, [])
 
         assert inspect(reason) =~ "no such function",
                "#{sql} reached a tenant: #{inspect(reason)}"
       end
+    end
+
+    test "each guard variant installs its own node-global policy, set once", %{path: path} do
+      # Variant 1 blocks `user_version` (`:block_tenant_ddl`), variant 0 allows it.
+      plain = open!(path, tenant?: true)
+      blocked = open!(path, tenant?: true, block_user_version?: true)
+      assert {:ok, _} = Connection.query(plain, "PRAGMA user_version = 7", [])
+      assert {:error, reason} = Connection.query(blocked, "PRAGMA user_version = 8", [])
+      assert inspect(reason) =~ "not authorized"
+
+      # Set-once: a tenant re-installing a wider variant changes nothing.
+      assert {:ok, %{rows: [[0]]}} =
+               Connection.query(blocked, "SELECT fathom_pragma_guard_install(0)", [])
+
+      assert {:error, _} = Connection.query(blocked, "PRAGMA user_version = 8", [])
     end
 
     test "a raw exqlite handle gets the functions but NOT the WAL hook", %{path: path} do

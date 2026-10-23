@@ -447,10 +447,19 @@ defmodule Fathom.Shard.NifDispatchTest do
       # Arm the auto-extension OUTSIDE the counted window: the first open of a node arms it on a
       # private control connection, once, and that is not a per-open cost.
       assert Fathom.Shard.Extension.open_mode() == :auto, "the auto-extension did not arm"
+      # Likewise the node-global pragma-guard policy (r8 #18 step 3) is pushed by the first tenant
+      # open of a node (and on a config change), not per open: warm it in the prod shape too.
+      for deadline <- [nil, 30_000] do
+        Application.put_env(:fathom, :query_timeout_ms, deadline)
+        {:ok, warm} = Connection.open(path, tenant?: true)
+        Connection.close(warm)
+      end
+
+      Application.delete_env(:fathom, :query_timeout_ms)
       %{path: path}
     end
 
-    test "a tenant :rw open is 11 dirty dispatches (was 23)", %{path: path} do
+    test "a tenant :rw open is 8 dirty dispatches (was 23)", %{path: path} do
       {res, total, by_fun} = count(fn -> Connection.open(path, tenant?: true) end)
       assert {:ok, conn} = res
       Connection.close(conn)
@@ -461,8 +470,10 @@ defmodule Fathom.Shard.NifDispatchTest do
       # process-global auto-extension): the per-open enable / load (prepare, step, release) /
       # disable is gone, 18 -> 13. r8 #18 step 2: the hardening batch and the size cap ride the
       # fixed-pragma batch, 13 -> 11: open, journal_mode x3, page_size x3 and ONE batch (8), plus
-      # the pragma guard's prepare/step/release.
-      assert total == 11, "open dispatches: #{inspect(by_fun)}"
+      # the pragma guard's prepare/step/release. r8 #18 step 3: the guard installs a node-global
+      # policy variant as the batch's last statement, 11 -> 8: open, journal_mode x3, page_size x3,
+      # one batch.
+      assert total == 8, "open dispatches: #{inspect(by_fun)}"
 
       refute Map.has_key?(by_fun, :enable_load_extension),
              "a tenant open turned extension loading on: #{inspect(by_fun)}"
@@ -485,7 +496,7 @@ defmodule Fathom.Shard.NifDispatchTest do
       end
     end
 
-    test "prod shape: a tenant :rw open is 11 dirty dispatches with the backstop armed (was 19)",
+    test "prod shape: a tenant :rw open is 8 dirty dispatches with the backstop armed (was 19)",
          %{path: path} do
       {res, total, by_fun} =
         with_prod_deadline(fn -> count(fn -> Connection.open(path, tenant?: true) end) end)
@@ -499,11 +510,11 @@ defmodule Fathom.Shard.NifDispatchTest do
 
       Connection.close(conn)
       # 18 after r8 #18 step 1; 13 after r8 #14 (no per-open extension load); 11 after r8 #18
-      # step 2 (one open batch).
-      assert total == 11, "open dispatches: #{inspect(by_fun)}"
+      # step 2 (one open batch); 8 after step 3 (the guard rides the batch).
+      assert total == 8, "open dispatches: #{inspect(by_fun)}"
     end
 
-    test "prod shape: a tenant :ro open is 5 dirty dispatches (was 13)", %{path: path} do
+    test "prod shape: a tenant :ro open is 2 dirty dispatches (was 13)", %{path: path} do
       {:ok, c0} = Connection.open(path)
       Connection.close(c0)
 
@@ -526,8 +537,9 @@ defmodule Fathom.Shard.NifDispatchTest do
                Connection.query(conn, "SELECT fathom_backstop(0)", [], dml?: false)
 
       Connection.close(conn)
-      # 10 after r8 #18 step 1; 5 after r8 #14 (no per-open extension load).
-      assert total == 5, "open dispatches: #{inspect(by_fun)}"
+      # 10 after r8 #18 step 1; 5 after r8 #14 (no per-open extension load); 2 after r8 #18 step 3
+      # (open + one batch carrying cache_size, the hooks, hardening, backstop and the guard).
+      assert total == 2, "open dispatches: #{inspect(by_fun)}"
       refute Map.has_key?(by_fun, :enable_load_extension)
     end
 
