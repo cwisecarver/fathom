@@ -332,6 +332,30 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
+  # UNDER THE AUTO-EXTENSION, ONE BATCH (expert review 2026-10-22 r8 #18 step 2). The functions
+  # exist from `sqlite3_open`, so nothing has to wait for a load: the fixed pragmas (with
+  # `fathom_conn_init()` in the hook slot, see `rw_open_sql/2`), the size cap, the tenant hardening,
+  # the `:ro`-fallback `query_only` and the deadline backstop all ride one `sqlite3_exec`, in that
+  # order, and the authorizer still goes on LAST, after every pragma fathom sets. `journal_mode`
+  # stays its own prepare/fetch (its row gates the open), and so does the `page_size` read the cap
+  # is derived from (10-19 #23 decided against caching it). Every statement keeps its failure
+  # semantics: `sqlite3_exec` stops at the first error, which fails the open as each separate
+  # `execute` did, except the backstop, which stays non-fatal (`maybe_harden/4`).
+  defp configure_readwrite(conn, tenant?, scope, guard_opts, wal?, :auto) do
+    with :ok <- if(wal?, do: enable_wal(conn), else: :ok),
+         # `set_busy_timeout`, not `PRAGMA busy_timeout`: see `configure/4`.
+         :ok <- Sqlite3.set_busy_timeout(conn, 5000),
+         lead = [
+           rw_open_sql(guard_opts[:deferred_sync?], :auto),
+           max_page_count_sql(conn),
+           query_only_sql(scope)
+         ],
+         :ok <- maybe_harden(conn, tenant?, :loaded, lead),
+         :ok <- maybe_authorizer(conn, tenant?, :loaded, guard_opts) do
+      {:ok, conn}
+    end
+  end
+
   defp configure_readwrite(conn, tenant?, scope, guard_opts, wal?, mode) do
     with :ok <- configure(conn, wal?, guard_opts[:deferred_sync?], mode),
          {:ok, ext} <- load_extension(conn, mode),
@@ -522,8 +546,10 @@ defmodule Fathom.Shard.Connection do
   end
 
   # Fallback belt for a `:ro` scope that could not get a read-only handle (see open_handle/2).
-  defp maybe_query_only(conn, :ro), do: Sqlite3.execute(conn, "PRAGMA query_only=ON")
-  defp maybe_query_only(_conn, _scope), do: :ok
+  defp maybe_query_only(conn, scope), do: exec_batch(conn, query_only_sql(scope))
+
+  defp query_only_sql(:ro), do: ";PRAGMA query_only=ON"
+  defp query_only_sql(_scope), do: []
 
   # Engine-level hardening for handles that run untrusted client SQL (expert review 2026-09-05 #3).
   # The PRAGMA allow-list in `Fathom.ShardExecutor` is the half of the tenant gate with NO engine
@@ -985,22 +1011,26 @@ defmodule Fathom.Shard.Connection do
     end
   end
 
-  defp maybe_max_page_count(conn) do
+  defp maybe_max_page_count(conn), do: exec_batch(conn, max_page_count_sql(conn))
+
+  # The cap as a batch fragment (`[]` = no cap), so the auto-extension open can carry it in its one
+  # batch (expert review 2026-10-22 r8 #18 step 2). Reads `page_size` when the cap is in bytes.
+  defp max_page_count_sql(conn) do
     case {Application.get_env(:fathom, :shard_max_page_count),
           Application.get_env(:fathom, :shard_max_bytes, @default_max_bytes)} do
       {n, _} when is_integer(n) and n > 0 ->
-        Sqlite3.execute(conn, "PRAGMA max_page_count=#{n}")
+        [";PRAGMA max_page_count=", Integer.to_string(n)]
 
       {n, _} when is_integer(n) ->
         # Explicit 0/negative: the documented opt-out.
-        :ok
+        []
 
       {_, bytes} when is_integer(bytes) and bytes > 0 ->
         pages = max(div(bytes, page_size(conn)), 1)
-        Sqlite3.execute(conn, "PRAGMA max_page_count=#{pages}")
+        [";PRAGMA max_page_count=", Integer.to_string(pages)]
 
       _ ->
-        :ok
+        []
     end
   end
 

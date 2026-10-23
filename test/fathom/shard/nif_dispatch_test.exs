@@ -450,7 +450,7 @@ defmodule Fathom.Shard.NifDispatchTest do
       %{path: path}
     end
 
-    test "a tenant :rw open is 13 dirty dispatches (was 23)", %{path: path} do
+    test "a tenant :rw open is 11 dirty dispatches (was 23)", %{path: path} do
       {res, total, by_fun} = count(fn -> Connection.open(path, tenant?: true) end)
       assert {:ok, conn} = res
       Connection.close(conn)
@@ -459,8 +459,10 @@ defmodule Fathom.Shard.NifDispatchTest do
       # engine-hardening PRAGMAs (trusted_schema, cell_size_check) are one more. Was 19 before that.
       # Since expert review 2026-10-22 r8 #14 the extension arrives with `sqlite3_open` (a
       # process-global auto-extension): the per-open enable / load (prepare, step, release) /
-      # disable is gone, 18 -> 13.
-      assert total == 13, "open dispatches: #{inspect(by_fun)}"
+      # disable is gone, 18 -> 13. r8 #18 step 2: the hardening batch and the size cap ride the
+      # fixed-pragma batch, 13 -> 11: open, journal_mode x3, page_size x3 and ONE batch (8), plus
+      # the pragma guard's prepare/step/release.
+      assert total == 11, "open dispatches: #{inspect(by_fun)}"
 
       refute Map.has_key?(by_fun, :enable_load_extension),
              "a tenant open turned extension loading on: #{inspect(by_fun)}"
@@ -483,7 +485,7 @@ defmodule Fathom.Shard.NifDispatchTest do
       end
     end
 
-    test "prod shape: a tenant :rw open is 13 dirty dispatches with the backstop armed (was 19)",
+    test "prod shape: a tenant :rw open is 11 dirty dispatches with the backstop armed (was 19)",
          %{path: path} do
       {res, total, by_fun} =
         with_prod_deadline(fn -> count(fn -> Connection.open(path, tenant?: true) end) end)
@@ -496,8 +498,9 @@ defmodule Fathom.Shard.NifDispatchTest do
                Connection.query(conn, "SELECT fathom_backstop(0)", [], dml?: false)
 
       Connection.close(conn)
-      # 18 after r8 #18 step 1; 13 after r8 #14 (no per-open extension load).
-      assert total == 13, "open dispatches: #{inspect(by_fun)}"
+      # 18 after r8 #18 step 1; 13 after r8 #14 (no per-open extension load); 11 after r8 #18
+      # step 2 (one open batch).
+      assert total == 11, "open dispatches: #{inspect(by_fun)}"
     end
 
     test "prod shape: a tenant :ro open is 5 dirty dispatches (was 13)", %{path: path} do
@@ -540,6 +543,10 @@ defmodule Fathom.Shard.NifDispatchTest do
       assert {:ok, %{rows: [[67_108_864]]}} = pragma.("journal_size_limit")
       assert {:ok, %{rows: [[1]]}} = pragma.("foreign_keys")
       assert {:ok, %{rows: [[-2000]]}} = pragma.("cache_size")
+      # r8 #18 step 2: the hardening and the size cap now ride the same batch.
+      assert {:ok, %{rows: [[0]]}} = pragma.("trusted_schema")
+      assert {:ok, %{rows: [[1]]}} = pragma.("cell_size_check")
+      assert {:ok, %{rows: [[1_048_576]]}} = pragma.("max_page_count")
       Connection.close(conn)
     end
   end
