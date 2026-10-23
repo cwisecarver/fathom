@@ -81,28 +81,34 @@ defmodule Fathom.Shard.Connection do
 
     # BEFORE `sqlite3_open` (expert review 2026-10-22 r8 #14): an armed auto-extension registers the
     # functions inside the open itself, so the mode must be settled (armed on first use) first.
-    with mode when mode in [:auto, :per_open, :skipped] <- Fathom.Shard.Extension.open_mode() do
-      case open_handle_ensuring_dir(path, scope, tenant?, dir) do
-        {:ok, conn, :readonly} ->
-          track_open(
-            close_on_error(conn, configure_readonly(conn, tenant?, guard_opts, mode)),
-            tenant?,
-            path
-          )
+    # A `case`, not a guarded `with`: the guard's fall-through value escaped the spec (dialyzer).
+    case Fathom.Shard.Extension.open_mode() do
+      {:error, reason} -> {:error, reason}
+      mode -> open_configured(path, scope, tenant?, dir, guard_opts, wal?, mode)
+    end
+  end
 
-        {:ok, conn, :readwrite} ->
-          track_open(
-            close_on_error(
-              conn,
-              configure_readwrite(conn, tenant?, scope, guard_opts, wal?, mode)
-            ),
-            tenant?,
-            path
-          )
+  defp open_configured(path, scope, tenant?, dir, guard_opts, wal?, mode) do
+    case open_handle_ensuring_dir(path, scope, tenant?, dir) do
+      {:ok, conn, :readonly} ->
+        track_open(
+          close_on_error(conn, configure_readonly(conn, tenant?, guard_opts, mode)),
+          tenant?,
+          path
+        )
 
-        {:error, reason} ->
-          {:error, reason}
-      end
+      {:ok, conn, :readwrite} ->
+        track_open(
+          close_on_error(
+            conn,
+            configure_readwrite(conn, tenant?, scope, guard_opts, wal?, mode)
+          ),
+          tenant?,
+          path
+        )
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
