@@ -369,6 +369,26 @@ defmodule Fathom.Shard do
   def epoch(pid) when is_pid(pid), do: GenServer.call(pid, :epoch)
 
   @doc """
+  `epoch/1` plus one flag: is this the FIRST successful epoch answer of this coordinator's life,
+  on a coordinator whose open took a fresh replication lineage? (expert review 2026-10-22 r8 #16)
+
+  `{:ok, epoch, true}` tells the first replication Session of a coordinator life that every
+  follower's answer to its first push is already known: the lineage is new (`open_lineage/2` always
+  takes one strictly above anything stamped, or the takeover claim, or resolves an `:unknown` one
+  later), so a reseed-on-reopen follower can only answer `:unknown_shard` and the Session may start
+  its seeds directly instead of shipping a doomed reset push first.
+
+  `false` for every later answer — a Session restarted under the same coordinator, or any caller
+  after an `epoch/1` answer — and whenever replication is off (`lineage: :disabled`). A wrong
+  `true` costs only an unnecessary seed; the commit ack is gated exactly as before.
+
+  Errors are those of `epoch/1`, and an error does not consume the flag.
+  """
+  @spec epoch_first_session(pid()) ::
+          {:ok, non_neg_integer(), boolean()} | {:error, :no_lease | :lineage_unknown}
+  def epoch_first_session(pid) when is_pid(pid), do: GenServer.call(pid, :epoch_first_session)
+
+  @doc """
   This coordinator's LINEAGE for the wire, or `0` when it has none to state.
 
   A different number from `epoch/1`, and the distinction is expert review 2026-08-24 #12. The lock
@@ -1036,6 +1056,10 @@ defmodule Fathom.Shard do
         # The single-flight HEAD that resolves an `:unknown` lineage, or nil (expert review
         # 2026-10-12 #15) — see start_lineage_resolve/1.
         lineage_task: nil,
+        # Has an `:epoch` / `:epoch_first_session` call been answered `{:ok, ...}` yet in this
+        # coordinator's life? The first such answer goes to the first replication Session of the
+        # life (expert review 2026-10-22 r8 #16); see `epoch_first_session/1`.
+        epoch_served?: false,
         # The current etag of the remote object (nil = brand-new / no object yet). The flush
         # fence If-Matches it so a stale PUT can't clobber a stealer (finding #15); each
         # successful flush advances it.
@@ -1624,13 +1648,23 @@ defmodule Fathom.Shard do
   # the open's HEAD fail, checkouts, checkins and DOWN handling queued behind it at the commit rate.
   # Now the refusal is immediate and starts ONE monitored HEAD (single-flight); its reply sets the
   # lineage in `handle_info`, and the next commit ships.
-  def handle_call(:epoch, _from, %{lease: %{epoch: _}, lineage: :unknown} = state),
-    do: {:reply, {:error, :lineage_unknown}, start_lineage_resolve(state)}
+  #
+  # Both `:epoch` and `:epoch_first_session` consume the "first answer of this life" flag, so a
+  # caller of either after the first Session (a restarted Session, a test) is told `false`.
+  def handle_call(req, _from, %{lease: %{epoch: _}, lineage: :unknown} = state)
+      when req in [:epoch, :epoch_first_session],
+      do: {:reply, {:error, :lineage_unknown}, start_lineage_resolve(state)}
 
   def handle_call(:epoch, _from, %{lease: %{epoch: epoch}} = state),
-    do: {:reply, {:ok, epoch}, state}
+    do: {:reply, {:ok, epoch}, %{state | epoch_served?: true}}
 
-  def handle_call(:epoch, _from, state), do: {:reply, {:error, :no_lease}, state}
+  def handle_call(:epoch_first_session, _from, %{lease: %{epoch: epoch}} = state) do
+    first? = not state.epoch_served? and is_integer(state.lineage)
+    {:reply, {:ok, epoch, first?}, %{state | epoch_served?: true}}
+  end
+
+  def handle_call(req, _from, state) when req in [:epoch, :epoch_first_session],
+    do: {:reply, {:error, :no_lease}, state}
 
   # `:disabled` / `:unknown` both mean "no lineage to claim" and travel as 0 — see `lineage/1`.
   def handle_call(:lineage, _from, %{lineage: n} = state) when is_integer(n),
