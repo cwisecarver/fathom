@@ -4250,7 +4250,7 @@ defmodule Fathom.Shard do
     # checkpoint_and_verify/1 runs BOTH on one connection (review 2026-07-24 #31) and reports which
     # stage failed, because the two failures need opposite handling: a corrupt local db must refuse
     # the flush, while a merely-busy checkpoint must fall back to the snapshot path.
-    case checkpoint_and_verify(state.path) do
+    case checkpoint_and_verify(state) do
       :ok ->
         # The free-page check runs AFTER the checkpoint, never before: in WAL mode the header's
         # page/freelist counts can be stale until the WAL is folded in, so a pre-checkpoint read
@@ -4424,15 +4424,56 @@ defmodule Fathom.Shard do
   #
   # This connection keeps synchronous=FULL: #11's relaxation is scoped to the snapshot connection,
   # and a checkpoint at synchronous=OFF can corrupt the main database on power loss.
-  defp checkpoint_and_verify(path) do
+  #
+  # AN EMPTY WAL SKIPS THE CHECKPOINT CONNECTION (expert review 2026-10-22 r8 #15). This route runs
+  # with `conns == 0` after the close chain settled, so the last close has usually already run
+  # SQLite's close-time checkpoint and unlinked `-wal`/`-shm`. A full `Connection.open` then
+  # re-created both (a 0-byte `-wal`, a 32 KiB `-shm` + mmap), loaded the extension, ran a no-op
+  # TRUNCATE, and its close unlinked them again: ~460 µs of a ~666 µs check (probe `drop.exs`).
+  # When `-wal` is absent or zero-length, `quick_check` runs on an `immutable=1` handle of the `.db`
+  # instead (`Integrity.quick_check_main_file_raw/2`), same raw result shapes, so the corrupt →
+  # quarantine / unknown → snapshot handling in `checkpoint_then_upload/2` is unchanged.
+  #
+  # WHY THE UPLOADED BYTES ARE STILL THE CHECKED BYTES. An absent/empty `-wal` holds no frame, so
+  # the TRUNCATE it skips was a no-op by definition: no committed write exists outside the `.db`.
+  # Nothing can add one before `Storage.flush` reads the file: the coordinator is terminating with
+  # no checkout (every handle comes from it), the pool is closed, and the window from this check
+  # to the upload is the same one the checkpoint path already had between its close and the
+  # upload. The gate is if anything tighter: it reads exactly the `.db` that is uploaded, the same
+  # argument rv6 F3 shipped for the pinned route. A WAL with ANY bytes (a header-only WAL counts)
+  # keeps the full checkpoint path. One deliberate difference: a `.db` SQLite calls "not a
+  # database" used to fail the pragma-running open (`:checkpoint_open_failed` → unknown → snapshot
+  # fallback, which fails too and keeps local); the immutable handle opens lazily, so the check
+  # itself reports it and the copy is quarantined (renamed, not deleted) — with an empty WAL there
+  # is no newer history to keep beside it.
+  defp checkpoint_and_verify(state) do
     # SCAN PERMIT (expert review 2026-10-20-2027 #10): the TRUNCATE checkpoint and the full
     # `quick_check` each hold a dirty-IO thread, and an idle wave / rolling deploy drops many shards
     # at once outside the ScanGate that bounds the periodic flush's scans. Wait at most a quarter of
     # `settle_yield_ms/0` (the enclosing `bounded_upload_for_drop/1` budget) and then scan anyway:
     # never fail the drop-flush because the gate was busy.
     Fathom.Shard.ScanGate.with_permit(div(settle_yield_ms(), 4), fn ->
-      checkpoint_and_verify_unpermitted(path)
+      path = state.path
+
+      if wal_empty?(path <> "-wal") do
+        emit_drop_verify(state, :main_file)
+        Integrity.quick_check_main_file_raw(path, &apply_scan_mmap/1)
+      else
+        emit_drop_verify(state, :checkpoint)
+        checkpoint_and_verify_unpermitted(path)
+      end
     end)
+  end
+
+  # Which check the `:checkpoint` drop route ran (expert review 2026-10-22 r8 #15): `:main_file`
+  # (empty WAL, immutable quick_check, no connection open) or `:checkpoint` (full open + TRUNCATE +
+  # quick_check). Observability for the route choice; both are silent on success.
+  defp emit_drop_verify(state, mode) do
+    :telemetry.execute(
+      [:fathom, :shard, :drop_flush, :verify],
+      %{count: 1},
+      %{shard_id: state.id, mode: mode}
+    )
   end
 
   defp checkpoint_and_verify_unpermitted(path) do

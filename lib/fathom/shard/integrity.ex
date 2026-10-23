@@ -116,6 +116,28 @@ defmodule Fathom.Shard.Integrity do
     end
   end
 
+  # `quick_check` of the MAIN FILE alone on an `immutable=1` handle, returning the RAW shapes of
+  # `classify_quick_check/1` with no `verify_flush?` gate — the drop path's check when its WAL is
+  # already empty (expert review 2026-10-22 r8 #15), so the caller's `classify_failure/1` handling
+  # (quarantine on corrupt, snapshot fallback on unknown) is unchanged. Not `run_quick_check_main_file/2`:
+  # that one is gated and returns `verdict/1`-wrapped reasons, which `classify_failure/1` would read
+  # as `:unknown` and so never quarantine a corrupt file. `prepare` runs on the handle first.
+  @spec quick_check_main_file_raw(Path.t(), (reference() -> term())) :: :ok | {:error, term()}
+  def quick_check_main_file_raw(path, prepare \\ fn _ -> :ok end) do
+    case Connection.open_immutable(path) do
+      {:ok, conn} ->
+        try do
+          _ = prepare.(conn)
+          classify_quick_check(Connection.query(conn, "PRAGMA quick_check", []))
+        after
+          Connection.close(conn)
+        end
+
+      {:error, reason} ->
+        {:error, {:quick_check_open_failed, reason}}
+    end
+  end
+
   # The same check as `run_quick_check/1` but WITHOUT the `verify_flush?` gate or `verdict/1`
   # classification — it returns the raw `{:quick_check, _}` / `{:quick_check_failed, _}` shapes for
   # the checkpoint-and-verify drop path, which does its own thing with them.

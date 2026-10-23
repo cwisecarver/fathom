@@ -234,7 +234,11 @@ defmodule Fathom.Shard.DropCompactionTest do
       qc = for {:qc, _} = e <- events, do: e
       opens = for {:open, _} = e <- events, do: e
       assert length(qc) == 1, "quick_check ran #{length(qc)} times: #{inspect(events)}"
-      assert length(opens) == 2, "Connection.open ran #{length(opens)} times"
+      # The snapshot's open only: since expert review 2026-10-22 r8 #15 the drop's check of an
+      # already-empty WAL (this fixture's, after the last close) runs on an immutable handle
+      # (`Connection.open_immutable/1`, not traced here) instead of a full checkpoint open. This
+      # asserted 2 (checkpoint + snapshot) before that change.
+      assert length(opens) == 1, "Connection.open ran #{length(opens)} times"
 
       # ordering: the one quick_check precedes the upload (Storage.flush)
       kinds = Enum.map(events, &elem(&1, 0))
