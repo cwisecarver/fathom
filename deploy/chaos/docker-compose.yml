@@ -60,6 +60,10 @@ x-fathom-env: &fathom-env
   # a durability PUT inside their own window -- set it explicitly in chaos.sh rather than relying
   # on a global default that silently taxes every other run.
   SHARD_FLUSH_INTERVAL_MS: "${SHARD_FLUSH_INTERVAL_MS:-300000}"
+  # The flush re-arm spread and the serialize-snapshot cap (expert review 2026-10-22 r8 #11, #9).
+  # Defaults match production's; the jitter falsifier and the serialize A/B set them per fleet.
+  SHARD_FLUSH_JITTER_RATIO: "${SHARD_FLUSH_JITTER_RATIO:-0.25}"
+  FLUSH_SERIALIZE_MAX_BYTES: "${FLUSH_SERIALIZE_MAX_BYTES:-16777216}"
   SHARD_IDLE_MS: "20000"
   # WAL size bound in bytes (expert review 2026-10-10 #30). Empty = the app default (64 MiB); set
   # JOURNAL_SIZE_LIMIT=0 on `up` to make every WAL reset truncate, the A2 stress case.
