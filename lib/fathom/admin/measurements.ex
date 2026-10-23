@@ -206,8 +206,11 @@ defmodule Fathom.Admin.Measurements do
   # Cost: ~1 ms per poll on a 12-scheduler VM (`allocator_sizes` for the 10 allocators).
   @spec carrier_gauges() :: %{optional(atom()) => number()}
   defp carrier_gauges do
-    {carriers, blocks} = alloc_sizes(:erlang.system_info(:alloc_util_allocators))
-    {driver_carriers, driver_blocks} = alloc_sizes([:driver_alloc])
+    # ONE walk (expert review 2026-10-22 r8 #24b): `driver_alloc` is one of the
+    # `alloc_util_allocators`, and querying it a second time cost another cross-scheduler
+    # `allocator_sizes` collection per poll for numbers the first walk already had.
+    {{carriers, blocks}, {driver_carriers, driver_blocks}} =
+      alloc_sizes(:erlang.system_info(:alloc_util_allocators))
 
     gauges = %{
       allocated_carriers: carriers,
@@ -233,15 +236,16 @@ defmodule Fathom.Admin.Measurements do
     end
   end
 
+  # `{{carriers, blocks} over every allocator, {carriers, blocks} of driver_alloc alone}`.
   defp alloc_sizes(allocators) do
-    Enum.reduce(allocators, {0, 0}, fn alloc, {c, b} ->
+    Enum.reduce(allocators, {{0, 0}, {0, 0}}, fn alloc, {{c, b}, driver} ->
       case :erlang.system_info({:allocator_sizes, alloc}) do
         instances when is_list(instances) ->
           {ic, ib} = sum_allocator_sizes(instances)
-          {c + ic, b + ib}
+          {{c + ic, b + ib}, if(alloc == :driver_alloc, do: {ic, ib}, else: driver)}
 
         _disabled ->
-          {c, b}
+          {{c, b}, driver}
       end
     end)
   end
@@ -356,13 +360,18 @@ defmodule Fathom.Admin.Measurements do
   """
   @spec disk() :: :ok
   def disk do
-    for {label, path} <-
-          [
-            {"data", Fathom.Shard.data_dir()},
-            {"replica", replica_dir()}
-          ],
-        is_binary(path),
-        {:ok, %{total_bytes: total, free_bytes: free}} <- [disk_info(path)] do
+    dirs =
+      for {_label, path} = d <- [data_dir_entry(), replica_dir_entry()], is_binary(path), do: d
+
+    # ONE `df` for every directory, bytes and inodes together (expert review 2026-10-22 r8 #10).
+    # This used to be `disk_info/1` (`disksup`, which runs `df` through its port) plus
+    # `inode_measurements/1` (`df -Pi`) per directory: four subprocesses per poll on a follower.
+    # A directory the combined read cannot answer falls back to the old per-directory pair, so a
+    # `df` that prints something unexpected costs the saving, never the gauge.
+    readings = volume_readings(Enum.map(dirs, &elem(&1, 1)))
+
+    for {{label, path}, reading} <- Enum.zip(dirs, readings),
+        {:ok, %{total_bytes: total, free_bytes: free} = r} <- [reading || per_dir_reading(path)] do
       if label == "data", do: put_data_free_bytes(free)
 
       measurements =
@@ -371,12 +380,28 @@ defmodule Fathom.Admin.Measurements do
           total_bytes: total,
           used_ratio: safe_ratio(total - free, total)
         }
-        |> Map.merge(inode_measurements(path))
+        |> Map.merge(inode_gauges(r))
 
       :telemetry.execute([:fathom, :node, :disk], measurements, %{dir: label})
     end
 
     :ok
+  end
+
+  defp data_dir_entry, do: {"data", Fathom.Shard.data_dir()}
+  defp replica_dir_entry, do: {"replica", replica_dir()}
+
+  # The old per-directory path (`disksup` bytes + `df -Pi` inodes), in the combined shape.
+  defp per_dir_reading(path) do
+    with {:ok, bytes} <- disk_info(path) do
+      inodes =
+        case inode_info(path) do
+          {:ok, i} -> i
+          :error -> %{total_inodes: nil, free_inodes: nil}
+        end
+
+      {:ok, Map.merge(bytes, inodes)}
+    end
   end
 
   # INODES, NOT ONLY BYTES (expert review 2026-10-21 r7 #24). An A2 replica is 5 files (`.db`,
@@ -386,17 +411,143 @@ defmodule Fathom.Admin.Measurements do
   # misdirection the byte gauge exists to remove. Absent (not 0) when the inode count cannot be read
   # or the filesystem has no fixed inode table (btrfs, ZFS report 0 total), so no alert fires on a
   # number that means nothing.
-  defp inode_measurements(path) do
-    case inode_info(path) do
-      {:ok, %{total_inodes: total, free_inodes: free}} ->
-        %{
-          free_inodes: free,
-          total_inodes: total,
-          inodes_used_ratio: safe_ratio(total - free, total)
+  defp inode_gauges(%{total_inodes: total, free_inodes: free})
+       when is_integer(total) and total > 0 and is_integer(free) do
+    %{
+      free_inodes: free,
+      total_inodes: total,
+      inodes_used_ratio: safe_ratio(total - free, total)
+    }
+  end
+
+  defp inode_gauges(_reading), do: %{}
+
+  @typedoc "One volume's free space: bytes always, inodes `nil` when the filesystem has none."
+  @type volume_reading :: %{
+          mount: String.t(),
+          total_bytes: non_neg_integer(),
+          free_bytes: non_neg_integer(),
+          total_inodes: non_neg_integer() | nil,
+          free_inodes: non_neg_integer() | nil
         }
 
-      :error ->
-        %{}
+  @doc """
+  Bytes AND inodes for the volume holding each of `paths`, from ONE `df` subprocess (expert review
+  2026-10-22 r8 #10). Returns a list aligned with `paths`: `{:ok, reading}`, or `nil` for a path
+  this read could not answer (the caller falls back to `disk_info/1` + `inode_info/1`).
+
+  Linux (GNU coreutils, the release image's Debian): `df -B1 --output=size,avail,itotal,iavail,target`.
+  Elsewhere (BSD/macOS): `df -Pki`, which prints the byte AND inode columns in one row. Columns
+  are found by header name; a row whose numbers do not parse (an unexpected `df`, a filesystem
+  name with spaces) is `nil` rather than a guess, for the same reason as `disk_info/1`. Free bytes
+  are the `avail` column, as `disksup` reports them. Spawns one OS process: poller use only.
+  """
+  @spec volume_readings([String.t()]) :: [{:ok, volume_reading()} | nil]
+  def volume_readings([]), do: []
+
+  def volume_readings(paths) do
+    args = Enum.map(paths, &existing_ancestor/1)
+    flavor = df_flavor()
+
+    {cmd_args, parse} =
+      case flavor do
+        :gnu -> {["-B1", "--output=size,avail,itotal,iavail,target", "--" | args], :gnu}
+        :bsd -> {["-Pki" | args], :bsd}
+      end
+
+    case System.cmd("df", cmd_args, stderr_to_stdout: true) do
+      {out, 0} -> align(parse_df_volumes(out, parse), length(paths))
+      _ -> List.duplicate(nil, length(paths))
+    end
+  rescue
+    _ -> List.duplicate(nil, length(paths))
+  end
+
+  defp df_flavor do
+    case :os.type() do
+      {:unix, :linux} -> :gnu
+      _ -> :bsd
+    end
+  end
+
+  # `df` prints one row per argument, in argument order. Any other count means the output is not
+  # what this parser understands, so nothing is trusted.
+  defp align(rows, n) when length(rows) == n, do: rows
+  defp align(_rows, n), do: List.duplicate(nil, n)
+
+  @doc false
+  # Rows of `df -B1 --output=size,avail,itotal,iavail,target` (`:gnu`) or `df -Pki` (`:bsd`), one
+  # entry per data row: `{:ok, reading}` or `nil`. Public for the test.
+  @spec parse_df_volumes(String.t(), :gnu | :bsd) :: [{:ok, volume_reading()} | nil]
+  def parse_df_volumes(out, flavor) do
+    case String.split(out, "\n", trim: true) do
+      [header | rows] ->
+        cols = header |> String.downcase() |> String.split()
+        Enum.map(rows, &parse_df_row(String.split(&1), cols, flavor))
+
+      [] ->
+        []
+    end
+  end
+
+  # GNU `--output` order is fixed by the argument: size avail itotal iavail target (no filesystem
+  # column), so the first four fields are the numbers and the rest is the mount point.
+  defp parse_df_row([size, avail, itotal, iavail | mount], _cols, :gnu) when mount != [] do
+    with {total, ""} when total > 0 <- Integer.parse(size),
+         {free, ""} when free >= 0 <- Integer.parse(avail) do
+      {:ok, reading(Enum.join(mount, " "), total, free, int_or_nil(itotal), int_or_nil(iavail))}
+    else
+      _ -> nil
+    end
+  end
+
+  defp parse_df_row(fields, cols, :bsd) do
+    with total_at when is_integer(total_at) <- Enum.find_index(cols, &(&1 == "1024-blocks")),
+         avail_at when is_integer(avail_at) <- Enum.find_index(cols, &(&1 == "available")),
+         used_at when is_integer(used_at) <- Enum.find_index(cols, &(&1 == "iused")),
+         ifree_at when is_integer(ifree_at) <- Enum.find_index(cols, &(&1 == "ifree")),
+         mount_at when is_integer(mount_at) <- Enum.find_index(cols, &(&1 == "mounted")),
+         # "Mounted on" is two header words and the last column, so a row has exactly one field
+         # fewer than the header has words. Any other count is a space in a filesystem name or a
+         # mount point, which would shift every index: unreadable, not guessed.
+         true <- length(fields) == length(cols) - 1,
+         {total_kb, ""} when total_kb > 0 <- Integer.parse(Enum.at(fields, total_at)),
+         {avail_kb, ""} when avail_kb >= 0 <- Integer.parse(Enum.at(fields, avail_at)) do
+      iused = int_or_nil(Enum.at(fields, used_at))
+      ifree = int_or_nil(Enum.at(fields, ifree_at))
+      itotal = if iused && ifree, do: iused + ifree
+
+      mount = Enum.at(fields, mount_at)
+      {:ok, reading(mount, total_kb * 1024, avail_kb * 1024, itotal, ifree)}
+    else
+      _ -> nil
+    end
+  end
+
+  defp parse_df_row(_fields, _cols, _flavor), do: nil
+
+  defp reading(mount, total, free, itotal, ifree) do
+    # No fixed inode table (btrfs, ZFS: 0 total) reads as "unknown", never as "0 free".
+    {itotal, ifree} =
+      if is_integer(itotal) and itotal > 0 and is_integer(ifree),
+        do: {itotal, ifree},
+        else: {nil, nil}
+
+    %{
+      mount: mount,
+      total_bytes: total,
+      free_bytes: free,
+      total_inodes: itotal,
+      free_inodes: ifree
+    }
+  end
+
+  defp int_or_nil(nil), do: nil
+
+  defp int_or_nil(s) do
+    case Integer.parse(s) do
+      {n, ""} when n >= 0 -> n
+      _ -> nil
     end
   end
 
@@ -553,9 +704,12 @@ defmodule Fathom.Admin.Measurements do
   # Walk up until something exists. Bounded by construction: each step drops one path component and
   # `Path.dirname/1` is a fixed point at the root, so the recursion terminates there even for a
   # path that shares no ancestor with anything real.
+  #
+  # Raw (`Fathom.FS.exists?/1`, expert review 2026-10-22 r8 #10): `File.exists?/1` is a
+  # `file_server_2` round trip, and this runs on the seed-admission path.
   defp existing_ancestor(path) do
     cond do
-      File.exists?(path) -> path
+      Fathom.FS.exists?(path) -> path
       Path.dirname(path) == path -> path
       true -> existing_ancestor(Path.dirname(path))
     end
