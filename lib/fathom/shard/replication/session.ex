@@ -2526,19 +2526,55 @@ defmodule Fathom.Shard.Replication.Session do
 
   defp unregister(_state), do: :ok
 
-  defp wal_registry(db_path, delta) do
-    with {:ok, conn} <- Exqlite.Sqlite3.open(":memory:") do
-      try do
-        case Fathom.Shard.Extension.load(conn) do
-          :ok -> registry_call(conn, db_path, delta)
-          other -> other
-        end
-      after
-        Exqlite.Sqlite3.close(conn)
-      end
+  # ONE LONG-LIVED REGISTRY CONNECTION (expert review 2026-10-22 r8 #17). Every Session start and
+  # stop used to open a fresh `:memory:` connection and load the extension into it (enable, dlopen,
+  # disable) just to run one SELECT: ~178 µs p50 per register+unregister pair, nearly all of it the
+  # load, paid on the first commit after every coordinator open. The registry is process-wide in the
+  # extension, so any connection that has loaded it reaches the same table: one `:memory:` handle is
+  # opened and loaded once per node and kept in `:persistent_term` (written once; a handle never
+  # changes). Each call prepares its OWN statement on it rather than sharing one, because bind and
+  # step are separate NIF calls and two Sessions interleaving them on one statement would run one
+  # Session's path with the other's delta; exqlite serializes calls on a connection with its own
+  # mutex (`SQLITE_THREADSAFE=1`), so separate statements on one handle are safe.
+  #
+  # RPO: unchanged. Registration still completes before the first ship (same place in
+  # `run_commit/…`, `ensure_registered/2`), so the hook still steps aside before any pinned
+  # checkpoint logic; only the connection used to tell it changed. A failed open or load is not
+  # cached here: the calling Session latches `:unavailable` exactly as before.
+  @registry_conn_key {__MODULE__, :wal_registry_conn}
+
+  @doc false
+  # Public for the concurrency test only.
+  @spec wal_registry(String.t(), -1 | 0 | 1) :: {:ok, String.t() | integer()} | {:error, term()}
+  def wal_registry(db_path, delta) do
+    with {:ok, conn} <- registry_conn() do
+      registry_call(conn, db_path, delta)
     end
   rescue
     e -> {:error, e}
+  end
+
+  defp registry_conn do
+    case :persistent_term.get(@registry_conn_key, nil) do
+      nil -> open_registry_conn()
+      conn -> {:ok, conn}
+    end
+  end
+
+  # Two Sessions racing the very first registration each open one; the second `put` wins and the
+  # loser's handle is closed by its resource destructor once unreferenced. Happens once per node.
+  defp open_registry_conn do
+    with {:ok, conn} <- Exqlite.Sqlite3.open(":memory:") do
+      case Fathom.Shard.Extension.load(conn) do
+        :ok ->
+          :persistent_term.put(@registry_conn_key, conn)
+          {:ok, conn}
+
+        other ->
+          Exqlite.Sqlite3.close(conn)
+          other
+      end
+    end
   end
 
   defp registry_call(conn, db_path, delta) do
