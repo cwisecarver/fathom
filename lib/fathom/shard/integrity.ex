@@ -206,6 +206,13 @@ defmodule Fathom.Shard.Integrity do
 
   defp verify_flush?, do: Application.get_env(:fathom, :verify_flush_integrity, true)
 
+  # Is the flush integrity gate on (`:verify_flush_integrity`, default true)? The VACUUM route's
+  # page-copy snapshot is only taken when it is (expert review 2026-10-22 r8 #9): without the
+  # check, `VACUUM INTO`'s own b-tree walk is the only thing that fails on garbage pages.
+  @doc false
+  @spec flush_gate_on?() :: boolean()
+  def flush_gate_on?, do: verify_flush?() not in [false, nil]
+
   # A local db failed quick_check: move it aside (preserve for forensics) and drop its now-stale
   # WAL/SHM so the next open pulls the last-good stored object instead of adopting the corrupt
   # local copy. Loud error + telemetry so an operator sees it (the good object is still safe).

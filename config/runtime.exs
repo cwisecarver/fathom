@@ -476,6 +476,20 @@ if raw = System.get_env("SHARD_FLUSH_JITTER_RATIO") do
   end
 end
 
+# The largest shard image (bytes) the periodic flush's VACUUM route snapshots with a page copy
+# (`sqlite3_serialize`) instead of `VACUUM INTO` (expert review 2026-10-22 r8 #9; default 16 MiB,
+# 0 = always VACUUM INTO). Peak memory per concurrent scan is ~2x this.
+if raw = System.get_env("FLUSH_SERIALIZE_MAX_BYTES") do
+  case Integer.parse(String.trim(raw)) do
+    {n, ""} when n >= 0 ->
+      config :fathom, :flush_serialize_max_bytes, n
+
+    _ ->
+      raise "FLUSH_SERIALIZE_MAX_BYTES must be a non-negative integer number of bytes " <>
+              "(0 = always VACUUM INTO), got: #{inspect(raw)}"
+  end
+end
+
 # The WAL's on-disk size bound in bytes (expert review 2026-10-10 #30; default 64 MiB, see
 # `Fathom.Shard.Connection.maybe_journal_size_limit/1`). -1 turns it off. The chaos rig sets 0 to
 # make every log reset truncate, which is the A2 stress case.

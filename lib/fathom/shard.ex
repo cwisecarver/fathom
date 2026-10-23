@@ -5407,17 +5407,25 @@ defmodule Fathom.Shard do
   # `:flush_compact_min_free_bytes` tune it, and a ratio of 1.0+ disables it. An unreadable header
   # answers false (keep the existing route; the integrity gate reports real damage).
   defp compaction_worthwhile?(path) do
-    ratio = Application.get_env(:fathom, :flush_compact_min_free_ratio, 0.25)
-    min_bytes = Application.get_env(:fathom, :flush_compact_min_free_bytes, 1_048_576)
-
     case Fathom.Shard.SqliteHeader.free_pages(path) do
-      {:ok, %{page_count: count, freelist: free, page_size: ps}} when count > 0 ->
-        free / count > ratio and free * ps > min_bytes
+      {:ok, %{page_count: count, freelist: free, page_size: ps}} ->
+        compaction_worthwhile_counts?(count, free, ps)
 
       _ ->
         false
     end
   end
+
+  # The rule itself, over counts from anywhere (the header above, or the snapshot's own read
+  # transaction in `serialize_or_vacuum/4`).
+  defp compaction_worthwhile_counts?(count, free, ps)
+       when is_integer(count) and count > 0 and is_integer(free) and is_integer(ps) do
+    ratio = Application.get_env(:fathom, :flush_compact_min_free_ratio, 0.25)
+    min_bytes = Application.get_env(:fathom, :flush_compact_min_free_bytes, 1_048_576)
+    free / count > ratio and free * ps > min_bytes
+  end
+
+  defp compaction_worthwhile_counts?(_count, _free, _ps), do: false
 
   # Absent or zero-length `-wal`: no frame, committed or not, outside the main file. A WAL that
   # holds only a header (restarted, nothing written) counts as non-empty: the conservative answer.
@@ -5755,8 +5763,13 @@ defmodule Fathom.Shard do
         try do
           apply_scan_mmap(conn)
 
-          with :ok <- if(verified?, do: :ok, else: Integrity.run_quick_check(conn)) do
-            do_snapshot(conn, temp, state.id)
+          if serialize_eligible?(verified?) do
+            serialize_or_vacuum(conn, temp, state, verified?)
+          else
+            with :ok <- if(verified?, do: :ok, else: Integrity.run_quick_check(conn)) do
+              emit_snapshot_mode(state, :vacuum)
+              do_snapshot(conn, temp, state.id)
+            end
           end
         after
           Connection.close(conn)
@@ -5767,6 +5780,137 @@ defmodule Fathom.Shard do
         # separate `verify_integrity/1` path applied.
         Integrity.verdict({:error, {:quick_check_open_failed, other}})
     end
+  end
+
+  # THE SNAPSHOT IS A PAGE COPY WHEN IT CAN BE (expert review 2026-10-22 r8 #9, user decision Q8 = A).
+  #
+  # `VACUUM INTO` does not copy pages: it re-creates the schema in the target and re-inserts every
+  # table and index b-tree, then writes a shard-sized temp the codec reads back. Its only job here
+  # is a frozen, consistent image of the live file. `sqlite3_serialize` gives exactly that image:
+  # it reads every page through the pager inside the current read transaction, WAL overlay
+  # applied, and copies the bytes. Probed (r8 flush panel, median): keystone 1.50 MB 2,268 µs vs
+  # 72 µs; 32 MB 50 ms vs 4.6 ms; 32 MB + 23 MB of un-checkpointed WAL 50-53 ms vs 4.8-8.2 ms, WAL
+  # frames included (sums and `quick_check` of the copy verified).
+  #
+  # ONE READ TRANSACTION: `BEGIN; quick_check; size; serialize; COMMIT`. The integrity gate now
+  # checks exactly the pages that are uploaded. Before, `quick_check` and `VACUUM INTO` were two
+  # autocommit reads of two different snapshots, and VACUUM rewrote the pages, so the gate never
+  # saw the uploaded state. The three guards above still hold: (a) the check runs on the LIVE
+  # connection (serialize copies bytes verbatim, so it repairs nothing the check would have to
+  # see); (b) it short-circuits before the copy; (c) is moot for serialize (no schema re-created)
+  # and still true for the VACUUM fallback, which runs on this same handle.
+  #
+  # GATES, each falling back to today's `VACUUM INTO` (after the COMMIT: VACUUM cannot run inside
+  # a transaction, so the fallback is exactly the old two-snapshot behaviour):
+  #   * the image exceeds `:flush_serialize_max_bytes` (default 16 MiB; 0 disables serialize).
+  #     Peak memory is ~2x the image (SQLite's buffer + the BEAM binary, both large enough to be
+  #     mmap'd single-block carriers and returned on free), and ScanGate bounds concurrent scans
+  #     at 8, so the transient worst case is 8 x 2 x 16 MiB = 256 MiB;
+  #   * the file is mostly free (`compaction_worthwhile_counts?/3`, the same rule as the drop and
+  #     pinned routes, on the counts read INSIDE the transaction): only VACUUM compacts;
+  #   * the integrity gate is off (`:verify_flush_integrity false`) and the caller did not verify:
+  #     VACUUM's own b-tree walk was then the only thing that would fail on garbage pages, and a
+  #     byte copy would upload them.
+  #
+  # COST, accepted with Q8 = A: the copy keeps b-tree slack and freelist pages VACUUM would repack,
+  # so the compressed object is +2.4% (keystone) to +14% (32 MB after churn) larger; the codec
+  # time that adds is far below the scan time saved. The copied page 1 keeps the WAL-mode bytes
+  # `02 02` (as the pinned route's live-file upload already does).
+  #
+  # FENCE ORDER UNCHANGED: `pre` is still read before this snapshot (the stamp under-claims), the
+  # snapshot still runs after `Fence.check` and before `recheck_before_put` and the pre-PUT intent,
+  # and `checkpoint_after_snapshot/3` still runs after the read transaction ended, on this handle.
+  # The temp is written raw with no fsync, the same no-durability argument as `do_snapshot/3`'s
+  # synchronous=OFF: it is read back in-process for the digest and the PUT and unlinked after.
+  defp serialize_eligible?(verified?),
+    do: serialize_max_bytes() > 0 and (verified? or Integrity.flush_gate_on?())
+
+  defp serialize_max_bytes,
+    do: Application.get_env(:fathom, :flush_serialize_max_bytes, 16 * 1024 * 1024)
+
+  defp serialize_or_vacuum(conn, temp, state, verified?) do
+    case Connection.exec(conn, "BEGIN") do
+      :ok ->
+        copied =
+          try do
+            with :ok <- if(verified?, do: :ok, else: Integrity.run_quick_check(conn)),
+                 {:ok, bytes, count, free, ps} <- snapshot_counts(conn) do
+              if bytes <= serialize_max_bytes() and
+                   not compaction_worthwhile_counts?(count, free, ps),
+                 do: serialize_main(conn),
+                 else: :vacuum
+            end
+          after
+            # A read-only transaction: COMMIT and ROLLBACK are the same. Ignore "no transaction is
+            # active" if SQLite already ended it on an error.
+            _ = Connection.exec(conn, "COMMIT")
+          end
+
+        case copied do
+          {:ok, blob} ->
+            emit_snapshot_mode(state, :serialize)
+
+            case Fathom.FS.write(temp, blob) do
+              :ok ->
+                # The read transaction has ended, so this PASSIVE is the same one `do_snapshot/3`
+                # runs after its VACUUM (pinned + quorum-gated under A2).
+                Fathom.Shard.Replication.Session.checkpoint_after_snapshot(conn, state.id)
+                :ok
+
+              {:error, _} = err ->
+                err
+            end
+
+          :vacuum ->
+            emit_snapshot_mode(state, :vacuum)
+            do_snapshot(conn, temp, state.id)
+
+          {:error, _} = err ->
+            err
+        end
+
+      {:error, reason} ->
+        # "Could not check", never "corrupt": `verdict/1` classifies an unknown tag as unknown.
+        Integrity.verdict({:error, {:snapshot_begin_failed, reason}})
+    end
+  end
+
+  # The image size and free-page counts of the snapshot the open read transaction sees. One
+  # statement over the table-valued pragma functions.
+  defp snapshot_counts(conn) do
+    case Connection.query(
+           conn,
+           "SELECT c.page_count, f.freelist_count, s.page_size " <>
+             "FROM pragma_page_count() c, pragma_freelist_count() f, pragma_page_size() s",
+           []
+         ) do
+      {:ok, %{rows: [[count, free, ps]]}} when is_integer(count) and is_integer(ps) ->
+        {:ok, count * ps, count, free, ps}
+
+      {:ok, other} ->
+        {:error, {:snapshot_counts, other}}
+
+      {:error, reason} ->
+        {:error, {:snapshot_counts, reason}}
+    end
+  end
+
+  # `sqlite3_serialize` of `main` on this handle, inside the caller's read transaction.
+  defp serialize_main(conn) do
+    case Exqlite.Sqlite3.serialize(conn, "main") do
+      {:ok, blob} when is_binary(blob) -> {:ok, blob}
+      {:error, reason} -> {:error, {:serialize_failed, reason}}
+    end
+  end
+
+  # Which primitive produced the VACUUM-route snapshot: `:serialize` (page copy) or `:vacuum`
+  # (`VACUUM INTO`). The route event stays `:vacuum` for both (expert review 2026-10-22 r8 #9).
+  defp emit_snapshot_mode(state, mode) do
+    :telemetry.execute(
+      [:fathom, :shard, :flush, :snapshot],
+      %{count: 1},
+      %{shard_id: state.id, mode: mode}
+    )
   end
 
   # run_quick_check/1, integrity_verdict/1 and verify_flush_integrity?/0 moved to
