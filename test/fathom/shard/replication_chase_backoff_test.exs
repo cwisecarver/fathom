@@ -26,7 +26,8 @@ defmodule Fathom.Shard.ReplicationChaseBackoffTest do
     :replication_quorum,
     :replication_timeout_ms,
     :replication_catchup_ms,
-    :shard_flush_interval_ms
+    :shard_flush_interval_ms,
+    :replication_max_queue_bytes
   ]
 
   setup do
@@ -64,8 +65,8 @@ defmodule Fathom.Shard.ReplicationChaseBackoffTest do
     |> assert("never: #{what}")
   end
 
-  test "late straggler acks do not run a catch-up per commit while a dead follower is backed off",
-       %{id: id, root: root} do
+  # Three live followers and one dead one at Q=2, the shard written once and settled.
+  defp fleet!(id, root) do
     live =
       for i <- 1..3 do
         name = :"chasebo_f#{i}_#{System.unique_integer([:positive])}"
@@ -117,6 +118,12 @@ defmodule Fathom.Shard.ReplicationChaseBackoffTest do
     _ = Session.commit(id, wal, coordinator)
     [{session, _}] = Registry.lookup(@registry, id)
     await!(fn -> :sys.get_state(session).inflight == %{} end, "first commit settles")
+    %{session: session, conn: conn, wal: wal, coordinator: coordinator}
+  end
+
+  test "late straggler acks do not run a catch-up per commit while a dead follower is backed off",
+       %{id: id, root: root} do
+    %{session: session, conn: conn, wal: wal, coordinator: coordinator} = fleet!(id, root)
 
     # Enter a catch-up episode the way the (capped) timer would. The cycle is one non-blocking round
     # (r7 #8): the dead follower's `:disconnected` reject arrives after it, as a late reply.
@@ -153,5 +160,48 @@ defmodule Fathom.Shard.ReplicationChaseBackoffTest do
     assert cycles <= 1,
            "#{cycles} catch-up cycles in 20 commits with a dead follower backed off at the cap: " <>
              "late straggler acks bypassed retry_delay_ms/2"
+  end
+
+  # A REFUSAL THAT LANDS BEFORE THE POST-SHIP DRAIN STILL COUNTS (CI run 39889287951, OTP 28: the
+  # test above failed its own precondition, `catchup_fails > 0`, with `inflight` already empty).
+  # The catch-up round ships fire-and-forget to the dead follower (the live three are current), so
+  # its `:disconnected` reply races the Session's `drain_late_replies` right after the round. When
+  # the drain won, the refusal was reconciled and FORGOTTEN: the round's own reject list was `[]`,
+  # so `arm_if_rejected/2` reset `catchup_fails` to 0, which reopens the rv7 F1 chase gate.
+  #
+  # Reproduced deterministically with the `:overloaded` refusal, which `Shipper.push/2` sends to
+  # the Session itself before the round returns, so it is ALWAYS in the mailbox at the drain: a
+  # byte budget of 1 refuses the only push the round makes. No push reaches a shipper, so no other
+  # reply can arrive afterwards and count it instead.
+  test "a refusal drained right after a round still deepens the catch-up backoff",
+       %{id: id, root: root} do
+    %{session: session} = fleet!(id, root)
+
+    test_pid = self()
+    handler = "chasebo-overloaded-#{id}"
+
+    :telemetry.attach(
+      handler,
+      [:fathom, :replication, :reject],
+      fn _, _, %{reason: reason}, _ ->
+        if self() == session, do: send(test_pid, {:session_refused, reason})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    Application.put_env(:fathom, :replication_max_queue_bytes, 1)
+    send(session, :catch_up)
+    st = :sys.get_state(session)
+    Application.delete_env(:fathom, :replication_max_queue_bytes)
+
+    assert_received {:session_refused, :overloaded},
+                    "fixture: the catch-up round pushed nothing for the budget to refuse"
+
+    assert st.catchup_fails > 0,
+           "the round's :overloaded refusal was drained and forgotten: catchup_fails reset to 0"
+
+    assert st.catchup_ref != nil, "the refused follower has no catch-up armed"
   end
 end

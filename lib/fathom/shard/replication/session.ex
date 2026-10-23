@@ -894,12 +894,22 @@ defmodule Fathom.Shard.Replication.Session do
           {:ok, new_state, rejects} ->
             new_state = start_seeds(new_state, wal_path, rejects)
 
+            # A REFUSAL DRAINED HERE STILL COUNTS. A round that stopped at its quorum (or shipped
+            # fire-and-forget, `needed == 0`) returns before its laggards answer, and a refusal that
+            # lands before this drain used to be reconciled and then FORGOTTEN: `arm_if_rejected/2`
+            # saw only the round's own `rejects` (often `[]`), reset `catchup_fails` to 0, and the
+            # backoff the refusal should have deepened was erased. The same reply landing a moment
+            # later, in `handle_info/2`, is counted. With a dead follower that meant the rv7 F1
+            # chase gate (`catchup_fails == 0`) reopened depending on scheduling (CI run 39889287951,
+            # OTP 28), and a synchronous `:overloaded` refusal (`Shipper.push/2` sends it to self())
+            # was never counted at all. Same reply, same treatment, whenever it arrives.
+            {new_state, late_rejects} = drain_late_replies_counted(new_state, wal_path, [])
+
             new_state
-            |> drain_late_replies(wal_path)
             # A commit can SUCCEED on the quorum while a follower was refused by OUR OWN shipper.
             # That follower is now behind with nothing scheduled to fix it, and the tenant saw
             # `:ok` — so nothing anywhere looks wrong. This is the arm that matters.
-            |> arm_if_rejected(rejects)
+            |> arm_if_rejected(rejects ++ late_rejects)
             # A follower the quorum did not need may still be short (expert review 2026-10-20 #3:
             # the commit no longer waits for it). The catch-up timer makes it good off the reply path.
             |> arm_if_short()
@@ -2968,7 +2978,12 @@ defmodule Fathom.Shard.Replication.Session do
     end)
   end
 
-  defp drain_late_replies(state, wal_path) do
+  defp drain_late_replies(state, wal_path),
+    do: state |> drain_late_replies_counted(wal_path, []) |> elem(0)
+
+  # `drain_late_replies/2` that also returns the refusals it reconciled, oldest first, for a caller
+  # that arms the catch-up from them (`do_commit/4`).
+  defp drain_late_replies_counted(state, wal_path, acc) do
     receive do
       # A late ACK is not noise to be thrown away — it is a follower reporting that it holds the
       # bytes we sent it, and the ONLY notification we will ever get. Discarding it left that
@@ -2979,7 +2994,7 @@ defmodule Fathom.Shard.Replication.Session do
         state
         |> settle_late_ack(from, next)
         |> forget_inflight(from)
-        |> drain_late_replies(wal_path)
+        |> drain_late_replies_counted(wal_path, acc)
 
       {:repl_reply, from, {:reject, _shard, reason, follower_offset}} ->
         rejects = [{from, reason, follower_offset}]
@@ -2987,12 +3002,12 @@ defmodule Fathom.Shard.Replication.Session do
         state
         |> reconcile(rejects)
         |> start_seeds(wal_path, rejects)
-        |> drain_late_replies(wal_path)
+        |> drain_late_replies_counted(wal_path, acc ++ rejects)
 
       {:repl_reply, _from, _other} ->
-        drain_late_replies(state, wal_path)
+        drain_late_replies_counted(state, wal_path, acc)
     after
-      0 -> state
+      0 -> {state, acc}
     end
   end
 
