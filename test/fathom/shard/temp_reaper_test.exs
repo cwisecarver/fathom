@@ -115,6 +115,46 @@ defmodule Fathom.Shard.TempReaperTest do
            "a pre-existing 0755 scratch dir must be tightened, not left world-readable"
   end
 
+  # Expert review 2026-10-22 r8 rv8 follow-up: a FAILED data-dir listing was read as an empty dir, so
+  # the pass called Retained.reconcile([], dir), which forgets every index entry absent from the
+  # listing -- one failed readdir wiped the whole retained-copy index (files stayed on disk,
+  # untracked, budget eviction lapsed). Invariant: a failed listing is a no-op pass.
+  test "a failed data-dir listing leaves the retained-copy index intact", %{path: path} do
+    alias Fathom.Shard.Retained
+
+    start_supervised!(TempReaper)
+    # Budget 0 (the test default) evicts a retained copy the moment it is indexed.
+    prev_budget = Application.get_env(:fathom, :shard_retain_local_bytes)
+    Application.put_env(:fathom, :shard_retain_local_bytes, 64 * 1024 * 1024)
+
+    on_exit(fn ->
+      if is_nil(prev_budget),
+        do: Application.delete_env(:fathom, :shard_retain_local_bytes),
+        else: Application.put_env(:fathom, :shard_retain_local_bytes, prev_budget)
+    end)
+
+    File.write!(path, "retained db bytes")
+    File.write!(Retained.marker(path), "")
+    on_exit(fn -> File.rm_rf([path, Retained.marker(path)]) end)
+
+    _ = TempReaper.sweep()
+    indexed = Retained.stats().count
+    assert indexed >= 1, "the fixture must put a retained copy in the index"
+
+    good = Application.get_env(:fathom, :shard_data_dir)
+    # A missing dir makes list_dir_isolated return {:error, :enoent}, deterministically.
+    Application.put_env(:fathom, :shard_data_dir, Path.join(good, "does_not_exist"))
+
+    try do
+      assert TempReaper.sweep() == 0
+    after
+      Application.put_env(:fathom, :shard_data_dir, good)
+    end
+
+    assert Retained.stats().count == indexed,
+           "a failed listing must not forget retained copies"
+  end
+
   # Expert review 2026-08-31 #17: do_sweep had no rescue, so a persistent local-FS fault on the
   # fleet-sized scan crash-loops the reaper — the DataPlane's restart budget absorbs a burst but a
   # persistent fault exhausts it and cascades to every open coordinator. A raise is now caught and

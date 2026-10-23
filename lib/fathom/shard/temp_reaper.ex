@@ -145,24 +145,26 @@ defmodule Fathom.Shard.TempReaper do
   defp do_sweep do
     # ONE directory listing for every family -- the orphan temps and the three quarantine kinds
     # used to be four separate `Path.wildcard` readdirs of the fleet-sized dir (expert review
-    # 2026-10-10 #P6). A listing that fails reads as an empty dir: this pass is a no-op, the next
-    # interval retries.
+    # 2026-10-10 #P6). A listing that fails makes the whole pass a no-op, the next interval
+    # retries.
     dir = Shard.data_dir()
 
-    names =
-      case Fathom.FS.list_dir_isolated(dir) do
-        {:ok, names} -> names
-        {:error, _} -> []
-      end
+    case Fathom.FS.list_dir_isolated(dir) do
+      {:ok, names} ->
+        sweep_listing(dir, names)
 
-    temps = for name <- names, Storage.temp_orphan?(name), do: Path.join(dir, name)
-    reaped = Storage.reap_named_temps(temps, @stale_after_ms)
-    if reaped > 0, do: Logger.info("shard temp reaper: reaped #{reaped} orphaned temp(s)")
-    sweep_quarantines(Shard.quarantine_files_in(names, dir))
+      {:error, reason} ->
+        # A failed listing must make the WHOLE pass a no-op (expert review 2026-10-22 r8 rv8
+        # follow-up). Treating it as an empty dir was wrong: `Retained.reconcile([], dir)` forgets
+        # every index entry not in the listing, so one timeout/EIO wiped the retained-copy index
+        # (files stayed on disk, untracked, budget eviction lapsed until the next good pass). The
+        # scratch sweep is skipped too: a pass that cannot list is a pass that retries whole.
+        Logger.warning(
+          "shard temp reaper: listing #{dir} failed (#{inspect(reason)}); skipping this pass"
+        )
 
-    # The same listing indexes and evicts clean-retained copies (expert review 2026-10-20-2027 #22).
-    Fathom.Shard.Retained.reconcile(names, dir)
-    reaped + sweep_scratch()
+        0
+    end
   rescue
     e ->
       Logger.warning(
@@ -174,6 +176,17 @@ defmodule Fathom.Shard.TempReaper do
     :exit, reason ->
       Logger.warning("shard temp reaper: sweep exited (#{inspect(reason)}); skipping this pass")
       0
+  end
+
+  defp sweep_listing(dir, names) do
+    temps = for name <- names, Storage.temp_orphan?(name), do: Path.join(dir, name)
+    reaped = Storage.reap_named_temps(temps, @stale_after_ms)
+    if reaped > 0, do: Logger.info("shard temp reaper: reaped #{reaped} orphaned temp(s)")
+    sweep_quarantines(Shard.quarantine_files_in(names, dir))
+
+    # The same listing indexes and evicts clean-retained copies (expert review 2026-10-20-2027 #22).
+    Fathom.Shard.Retained.reconcile(names, dir)
+    reaped + sweep_scratch()
   end
 
   # Age-gated reap of the scratch dir (see `scratch_dir/0`). Entries may be files or directories.
