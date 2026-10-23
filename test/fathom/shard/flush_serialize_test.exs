@@ -13,6 +13,7 @@ defmodule Fathom.Shard.FlushSerializeTest do
     * the integrity gate still refuses a corrupt live file, and nothing is uploaded;
     * the gate checks the IMAGE (rv8 F1): `sqlite3_serialize` zero-fills a page it cannot read and
       still succeeds, so a zeroed page in the copy must divert to `VACUUM INTO`, never be uploaded;
+    * a serialize error falls back to `VACUUM INTO` instead of failing the flush (rv8 F2).
 
   The pinned-live route is switched off (`:flush_pinned_live_upload`) so every flush here takes the
   VACUUM route under test. Not async: telemetry handlers, app env, real shard files.
@@ -408,5 +409,25 @@ defmodule Fathom.Shard.FlushSerializeTest do
       assert :ok = Shard.verify_integrity(object(id)), "the zero-filled image was uploaded"
       assert count_rows(object(id)) == 2_000
     end
+  end
+
+  # rv8 F2: a serialize error (a NULL buffer on NOMEM) used to fail the flush every interval for
+  # that shard although `VACUUM INTO` would have worked.
+  test "a serialize error falls back to VACUUM INTO and the flush succeeds", %{
+    id: id,
+    path: path
+  } do
+    Application.put_env(:fathom, :flush_serialize_result_hook, fn _ -> {:error, :nomem} end)
+    conn = seed_in_wal!(id, path, 300)
+
+    coordinator = flush!(id)
+    ShardExecutor.close(conn)
+
+    refute_received {:snapshot, :serialize}
+    assert_received {:snapshot, :vacuum}
+    assert count_rows(object(id)) == 300
+
+    assert :sys.get_state(coordinator).flush_failures == 0,
+           "the flush failed instead of falling back"
   end
 end

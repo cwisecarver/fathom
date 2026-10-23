@@ -5921,7 +5921,9 @@ defmodule Fathom.Shard do
   # verified) then `VACUUM INTO`: a corrupt live file is still refused there, and a transient read
   # error either recurs (VACUUM fails the flush) or does not (a good object is uploaded). The temp is
   # unlinked first, because `VACUUM INTO` refuses a non-empty target.
-
+  #
+  # ERRORS FALL BACK TOO (rv8 F2): a `serialize` NULL (NOMEM of the buffer) or a `snapshot_counts`
+  # quirk used to fail the flush every interval for that shard, though `VACUUM INTO` would work.
   defp serialize_or_vacuum(conn, temp, state, verified?) do
     case Connection.exec(conn, "BEGIN") do
       :ok ->
@@ -5950,8 +5952,12 @@ defmodule Fathom.Shard do
           :vacuum ->
             vacuum_snapshot(conn, temp, state, verified?)
 
-          {:error, _} = err ->
-            err
+          {:error, reason} ->
+            Logger.warning(
+              "shard #{state.id}: page-copy snapshot failed (#{inspect(reason, printable_limit: 300)}); using VACUUM INTO"
+            )
+
+            vacuum_snapshot(conn, temp, state, verified?)
         end
 
       {:error, reason} ->
