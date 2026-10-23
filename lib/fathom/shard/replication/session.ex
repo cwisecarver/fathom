@@ -2626,7 +2626,9 @@ defmodule Fathom.Shard.Replication.Session do
 
   @doc false
   # Public for the concurrency test only.
-  @spec wal_registry(String.t(), -1 | 0 | 1) :: {:ok, String.t() | integer()} | {:error, term()}
+  # `:skipped` is `Extension.load/1`'s answer when no extension is configured.
+  @spec wal_registry(String.t(), -1 | 0 | 1) ::
+          {:ok, String.t() | integer()} | {:error, term()} | :skipped
   def wal_registry(db_path, delta) do
     with {:ok, conn} <- registry_conn() do
       registry_call(conn, db_path, delta)
