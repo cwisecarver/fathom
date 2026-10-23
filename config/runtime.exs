@@ -462,6 +462,20 @@ else
   end
 end
 
+# The ± spread on every periodic durability-flush re-arm, as a fraction of the interval (default
+# 0.25 = `Fathom.Shard.@default_flush_jitter_ratio`; 0 = none; values above 1.0 act as 1.0). An env
+# knob so the rig can A/B timer phase lock after a mass (re)open without a rebuild (expert review
+# 2026-10-22 r8 #11). A malformed value fails the boot rather than silently keeping 0.25.
+if raw = System.get_env("SHARD_FLUSH_JITTER_RATIO") do
+  case Float.parse(String.trim(raw)) do
+    {ratio, ""} when ratio >= 0.0 and ratio <= 1.0 ->
+      config :fathom, :shard_flush_jitter_ratio, ratio
+
+    _ ->
+      raise "SHARD_FLUSH_JITTER_RATIO must be a number in [0, 1], got: #{inspect(raw)}"
+  end
+end
+
 # The WAL's on-disk size bound in bytes (expert review 2026-10-10 #30; default 64 MiB, see
 # `Fathom.Shard.Connection.maybe_journal_size_limit/1`). -1 turns it off. The chaos rig sets 0 to
 # make every log reset truncate, which is the A2 stress case.
