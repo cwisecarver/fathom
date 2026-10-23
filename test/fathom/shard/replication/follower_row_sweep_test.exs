@@ -95,7 +95,7 @@ defmodule Fathom.Shard.Replication.FollowerRowSweepTest do
     answer
   end
 
-  test "an idle row is swept and re-derived unchanged (but for the epoch) on the next read",
+  test "an idle row is swept and re-derived unchanged on the next read",
        ctx do
     %{name: name, id: id, port: port} = ctx
     h = plant!(ctx)
@@ -111,8 +111,10 @@ defmodule Fathom.Shard.Replication.FollowerRowSweepTest do
     assert position!(port, id) == wire_before
     assert resident?(name, id), "the re-derived row was not re-installed"
 
-    # Every field but the epoch, which is on no disk and comes back 0, exactly as after a restart.
-    assert Follower.state_of(name, id) == %{before | epoch: 0}
+    # EVERY field, the epoch included. This asserted `%{before | epoch: 0}` until expert review
+    # 2026-10-22 r8 #8 persisted the epoch beside the lineage: a re-derived epoch 0 made the owner's
+    # next push re-ship the whole WAL and run a full absorb, which is the defect that item fixed.
+    assert Follower.state_of(name, id) == before
     assert %{next_offset: off, torn: false, lineage: @lineage, wal_ordinal: @ordinal} = before
     assert off == h.commit_extent
   end
@@ -213,8 +215,9 @@ defmodule Fathom.Shard.Replication.FollowerRowSweepTest do
     assert ordinal == @ordinal + 1
   end
 
-  # Integration review of expert review 2026-10-20-2027 #11. A swept row re-derives epoch 0 (the
-  # epoch is on no disk), which drops the EPOCH fence: any deposed primary's lock epoch is > 0.
+  # Integration review of expert review 2026-10-20-2027 #11. A swept row re-derived epoch 0 (the
+  # epoch was on no disk until expert review 2026-10-22 r8 #8; it still is with the ordinal wire
+  # off), which drops the EPOCH fence: any deposed primary's lock epoch is > 0.
   # Invariant: the LINEAGE fence (above it in `FollowerLog.decide/2`, from the lineage sidecar)
   # still refuses a deposed owner's push, even a well-formed offset-0 reset that `decide_fresh`
   # would otherwise accept. Probed by mutation: without the lower-lineage clause this push is acked.
@@ -245,8 +248,9 @@ defmodule Fathom.Shard.Replication.FollowerRowSweepTest do
     assert {:ok, {:reject, ^id, :stale_epoch, 0}} =
              send_frame!(port, Protocol.encode_push(zombie))
 
-    # The replica is untouched: same WAL identity, lineage and ordinal, not torn.
-    assert %{epoch: 0, salt1: salt1, lineage: @lineage, wal_ordinal: @ordinal, torn: false} =
+    # The replica is untouched: same WAL identity, lineage and ordinal, not torn. (Its epoch is
+    # the persisted one since r8 #8; it was 0 here before, and the lineage fence is what refused.)
+    assert %{salt1: salt1, lineage: @lineage, wal_ordinal: @ordinal, torn: false} =
              Follower.state_of(name, id)
 
     assert salt1 == h.salt1

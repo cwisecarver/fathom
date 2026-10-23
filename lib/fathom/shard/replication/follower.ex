@@ -2200,23 +2200,25 @@ defmodule Fathom.Shard.Replication.Follower do
   defp put_state(name, shard_id, state) do
     tab = table(name)
 
-    {was_torn?, was_lineage, was_ordinal} =
+    {was_torn?, was_ownership, was_ordinal} =
       case :ets.lookup(tab, shard_id) do
         [{^shard_id, %{torn: t} = prev}] ->
-          {t, Map.get(prev, :lineage, 0), {Map.get(prev, :wal_ordinal, 0), prev.salt1}}
+          {t, {Map.get(prev, :lineage, 0), Map.get(prev, :epoch, 0)},
+           {Map.get(prev, :wal_ordinal, 0), prev.salt1}}
 
         # No resident row: rows are derived on first use (expert review 2026-10-21 #5), so a write
         # can land on a replica whose row was never derived (a lineage-0 seed install) or was swept.
         # The sidecars on disk are what the row would have said; assuming "untorn, lineage 0" left a
         # stale torn marker behind an untorn install. `nil` ordinal always rewrites that sidecar.
         _ ->
-          {Fathom.FS.exists?(torn_path(name, shard_id)), recovered_lineage(name, shard_id), nil}
+          {Fathom.FS.exists?(torn_path(name, shard_id)), recovered_ownership(name, shard_id), nil}
       end
 
     # Marker BEFORE the ETS row, so a crash between the two leaves the SAFE state: the marker
     # present and the replica treated as torn, never the reverse.
     if was_torn? != state.torn, do: sync_torn_marker(name, shard_id, state)
-    if state.lineage != was_lineage, do: sync_lineage(name, shard_id, state.lineage)
+    ownership = {state.lineage, state.epoch}
+    if ownership != was_ownership, do: sync_ownership(name, shard_id, ownership)
     ordinal = {Map.get(state, :wal_ordinal, 0), state.salt1}
     if ordinal != was_ordinal, do: sync_ordinal(name, shard_id, ordinal)
     :ets.insert(tab, {shard_id, state})
@@ -2230,10 +2232,20 @@ defmodule Fathom.Shard.Replication.Follower do
   # deposed one included. It changes once per ownership, so this is one small write per takeover,
   # not per frame. Written plainly (no fsync): losing it to an OS crash recovers 0, which is exactly
   # the pre-fix behaviour, never a wrong value.
-  defp sync_lineage(name, shard_id, lineage) when is_integer(lineage) and lineage > 0,
-    do: write_state_file(lineage_path(name, shard_id), Integer.to_string(lineage), :lineage)
+  #
+  # THE EPOCH RIDES IN THE SAME SIDECAR (expert review 2026-10-22 r8 #8, decision Q11 = A), as
+  # `"<lineage> <epoch>"`, rewritten when either changes (still about once per ownership). A
+  # restarted follower used to recover epoch 0, so the current owner's next push (`pushed > epoch`)
+  # went to `decide_fresh/2`, which refuses any non-zero offset: the primary re-shipped the WHOLE
+  # current WAL from offset 0 (routinely 4-16 MB per shard) and the follower ran a FULL absorb of
+  # bytes it already held, for every active followed shard, on every deploy and every idle-row
+  # sweep. Lineage first, so a torn write loses the epoch before the lineage (recovering the safe
+  # epoch 0 = the old behaviour). See `recovered_ownership/2` for when the epoch is trusted.
+  defp sync_ownership(name, shard_id, {lineage, epoch})
+       when is_integer(lineage) and lineage > 0 and is_integer(epoch) and epoch >= 0,
+       do: write_state_file(lineage_path(name, shard_id), "#{lineage} #{epoch}", :lineage)
 
-  defp sync_lineage(_name, _shard_id, _lineage), do: :ok
+  defp sync_ownership(_name, _shard_id, _ownership), do: :ok
 
   # THE ORDINAL SURVIVES A RESTART TOO (expert review 2026-10-15 #4, default D2). Recovery rebuilt
   # every replica at `wal_ordinal: 0` ("not stated"), which `Promote.fresher?/2` refuses to rank, so
@@ -2272,12 +2284,56 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
-  defp recovered_lineage(name, shard_id) do
+  @doc false
+  # `{lineage, epoch}` from the lineage sidecar (expert review 2026-10-22 r8 #8). Public for the
+  # test.
+  #
+  # The epoch is recovered ONLY beside a stated lineage (> 0), and only on a fleet whose pushes
+  # state one (`Protocol.ordinal_wire?/0`; see below). With lineage 0 the epoch is the only
+  # ownership evidence `FollowerLog` has, and recovering it low (0) is the documented escape from
+  # the epoch fence's reopen deadlock (`FollowerLog.decide/2`, the lineage-fence comment): a
+  # reopened primary's lock epoch resets to 1, so a persisted higher epoch there would refuse the
+  # real owner `:stale_epoch` forever. An old-format sidecar (`"<lineage>"`) or an unreadable epoch
+  # field recovers epoch 0, which is exactly the pre-r8 behaviour.
+  #
+  # WHY A RECOVERED EPOCH CANNOT FENCE OUT THE LIVE OWNER. Lineage is taken strictly above
+  # anything stamped at every coordinator open (`Fathom.Shard`'s `open_lineage/2`), so one lineage
+  # value names exactly one coordinator life, and that life holds ONE lease, i.e. one lock epoch:
+  # the epoch only resets (to 1) on a release, which ends the life, and the next life takes a new,
+  # higher lineage. So at equal lineage the persisted epoch is at most the live owner's: it was
+  # written from a push of that same life (decide/2 adopts `push.epoch`), from its seed, or raised
+  # by `fence_for_promotion/3` to a promoting lease's epoch, which is the deposed-owner fence that
+  # is MEANT to refuse it (and also marks the replica torn). A lower persisted value (a write lost to
+  # an OS crash) recovers today's path: `pushed > epoch` -> `decide_fresh/2` -> one re-ship. A
+  # different lineage is decided by the lineage fence above the epoch clause whatever the epoch
+  # says: lower is refused `:stale_epoch`, higher goes to `decide_fresh/2` and a reseed.
+  @spec recovered_ownership(atom(), String.t()) :: {non_neg_integer(), non_neg_integer()}
+  def recovered_ownership(name \\ __MODULE__, shard_id) do
     with {:ok, text} <- Fathom.FS.read(lineage_path(name, shard_id)),
-         {n, ""} when n > 0 <- Integer.parse(String.trim(text)) do
-      n
+         [l | rest] <- String.split(String.trim(text), " ", parts: 2),
+         {lineage, ""} when lineage > 0 <- Integer.parse(l) do
+      # ONLY WHERE PUSHES STATE A LINEAGE. The lineage fence fires only when BOTH sides state one,
+      # and a push carries its lineage only on the ordinal frame (`Protocol.ordinal_wire?/0`, on in
+      # prod, off in dev/test). With it off, every push reaches the EPOCH fence, where a reopened
+      # owner's reset-to-1 lock epoch below a recovered higher one would be refused `:stale_epoch`
+      # — and the restart's epoch 0 is that deadlock's documented escape. Found by this item's own
+      # test (`follower_restart_epoch_test.exs`) before it shipped. Fleet config is uniform, so this
+      # node's gate says what its primaries send.
+      epoch =
+        case rest do
+          [e] ->
+            case Integer.parse(e) do
+              {n, ""} when n >= 0 -> if Protocol.ordinal_wire?(), do: n, else: 0
+              _ -> 0
+            end
+
+          [] ->
+            0
+        end
+
+      {lineage, epoch}
     else
-      _ -> 0
+      _ -> {0, 0}
     end
   end
 
@@ -2604,7 +2660,7 @@ defmodule Fathom.Shard.Replication.Follower do
   #     the whole replica (and a seed stating a lineage reads the row first, for the fence); the
   #     rest are `forget/2` (removes everything, the row included) and the seed temp reaper (temps
   #     only). Between boot and first use, the files a derive reads do not move.
-  #   * LINEAGE FENCE: `recovered_lineage/2` reads the sidecar in both cases; the fence in
+  #   * LINEAGE FENCE: `recovered_ownership/2` reads the sidecar in both cases; the fence in
   #     `FollowerLog.decide/2` and `stale_lineage_seed?/2` sees the same number.
   #   * TORN TAIL: `Wal.read/1`'s `commit_extent` (2026-09-29 #26) and the torn marker are read by
   #     `derive_state/3` in both cases.
@@ -2615,7 +2671,7 @@ defmodule Fathom.Shard.Replication.Follower do
   #   * `put_state/3` on a row that is not resident reads the previous torn/lineage from the
   #     sidecars, not from defaults, so a write that lands before any derive (a lineage-0 seed
   #     install) still clears a stale torn marker exactly as it did over a boot-derived row.
-  #   * EPOCH: 0 in both cases (below).
+  #   * EPOCH: the lineage sidecar's, in both cases (below).
   # What is NOT the same: `replica_shard_ids/1` (the rebalancer's warm set) lists only resident
   # rows, so after a restart it starts empty and refills as pushes and asks arrive — the trade the
   # sweep already accepted (user decision 2026-10-21). And a tombstoned replica's bytes stay on disk
@@ -2628,12 +2684,14 @@ defmodule Fathom.Shard.Replication.Follower do
   # `Wal.read/1` reports `ckpt_seq`, `salt1` and `size`, which are exactly `wal_gen`, `salt1` and
   # `next_offset`.
   #
-  # EPOCH IS RECOVERED AS 0, deliberately low. It is the primary's lease epoch and appears nowhere
-  # on disk. Guessing high would make this node reject the real primary as `:stale_epoch` and stall
-  # the shard until the epoch caught up; guessing low costs exactly one round trip — the first push
-  # is `pushed > epoch`, which routes to `decide_fresh`, which rejects a non-zero offset asking for
-  # 0, and the primary answers with `{:reset, 0, _}`. That re-sends the current WAL, not the
-  # database, and is what "cheap and self-correcting" looks like next to a full re-seed.
+  # EPOCH: PERSISTED BESIDE THE LINEAGE, recovered only when the lineage is stated (expert review
+  # 2026-10-22 r8 #8; `recovered_ownership/2` says why that can never fence out the live owner).
+  # Guessing high would make this node reject the real primary as `:stale_epoch`; guessing low (0,
+  # the pre-r8 answer, and still the answer for lineage 0 or an old sidecar) is safe but NOT cheap,
+  # as this comment used to claim: the first push is `pushed > epoch`, which routes to
+  # `decide_fresh`, which rejects a non-zero offset asking for 0, and the primary re-sends the WHOLE
+  # current WAL from offset 0 (routinely 4-16 MB) and the follower runs a FULL absorb of bytes it
+  # already held, per active followed shard, on every restart and idle-row sweep.
   #
   # A shard whose WAL cannot be read is simply not recovered: it stays unknown and gets a normal
   # seed. Skipping is always safe here; claiming bytes we cannot verify is not.
@@ -2690,8 +2748,7 @@ defmodule Fathom.Shard.Replication.Follower do
       # together — but this is not a seed, it is a recovery, and the marker on disk is the only
       # thing that remembers the two files were a generation apart when we went down.
       torn? = Fathom.FS.exists?(torn_path(name, shard_id))
-      lineage = recovered_lineage(name, shard_id)
-      recovered_state(name, shard_id, header, torn?, lineage, log?)
+      recovered_state(name, shard_id, header, torn?, recovered_ownership(name, shard_id), log?)
     else
       _ -> nil
     end
@@ -2713,8 +2770,8 @@ defmodule Fathom.Shard.Replication.Follower do
   #   * `torn` — the durable marker, which `put_state/3` writes BEFORE the ETS row, so a torn row is
   #     never swept into an untorn one;
   #   * `lineage`, `wal_ordinal` — their sidecars, written by `put_state/3` when they change;
-  #   * `epoch` — nowhere on disk, recovered as 0: the next push takes `decide_fresh/2`, the one
-  #     round trip a restart already costs. A replica whose lineage is unstated (0) is NOT swept,
+  #   * `epoch` — in the lineage sidecar since expert review 2026-10-22 r8 #8, recovered only beside
+  #     a stated lineage (`recovered_ownership/2`). A replica whose lineage is unstated (0) is NOT swept,
   #     because there the epoch is the only ownership evidence and re-deriving 0 would read as a
   #     new ownership and re-seed it (`FollowerLog.ownership_change?/2`).
   # And the sweep does not trust that argument blindly: under the shard's lock it re-derives the
@@ -2777,8 +2834,10 @@ defmodule Fathom.Shard.Replication.Follower do
   defp rederivable?(_row, nil), do: false
 
   defp rederivable?(row, derived) do
+    # Never a HIGHER epoch than the row (r8 #8): that would fence the owner the row accepts.
     derived.wal_gen == row.wal_gen and derived.salt1 == row.salt1 and
       derived.lineage == row.lineage and
+      derived.epoch <= row.epoch and
       Map.get(derived, :wal_ordinal, 0) == Map.get(row, :wal_ordinal, 0) and
       derived.next_offset <= row.next_offset and
       (derived.torn or not row.torn)
@@ -2856,14 +2915,18 @@ defmodule Fathom.Shard.Replication.Follower do
          shard_id,
          %{ckpt_seq: gen, salt1: salt} = header,
          torn?,
-         lineage,
+         {lineage, epoch},
          _log?
        ) do
     # Only for the WAL whose salt it was written for (expert review 2026-10-15 #4).
     ordinal = recovered_ordinal(name, shard_id, salt)
 
+    # The persisted epoch (r8 #8; 0 for lineage 0 or an old sidecar, see `recovered_ownership/2`):
+    # the same owner's next push then meets `next_offset == offset` and APPENDS. A torn tail (an OS
+    # crash left the commit extent below what the primary recorded) answers `:offset_mismatch` at the
+    # real extent, and the primary re-sends only the tail, as it does in-life.
     %{
-      FollowerLog.seeded(0, gen, salt, header.commit_extent, lineage)
+      FollowerLog.seeded(epoch, gen, salt, header.commit_extent, lineage)
       | torn: torn?,
         wal_ordinal: ordinal
     }
@@ -2880,7 +2943,7 @@ defmodule Fathom.Shard.Replication.Follower do
   #
   # Epoch 0 as for every recovered replica, so the first push takes `decide_fresh/2` and resets
   # from offset 0 — nothing is ever appended to the empty WAL at the recorded offset.
-  defp recovered_state(name, shard_id, :empty, torn?, lineage, log?) do
+  defp recovered_state(name, shard_id, :empty, torn?, {lineage, _epoch}, log?) do
     case recovered_db_position(name, shard_id) do
       {:ok, %{lineage: ^lineage, wal_ordinal: ordinal, next_offset: extent}} ->
         %{FollowerLog.seeded(0, 0, 0, extent, lineage) | torn: torn?, wal_ordinal: ordinal}

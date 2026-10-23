@@ -73,8 +73,9 @@ defmodule Fathom.Shard.Replication.FollowerStateFsyncTest do
     assert_received {:synced, :lineage}, "the lineage file was written without an fsync"
     assert_received {:synced, :ordinal}, "the ordinal file was written without an fsync"
 
-    # And they say what they should.
-    assert File.read!(Follower.lineage_path(ctx.name, ctx.id)) == "3"
+    # And they say what they should. The lineage sidecar carries the epoch too since expert review
+    # 2026-10-22 r8 #8 (`"<lineage> <epoch>"`).
+    assert File.read!(Follower.lineage_path(ctx.name, ctx.id)) =~ ~r/^3 \d+$/
     assert File.read!(Follower.ordinal_path(ctx.name, ctx.id)) == "7 77"
     assert %{lineage: 3, wal_ordinal: 7} = Follower.state_of(ctx.name, ctx.id)
   end
@@ -85,7 +86,7 @@ defmodule Fathom.Shard.Replication.FollowerStateFsyncTest do
     seed!(ctx.name, ctx.id)
 
     refute_received {:synced, _}
-    assert File.read!(Follower.lineage_path(ctx.name, ctx.id)) == "3"
+    assert File.read!(Follower.lineage_path(ctx.name, ctx.id)) =~ ~r/^3 \d+$/
     assert File.read!(Follower.ordinal_path(ctx.name, ctx.id)) == "7 77"
   end
 end

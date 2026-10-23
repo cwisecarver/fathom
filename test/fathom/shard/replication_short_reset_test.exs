@@ -430,8 +430,9 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     %{name: name, state: state, id: id} = seeded_follower!(ctx)
     assert state.lineage > 0, "precondition: the seeded replica states no lineage to fence with"
 
-    # The WRITE side: a seed persisted the lineage beside the replica.
-    assert File.read!(Follower.lineage_path(name, id)) == Integer.to_string(state.lineage)
+    # The WRITE side: a seed persisted the lineage beside the replica (with the epoch after it
+    # since expert review 2026-10-22 r8 #8: `"<lineage> <epoch>"`).
+    assert File.read!(Follower.lineage_path(name, id)) == "#{state.lineage} #{state.epoch}"
 
     # A fresh shard's lineage is 1, and a push cannot state anything LOWER than 1 (0 means
     # "unstated", which skips the fence by design). So advance the recorded lineage the way a later
