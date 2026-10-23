@@ -191,6 +191,22 @@ defmodule Fathom.FSBypassTest do
       assert {:ok, []} = FS.list_dir_isolated(dir)
     end
 
+    # rv8 F7: the listing had no timeout, so a readdir hung on bad media or a stuck mount blocked
+    # the tombstone sweeper forever. Invariant: it returns `{:error, :timeout}` within the bound and
+    # leaves no stray `:DOWN` in the caller's mailbox. A 0 ms bound over 5,000 entries cannot be
+    # met (the side process must still be scheduled and read the dir), so the timeout path is
+    # taken every run.
+    test "is bounded: a listing that overruns its timeout returns {:error, :timeout}", %{
+      tmp_dir: dir
+    } do
+      for i <- 1..5_000, do: File.write!(Path.join(dir, "t#{i}.db"), "")
+
+      assert {:error, :timeout} = FS.list_dir_isolated(dir, 0)
+      refute_receive {:DOWN, _, :process, _, _}, 100
+      assert {:ok, names} = FS.list_dir_isolated(dir)
+      assert length(names) == 5_000
+    end
+
     test "makes no file_server_2 request", %{tmp_dir: dir} do
       for i <- 1..200, do: File.write!(Path.join(dir, "t#{i}.db"), "")
 

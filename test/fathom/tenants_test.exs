@@ -274,6 +274,27 @@ defmodule Fathom.TenantsTest do
       assert Fathom.Rebalancer.Overrides.for_shard(id) == nil
     end
 
+    # rv8 F7. Symptom: a data-dir listing failure in the local erase was read as `:ok`, so purge
+    # completed (and DeleteJob finished) with the tenant's local files still on disk. Invariant:
+    # purge returns the error, so DeleteJob retries the (idempotent) erase.
+    test "returns an error, so DeleteJob retries, when the local erase cannot list the data dir",
+         %{id: id} do
+      not_a_dir = Path.join(System.tmp_dir!(), "#{id}-notadir")
+      File.write!(not_a_dir, "")
+      prev = Application.get_env(:fathom, :shard_data_dir)
+      Application.put_env(:fathom, :shard_data_dir, not_a_dir)
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:fathom, :shard_data_dir, prev),
+          else: Application.delete_env(:fathom, :shard_data_dir)
+
+        File.rm(not_a_dir)
+      end)
+
+      assert {:error, {:local_erase, :enotdir}} = Tenants.purge(id)
+    end
+
     test "erases every stored object of an idle tenant", %{id: id} do
       write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('secret')"])
       flush!(id)

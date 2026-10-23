@@ -62,11 +62,16 @@ defmodule Fathom.FS do
   120k entries, never reclaimed, and every other non-raw file op on the node stalls ~110 ms behind
   it). The raw readdir runs in the side process, so the scratch garbage it allocates dies with that
   process rather than staying on the caller's heap; only the final name list is copied back. Returns
-  names as binaries. No timeout, deliberately (the callers are janitors/sweepers, and a timeout
-  would only crash them); a crash in the side process comes back as `{:error, reason}`.
+  names as binaries. A crash in the side process comes back as `{:error, reason}`.
+
+  BOUNDED (rv8 F7, expert review 2026-10-22 r8 #7): after `timeout_ms` (default 60 s; a 120k-entry
+  readdir takes ~0.1 s) the side process is killed and the result is `{:error, :timeout}`, so a
+  readdir hung on bad media or a stuck mount cannot block the tombstone sweeper or the temp reaper
+  forever. Every caller already treats `{:error, _}` as "this pass did nothing". A readdir stuck in
+  the kernel keeps its dirty-IO thread until it returns; the kill only frees the caller.
   """
-  @spec list_dir_isolated(Path.t()) :: {:ok, [String.t()]} | {:error, term()}
-  def list_dir_isolated(dir) do
+  @spec list_dir_isolated(Path.t(), timeout()) :: {:ok, [String.t()]} | {:error, term()}
+  def list_dir_isolated(dir, timeout_ms \\ 60_000) do
     dir = IO.chardata_to_string(dir)
 
     {pid, ref} =
@@ -83,6 +88,11 @@ defmodule Fathom.FS do
     receive do
       {:DOWN, ^ref, :process, ^pid, {:done, result}} -> result
       {:DOWN, ^ref, :process, ^pid, reason} -> {:error, reason}
+    after
+      timeout_ms ->
+        Process.demonitor(ref, [:flush])
+        Process.exit(pid, :kill)
+        {:error, :timeout}
     end
   end
 end

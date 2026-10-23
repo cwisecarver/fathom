@@ -290,14 +290,14 @@ defmodule Fathom.Tenants do
           # sweep's LIST and its DELETEs; the migrator refuses to retain for a tombstoned id, and
           # this second pass collects the one that raced that check. Idempotent, like the first.
           with :ok <- Storage.put_tombstone(id),
-               :ok <- Storage.purge_shard(id) do
-            rm_local(id)
+               :ok <- Storage.purge_shard(id),
+               :ok <- rm_local(id) do
             :telemetry.execute([:fathom, :tenants, :deleted], %{count: 1}, %{shard_id: id})
             :ok
           else
             {:error, reason} ->
               Logger.error(
-                "tenant #{id}: tombstone marker write or final sweep failed " <>
+                "tenant #{id}: tombstone marker write, final sweep or local erase failed " <>
                   "(#{inspect(reason)}) — will retry"
               )
 
@@ -830,16 +830,23 @@ defmodule Fathom.Tenants do
   (expert review 2026-10-15 #3). Run on EVERY node by `Fathom.Tenants.Tombstones` when it learns of a
   delete, and by its boot sweep, not only by `purge/1` on the DeleteJob's node. Idempotent. Refuses
   (no-op) for an id that is not tombstoned: this is destructive and unfenced.
+
+  Returns `{:error, reason}` when the data dir could not be listed (rv8 F7): nothing was erased,
+  so `[:fathom, :tenants, :local_erased]` is NOT emitted; `rm_local/1` has already logged and
+  emitted `[:fathom, :tenants, :local_erase_failed]`. No retry here: the boot `sweep_local/0`
+  re-runs every tombstoned id, and `purge/1` returns the error so its `DeleteJob` retries.
   """
-  @spec erase_local(String.t()) :: :ok
+  @spec erase_local(String.t()) :: :ok | {:error, term()}
   def erase_local(shard_id) do
     with {:ok, id} <- cast(shard_id), true <- Tombstones.tombstoned?(id) do
       Shards.stop(id)
-      rm_local(id)
-      :telemetry.execute([:fathom, :tenants, :local_erased], %{count: 1}, %{shard_id: id})
-    end
 
-    :ok
+      with :ok <- rm_local(id) do
+        :telemetry.execute([:fathom, :tenants, :local_erased], %{count: 1}, %{shard_id: id})
+      end
+    else
+      _ -> :ok
+    end
   end
 
   # Remove every local working file for the shard after the coordinator is stopped: the live
@@ -852,6 +859,11 @@ defmodule Fathom.Tenants do
   # `file_server_2` (69 MB pinned per 120k entries) on EVERY node for EVERY tombstone. The listing
   # is now raw in a side process and each file is removed raw; the erase of quarantine copies stays
   # immediate (erasure outranks forensics).
+  #
+  # A LISTING FAILURE IS NOT AN ERASURE (rv8 F7). This used to read `{:error, _}` (and any raise)
+  # as `:ok`, so `erase_local/1` emitted `:local_erased` and `purge/1` completed with every local
+  # file still on disk. Now it logs, emits `[:fathom, :tenants, :local_erase_failed]`, and returns
+  # the error. `:enoent` is a success: no data dir means no local files.
   defp rm_local(id) do
     dir = Fathom.Shard.data_dir()
     prefix = Path.basename(Fathom.Shard.db_path(id))
@@ -862,13 +874,30 @@ defmodule Fathom.Tenants do
             String.starts_with?(name, prefix),
             do: Fathom.FS.rm(Path.join(dir, name))
 
-      {:error, _} ->
         :ok
-    end
 
-    :ok
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        local_erase_failed(id, reason)
+    end
   rescue
-    _ -> :ok
+    e -> local_erase_failed(id, e)
+  end
+
+  defp local_erase_failed(id, reason) do
+    Logger.error(
+      "tenant #{id}: local erase skipped, data dir listing failed (#{inspect(reason)}); " <>
+        "local files may remain"
+    )
+
+    :telemetry.execute([:fathom, :tenants, :local_erase_failed], %{count: 1}, %{
+      shard_id: id,
+      reason: reason
+    })
+
+    {:error, {:local_erase, reason}}
   end
 
   defp note_remote_holder(id) do

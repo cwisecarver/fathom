@@ -1111,6 +1111,11 @@ defmodule Fathom.Telemetry do
         description:
           "Per-node local erases of a tombstoned tenant's coordinator and <id>.db* files (expert review 2026-10-15 #3). One per node per delete, plus the boot sweep's finds; a node that never reports one for a delete still holds the tenant's data"
       ),
+      counter("fathom.tenants.local_erase_failed.count",
+        event_name: [:fathom, :tenants, :local_erase_failed],
+        description:
+          "Local erases that did NOT happen because the data dir could not be listed (rv8 F7) — the tombstoned tenant's <id>.db* files may still be on this node. The boot sweep re-runs every tombstoned id and DeleteJob retries; a non-zero count is a node whose data dir is unreadable"
+      ),
       counter("fathom.tenants.purge_while_held.count",
         event_name: [:fathom, :tenants, :purge_while_held],
         description:
