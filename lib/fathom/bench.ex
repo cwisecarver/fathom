@@ -3838,7 +3838,11 @@ defmodule Fathom.Bench do
       put_env_scoped(:shard_load, true),
       put_env_scoped(:metrics_collector, true),
       put_env_scoped(:shard_flush_interval_ms, 300_000),
-      put_env_scoped(:shard_idle_ms, 600_000)
+      put_env_scoped(:shard_idle_ms, 600_000),
+      # Prod config turns replication on, but the bench starts no replication supervisor, so a
+      # coordinator write raises "unknown registry: ...SessionRegistry" (the round-7 hrana_sdk_rt
+      # crash, 1d7b73a4). This arm measures the idle coordinator, not A2.
+      put_env_scoped(:replication_enabled, false)
     ]
 
     # Coordinators in heartbeat mode subscribe to the lapse topic; without the PubSub they log a
