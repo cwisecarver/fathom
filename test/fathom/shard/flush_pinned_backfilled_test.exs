@@ -28,6 +28,8 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
       writer ran nonstop, but a nonstop writer never lets a pin find the WAL backfilled, so the
       route went unexercised; with the bursty writer it needs to exercise the route, the weakened
       guard passed 4 of 4 runs. The deterministic reader test above is what the guard rests on.
+      Every third round quiesces the writer, so the route is exercised deterministically rather
+      than by luck of the writer's gaps (which never lined up on a slow CI runner).
 
   Not async: telemetry handlers and app env are global.
   """
@@ -170,6 +172,14 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
       {:written, from} ->
         send(from, {:written, i})
         write_loop(raw, i, test_pid)
+
+      # Quiesce BETWEEN commits (this receive only runs between inserts) until `:resume`.
+      {:pause, from} ->
+        send(from, {:paused, i})
+
+        receive do
+          :resume -> write_loop(raw, i, test_pid)
+        end
     after
       0 ->
         {:ok, _} = Connection.query(raw, "INSERT INTO t VALUES (?1, zeroblob(500))", [i])
@@ -280,23 +290,51 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
 
         assert_receive {:writer_ready, ^writer}, 5_000
 
+        # Every third round the writer is QUIESCED for the flush, so that round deterministically
+        # reaches the pin on a fully backfilled WAL (the flush's own pre-pin PASSIVE folds every
+        # frame, and nothing commits after it) and must take `:pinned_live`. The route used to be
+        # reached only by luck of the bursty writer's gaps: on a slow 2-core CI runner all 30
+        # rounds took `:vacuum` (CI run 39889287951, OTP 29), and the route assertion failed while
+        # the invariant this test guards held. The other rounds still flush under a live writer.
         results =
           for round <- 1..30 do
+            quiet? = rem(round, 3) == 0
             # Mark the shard dirty through the executor (the flush is write-gated).
             {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO u VALUES (?1)", [round]))
-            send(writer, {:written, self()})
-            assert_receive {:written, floor}, 5_000
+
+            floor =
+              if quiet? do
+                send(writer, {:pause, self()})
+                assert_receive {:paused, next}, 5_000
+                next
+              else
+                send(writer, {:written, self()})
+                assert_receive {:written, next}, 5_000
+                next
+              end
+
             flush!(coordinator)
+            if quiet?, do: send(writer, :resume)
             rows = object_rows(id)
             k = length(rows)
             assert rows == Enum.to_list(1..k//1), "round #{round}: object is not a prefix"
             assert k >= floor - 1, "round #{round}: object (#{k}) older than the pre-flush state"
 
-            receive do
-              {:route, route} -> route
-            after
-              0 -> flunk("round #{round}: no flush route reported")
-            end
+            route =
+              receive do
+                {:route, route} -> route
+              after
+                0 -> flunk("round #{round}: no flush route reported")
+              end
+
+            if quiet?,
+              do:
+                assert(
+                  route == :pinned_live,
+                  "round #{round}: a quiesced writer's flush took #{inspect(route)}"
+                )
+
+            route
           end
 
         send(writer, :stop)

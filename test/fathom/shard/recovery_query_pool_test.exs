@@ -66,7 +66,7 @@ defmodule Fathom.Shard.RecoveryQueryPoolTest do
 
   # `script.(shard_id, conn_no, query_no)` returns the actions to take for one query:
   # `:answer` (a definite position naming this conn and query), `{:sleep, ms}`, `{:raw, iodata}`
-  # (sent as is), `:stray` (an extra answer nobody asked for), or `:close`.
+  # (sent as is), `:answer_with_stray` (an answer trailed by an extra one nobody asked for), or `:close`.
   defp start_peer(script, port \\ 0) do
     test = self()
 
@@ -149,8 +149,22 @@ defmodule Fathom.Shard.RecoveryQueryPoolTest do
       :answer ->
         _ = :gen_tcp.send(sock, Protocol.encode_position(shard, pos(conn * 1000 + q)))
 
-      :stray ->
-        _ = :gen_tcp.send(sock, Protocol.encode_position(shard, pos(9_999)))
+      # The answer and a stray in ONE write, so the stray reaches the asker's socket no later than
+      # the answer it trails. A second write would not: the peer's `send` returning says nothing
+      # about when those bytes arrive (Nagle holds a small segment behind an unacked one,
+      # and a loaded host defers loopback delivery), so a test that waited for `{:stray_sent, _}`
+      # could still ask again before the stray landed. Framed by hand: `packet: 4` adds one header
+      # per `send`.
+      :answer_with_stray ->
+        frames =
+          for off <- [conn * 1000 + q, 9_999] do
+            bin = IO.iodata_to_binary(Protocol.encode_position(shard, pos(off)))
+            <<byte_size(bin)::32, bin::binary>>
+          end
+
+        :ok = :inet.setopts(sock, packet: :raw)
+        _ = :gen_tcp.send(sock, frames)
+        :ok = :inet.setopts(sock, packet: 4)
         send(test, {:stray_sent, conn})
 
       {:sleep, ms} ->
@@ -345,9 +359,16 @@ defmodule Fathom.Shard.RecoveryQueryPoolTest do
     test "a stray frame on an idle pooled socket discards it" do
       start_pool(1)
 
+      # One write (`:answer_with_stray`): once the asker has read the answer, the stray is already
+      # in its socket, which is the state this test is about. It used to be `[:answer, :stray]`, two
+      # writes, and failed on both CI legs (run 39889287951) with 9999: the stray was still in
+      # flight when the pool's zero-timeout idle check ran, so it read as the second ask's answer.
+      # That window is not a pool bug: a zero-timeout `recv` cannot see bytes not yet delivered, and
+      # the query frame has no request id. What the pool guarantees is that a frame ALREADY waiting
+      # discards the socket, and that a real follower never sends one.
       peer =
         start_peer(fn
-          _s, 1, 1 -> [:answer, :stray]
+          _s, 1, 1 -> [:answer_with_stray]
           _s, _c, _q -> [:answer]
         end)
 

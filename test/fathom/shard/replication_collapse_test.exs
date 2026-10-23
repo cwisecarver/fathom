@@ -191,7 +191,12 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
       end
     end)
     |> Enum.find(&is_boolean/1)
-    |> assert("the released follower's reply never settled")
+    |> assert(
+      "the released follower's reply never settled: " <>
+        inspect(
+          Map.take(:sys.get_state(session), [:inflight, :inflight_at, :followers, :seeding])
+        )
+    )
   end
 
   defp await_queue!(pid, n, timeout \\ 3_000) do
@@ -788,6 +793,13 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     # seed can land in a second. Then the commit under test starts a fresh seed for `c`.
     _ = Session.commit(id, wal, coordinator)
     session = session!(id)
+    # Let that commit's straggler settle first. Its quorum is impossible as soon as the dead
+    # follower and `c` refuse, so `a`'s ack can still be outstanding when it returns. On a slow CI
+    # runner it was still outstanding ~900 ms later (CI run 39889287951, OTP 28): the commit under
+    # test then SKIPPED `a` as in flight, that skip and the dead follower made its quorum impossible
+    # before `c` answered, and no seed was started (log: `[disconnected, already_in_flight]` then
+    # `[already_in_flight, already_in_flight]`; reproduced by pausing `a`'s replies).
+    await_no_inflight!(session)
     :sys.replace_state(session, &%{&1 | seed_rate: 0.001, seeding: %{}})
 
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
