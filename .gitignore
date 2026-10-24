@@ -80,3 +80,9 @@ deploy/chaos/lb-runtime/*.applied
 # Dialyzer PLTs. Kept in priv/ rather than _build so `rm -rf _build` does not throw away a
 # ~10-20 minute build; machine- and OTP-specific, so never committed.
 /priv/plts/
+
+# Jepsen (jepsen/fathom): lein build output and per-run result stores.
+/jepsen/fathom/target/
+/jepsen/fathom/store/
+/jepsen/fathom/.lein-*
+/jepsen/fathom/.nrepl-port
