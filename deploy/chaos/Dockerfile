@@ -66,7 +66,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/fathom/native/fathom_udf/target \
     mix compile
-# Downloads the tailwind/esbuild binaries on first run, builds + digests assets
+# Fetch the tailwind binary with curl first, so `tailwind.install --if-missing` finds it and skips
+# its own download. GitHub's release redirect now carries a ~9 KB header line (2026-10-24: 11.5 KB
+# of headers in all), past the 10 KB cap of the httpc client mix tailwind uses, which fails the
+# build with `header_too_long`. The path and URL are the ones `Tailwind.bin_path/0` and its default
+# base URL produce on a glibc linux host; the version is the one config.exs pins.
+RUN TW_VER=$(grep -A1 'config :tailwind' config/config.exs | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') && \
+    TW_ARCH=$(uname -m | sed -e 's/aarch64/arm64/' -e 's/x86_64/x64/') && \
+    curl -fsSL -o "_build/tailwind-linux-$TW_ARCH-$TW_VER" \
+      "https://github.com/tailwindlabs/tailwindcss/releases/download/v$TW_VER/tailwindcss-linux-$TW_ARCH" && \
+    chmod +x "_build/tailwind-linux-$TW_ARCH-$TW_VER"
+# Downloads the esbuild binary on first run, builds + digests assets
 # (config/prod.exs expects priv/static/cache_manifest.json at endpoint boot).
 RUN mix assets.setup && mix assets.deploy
 
