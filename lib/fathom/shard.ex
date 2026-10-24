@@ -1015,7 +1015,7 @@ defmodule Fathom.Shard do
           lease,
           etag1,
           lineage,
-          local_writes? and verdict == :ok,
+          local_writes? and verdict == :ok and not took_from_another_holder?(lease),
           head,
           prefetch
         )
@@ -1342,6 +1342,28 @@ defmodule Fathom.Shard do
   # 2026-10-17 #1): a peer that held the shard while we opened can flush and clean-release (which
   # DELETES the lock) between our speculative GET and our create, so the pull holds the pre-flush
   # object. See `cold_fresh_check/5` for what that costs and what it still leaves open.
+  # A WARM LOCAL IS NOT THE NEWEST HISTORY WHEN THE LEASE CAME FROM ANOTHER HOLDER (Jepsen
+  # 2026-10-24, `WarmTakeoverPromoteTest`). Promote-on-open skips a warm local (2026-09-18 #1) on
+  # the argument that no replica can be ahead of this node's own former-primary file. That holds only
+  # if nobody else owned the shard since. Jepsen: fathom4's flush landed and it released; fathom3
+  # took over, promoted exactly those bytes, and acked 5,044 writes it never managed to flush (MinIO
+  # paused); fathom4 stole the shard back, found its local copy byte-identical to the object (so
+  # `Fork.resolve` correctly saw no fork), opened WARM, skipped the promotion, and served without
+  # fathom3's quorum-acked writes, which its own replica table was holding. Whenever the lease was
+  # stolen from another NODE (`:prev_owner` names one), the promotion decision runs. It only
+  # promotes a replica strictly ahead of the object, so a local that equals the object loses
+  # nothing, and a reclaim of this node's own lock (no `:prev_owner`) is unchanged.
+  #
+  # NOT for a released marker (`Storage.released_owner/0`). A clean marker records that the
+  # visitors since wrote nothing (the touch provenance, 2026-10-12 #10), so the warm local IS the
+  # newest history, and running the decision there would refuse a safe open whenever peers are
+  # short (`RefusedOpenUnderQuorumTest` pins serving it). Known gap, not covered: a holder that
+  # wrote and then released DIRTY, over an object whose bytes still equal this node's flush.
+  defp took_from_another_holder?(%{prev_owner: prev}) when is_binary(prev),
+    do: prev != Storage.released_owner()
+
+  defp took_from_another_holder?(_lease), do: false
+
   defp revalidate_takeover(shard_id, path, lease, etag, warm?, head) do
     cond do
       # Round-2 #19 (merged M15): a NON-takeover warm open must ALSO re-check its

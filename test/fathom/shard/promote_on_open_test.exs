@@ -798,6 +798,138 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     assert open_and_read(id) == Enum.to_list(1..10)
   end
 
+  # Jepsen 2026-10-24 (16 shards, MinIO pauses): fathom4 flushed and released; fathom3 took over,
+  # promoted exactly those bytes, and acked 5,044 writes it never flushed; fathom4 stole the shard
+  # back with a local copy byte-identical to the object, so `Fork.resolve` correctly saw no fork,
+  # the open went WARM, promote-on-open skipped (a warm local "cannot be behind a replica"), and
+  # fathom3's quorum-acked writes, held in fathom4's own replica table, were never served. The
+  # invariant: a lease taken from ANOTHER holder never lets a warm local pre-empt a replica that is
+  # strictly ahead of the object.
+  test "a takeover from another holder promotes past a warm local that equals the object", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :replication_recover_from_peers, true)
+
+    # Rows 1..3 flushed, 1..10 on disk; the replica holds all ten, ahead of the object.
+    {conn, coordinator} = build_shard(id, 10, 3)
+    assert {:ok, stamp} = Storage.object_position(id)
+
+    install_replica(id, %{
+      epoch: stamp.epoch,
+      wal_gen: stamp.wal_gen,
+      wal_ordinal: stamp.wal_ordinal,
+      offset: stamp.offset + 1
+    })
+
+    own_lease = :sys.get_state(coordinator).lease
+    tear_down_primary(id, conn, coordinator)
+
+    # THIS node's warm local: the stored object's own bytes, with a sidecar naming its etag.
+    path = Fathom.Shard.db_path(id)
+    assert {:ok, etag} = Storage.pull(id, path)
+    Fathom.Shard.Provenance.write(path, etag)
+
+    # ANOTHER holder took the shard in between and is gone: its lock, long expired.
+    :ok = Storage.release_lease(id, own_lease)
+    {:ok, _} = Storage.acquire_lease(id, "other-holder#1", -60_000)
+
+    assert open_and_read(id) == Enum.to_list(1..10),
+           "the takeover served its warm local (the object's rows) over a replica holding the " <>
+             "previous holder's acked writes"
+  end
+
+  # Jepsen 2026-10-24 (`--hard`, MinIO paused): a takeover chose a replica ahead of the stored
+  # object, the promotion's PUT timed out, and the open served the OLDER object. The acked tail was
+  # gone, and the new owner then wrote at a higher lineage that outranked every replica still
+  # holding it. A promotion that fails on a store error must refuse the open inside the
+  # under-quorum window, so the client retries and the retry runs recovery again.
+  test "a promotion that fails on a store error refuses the open instead of serving the object",
+       ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :replication_recover_from_peers, true)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+
+    {conn, coordinator} = build_shard(id, 10, 3)
+    assert {:ok, stamp} = Storage.object_position(id)
+
+    install_replica(id, %{
+      epoch: stamp.epoch,
+      wal_gen: stamp.wal_gen,
+      wal_ordinal: stamp.wal_ordinal,
+      offset: stamp.offset + 1
+    })
+
+    tear_down_primary(id, conn, coordinator)
+
+    # ONE unreachable peer at quorum 2. This node's own replica then meets the responder floor
+    # alone (needed = max(N - Q + 1, 1) = 1), so the decision is reached without a socket and the
+    # promotion runs, while `error_window/3` still sees a peer set and so has a window to refuse
+    # in. With NO peers it answers `:none` by design, and the test would measure nothing.
+    keys = [
+      :replication_followers,
+      :replication_quorum,
+      :replication_recovery_underquorum_window_ms,
+      :replication_recovery_refusal_ttl_ms
+    ]
+
+    prev = Map.new(keys, &{&1, Application.get_env(:fathom, &1)})
+
+    on_exit(fn ->
+      for {k, v} <- prev,
+          do:
+            if(is_nil(v),
+              do: Application.delete_env(:fathom, k),
+              else: Application.put_env(:fathom, k, v)
+            )
+
+      Fleet.publish([])
+    end)
+
+    Application.put_env(:fathom, :replication_followers, [{"dead1", "127.0.0.1", 1}])
+    Application.put_env(:fathom, :replication_quorum, 2)
+    Application.put_env(:fathom, :replication_recovery_underquorum_window_ms, 60_000)
+    Application.put_env(:fathom, :replication_recovery_refusal_ttl_ms, 0)
+    Fleet.publish([])
+    refute Recovery.peers() == [], "fixture: the peer set is what gives the refusal a window"
+
+    # The window's table is created by the `Fleet` supervisor in production. Without it the window
+    # lookup raises and `error_window/3` reads that as "expired", so the open would fall straight
+    # through to the object and the test would measure nothing.
+    Recovery.init_table()
+
+    # The table belongs to the test process and dies with it; delete the row only if it is still up.
+    on_exit(fn ->
+      if :ets.whereis(Recovery.UnderQuorumWindow) != :undefined,
+        do: :ets.delete(Recovery.UnderQuorumWindow, id)
+    end)
+
+    # The promotion's publish PUT fails the way a paused object store fails it.
+    Application.put_env(:fathom, :storage_fault, :flush)
+
+    {result, _log} = ExUnit.CaptureLog.with_log(fn -> ShardExecutor.open(id) end)
+
+    case result do
+      {:ok, served} ->
+        rows = rows(served)
+        ShardExecutor.close(served)
+
+        flunk(
+          "the open served the stored object (#{inspect(rows)}) after the promotion failed: the " <>
+            "replica's acked tail is lost, and this owner now writes over it at a higher lineage"
+        )
+
+      {:error, _} ->
+        :ok
+    end
+
+    # NOT asserted here: that the retry then recovers the tail. A failed publish leaves THIS node's
+    # replica fenced and torn on purpose (`Promote.stage/4`: it must refuse the deposed owner's
+    # pushes and wait for a re-seed), and this fixture's replica is the only copy. In a fleet the
+    # acked frames are on a quorum of followers, so the retry pulls them from a peer; the rig's
+    # Jepsen run is the end-to-end check for that half.
+  end
+
   # ONE DECISION READ PER COLD OPEN, NOT TWO (expert review 2026-10-01 perf #3). With shipping on,
   # `open_lineage` HEADs the object to derive this ownership's lineage, and the fleet path then
   # HEADed the SAME object again, back to back under the same lease with nothing served in

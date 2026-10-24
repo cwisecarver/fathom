@@ -9,10 +9,14 @@ defmodule Fathom.Shard.PromoteOnOpen do
   fence etag so far, and the lineage.
 
   `maybe_promote_replica/8` is the only decision entry point (the coordinator passes `warm?`, and a warm open
-  never promotes — see the head of that function). Every branch that is not a proven win returns
-  the caller's `etag` unchanged, so the ordinary open path is bit-for-bit what it was — including
-  every error, because a failed promotion must never fail an open (the stored-object path is still
-  correct, it just recovers less). `Promote.fresher?/2` is what makes it safe: a replica is promoted
+  never promotes — see the head of that function). Every branch that decides "nothing fresher"
+  returns the caller's `etag` unchanged, so the ordinary open path is bit-for-bit what it was. An
+  ERROR is different: an unreadable head, too few peer answers, or a promotion that fails after a
+  fresher replica was chosen leaves the decision unconfirmed, and serving the stored object then
+  drops quorum-acked writes. Those refuse the open for the under-quorum window
+  (`Recovery.error_window/3`) and fall back to the object only after it (Jepsen 2026-10-24: a
+  promotion failed on a MinIO pause, the open served the object, and the acked tail was lost for
+  good). `Promote.fresher?/2` is what makes it safe: a replica is promoted
   only when STRICTLY ahead of what the object claims, the object's claim never exceeds what it holds
   (a live flush stamps the position as of BEFORE its snapshot, `Position.snapshot_position/2`, so
   a replica holding acked writes the object lacks always wins — expert review 2026-10-15 #5; the
@@ -658,13 +662,26 @@ defmodule Fathom.Shard.PromoteOnOpen do
                     "(#{inspect(reason)}); refusing to serve a diverged local copy"
         end
       else
+        # A FAILED PROMOTION IS AN UNCONFIRMED DECISION, NOT A "NO" (Jepsen 2026-10-24,
+        # `PromoteOnOpenTest` "a promotion that fails on a store error refuses the open"). This
+        # used to log and serve the stored object, on the moduledoc's argument that the
+        # stored-object path "is still correct, it just recovers less". By here a replica was
+        # chosen as strictly ahead of the object, so "less" is quorum-acked writes, and this owner
+        # then writes over them at a higher lineage that outranks every replica still holding them.
+        # Jepsen hit it on a MinIO pause: the pre-promotion snapshot or the publish timed out, the
+        # takeover served the object, and the acked tail was gone for good.
+        #
+        # So it takes the same window as an unreadable decision head (expert review 2026-10-13 #15):
+        # refuse the open inside the under-quorum window, so the client retries and the retry runs
+        # recovery again, and fall back to the object, logged as an error, only after it. With no
+        # peers configured `error_window/3` answers `:none` and the open proceeds as before.
         {:error, reason} ->
           Logger.warning(
-            "shard #{shard_id}: replica promotion declined (#{inspect(reason)}); " <>
-              "opening from the stored object"
+            "shard #{shard_id}: replica promotion failed (#{inspect(reason)}); refusing the " <>
+              "open for the under-quorum window rather than serving the older stored object"
           )
 
-          etag
+          refuse_or_etag(Recovery.error_window(shard_id, {:promotion_failed, reason}), path, etag)
       end
     after
       Enum.each(["", "-wal", "-shm"], &Fathom.FS.rm(temp <> &1))
