@@ -726,9 +726,10 @@ defmodule Fathom.ShardLeaseReleaseTest do
     # path it was unbounded relative to when ownership was actually lost.
     #
     # The shard here is deliberately CLEAN — never written since open — which is exactly the state
-    # that used to make this invisible. The lapse is driven through the real handler, and
-    # `check_lease` is forced to a TRANSIENT error so `Fence.check/2` lands on `:skip`
-    # (`fence.ex`'s `{:error, _reason} -> :skip`), which is the cut-from-storage verdict.
+    # that used to make this invisible. The lapse is driven through the real handler, and the
+    # revalidation's lock renew (a `check_lease` read until Jepsen 2026-10-24) is forced to a
+    # TRANSIENT error so `Fence.check/2` lands on `:skip` (`fence.ex`'s
+    # `{:error, _reason} -> :skip`), which is the cut-from-storage verdict.
     test "the not-valid clock starts at the lapse even when the shard is CLEAN", %{shard: shard} do
       prev_jitter = Application.get_env(:fathom, :lapse_revalidate_jitter_ms)
       prev_fence = Application.get_env(:fathom, :fence_writes_when_stealable)
@@ -738,7 +739,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
       on_exit(fn ->
         restore_env(:lapse_revalidate_jitter_ms, prev_jitter)
         restore_env(:fence_writes_when_stealable, prev_fence)
-        Application.delete_env(:fathom, :faulty_check_lease_result)
+        Application.delete_env(:fathom, :faulty_renew_lease_result)
       end)
 
       seed!(shard, "read-mostly")
@@ -758,7 +759,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
       # steal, which is the cut-from-storage shape.
       Application.put_env(
         :fathom,
-        :faulty_check_lease_result,
+        :faulty_renew_lease_result,
         {:error, {:transient, :s3_unreachable}}
       )
 

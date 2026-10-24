@@ -15,8 +15,8 @@ defmodule Fathom.Shard.Fence do
     * **Heartbeat mode** (`acquire_gen` set): the node heartbeat proves liveness.
       `valid_for_write?/1` returns `:ok` (valid with margin AND no lapse since acquire
       ⇒ we still own it and it won't expire mid-write ⇒ write with no per-shard I/O),
-      `:revalidate` (a lapse happened ⇒ a steal may have occurred ⇒ re-check the lock
-      with a read-only `check_lease` and self-fence if superseded), or `:not_valid`
+      `:revalidate` (a lapse happened ⇒ a steal may have occurred ⇒ re-confirm the lock
+      with a fenced RENEW, a write, and self-fence if superseded), or `:not_valid`
       (not comfortably valid ⇒ don't write). If the heartbeat process is gone the check
       exits and we fall back to the legacy renew fence.
 
@@ -77,8 +77,18 @@ defmodule Fathom.Shard.Fence do
   end
 
   # A lapse happened since acquire; a steal may have occurred during the gap. Confirm
-  # ownership with a read-only lock check and refresh the generation so subsequent
+  # ownership by RENEWING the lock (a fenced PUT) and refresh the generation so subsequent
   # flushes don't revalidate again.
+  #
+  # A WRITE, NOT A READ (Jepsen 2026-10-24, `RevalidateCasTest`). This was a read-only
+  # `check_lease`. A steal is `get_lock` → heartbeat read → `put_lock If-Match <etag it read>`,
+  # and a read leaves the lock's etag where it was, so a thief that read the lock and a stale
+  # heartbeat during the lapse could still win its If-Match AFTER this check passed: the owner
+  # resumed acking writes and the thief took the shard, two writers on one shard. Jepsen hit it
+  # when MinIO froze for 22 s and came back. Renewing moves the etag, so a thief that read the lock
+  # before this 412s, and one that reads it after also reads the heartbeat after the owner renewed
+  # it and finds the owner live. One of the two wins, never both. The cost is a PUT instead of a GET
+  # per shard per lapse; `renew_lease` already resolves a 412 against this node's own write.
   defp revalidate(ctx, deps) do
     # Sample the generation BEFORE the ownership re-check, not after: a steal landing between
     # check_lease returning :ok and the generation read would otherwise be folded into the new
@@ -106,8 +116,8 @@ defmodule Fathom.Shard.Fence do
     # reason — that contrast is what shows the `nil` here was unintended rather than a decision.
     gen = generation(deps) || ctx.acquire_gen
 
-    case deps.check_lease.(ctx.id, ctx.lease) do
-      :ok -> {:ok, %{lease: ctx.lease, acquire_gen: gen}}
+    case deps.renew_lease.(ctx.id, ctx.lease, ctx.ttl_ms) do
+      {:ok, lease} -> {:ok, %{lease: lease, acquire_gen: gen}}
       {:error, :superseded} -> :superseded
       {:error, _reason} -> :skip
     end

@@ -91,9 +91,10 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
   # open rather than timing a fast one: with the GET in flight, the coordinator must still answer.
   # Pre-fix it cannot — it is inside `Fence.check/2` — and this times out.
   #
-  # `:faulty_check_lease` already exists for exactly this shape; its own comment says it was added
-  # to prove the flush's 412-reconcile runs off-process (review 2026-07-14 #8). This is the third
-  # inline round trip in the module, after the flush fence (#18) and the legacy renew PUT (#29).
+  # The hold is `FaultyStorage`'s `:faulty_renew_lease` hook: the revalidation renews the lock (Jepsen
+  # 2026-10-24). This was `:faulty_check_lease`, written to prove the flush's 412-reconcile runs
+  # off-process (review 2026-07-14 #8); this is the third inline round trip in the module, after the
+  # flush fence (#18) and the legacy renew PUT (#29).
   test "a lapse revalidation does not block the coordinator mailbox", %{shard: shard, hb: hb} do
     prev_storage = Application.get_env(:fathom, :shard_storage)
     Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
@@ -120,10 +121,13 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       end
     end
 
-    Application.put_env(:fathom, :faulty_check_lease, blocker)
+    # The revalidation RENEWS the lock now (a write, Jepsen 2026-10-24 `RevalidateCasTest`); it
+    # used to be a read-only `check_lease`, which this test originally held open. The invariant is
+    # the same: the coordinator stays responsive while the lapse re-check is in flight.
+    Application.put_env(:fathom, :faulty_renew_lease, blocker)
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_check_lease)
+      Application.delete_env(:fathom, :faulty_renew_lease)
 
       if prev_storage,
         do: Application.put_env(:fathom, :shard_storage, prev_storage),

@@ -124,6 +124,22 @@ defmodule Fathom.Test.FaultyStorage do
   def renew_lease(shard_id, lease, ttl_ms) do
     renew_delay()
 
+    # The heartbeat-mode lapse revalidation renews the lock (Jepsen 2026-10-24, `RevalidateCasTest`)
+    # where it used to call `check_lease`, so the two hooks tests used to hold or fail that re-check
+    # live here too: `:faulty_renew_lease` (a 0-arity fun run first, e.g. to block) and
+    # `:faulty_renew_lease_result` (a forced result).
+    case Application.get_env(:fathom, :faulty_renew_lease) do
+      fun when is_function(fun, 0) -> fun.()
+      _ -> :ok
+    end
+
+    case Application.get_env(:fathom, :faulty_renew_lease_result) do
+      nil -> modelled_renew(shard_id, lease, ttl_ms)
+      forced -> forced
+    end
+  end
+
+  defp modelled_renew(shard_id, lease, ttl_ms) do
     cond do
       fault() == :renew ->
         {:error, {:transient, :s3_unreachable}}

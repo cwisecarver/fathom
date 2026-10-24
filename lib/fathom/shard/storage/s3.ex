@@ -2986,9 +2986,19 @@ defmodule Fathom.Shard.Storage.S3 do
 
     # Carries the claim this lease wrote (#3): a renew rewrites the whole lock body, and dropping it
     # would let a later successor fall back to the fresh-create bound and collide with our lineage.
+    #
+    # The expiry strictly ADVANCES past the one we last wrote, so the body always changes. The etag
+    # is the body's MD5, and a lapse revalidation (`Fence.revalidate/2`) relies on this renew moving
+    # it so a concurrent steal's If-Match fails; a byte-identical renew in the same millisecond as
+    # the previous lock write would leave the etag, and the steal, where they were
+    # (`RevalidateCasTest`).
     renewed =
       Map.merge(
-        %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms},
+        %{
+          owner: owner,
+          epoch: epoch,
+          expires_at_ms: max(now + ttl_ms, Map.get(lease, :expires_at_ms, 0) + 1)
+        },
         Map.take(lease, [:claim])
       )
 

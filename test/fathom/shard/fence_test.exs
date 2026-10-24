@@ -39,15 +39,22 @@ defmodule Fathom.Shard.FenceTest do
       assert :skip = Fence.check(ctx(), d)
     end
 
-    test ":revalidate + still owned => proceed with a refreshed generation" do
+    # THE REVALIDATION RENEWS THE LOCK, A WRITE (Jepsen 2026-10-24, `RevalidateCasTest`). These
+    # :revalidate tests used to stub `check_lease` and assert the read-only check, which is what
+    # let a thief that read the lock during the lapse win its If-Match steal after the owner had
+    # resumed: two writers on one shard. A renew moves the lock etag, so one of the two wins.
+    # `check_lease` is left to fail the test if the fence ever goes back to reading.
+    test ":revalidate + still owned => renews the lock and proceeds with a refreshed generation" do
+      renewed = %{@lease | expires_at_ms: 2_000_000}
+
       d =
         deps(%{
           valid_for_write: fn _ -> :revalidate end,
-          check_lease: fn "shard_a", _lease -> :ok end,
+          renew_lease: fn "shard_a", @lease, 30_000 -> {:ok, renewed} end,
           generation: fn -> 9 end
         })
 
-      assert {:ok, %{lease: @lease, acquire_gen: 9}} = Fence.check(ctx(), d)
+      assert {:ok, %{lease: ^renewed, acquire_gen: 9}} = Fence.check(ctx(), d)
     end
 
     # A HEARTBEAT-PROCESS EXIT DURING REVALIDATE MUST NOT NULL THE GENERATION
@@ -67,7 +74,7 @@ defmodule Fathom.Shard.FenceTest do
       d =
         deps(%{
           valid_for_write: fn _ -> :revalidate end,
-          check_lease: fn "shard_a", _lease -> :ok end,
+          renew_lease: fn "shard_a", lease, 30_000 -> {:ok, lease} end,
           generation: fn -> exit(:noproc) end
         })
 
@@ -90,12 +97,12 @@ defmodule Fathom.Shard.FenceTest do
     end
 
     test ":revalidate + superseded => :superseded (self-fence, no {:ok,_})" do
-      # generation is sampled before check_lease (finding #5), so it's read even on this path.
+      # generation is sampled before the renew (finding #5), so it's read even on this path.
       d =
         deps(%{
           valid_for_write: fn _ -> :revalidate end,
           generation: fn -> 9 end,
-          check_lease: fn _id, _lease -> {:error, :superseded} end
+          renew_lease: fn _id, _lease, _ttl -> {:error, :superseded} end
         })
 
       assert :superseded = Fence.check(ctx(), d)
@@ -106,16 +113,16 @@ defmodule Fathom.Shard.FenceTest do
         deps(%{
           valid_for_write: fn _ -> :revalidate end,
           generation: fn -> 9 end,
-          check_lease: fn _id, _lease -> {:error, :timeout} end
+          renew_lease: fn _id, _lease, _ttl -> {:error, :timeout} end
         })
 
       assert :skip = Fence.check(ctx(), d)
     end
 
     # Finding #5: the revalidate baseline must be sampled BEFORE the ownership re-check. If
-    # generation is read after check_lease returns :ok, a steal landing in that gap is folded
+    # generation is read after the renew returns :ok, a steal landing in that gap is folded
     # into the refreshed baseline and hidden, so every later flush passes unconditionally.
-    test ":revalidate samples the generation before check_lease, not after" do
+    test ":revalidate samples the generation before the renew, not after" do
       calls = start_supervised!({Agent, fn -> [] end})
       record = fn tag -> Agent.update(calls, &[tag | &1]) end
 
@@ -123,11 +130,11 @@ defmodule Fathom.Shard.FenceTest do
         deps(%{
           valid_for_write: fn _ -> :revalidate end,
           generation: fn -> record.(:generation) && 9 end,
-          check_lease: fn "shard_a", _lease -> record.(:check_lease) && :ok end
+          renew_lease: fn "shard_a", lease, _ttl -> record.(:renew_lease) && {:ok, lease} end
         })
 
       assert {:ok, %{acquire_gen: 9}} = Fence.check(ctx(), d)
-      assert Enum.reverse(Agent.get(calls, & &1)) == [:generation, :check_lease]
+      assert Enum.reverse(Agent.get(calls, & &1)) == [:generation, :renew_lease]
     end
 
     test "heartbeat process down => falls back to the legacy renew fence" do
