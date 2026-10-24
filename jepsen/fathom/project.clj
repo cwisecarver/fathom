@@ -6,5 +6,5 @@
                  [jepsen "0.3.15"]
                  [clj-http "3.13.1"]
                  [cheshire "6.2.0"]]
-  :jvm-opts ["-Xmx4g" "-Djava.awt.headless=true"]
+  :jvm-opts ["-Xmx24g" "-Djava.awt.headless=true"]
   :repl-options {:init-ns jepsen.fathom})

@@ -293,7 +293,14 @@ services:
     # Raised rather than lowering POOL_SIZE per node: the pool size is what a production node
     # actually runs, and shrinking it would make every throughput scenario measure a topology
     # nobody deploys.
-    command: ["postgres", "-c", "max_connections=300"]
+    #
+    # TCP keepalives (Jepsen 2026-10-24): a fathom node that is SIGKILLed or cut off the network
+    # never closes its ~30 Repo connections, and with Linux's default keepalive (2 h) Postgres keeps
+    # every one. A few dozen kills used all 300 slots three minutes into a 30-minute Jepsen run, and
+    # every node's control plane then failed with `too many clients already` for the rest of it.
+    # Probing after 10 s idle and giving up after 3 x 5 s frees a dead node's slots in ~25 s.
+    command: ["postgres", "-c", "max_connections=300", "-c", "tcp_keepalives_idle=10",
+              "-c", "tcp_keepalives_interval=5", "-c", "tcp_keepalives_count=3"]
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres

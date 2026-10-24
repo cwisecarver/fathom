@@ -116,7 +116,18 @@
 (defn disconnect! [node] (docker! "network" "disconnect" network (cname node)))
 ;; --alias: without it the reconnected container has no DNS name and peers
 ;; dialling "<node>" get nxdomain (chaos.sh revive, 2026-10-13).
-(defn connect! [node] (docker! "network" "connect" "--alias" node network (cname node)))
+(defn log-ip!
+  "Logs the node's current address. A reconnect can hand a node a new IP, and the
+  LB's X-Fathom-Upstream header (recorded as :served-by) names an IP, so this
+  log is how an op is traced back to a node."
+  [node]
+  (info "ip" node (docker! "inspect" "-f"
+                           (str "{{(index .NetworkSettings.Networks \"" network "\").IPAddress}}")
+                           (cname node))))
+
+(defn connect! [node]
+  (docker! "network" "connect" "--alias" node network (cname node))
+  (log-ip! node))
 
 (defn kill! [node] (disconnect! node) (docker! "kill" (cname node)))
 ;; `docker start` keeps the env the container was created with, so a revived
@@ -207,7 +218,7 @@
 
 (defrecord RigNemesis [active]
   nemesis/Nemesis
-  (setup! [this test] this)
+  (setup! [this test] (doseq [n (:nodes test)] (log-ip! n)) this)
   (invoke! [this test op]
     (case (:f op)
       :start (if-let [[f nodes :as fault] (pick-fault test @active)]

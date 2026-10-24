@@ -135,7 +135,12 @@
       (track-keys! test k txn)
       (try+
         (let [resp (pipeline! test via node shard batch)
-              body (try (json/parse-string (:body resp) true) (catch Exception _ nil))]
+              body (try (json/parse-string (:body resp) true) (catch Exception _ nil))
+              ;; Who served it: the client's own node when direct, nginx's upstream address
+              ;; (deploy/chaos/nginx.conf) through the LB. Recorded on every completion.
+              op   (assoc op :via via :served-by (if (= :direct via)
+                                                    node
+                                                    (get-in resp [:headers "x-fathom-upstream"])))]
           (if (= 200 (:status resp))
             (let [r (first (:results body))]
               (if (= "ok" (:type r))

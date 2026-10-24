@@ -64,6 +64,17 @@ fi
 start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 lein run test "$@"
 rc=$?
+
+# Keep every node's log with the run. `chaos.sh down` deletes the containers and their logs with
+# them, which is how the evidence for one anomaly was lost on 2026-10-24.
+store=$(ls -td store/*/20* 2>/dev/null | head -1)
+if [ -n "$store" ]; then
+  mkdir -p "$store/node-logs"
+  for c in fathom1 fathom2 fathom3 fathom4 fathom5 postgres minio; do
+    "$DOCKER" logs -t "fathom-chaos-$c-1" >"$store/node-logs/$c.log" 2>&1
+  done
+  echo "node logs saved to $store/node-logs"
+fi
 steps=0
 for n in 1 2 3 4 5; do
   c=$("$DOCKER" logs --since "$start" "fathom-chaos-fathom$n-1" 2>&1 | grep -c 'clock lags the store')
