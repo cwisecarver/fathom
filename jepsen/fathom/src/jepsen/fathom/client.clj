@@ -22,13 +22,23 @@
   {"fathom1" 18081 "fathom2" 18082 "fathom3" 18083 "fathom4" 18084 "fathom5" 18085})
 
 (defn base-url
-  "Where a client bound to `node` sends requests. :lb goes through nginx, which
-  routes each shard to its one owner; :direct goes to the node itself, so ops
-  land on non-owners too and exercise the lease refusal and steal paths."
-  [test node]
-  (case (:target test)
+  "Where a client sends requests. :lb goes through nginx, which routes each
+  shard to its one owner; :direct goes to the client's node itself, so ops land
+  on non-owners too and exercise the lease refusal and steal paths."
+  [test via node]
+  (case via
     :lb     (str "http://localhost:" (:lb-port test))
     :direct (str "http://localhost:" (direct-ports node))))
+
+(def ^:private opened (atom 0))
+
+(defn- via-for
+  "The target this client uses. :mixed alternates clients between the LB and
+  their own node, so owner-routed and non-owner traffic hit a shard at once."
+  [test]
+  (case (:target test)
+    :mixed (if (even? (swap! opened inc)) :lb :direct)
+    (:target test)))
 
 (defn- stmt
   ([sql] {:sql sql})
@@ -95,8 +105,8 @@
       :else                                   [:info (or (some :message step_errors) :unknown)])))
 
 (defn pipeline!
-  [test node shard batch]
-  (http/post (str (base-url test node) "/v2/pipeline")
+  [test via node shard batch]
+  (http/post (str (base-url test via node) "/v2/pipeline")
              {:headers            {"Host" (str shard "." domain)}
               :content-type       :json
               :body               (json/generate-string
@@ -108,16 +118,23 @@
 
 (defn shard-name [test k] (str (:shard-prefix test) "-" k))
 
-(defrecord AppendClient [node]
+(defn track-keys!
+  "Remembers every key a shard's transactions touched, for the final reads."
+  [test k txn]
+  (when-let [tracker (:key-tracker test)]
+    (swap! tracker update k (fnil into (sorted-set)) (map second txn))))
+
+(defrecord AppendClient [node via]
   client/Client
-  (open! [this test node] (assoc this :node node))
+  (open! [this test node] (assoc this :node node :via (via-for test)))
   (setup! [this test])
   (invoke! [this test op]
     (let [[k txn] (:value op)
           shard   (shard-name test k)
           batch   (txn->batch txn)]
+      (track-keys! test k txn)
       (try+
-        (let [resp (pipeline! test node shard batch)
+        (let [resp (pipeline! test via node shard batch)
               body (try (json/parse-string (:body resp) true) (catch Exception _ nil))]
           (if (= 200 (:status resp))
             (let [r (first (:results body))]
@@ -144,4 +161,4 @@
   (teardown! [this test])
   (close! [this test]))
 
-(defn client [] (->AppendClient nil))
+(defn client [] (->AppendClient nil nil))

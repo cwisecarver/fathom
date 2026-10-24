@@ -19,7 +19,21 @@
             [jepsen.fathom.client :as fclient]
             [jepsen.fathom.nemesis :as fnemesis]))
 
-(def all-faults #{:kill :pause :isolate :s3-cut})
+(def all-faults (into fnemesis/node-faults fnemesis/solo-faults))
+(def default-faults #{:kill :pause :isolate :s3-cut})
+
+(defrecord FinalReads [tracker]
+  ;; Reads back every key each shard ever touched, after the faults are healed,
+  ;; the way Bufstream's final-read phase rewound consumers to offset 0: a lost
+  ;; append on a key the workload had already retired is otherwise invisible.
+  ;; Built when first asked, so it sees the whole run's keys.
+  gen/Generator
+  (op [_ test ctx]
+    (gen/op (for [[k ks] (sort @tracker)
+                  chunk  (partition-all 8 ks)]
+              {:f :txn :value (independent/tuple k (mapv (fn [key] [:r key nil]) chunk))})
+            test ctx))
+  (update [this _ _ _] this))
 
 (defn workload
   [opts]
@@ -40,16 +54,20 @@
   (let [w        (workload opts)
         quiet    (:quiet-period opts)
         faulty   (max 0 (- (:time-limit opts) quiet))
+        faults   (fnemesis/generator (:nemesis-interval opts))
+        faults   (if (:hard opts) (fnemesis/hard-generator) faults)
         nem-gen  (if (seq (:faults opts))
-                   (gen/phases (gen/time-limit faulty (fnemesis/generator (:nemesis-interval opts)))
+                   (gen/phases (gen/time-limit faulty faults)
                                {:type :info :f :stop})
-                   nil)]
+                   nil)
+        tracker  (atom {})]
     (merge tests/noop-test
            opts
            {:name         (str "fathom-" (name (:target opts)) "-"
-                               (if (seq (:faults opts))
-                                 (str/join "+" (map name (sort (:faults opts))))
-                                 "none"))
+                               (cond
+                                 (:hard opts)         "hard"
+                                 (seq (:faults opts)) (str/join "+" (map name (sort (:faults opts))))
+                                 :else                "none"))
             ;; The rig's fixed fleet; the client-thread count must be a
             ;; multiple of threads-per-shard for concurrent-generator.
             :nodes        ["fathom1" "fathom2" "fathom3" "fathom4" "fathom5"]
@@ -58,32 +76,43 @@
             :db           db/noop
             :ssh          {:dummy? true}
             :shard-prefix (str "jep" (quot (System/currentTimeMillis) 1000))
+            :key-tracker  tracker
             :client       (fclient/client)
             :nemesis      (fnemesis/nemesis)
             :checker      (checker/compose
                             {:append     (:checker w)
                              :stats      (checker/stats)
                              :exceptions (checker/unhandled-exceptions)})
-            :generator    (gen/time-limit
-                            (:time-limit opts)
-                            (gen/nemesis nem-gen
-                                         (->> (:generator w)
-                                              (gen/stagger (/ (:rate opts))))))})))
+            :generator    (gen/phases
+                            (gen/time-limit
+                              (:time-limit opts)
+                              (gen/nemesis nem-gen
+                                           (->> (:generator w)
+                                                (gen/stagger (/ (:rate opts))))))
+                            ;; Heal anything still active, then read everything back.
+                            (gen/nemesis {:type :info :f :stop})
+                            (gen/clients (->FinalReads tracker)))})))
 
 (defn parse-faults [s]
-  (if (#{"" "none"} s)
-    #{}
-    (set (map keyword (str/split s #",")))))
+  (cond
+    (#{"" "none"} s) #{}
+    (= "all" s)      all-faults
+    :else            (set (map keyword (str/split s #",")))))
 
 (def cli-opts
   [[nil "--target TARGET" ":lb (through nginx, like a real client) or :direct (random node, forces lease contention)"
     :default :lb
     :parse-fn keyword
-    :validate [#{:lb :direct} "must be lb or direct"]]
-   [nil "--faults LIST" "Comma list of kill,pause,isolate,s3-cut, or none"
-    :default all-faults
+    :validate [#{:lb :direct :mixed} "must be lb, direct or mixed"]]
+   [nil "--faults LIST" (str "Comma list of " (str/join "," (sort (map name all-faults))) ", all, or none")
+    :default default-faults
     :parse-fn parse-faults
     :validate [#(every? all-faults %) "unknown fault"]]
+   [nil "--hard" "Shifting fault combinations (up to --max-concurrent-faults at once, 3-30 s each) instead of one fault per interval"
+    :default false]
+   [nil "--max-concurrent-faults N" "With --hard: faults allowed active at once"
+    :default 2
+    :parse-fn parse-long]
    [nil "--nemesis-interval SECS" "Seconds each fault lasts, and the gap between faults"
     :default 20
     :parse-fn parse-long]

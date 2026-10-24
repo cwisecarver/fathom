@@ -69,7 +69,9 @@ for n in 1 2 3 4 5; do
   c=$("$DOCKER" logs --since "$start" "fathom-chaos-fathom$n-1" 2>&1 | grep -c 'clock lags the store')
   steps=$((steps + c))
 done
-if [ "$steps" -gt 0 ]; then
+if [ "$steps" -gt 0 ] && [[ " $* " == *clock-* || " $* " == *"faults all"* ]]; then
+  echo "($steps 'clock lags the store' lines: expected, this run jumps the clock on purpose)"
+elif [ "$steps" -gt 0 ]; then
   echo "*** RUN INVALID: $steps 'clock lags the store' lines in node logs — colima clock stepped."
   exit 2
 fi
