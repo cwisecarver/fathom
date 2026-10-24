@@ -1849,6 +1849,7 @@ defmodule Fathom.Shard do
   # (`release/2`), so a later read-only checkout gets the optimisation back.
   def handle_cast(:became_dirty, state) do
     state = %{sync_sidecar_once(state) | wrote_during_checkout?: true}
+    stamp_first_write(state)
 
     if state.flush_timer == nil or state.flush_timer_slow? do
       {:noreply, schedule_flush(state)}
@@ -4859,6 +4860,28 @@ defmodule Fathom.Shard do
   end
 
   defp stamp_on_open(state, _head, _promoted?), do: state
+
+  # THE NO-OBJECT HALF OF THE STAMPING FLUSH (Jepsen 2026-10-24, `jepsen/fathom` direct
+  # pause+kill). `stamp_on_open/3` skips a shard with NO object, and so did everything else: a
+  # brand-new shard's first object waited for the first periodic tick, up to a whole
+  # `SHARD_FLUSH_INTERVAL_MS`. In that window there is no stamp to beat, `fresher?(_, nil)` is
+  # false, and `rankable_stamp?(nil)` skips the fleet ask, so a survivor served the shard EMPTY
+  # while three peers held its quorum-acked writes. On a replicating shard with no object
+  # (`etag == nil`), the first write flushes at once; that publish carries this lineage's stamp, and
+  # every later frame ranks above it.
+  #
+  # AT THE FIRST WRITE, not at the open like `stamp_on_open/3`: with no object there is nothing to
+  # protect until something is written, and stamping at open would PUT an empty database for every
+  # read-only probe of a shard id that never existed. What remains is the window between the first
+  # acked write and this PUT landing (one object-store round trip) instead of a whole interval.
+  # A flush already in flight is not stacked (`:durability_flush` reschedules), and a failed PUT
+  # leaves `etag` nil, so the next stream's first write asks again.
+  defp stamp_first_write(%{etag: nil, lineage: lineage}) when is_integer(lineage) do
+    if Fleet.replicating?(), do: send(self(), :durability_flush)
+    :ok
+  end
+
+  defp stamp_first_write(_state), do: :ok
 
   # `:infinity` IS DELIBERATE (perf review 2026-10-21 #6, probed and kept). Every step inside the
   # head task carries its own bound (Req's timeouts on the HEAD, the ask's connect/query timeouts,
