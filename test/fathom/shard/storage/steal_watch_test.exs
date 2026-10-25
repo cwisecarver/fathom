@@ -182,6 +182,25 @@ defmodule Fathom.Shard.Storage.StealWatchTest do
            "the watch is an AND with the store-clock rule, never a replacement"
   end
 
+  # `./chaos.sh rpo`, 2026-10-25: the first version of the watch also gated a RELEASED marker, so a
+  # shard its holder had cleanly let go of answered "temporarily owned by another node" to every
+  # other node for a whole window — every rebalance and idle handoff, 35 s in prod. A release is the
+  # holder's own statement, not a clock reading, so it is taken on the first look.
+  test "a released marker is taken on the first look, with no watch" do
+    owner_now = Storage.now_ms()
+    store = start_store(owner_now, owner_now + 30_000, owner_now + 30_000)
+
+    put_object(
+      store,
+      @lock_key,
+      Storage.encode_lease(Storage.released_marker(%{epoch: 5}, nil))
+    )
+
+    assert {:ok, %{took_over: true, epoch: 6}} =
+             S3.acquire_lease(@shard, "next@node#inc2", 30_000),
+           "a cleanly released shard waited out the steal watch"
+  end
+
   test "the default window is the lease TTL plus the steal margin" do
     Application.delete_env(:fathom, :steal_watch_ms)
     Application.put_env(:fathom, :steal_margin_ms, 5_000)

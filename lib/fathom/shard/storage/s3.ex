@@ -2865,10 +2865,18 @@ defmodule Fathom.Shard.Storage.S3 do
   # below trusts the owner's wall clock to agree with S3's within the margin, so the hold is also
   # live until this node has itself seen it unchanged for a whole `Storage.steal_watch_window_ms/0`.
   # See `Storage.steal_watch_remaining_ms/2` for why that holds with any clocks. The proven-dead
-  # previous-incarnation fast path is exempt: it is this node's own frozen-expiry proof.
+  # previous-incarnation fast path is exempt: it is this node's own frozen-expiry proof. So is a
+  # released marker: the holder wrote it to say it let go, and no clock decides that. Gating it made
+  # every clean cross-node handoff wait a whole window (35 s in prod), which `./chaos.sh rpo` caught
+  # on 2026-10-25 as a "shard temporarily owned by another node" on a shard nobody held.
   defp stealable_at(shard_id, other, now, lock_expires_at_ms, lock_fp) do
+    released = Storage.released_owner()
+
     case store_clock_stealable_at(shard_id, other, now, lock_expires_at_ms) do
       {:ok, at, ref_now, :fast_steal} ->
+        {:ok, at, ref_now}
+
+      {:ok, at, ref_now, _hb_fp} when other == released ->
         {:ok, at, ref_now}
 
       {:ok, at, ref_now, hb_fp} ->
