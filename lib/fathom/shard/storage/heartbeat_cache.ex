@@ -153,6 +153,8 @@ defmodule Fathom.Shard.Storage.HeartbeatCache do
     # right owner because it is the one always-on process on the S3 steal path: Fleet is started only
     # when replication is on, and Heartbeat is disabled in test.
     :ok = Fathom.Shard.Storage.init_quiescence_table()
+    # And of the clock-free steal watch (Jepsen finding 3, 2026-10-24), for the same reason.
+    :ok = Fathom.Shard.Storage.init_steal_watch_table()
     {:ok, %{}}
   end
 end

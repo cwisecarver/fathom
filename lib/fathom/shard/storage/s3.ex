@@ -2543,8 +2543,8 @@ defmodule Fathom.Shard.Storage.S3 do
     now = Storage.now_ms()
 
     case get_lock(shard_id) do
-      {:ok, %{owner: other, expires_at_ms: lock_exp}, _etag} ->
-        case owner_live?(shard_id, other, now, lock_exp) do
+      {:ok, %{owner: other, expires_at_ms: lock_exp} = lock, etag} ->
+        case owner_live?(shard_id, other, now, lock_exp, lock_fingerprint(lock, etag)) do
           :live -> {:held, other}
           :dead -> :free
           {:error, reason} -> {:error, reason}
@@ -2575,8 +2575,8 @@ defmodule Fathom.Shard.Storage.S3 do
   # instant an acquire hands back and the instant a later probe would read are the same number.
   # See #13 for why the raw value cannot be returned: it is on S3's Date clock when the store
   # sends one, and diffing that against `System.system_time/1` bakes the skew into the answer.
-  defp steal_instant(shard_id, other, now, lock_exp) do
-    case stealable_at(shard_id, other, now, lock_exp) do
+  defp steal_instant(shard_id, other, now, lock_exp, lock_fp) do
+    case stealable_at(shard_id, other, now, lock_exp, lock_fp) do
       {:ok, at, ref_now} -> at + (now - ref_now)
       _ -> nil
     end
@@ -2587,8 +2587,8 @@ defmodule Fathom.Shard.Storage.S3 do
     now = Storage.now_ms()
 
     case get_lock(shard_id) do
-      {:ok, %{owner: other, expires_at_ms: lock_exp}, _etag} ->
-        case stealable_at(shard_id, other, now, lock_exp) do
+      {:ok, %{owner: other, expires_at_ms: lock_exp} = lock, etag} ->
+        case stealable_at(shard_id, other, now, lock_exp, lock_fingerprint(lock, etag)) do
           # Normalise onto the CALLER's clock. `stealable_at/3` compares against S3's Date when
           # the store sends one (#13), so the instant it returns is on that clock — handing it
           # back raw would have the caller diff it against `System.system_time/1` and bake the
@@ -2645,14 +2645,16 @@ defmodule Fathom.Shard.Storage.S3 do
       # Someone else holds it — liveness is *their heartbeat* (with the lock's own TTL as the
       # fallback when they run no heartbeat — see owner_live?/3).
       {:ok, %{owner: other, epoch: epoch, expires_at_ms: lock_exp} = dead_lock, etag} ->
-        case owner_live?(shard_id, other, now, lock_exp) do
+        lock_fp = lock_fingerprint(dead_lock, etag)
+
+        case owner_live?(shard_id, other, now, lock_exp, lock_fp) do
           :live ->
             # CARRIES THE STEAL INSTANT (expert review 2026-08-26 #23). `owner_live?/4` and
             # `stealable_at/4` are the same rule read two ways, and this branch has just paid for
             # the reads both need — so handing the instant back saves `Shards.held_retry/4` a
             # whole `lease_stealable_at/1` round trip on the first held error. `nil` when it
             # cannot be computed, which the caller already treats as "poll instead of aim".
-            {:error, {:held, other, steal_instant(shard_id, other, now, lock_exp)}}
+            {:error, {:held, other, steal_instant(shard_id, other, now, lock_exp, lock_fp)}}
 
           :dead ->
             # The new lock records the lineage this owner claims, strictly above anything the dead
@@ -2837,12 +2839,16 @@ defmodule Fathom.Shard.Storage.S3 do
   # backend can inject a heartbeat-read failure for the fail-closed test. The
   # steal_margin absorbs inter-node clock skew (see Storage.steal_margin_ms/0): only
   # steal once the heartbeat is expired by more than the margin.
-  defp owner_live?(shard_id, other, now, lock_expires_at_ms) do
-    case stealable_at(shard_id, other, now, lock_expires_at_ms) do
+  defp owner_live?(shard_id, other, now, lock_expires_at_ms, lock_fp) do
+    case stealable_at(shard_id, other, now, lock_expires_at_ms, lock_fp) do
       {:ok, at, ref_now} -> if ref_now <= at, do: :live, else: :dead
       {:error, _} = error -> error
     end
   end
+
+  # Everything about the lock that the owner rewrites when it renews it (legacy mode) or a peer
+  # rewrites when it takes it: the steal watch restarts when any of it moves.
+  defp lock_fingerprint(lock, etag), do: {Map.get(lock, :epoch), lock.expires_at_ms, etag}
 
   # The instant `other`'s hold becomes stealable, plus the reference clock it should be compared
   # against (S3's own Date when the store sent one — see the skew reasoning below). THE single
@@ -2854,7 +2860,31 @@ defmodule Fathom.Shard.Storage.S3 do
   # ALONE while this required both signals lapsed (#12), so a checkout could hold and retry its
   # whole crash-failover budget waiting for a steal that could not happen yet, then return the
   # error it would have returned immediately.
-  defp stealable_at(shard_id, other, now, lock_expires_at_ms) do
+  #
+  # THE CLOCK-FREE WATCH IS AN AND ON TOP (Jepsen finding 3, 2026-10-24): the store-clock instant
+  # below trusts the owner's wall clock to agree with S3's within the margin, so the hold is also
+  # live until this node has itself seen it unchanged for a whole `Storage.steal_watch_window_ms/0`.
+  # See `Storage.steal_watch_remaining_ms/2` for why that holds with any clocks. The proven-dead
+  # previous-incarnation fast path is exempt: it is this node's own frozen-expiry proof.
+  defp stealable_at(shard_id, other, now, lock_expires_at_ms, lock_fp) do
+    case store_clock_stealable_at(shard_id, other, now, lock_expires_at_ms) do
+      {:ok, at, ref_now, :fast_steal} ->
+        {:ok, at, ref_now}
+
+      {:ok, at, ref_now, hb_fp} ->
+        case Storage.steal_watch_remaining_ms(shard_id, {other, lock_fp, hb_fp}) do
+          left when left > 0 -> {:ok, max(at, ref_now + left), ref_now}
+          _complete -> {:ok, at, ref_now}
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  # The store-clock half of `stealable_at/5`, plus a fingerprint of the heartbeat it read (or
+  # `:fast_steal` for the proven-dead fast path, which the watch does not gate).
+  defp store_clock_stealable_at(shard_id, other, now, lock_expires_at_ms) do
     margin = Storage.steal_margin_ms()
 
     case cached_read_heartbeat_dated(other) do
@@ -2884,12 +2914,12 @@ defmodule Fathom.Shard.Storage.S3 do
         # kept serving. A stale-but-present object was strictly WORSE than an absent one.
         #
         # An owner is dead only when BOTH its heartbeat and its lock TTL have lapsed.
-        {:ok, max(exp, lock_expires_at_ms) + margin, s3_now || now}
+        {:ok, max(exp, lock_expires_at_ms) + margin, s3_now || now, {:hb, exp}}
 
       # A heartbeat object that isn't `other`'s — treat as no signal and fall back to the
       # lock's own TTL, same as :not_found.
-      {:ok, _mismatch, s3_now} ->
-        {:ok, lock_expires_at_ms + margin, s3_now || now}
+      {:ok, mismatch, s3_now} ->
+        {:ok, lock_expires_at_ms + margin, s3_now || now, {:hb_mismatch, mismatch}}
 
       # No heartbeat object at all (`heartbeat_server: false` legacy mode, or the owner's
       # heartbeat was cleared): fall back to the lock's OWN TTL for liveness (finding #11).
@@ -2904,8 +2934,8 @@ defmodule Fathom.Shard.Storage.S3 do
         # says the heartbeat OBJECT stopped; it does not say the process did. See
         # `Storage.fast_steal_ok?/4` for why the finding's own condition was rejected.
         if Storage.fast_steal_ok?(other, shard_id, lock_expires_at_ms, s3_now || now),
-          do: {:ok, 0, s3_now || now},
-          else: {:ok, lock_expires_at_ms + margin, s3_now || now}
+          do: {:ok, 0, s3_now || now, :fast_steal},
+          else: {:ok, lock_expires_at_ms + margin, s3_now || now, :no_hb}
 
       {:error, reason} ->
         {:error, reason}

@@ -118,6 +118,18 @@ with the code performing it. The cases, as the code has them:
   its lock expiry has not moved across a probe window (`lease_quiescence_probe_ms`, default
   `ttl/2`). Only then is it stealable immediately.
 
+**On S3, a clock-free watch gates every case except that last one** (Jepsen finding 3,
+2026-10-24, `docs/reviews/jepsen-2026-10-24.md`). The instants above compare S3's `Date` with an
+expiry the owner stamped from its own wall clock, so they are only as safe as those clocks agree; a
+35 s clock step on the rig made every live owner look dead and two nodes acked writes for one shard.
+So a hold is ALSO live until this node has itself seen the lock and the heartbeat unchanged for
+`Storage.steal_watch_window_ms/0` (`:steal_watch_ms`, default `ttl + steal_margin`) on its own
+monotonic clock (`Storage.steal_watch_remaining_ms/2`, wired in `s3.ex` `stealable_at/5`). A live
+owner renews every `ttl/3`, which restarts the watch, so no clock disagreement can make it
+stealable. The watch is an AND, so an owner whose clock runs ahead still gets the later instant.
+`Storage.Local` (one host, one clock) does not apply it, and the test suite turns it off
+(`config/test.exs`) except in `steal_watch_test.exs`.
+
 **The lock TTL is not renewed in heartbeat mode.** A coordinator that acquired its lease with a
 live heartbeat arms no per-shard renew timer (`shard.ex`, `if acquire_gen == nil, do:
 schedule_renew/1`), and `Heartbeat` documents that per-shard locks are "never renewed in heartbeat
@@ -183,7 +195,9 @@ Each one is taken over only when the *next request* for it touches a survivor �
 node's heartbeat ages past `ttl + steal_margin`, that survivor's `acquire_lease` returns `{:held}`.
 So after a **hard crash** (heartbeat not cleared), the dead node's whole keyspace slice has an **RTO
 floor ≈ `ttl + steal_margin`** (default `30s + 5s = 35s`), paid per shard, driven only by tenant
-traffic. Each tail shard re-pays its own steal + pull when first touched.
+traffic. On S3 the clock-free watch above counts that window from the survivor's FIRST look at the
+hold rather than from the dead owner's last renewal, so the floor is up to one more TTL when the
+first request arrives soon after the crash. Each tail shard re-pays its own steal + pull when first touched.
 
 **`:shard_lease_ttl_ms` is the RTO knob.** Lowering it shortens the failover window — at the cost of
 **pause-tolerance**: a GC/VM/hypervisor pause *longer than the TTL* makes a still-alive owner look

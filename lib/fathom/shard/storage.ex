@@ -1733,6 +1733,118 @@ defmodule Fathom.Shard.Storage do
     ArgumentError -> :ok
   end
 
+  # CLOCK-FREE STEAL WATCH (Jepsen finding 3, 2026-10-24).
+  #
+  # The store-clock steal rule compares S3's `Date` against an expiry the OWNER stamped from its own
+  # wall clock, so it is only as safe as the two clocks agree: a 35 s VM clock step made every live
+  # owner look dead at once and two nodes acked writes for one shard. This rule uses no clock that
+  # another machine wrote. A stealer may take a foreign hold only after it has itself seen the
+  # owner's lock and heartbeat UNCHANGED for `steal_watch_window_ms/0` on its own monotonic clock.
+  #
+  # Why that is enough: an owner stamps a renewal from a cycle that STARTED before the PUT, and its
+  # own deadline is `cycle start + ttl` on its monotonic clock. The stealer can first see a renewal
+  # only after the PUT landed, so `first seen >= cycle start`, and it steals no earlier than
+  # `first seen + ttl + margin` - later in real time than the store-clock rule allows with PERFECT
+  # clocks. A live owner renews every `ttl / 3`, which changes the heartbeat and restarts the watch,
+  # so a live owner never completes one whatever any clock says.
+  #
+  # It is an AND with the store-clock rule, never a replacement: an owner whose clock runs AHEAD
+  # still gets the later of the two.
+  #
+  # Cost: a takeover now waits ttl + margin from its FIRST look at the hold, not from the owner's
+  # last renewal, so crash failover is up to about one TTL slower.
+  @steal_watch_table __MODULE__.StealWatch
+  # Past this many entries, entries older than two windows are pruned. Dropping an entry only
+  # restarts a watch (a later steal), never an earlier one.
+  @steal_watch_prune_at 50_000
+
+  @doc """
+  How long a stealer must see a foreign hold unchanged on its own monotonic clock before it may
+  steal it: `:steal_watch_ms` when set, else `shard_lease_ttl_ms + steal_margin_ms`. 0 turns the
+  watch off (the test suite's default, so the existing steal tests keep their timing; the watch has
+  its own tests).
+  """
+  # `number()`: the TTL comes from untyped app env, so a float is what dialyzer can't rule out.
+  @spec steal_watch_window_ms() :: number()
+  def steal_watch_window_ms do
+    case Application.get_env(:fathom, :steal_watch_ms) do
+      ms when is_integer(ms) and ms >= 0 ->
+        ms
+
+      _ ->
+        Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000) + steal_margin_ms()
+    end
+  end
+
+  @doc """
+  Record an observation of `shard_id`'s foreign hold, identified by `fingerprint` (everything the
+  owner rewrites when it renews), and return the monotonic ms left before the watch completes.
+  `<= 0` means the hold has been seen unchanged for the whole window.
+
+  A missing table reads as "first seen now" every call, so the watch never completes: fail closed.
+  """
+  @spec steal_watch_remaining_ms(String.t(), term()) :: number()
+  def steal_watch_remaining_ms(shard_id, fingerprint) do
+    case steal_watch_window_ms() do
+      0 ->
+        0
+
+      window ->
+        now = System.monotonic_time(:millisecond)
+        {since, changed?} = watch_since(steal_watch_entry(shard_id), fingerprint, now)
+        if changed?, do: put_steal_watch(shard_id, fingerprint, now, window)
+        since + window - now
+    end
+  end
+
+  @doc false
+  # Pure: when the current unchanged run of `fingerprint` started, and whether that is new. Any
+  # change, including back to an older value, restarts the run.
+  @spec watch_since({term(), integer()} | nil, term(), integer()) :: {integer(), boolean()}
+  def watch_since({fingerprint, since}, fingerprint, _now), do: {since, false}
+  def watch_since(_entry, _fingerprint, now), do: {now, true}
+
+  defp steal_watch_entry(shard_id) do
+    case :ets.lookup(@steal_watch_table, shard_id) do
+      [{^shard_id, fingerprint, since}] -> {fingerprint, since}
+      _ -> nil
+    end
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp put_steal_watch(shard_id, fingerprint, now, window) do
+    if :ets.info(@steal_watch_table, :size) >= @steal_watch_prune_at do
+      :ets.select_delete(@steal_watch_table, [
+        {{:_, :_, :"$1"}, [{:<, :"$1", now - 2 * window}], [true]}
+      ])
+    end
+
+    :ets.insert(@steal_watch_table, {shard_id, fingerprint, now})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # Created at boot under the same long-lived owner as the quiescence table.
+  @doc false
+  @spec init_steal_watch_table() :: :ok
+  def init_steal_watch_table do
+    :ets.new(@steal_watch_table, [:named_table, :public, :set, read_concurrency: true])
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc false
+  @spec reset_steal_watch() :: :ok
+  def reset_steal_watch do
+    :ets.delete_all_objects(@steal_watch_table)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
   # How long silence has to last before it means nobody is renewing.
   #
   # `renew_lease` runs every `ttl/3`, so anything shorter can catch a live renewer BETWEEN

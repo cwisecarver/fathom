@@ -139,3 +139,9 @@ config :phoenix_live_view,
 # Sort query params output of verified routes for robust url comparisons
 config :phoenix,
   sort_verified_routes_query_params: true
+
+# The clock-free steal watch (Jepsen finding 3, 2026-10-24) makes a stealer wait ttl + margin from
+# its FIRST look at a foreign hold. Off here so the many steal tests that seed an already-expired
+# lock keep their timing; `steal_watch_test.exs` turns it on and pins the rule. Prod and the chaos
+# rig run it ON (the default).
+config :fathom, :steal_watch_ms, 0

@@ -626,6 +626,11 @@ defmodule Fathom.Bench do
       samples = Keyword.get(opts, :failover_samples, @cold_open_s3_samples)
       size_kb = Keyword.get(opts, :warm_size_kb, @warm_size_kb)
 
+      # The clock-free steal watch (Jepsen finding 3, 2026-10-24) is a fixed ttl + margin wait from
+      # the first look, not work; this arm times the takeover's S3 work, so it runs with the watch off.
+      prev_watch = Application.get_env(:fathom, :steal_watch_ms)
+      Application.put_env(:fathom, :steal_watch_ms, 0)
+
       try do
         # Warm-up doubles as a reachability probe (raises → degrade to nil).
         probe = uniq("bench_rto_probe")
@@ -655,6 +660,8 @@ defmodule Fathom.Bench do
         :exit, reason ->
           Logger.warning("failover_rto skipped: #{inspect(reason)}")
           nil
+      after
+        restore_env(:steal_watch_ms, prev_watch)
       end
     else
       nil
