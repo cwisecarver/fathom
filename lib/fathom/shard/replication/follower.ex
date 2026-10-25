@@ -3138,6 +3138,7 @@ defmodule Fathom.Shard.Replication.Follower do
   defp reset_verdict(%{} = prev, push) do
     cond do
       FollowerLog.ownership_change?(prev, push) -> :ownership
+      skipped_generations?(prev, push) -> :short
       complete_through_reset?(prev, push) -> :complete
       true -> :short
     end
@@ -3145,6 +3146,27 @@ defmodule Fathom.Shard.Replication.Follower do
 
   # No prior state: the reset IS the first frame for this shard.
   defp reset_verdict(nil, _push), do: :complete
+
+  # A RESET THAT SKIPS WAL ORDINALS IS SHORT, WHATEVER `prev_extent` SAYS (Jepsen 2026-10-25,
+  # docs/reviews/jepsen-2026-10-24.md). The coordinator gives each WAL salt the next ordinal, and
+  # every push carries the ordinal of the generation it ships. A follower at ordinal 1 handed a reset
+  # into ordinal 33 never received generations 2..32, so the WAL it is about to absorb is missing
+  # every page those generations wrote.
+  #
+  # `prev_extent` could not say so. It is the primary's statement about this follower's OWN
+  # generation, so it is only as good as the primary's record of the follower, and the rig showed
+  # that record missing: a seed timed out on the primary (no record kept) and installed on the
+  # follower 2 s later, 32 s stale. The next reset stated 0 ("no statement"), the follower read that
+  # as complete, absorbed, cleared `torn`, and was promoted without 31 generations of acked writes.
+  # The ordinals are the follower's own evidence and need no record on the other side.
+  #
+  # Only between two STATED ordinals (0 is "not stated": the ordinal wire off, or a seed that could
+  # not name one). A skipped number with nothing in it costs one seed; a missed one loses writes.
+  defp skipped_generations?(%{wal_ordinal: held}, %Protocol.Push{wal_ordinal: pushed})
+       when is_integer(held) and held > 0 and is_integer(pushed) and pushed > 0,
+       do: pushed > held + 1
+
+  defp skipped_generations?(_prev, _push), do: false
 
   # NEVER ABSORB ACROSS AN OWNERSHIP CHANGE (expert review 2026-09-29 #1). The absorb is sound only
   # when the pushing primary's base IS the state our old WAL leads to — true for a checkpoint within

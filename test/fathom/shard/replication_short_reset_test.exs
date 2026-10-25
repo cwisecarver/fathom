@@ -347,6 +347,65 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
              "upgrade that marks the entire fleet un-promotable"
   end
 
+  # JEPSEN 2026-10-25 (docs/reviews/jepsen-2026-10-24.md): a seed timed out on the primary, installed
+  # on the follower 2 s later at WAL ordinal 1, and the next reset arrived at ordinal 33 with
+  # `prev_extent` 0 because the primary kept no record of a seed it thought had failed. The follower
+  # read 0 as "complete", absorbed, cleared torn, and was promoted without 31 generations of acked
+  # writes (58 lost on shard 13). The ordinals are the follower's own evidence of the skip.
+  describe "WAL ordinals at a reset" do
+    setup do
+      prev = Application.get_env(:fathom, :replication_ordinal_wire)
+      # The ordinal rides only the ordinal frame, so the crafted push must use prod's wire.
+      Application.put_env(:fathom, :replication_ordinal_wire, true)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:fathom, :replication_ordinal_wire),
+          else: Application.put_env(:fathom, :replication_ordinal_wire, prev)
+      end)
+    end
+
+    # The follower's position as the rig had it: holding ordinal `held`, its WAL complete as far
+    # as `prev_extent` can tell.
+    defp at_ordinal!(ctx, held) do
+      %{name: name, state: state, id: id} = seeded = seeded_follower!(ctx)
+      state = %{state | wal_ordinal: held}
+      :ets.insert(Follower.table(name), {id, state})
+      %{seeded | state: state}
+    end
+
+    test "a reset that SKIPS ordinals asks for a seed even when prev_extent says complete", ctx do
+      %{name: name, port: port, state: state, id: id} = at_ordinal!(ctx, 1)
+      push = %{reset_push(id, state, state.next_offset) | wal_ordinal: 33, lineage: state.lineage}
+
+      assert {:ok, reply} = send_frame!(port, Protocol.encode_push(push))
+
+      assert match?({:reject, ^id, :unknown_shard, _}, reply),
+             "no seed requested: #{inspect(reply)}"
+
+      assert Follower.state_of(name, id).torn,
+             "a follower that missed ordinals 2..32 absorbed its WAL and cleared torn: it is " <>
+               "promotable and missing every page those generations wrote"
+    end
+
+    test "a reset to the NEXT ordinal still absorbs and clears torn", ctx do
+      %{name: name, port: port, state: state, id: id} = at_ordinal!(ctx, 1)
+      push = %{reset_push(id, state, state.next_offset) | wal_ordinal: 2, lineage: state.lineage}
+
+      assert {:ok, _} = send_frame!(port, Protocol.encode_push(push))
+
+      refute Follower.state_of(name, id).torn,
+             "an adjacent generation held in full was treated as a gap; every reset would re-seed"
+    end
+  end
+
+  test "the primary states UNKNOWN, not 'no statement', for a follower it holds no record of" do
+    # Pre-fix this was 0, which the follower reads as "complete" (see the test above it: a seed
+    # that timed out here leaves no record while the follower holds stale files).
+    extent = Session.outgoing_extent(%{followers: %{}, seen: []}, :no_record)
+    assert extent > 0xFFFF_FFFF, "a recordless follower was told its WAL was complete"
+  end
+
   # TORN IS STICKY (expert review 2026-09-29 #2). Both tests below failed before the fix: the second
   # reset — one the follower held COMPLETELY — cleared a torn flag the first reset had correctly set,
   # although the pages the first reset's missing tail carried are in neither file. `FollowerLog`

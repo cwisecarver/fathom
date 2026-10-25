@@ -1987,7 +1987,19 @@ defmodule Fathom.Shard.Replication.Session do
   # show one WITH FRAMES between the follower's and the current one, the follower is short whatever
   # it holds of its own: `own + 1` is the smallest statement that says so, and the follower answers
   # it with a seed request (`Follower.short_reset?/3`). `missed_generation?/3` has the rule.
-  defp outgoing_extent(state, shipper) do
+  #
+  # NO RECORD IS "UNKNOWN", NOT "NO STATEMENT" (Jepsen 2026-10-25, docs/reviews/jepsen-2026-10-24.md).
+  # A follower this Session holds no position for is one whose files it cannot vouch for: the rig
+  # showed a seed that timed out here (so no position was recorded) and installed on the follower
+  # 2 s later, stale. Stating 0 told that follower its WAL was complete. A value no follower can
+  # hold makes it ask for a seed instead (`Follower.short_reset?/3`), which is the honest answer
+  # when we do not know. A reset only reaches a recordless follower at THIS lineage after such a
+  # seed or a Session restart, so the cost is one seed there; a new ownership re-seeds anyway.
+  @unknown_extent 0xFFFF_FFFF_FFFF_FFFF
+
+  @doc false
+  # Public only so the no-record rule can be pinned without staging a timed-out seed.
+  def outgoing_extent(state, shipper) do
     case Map.get(state.followers, shipper) do
       %{wal_gen: gen, salt1: salt, offset: own} when is_integer(own) ->
         if missed_generation?(state.seen, gen, salt),
@@ -1995,7 +2007,7 @@ defmodule Fathom.Shard.Replication.Session do
           else: own_generation_extent(state, gen, salt, own)
 
       _ ->
-        0
+        @unknown_extent
     end
   end
 
