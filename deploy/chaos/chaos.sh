@@ -233,6 +233,19 @@ recoverable_seqs() {
 # `val` yields the literal "null" on an error/empty response. Guard every arithmetic use:
 # bash arithmetic treats a bare word as a variable name, so `$(( n + null ))` aborts under set -u.
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# A survivor starts its own TTL + margin watch on its FIRST look at a dead owner's lease (the
+# clock-free steal, Jepsen 2026-10-24 finding 3), so a fixed sleep past the TTL is not enough:
+# the first direct request is refused and only starts the clock. Poll a read until the takeover
+# lands; the scenario's own write then goes in once, so a retry can never duplicate it.
+await_steal() {
+  local node=$1 shard=$2 out deadline=$((SECONDS + (TTL_MS + STEAL_MARGIN_MS) / 1000 + 20))
+  while (( SECONDS < deadline )); do
+    out=$(sql_direct "$node" "$shard" "SELECT count(*) FROM kv" 2>/dev/null | val)
+    is_num "$out" && return 0
+    sleep 2
+  done
+  return 1
+}
 
 # seed <shard>: kv table exists AND is EMPTY.
 #
@@ -552,7 +565,7 @@ cmd_pause_fence() {
   sleep "$wait_s"
 
   echo "forcing the steal: writing to $shard directly on $survivor (LB passive health can't see a frozen node — that hang is the documented OSS-nginx limitation)"
-  if sql_direct "$survivor" "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 400)" >/dev/null; then
+  if await_steal "$survivor" "$shard" && sql_direct "$survivor" "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 400)" >/dev/null; then
     echo "  steal OK: $survivor serves $shard"
   else
     echo "  FAIL: survivor could not steal"; "$DOCKER" unpause "$(cname "$owner")"; return 1
@@ -1183,8 +1196,9 @@ rpo_trial() {
   # shard with no `kv` table and the read fails on missing SQL, which looks nothing like the loss
   # being measured but fails the trial just the same.
   seed "$shard" >/dev/null 2>&1
-  sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 1)" >/dev/null || {
-    echo "base write failed"; echo INVALID; return; }
+  local base_out
+  base_out=$(sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 1)" 2>&1) || {
+    echo "base write failed: $(printf '%s' "$base_out" | head -c 400)"; echo INVALID; return; }
   for n in "${NODES[@]}"; do rpc "$n" "Fathom.Shards.flush(\"$shard\")" >/dev/null 2>&1; done
 
   if [ "$(rpo_object_count "$shard" fathom1 1)" != "1" ]; then
@@ -1266,6 +1280,7 @@ rpo_trial() {
   # Direct to the victim, not through the LB: which node nginx re-hashes to is not something this
   # scenario should be at the mercy of, and the claim under test is about a specific node that
   # holds no replica taking the shard over.
+  await_steal "$victim" "$shard" || echo "  $victim did not take $shard over within the steal watch"
   count=$(sql_direct "$victim" "$shard" "SELECT count(*) FROM kv WHERE seq = 999" | val)
   echo "$victim opened $shard and reports seq=999 rows: $count"
   compose logs --since 2m "$victim" 2>/dev/null |
