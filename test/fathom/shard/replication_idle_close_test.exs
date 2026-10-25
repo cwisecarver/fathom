@@ -351,6 +351,19 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
     assert eventually(fn -> idle_settled?(coordinator) end, 500),
            "the idle drain never ran while the Session stayed silent"
 
+    # The drain hands the pooled handles to an async closer (`state.closing`), and THAT close is the
+    # one that folds the WAL. An empty pool means the handoff happened, not that the close finished:
+    # under suite load the refute below used to run first (12 of 12 failures with the CPU saturated,
+    # the WAL gone 1-55 ms later). Wait for the closer itself, not for a timeout.
+    case :sys.get_state(coordinator).closing do
+      pid when is_pid(pid) ->
+        ref = Process.monitor(pid)
+        assert_receive {:DOWN, ^ref, :process, ^pid, _}, 5_000
+
+      nil ->
+        :ok
+    end
+
     refute File.exists?(wal(id)), "the drain ran but its close did not fold the WAL"
   end
 
