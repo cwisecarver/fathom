@@ -1003,6 +1003,9 @@ defmodule Fathom.Application do
       # shards here and ShardExecutor reads it lock-free before each write. Before the shard
       # supervisor so the table is up before any coordinator publishes/forgets.
       Fathom.Shard.WriteFence,
+      # Owns the under-quorum commit marks (Jepsen finding 7, 2026-10-25): ShardExecutor marks a
+      # shard whose commit failed its quorum and confirms before serving it again.
+      Fathom.Shard.Replication.QuorumFence,
       # Owns the node-global schema generation (expert review 2026-08-26 #7): bumped when any
       # connection runs DDL, read by Connection's statement cache to know its cached COLUMN LIST
       # may be stale. Before the shard supervisor so the table is up before any statement prepares.

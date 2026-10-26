@@ -18,6 +18,7 @@ defmodule Fathom.ShardExecutor do
   alias Fathom.Migrator.Capture
   alias Fathom.Shard
   alias Fathom.Shard.Connection
+  alias Fathom.Shard.Replication.QuorumFence
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Replication.WalSync
   alias Fathom.Shard.WriteFence
@@ -203,7 +204,7 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp do_execute(
-         {_pid, _ref, conn, shard_id, scope, token_version, opts} = handle,
+         {pid, _ref, conn, shard_id, scope, token_version, opts} = handle,
          %Stmt{sql: sql} = stmt
        ) do
     # Classify the statement ONCE — dml?/ddl? each slice+downcase the statement head, and the old
@@ -359,8 +360,39 @@ defmodule Fathom.ShardExecutor do
            status: 400
          }}
 
+      # Last, because it may wait a replication round: every cheaper refusal above wins first.
+      # ROLLBACK (either form) reads nothing and must stay possible, or a client is stuck inside a
+      # transaction it is trying to abandon (the same exemption as the write fence above).
+      refusal =
+          not String.starts_with?(head, "rollback") and confirm_quorum(shard_id, pid, opts) ->
+        {:error, refusal}
+
       true ->
         run_statement(handle, stmt, head, dml?, ddl?)
+    end
+  end
+
+  # Jepsen finding 7 (2026-10-25): a commit that failed its quorum is still visible locally, so a
+  # read here could return a value that vanishes if another node takes the shard over. Before any
+  # statement on a shard holding such a commit, run one more quorum round (it ships everything
+  # committed so far); serve only once that round succeeds. Reads too: the hazard IS the read.
+  # One ETS lookup per statement on a healthy shard. See `QuorumFence` for the gen rule.
+  defp confirm_quorum(shard_id, pid, opts) do
+    case QuorumFence.marked(shard_id) do
+      nil ->
+        nil
+
+      gen ->
+        sync? = deferred_sync?(opts)
+
+        case Session.commit(shard_id, Shard.db_path(shard_id) <> "-wal", pid, sync: sync?) do
+          :ok ->
+            QuorumFence.clear(shard_id, gen)
+            nil
+
+          {:error, reason} ->
+            no_quorum_error(shard_id, reason)
+        end
     end
   end
 
@@ -849,6 +881,7 @@ defmodule Fathom.ShardExecutor do
     cond do
       repl_on? and ships_now?(conn, head, wrote?, autocommit) ->
         Session.commit(shard_id, Shard.db_path(shard_id) <> "-wal", pid, sync: sync?)
+        |> mark_if_unconfirmed(shard_id)
 
       sync? and ships_now?(conn, head, wrote?, autocommit) ->
         fallback_sync(shard_id, pid)
@@ -857,6 +890,18 @@ defmodule Fathom.ShardExecutor do
         :ok
     end
   end
+
+  # A failed round leaves the commit visible but not on a quorum: fence the shard until a later round
+  # confirms it (`confirm_quorum/3`). A failed local WAL sync is not a quorum failure and has its own
+  # fence (`WalSync.poison/2`), so it is left out.
+  defp mark_if_unconfirmed({:error, {:wal_sync_failed, _}} = err, _shard_id), do: err
+
+  defp mark_if_unconfirmed({:error, _} = err, shard_id) do
+    QuorumFence.mark(shard_id)
+    err
+  end
+
+  defp mark_if_unconfirmed(:ok, _shard_id), do: :ok
 
   # The replication-off fallback sync (rv6 F6). It honours and sets the same coordinator-keyed
   # poison as the Session: a shard whose fdatasync failed acks nothing more until it is reopened,

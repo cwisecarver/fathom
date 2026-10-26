@@ -30,6 +30,10 @@ defmodule Fathom.Shard.Replication.Session do
 
   Reporting success instead would be worse in the way that matters: it would make the failure
   invisible exactly when the data is least protected.
+
+  The failed commit is also VISIBLE locally, and a takeover by a node that never got its frames
+  makes it vanish after a client has read it. `Fathom.Shard.Replication.QuorumFence` closes that:
+  the executor serves nothing more from the shard on this node until a later round confirms it.
   """
   use GenServer
 
