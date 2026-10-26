@@ -6,6 +6,7 @@
 #   ./chaos.sh build              build the fathom release image
 #   ./chaos.sh build-driver       build the in-network elixir tpc-driver image (for TPC_NET=container)
 #   ./chaos.sh up | down | logs [-f] [svc]   (logs prints and exits; -f follows)
+#                                 (`up` caps VM writeback at 1 GB; RIG_DIRTY_BACKGROUND_BYTES=0 keeps the default)
 #   ./chaos.sh smoke              write+read a few tenants through the LB; check isolation
 #   ./chaos.sh owner <shard>      which node holds the shard file
 #   ./chaos.sh latency <ms>|clear inject S3 latency on every node (toxiproxy)
@@ -302,7 +303,28 @@ cmd_build_driver() { compose build driver; }
 # exit code of its final command, so ordering it before `compose ps`/`check_lb_port` — both of which
 # succeed — silently swallowed the failure and `up` returned 0 with a node dead, which is the exact
 # thing this check exists to stop.
-cmd_up()    { compose up -d --wait --wait-timeout 180 || true; compose ps; check_lb_port; ensure_nodes_up; }
+cmd_up()    { set_vm_writeback; compose up -d --wait --wait-timeout 180 || true; compose ps; check_lb_port; ensure_nodes_up; }
+
+# Cap the docker VM's dirty page cache so writeback runs steadily instead of in bursts.
+#
+# The colima VM has ~94 GB of RAM, so the kernel's default `dirty_background_ratio=10` (~9.4 GB) is
+# never reached: dirty pages (mostly A2 follower writes, which are not fsynced) pile up until the
+# 30 s `dirty_expire_centisecs` and ~7 GB is then written back at once. Every `synchronous=FULL`
+# commit fsync waits behind that, which put a 1.1-1.2 s p99 spike in the 30 s and 60 s windows of
+# every replication-ON tpc-fleet run (docs/reviews/tpc-fleet-repl-on-2026-10-26.md). Measured at
+# 1024 tenants: default 4,317 txn/s p99 598 ms; 1 GB 4,008 / 417 (flat); 256 MB 3,404 / 485; 64 MB
+# 2,273 / 762 (constant writeback slows every fsync). `vm.*` is not namespaced, so a privileged
+# container sets it for the whole VM; `colima restart` resets it, and every `up` sets it again.
+# RIG_DIRTY_BACKGROUND_BYTES=0 leaves the VM's default alone (to reproduce the old numbers).
+set_vm_writeback() {
+  local bytes=${RIG_DIRTY_BACKGROUND_BYTES:-1073741824}
+  [ "$bytes" = "0" ] && { echo "vm writeback: left at the VM default (RIG_DIRTY_BACKGROUND_BYTES=0)" >&2; return 0; }
+  if "$DOCKER" run --rm --privileged alpine:3.20 sysctl -w "vm.dirty_background_bytes=$bytes" >/dev/null 2>&1; then
+    echo "vm writeback: vm.dirty_background_bytes=$bytes" >&2
+  else
+    echo "WARNING: could not set vm.dirty_background_bytes; p99 will show ~30 s writeback spikes" >&2
+  fi
+}
 
 # EVERY fathom node must be up, or say so loudly.
 #
