@@ -38,11 +38,43 @@ p99 by 10 s window, fresh VM:
 0s=350  10s=314  20s=321  30s=1167  40s=320  50s=355  60s=1191  70s=343  80s=324  90s=298
 ```
 
-The two bad windows are 30 s and 60 s: the flush interval. The 10 slowest transactions (1.7-1.8 s)
-all sit at 30.8 s or 63.7 s. Between flushes p99 is 300-350 ms. The tired-VM run shows the same
-shape (30 s, 60 s and 90 s windows at 1.1-2.0 s). So the p99 tail is mostly the flush (checkpoint +
-the replication work it starts), not steady-state commit cost. This is read off the windows, not
-proven by an experiment.
+The two bad windows are 30 s and 60 s; the 10 slowest transactions (1.7-1.8 s) all sit at 30.8 s
+or 63.7 s, and between them p99 is 300-350 ms. A first reading blamed the flush. Experiments the
+same day showed it is the colima VM's page-cache writeback instead.
+
+### Experiment: what makes the 30 s / 60 s spikes
+
+Each arm is one run on a fresh `colima restart`, everything else as above, 0 `clock lags` lines.
+
+| arm | what changed | spikes at 30 / 60 s (p99 of window) | result |
+|---|---|---|---|
+| X | `SHARD_FLUSH_INTERVAL_MS=45000` | still at 30 / 60 s (1,673 / 1,181 ms) | the flush is not the cause |
+| Y | rig nginx: `keepalive_requests 1000000` at server scope | still at 30 / 60 s (1,129 / 1,161 ms); 0 LB listen overflows | the LB's 1000-request recycle is not the cause |
+
+Both arms sampled `/proc/meminfo` in the VM once a second. Dirty page cache climbs at ~70 MB/s to
+7.9 GB, then drops to 0.8 GB at 34-42 s, again at 66-74 s and again at ~100 s after the run starts:
+the spikes. The VM has 94 GB of RAM, so `dirty_background_ratio=10` (9.4 GB) is never reached and
+nothing is written back until pages hit `dirty_expire_centisecs=3000` (30 s). Then ~7 GB goes to
+the virtual disk at once, and every `synchronous=FULL` commit fsync waits behind it. Most of that
+data is follower replica writes, which are not fsynced (`:replication_fsync` defaults to off).
+
+Then the same run with `vm.dirty_background_bytes` set in the VM (`sudo sysctl -w`), so writeback
+runs continuously above that much dirty data:
+
+| `dirty_background_bytes` | txn/s | p50 | p99 | worst 10 s window | commits that skipped a follower |
+|---|---|---|---|---|---|
+| default (ratio 10% = 9.4 GB) | 4,317 | 215 ms | 598 ms | 1,191 ms | 17,946 (4.3%) |
+| **1 GB** | **4,008** | **233 ms** | **417 ms** | **454 ms** | 21,427 (5.2%) |
+| 256 MB | 3,404 | 284 ms | 485 ms | 523 ms | 35,262 (8.5%) |
+| 64 MB | 2,273 | 434 ms | 762 ms | 853 ms | 173,740 (42%) |
+
+1 GB removes the spikes (every window 400-454 ms) and cuts p99 by 30% for 7% of throughput. Lower
+values write back so constantly that every fsync and follower write slows: throughput falls and p99
+rises again. Each row is a single run, so the 1 GB numbers are a direction, not a calibrated optimum.
+
+What this means outside the rig: any Linux host with a lot of RAM and default `vm.dirty_*` settings
+batches writeback the same way, and fathom's unfsynced follower writes fill it fast. A deployment
+should set `vm.dirty_background_bytes` (around 1 GB was best here) rather than rely on the ratio.
 
 Other context from the fresh run: cross-LB `SELECT 1` RTT p50 179 µs; 416,768 quorum commits, all
 `ok`; 6,319 catch-up rounds, all `ok` (the tired run had 2 catch-up timeouts); the LB put 186-222
@@ -51,4 +83,4 @@ shards on each node (spread 1.19x), and each node's steady-state p99 was 656-731
 ## Limits
 
 One VM runs all five nodes, so the absolute txn/s is CPU-bound by one box. Replication traffic
-crosses a container network, not a real one. Each configuration is a single run.
+crosses a container network, not a real one. Each configuration is a single run. Logs: `logs/tpc-fleet-1024-qf*.log`, `logs/disc-{X,Y,Z,G1,M256}/` (local, not committed).
