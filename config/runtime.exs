@@ -1084,14 +1084,14 @@ end
 
 # Workers per primary connection on the follower (expert review 2026-10-01 #7). Each shard's frames
 # go to one worker, so a slow absorb on one shard no longer holds every other shard on the link.
-# Default 8; 1 restores the old single serial loop.
+# Default 32 (8 until 2026-10-26); 1 restores the old single serial loop.
 if n = env_int.("REPLICATION_FOLLOWER_WORKERS") do
   config :fathom, :replication_follower_workers, n
 end
 
 # Held replica-WAL fds per follower worker (expert review 2026-10-08 #28). Node total = this ×
 # REPLICATION_FOLLOWER_WORKERS × inbound primaries, held for the connections' lifetime — size it
-# from `nofile`. Default 64; 0 disables the cache (open-pwrite-close per push).
+# from `nofile`. Default 16 (64 until the worker default went 8 -> 32); 0 disables the cache (open-pwrite-close per push).
 if n = env_nonneg_int.("REPLICATION_HELD_WAL_FDS") do
   config :fathom, :replication_held_wal_fds, n
 end

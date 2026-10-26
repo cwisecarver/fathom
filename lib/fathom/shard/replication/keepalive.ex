@@ -4,7 +4,7 @@ defmodule Fathom.Shard.Replication.Keepalive do
 
   The follower's reader does `:gen_tcp.recv(sock, 0)` — no timeout, by design: an idle connection is
   a healthy one. But a hard peer loss (power, kernel panic, a partition that drops rather than
-  resets) leaves that connection half-open forever: the reader, its up-to-8 workers and their fds
+  resets) leaves that connection half-open forever: the reader, its workers (32 by default) and their fds
   stay allocated, and a seed that was mid-stream keeps its shard lock until the 180 s age takeover
   (`FILO_NO_QUORUM` for that shard meanwhile). The OS default keepalive idle is two hours, which is
   no protection at all, so both ends enable keepalive with a ~30 s idle:

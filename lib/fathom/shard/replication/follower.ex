@@ -908,6 +908,15 @@ defmodule Fathom.Shard.Replication.Follower do
   # `@max_outstanding_bytes` — the socket then fills and the primary blocks, exactly as before, just
   # later. `:replication_follower_workers` = 1 restores the serial behaviour.
   #
+  # DEFAULT 32, not 8 (2026-10-26, docs/reviews/tpc-fleet-repl-on-2026-10-26.md). A worker does its
+  # shards' pwrites one at a time on dirty IO, so at 8 per link ~26 shards queued behind each one,
+  # and a follower whose previous push for a shard was still queued got SKIPPED by the next commit
+  # (quorum then had to come from the other followers): 4-6% of commits on the 1024-tenant rig, at
+  # ~2x the collect time. 32: 0.5% skipped, p99 430 -> 411 ms, 3 alternated runs a side, every 32
+  # run better than every 8 run. The held-fd cap below drops 64 -> 16 so the node's fd budget and
+  # each worker's fds-per-shard ratio stay where they were.
+  @default_workers 32
+  #
   # `seeds` (partial seeds in flight on THIS connection) now lives in the worker that owns those
   # shards. Still connection-scoped: when the connection drops, every worker discards its partial
   # seeds on the way out, so a reconnect never inherits them.
@@ -922,7 +931,8 @@ defmodule Fathom.Shard.Replication.Follower do
       sock: sock,
       name: name,
       binding: Protocol.binding(),
-      nworkers: max(Application.get_env(:fathom, :replication_follower_workers, 8), 1),
+      nworkers:
+        max(Application.get_env(:fathom, :replication_follower_workers, @default_workers), 1),
       workers: %{},
       outstanding: 0,
       # True once ONE frame has decoded (and, with frame auth on, verified): until then the read has
@@ -3605,13 +3615,15 @@ defmodule Fathom.Shard.Replication.Follower do
   # and closed when it exits. Capped so a follower of thousands of shards cannot exhaust its fds.
   #
   # THE CAP IS AN FD BUDGET, AND IT MULTIPLIES (expert review 2026-10-08 #28): held fds per node =
-  # cap × `:replication_follower_workers` × inbound primaries — 64 × 8 × 4 = 2,048 on a 5-node
+  # cap × `:replication_follower_workers` × inbound primaries — 16 × 32 × 4 = 2,048 on a 5-node
   # fleet, held for as long as the connections live, on top of each served shard's own fds. At
   # Linux's default `nofile` of 1024 that alone exceeds the limit. Configurable with
   # `REPLICATION_HELD_WAL_FDS` (0 turns the cache off: open-pwrite-close per push, the pre-perf-#7
   # cost); size it from `nofile` alongside the served-density budget (docs/configuration.md). Above
   # the cap a worker serving more active shards than it holds misses on most pushes.
-  @default_held_fds_cap 64
+  # 16, not 64, since the worker default went 8 -> 32: same node total, and since a link's shards
+  # spread over 4x the workers, the same held fds per active shard.
+  @default_held_fds_cap 16
 
   defp held_fds_cap,
     do: Application.get_env(:fathom, :replication_held_wal_fds, @default_held_fds_cap)
