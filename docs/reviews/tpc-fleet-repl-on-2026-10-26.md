@@ -80,6 +80,21 @@ Other context from the fresh run: cross-LB `SELECT 1` RTT p50 179 µs; 416,768 q
 `ok`; 6,319 catch-up rounds, all `ok` (the tired run had 2 catch-up timeouts); the LB put 186-222
 shards on each node (spread 1.19x), and each node's steady-state p99 was 656-731 ms.
 
+### Follower workers: 8 vs 32 per link (with the 1 GB writeback cap)
+
+A follower worker writes its shards' pushes one at a time. At 8 per link about 26 shards share each
+worker, and a commit whose previous push to a follower is still queued skips that follower. Three
+alternated runs a side, fresh VM each:
+
+| workers (held fds) | p99 per run | p99 avg | p95 avg | txn/s avg | commits that skipped a follower |
+|---|---|---|---|---|---|
+| 8 (64) | 424 / 432 / 435 ms | 430 ms | 367 ms | 4,011 | 4.1-6.2% |
+| **32 (16)** | **406 / 421 / 407 ms** | **411 ms** | **351 ms** | **4,073** | **0.5-0.6%** |
+
+Every 32-worker run beat every 8-worker run. 32 / 16 became the default in `c46adf3b` (same node fd
+budget: 16 × 32 × 4 = 2,048). `./chaos.sh rpo` passed, and a 30-minute all-faults Jepsen run on it
+was 16 of 16 valid (`docs/reviews/jepsen-2026-10-24.md`).
+
 ## Limits
 
 One VM runs all five nodes, so the absolute txn/s is CPU-bound by one box. Replication traffic
