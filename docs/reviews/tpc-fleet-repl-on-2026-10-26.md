@@ -95,7 +95,43 @@ Every 32-worker run beat every 8-worker run. 32 / 16 became the default in `c46a
 budget: 16 × 32 × 4 = 2,048). `./chaos.sh rpo` passed, and a 30-minute all-faults Jepsen run on it
 was 16 of 16 valid (`docs/reviews/jepsen-2026-10-24.md`).
 
+### Replication process priority: `normal` vs `all` (32 workers, 1 GB writeback cap)
+
+`REPLICATION_PROCESS_PRIORITY=all` runs the replication processes at high BEAM priority. Three
+alternated runs a side, fresh VM each, 0 errors, 0 shed, 0 `clock lags` in every run.
+
+Closed loop (`tpc-fleet 1024`, every tenant sends its next txn when the last returns):
+
+| priority | p99 per run | p99 avg | p50 avg | txn/s avg | replication commit time (mean) | commits that skipped a follower |
+|---|---|---|---|---|---|---|
+| normal | 408 / 412 / 410 ms | 410 ms | 233 ms | 4,038 | 39.8 ms | 0.3-0.7% |
+| all | 399 / 404 / 418 ms | 407 ms | 229 ms | 4,113 | 16.9 ms | 0.0% |
+
+`all` cuts the replication part of a commit by 58%, but p99 does not move: the rig is CPU-bound, and
+in a closed loop latency is about tenants / throughput (Little's law), so time saved in one queue
+is spent in another. Only the 2% throughput gain shows.
+
+Open loop (`TPC_TAIL_ARMS=open TPC_OPEN_RATE=3000 ./chaos.sh tpc-tail 1024 400 1000 1`, a fixed
+3,000 txn/s, about 74% of capacity), to see whether the commit-time cut reaches latency below
+saturation:
+
+| priority | p99 per run | p99 avg | p50 avg | replication commit time (build + collect, mean) | commits that skipped a follower |
+|---|---|---|---|---|---|
+| normal | 200 / 141 / 151 ms | 164 ms | 21 ms | 4.1 ms | 0.3-0.6% |
+| all | 136 / 267 / 194 ms | 199 ms | 23 ms | 3.2 ms | 0.0% |
+
+Below saturation replication costs only ~4 ms a commit, so `all` has little to remove, and the runs
+overlap. `normal` stays the default. Two things this shows:
+
+- At 3,000 txn/s p50 is 21 ms, against ~230 ms closed loop at capacity: the closed-loop p50 is
+  almost all queueing.
+- p99 is still 140-270 ms at 74% load, with single 10 s windows up to 418 ms, and it varies run to
+  run by 2x. That tail is not replication priority; its cause is not yet known.
+
 ## Limits
 
 One VM runs all five nodes, so the absolute txn/s is CPU-bound by one box. Replication traffic
-crosses a container network, not a real one. Each configuration is a single run. Logs: `logs/tpc-fleet-1024-qf*.log`, `logs/disc-{X,Y,Z,G1,M256}/` (local, not committed).
+crosses a container network, not a real one. The writeback rows are single runs; the worker and
+priority comparisons are three runs a side. Logs: `logs/tpc-fleet-1024-qf*.log`,
+`logs/disc-{X,Y,Z,G1,M256}/`, `logs/disc-pr{N,A}-{1,2,3}/`, `logs/disc-ol{N,A}-{1,2,3}/` (local, not
+committed).
