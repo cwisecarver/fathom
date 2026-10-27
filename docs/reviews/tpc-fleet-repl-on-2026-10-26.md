@@ -158,9 +158,13 @@ by submitting thread), 409,600 transactions:
 | everything else at the file level (`.db`, `-shm`, container logs, Postgres, MinIO) | ~4 |
 | **on the disk:** writeback (`kworker`) / ext4 journal (`jbd2`) / fsync-driven (`erts_dios`) | 67.8 / 43.3 / 23.6 = **136.5** |
 
-Every node shipped every shard to all four peers while a commit waits for two. The primary WAL
-also sees ~2 fsyncs per transaction (841,920 for 409,600), not 1; that drives most of the journal's
-43 KB and is not explained yet.
+Every node shipped every shard to all four peers while a commit waits for two. (The trace counted
+~2 primary WAL fsyncs per transaction, 841,920 for 409,600. That is a counting artifact: a node's
+`/data` sits on the container's overlayfs root, so each `fsync` reaches `vfs_fsync_range` once on
+overlay and once on ext4. Counting `sys_enter_fsync` in an exqlite probe gave 100 syscalls for 100
+commits.) The exqlite build calls `fsync`, not `fdatasync` (no `HAVE_FDATASYNC`), so every commit
+also journals the WAL's inode. That probably drives much of the ext4 journal's 43 KB; not yet
+measured.
 
 Three followers instead of four (a ring: `fathomN` ships to the next three), three alternated runs
 a side:
