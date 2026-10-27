@@ -2433,6 +2433,9 @@ cmd_tpc_tail() {
         --boot "${TPC_BOOT:-100}" --excl-s "${TPC_EXCL_S:-10}" --tenant-hist 1 \
         $( [ "$arm" = open ] && echo "--rate $rate" ) \
         --txns "$txns" --clients "$tenants" --accounts "$accounts" 2>/dev/null)
+      # TPC_JSON_OUT=<prefix> keeps the driver's raw JSON (per-second p99 + t0_wall_ms) for lining
+      # slow seconds up with samples taken in the VM.
+      [ -n "${TPC_JSON_OUT:-}" ] && printf '%s\n' "$json" > "${TPC_JSON_OUT}.${arm}${k}.json"
       tps=$(printf '%s' "$json" | jq -r '.tpcb_tps // 0')
       printf "  %-12s %9s %9s %6s %5s\n" "$arm#$k" "$tps" \
         "$(printf '%s' "$json" | jq -r '(.tail.p50_us // 0) / 1000 | . * 100 | round / 100')" \

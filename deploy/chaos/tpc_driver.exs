@@ -255,7 +255,20 @@ defmodule TpcStats do
             %{"at_s" => div(w * window_us, 1_000_000), "n" => length(ls), "p99_us" => q(t, 0.99)}
           end)
 
+        # 1 s windows plus the wall-clock time of t0, so a slow second can be lined up with
+        # per-second samples taken in the VM (vmstat, /proc/pressure) on the same clock.
+        seconds =
+          samples
+          |> Enum.group_by(fn {s, _, _} -> div(s - t0, 1_000_000) end, &elem(&1, 1))
+          |> Enum.sort()
+          |> Enum.map(fn {sec, ls} ->
+            t = sorted_tuple(ls)
+            [sec, length(ls), q(t, 0.99), q(t, 1.0)]
+          end)
+
         %{
+          "t0_wall_ms" => div(t0 + System.time_offset(:microsecond), 1000),
+          "seconds" => seconds,
           "n" => tuple_size(resp),
           "p50_us" => q(resp, 0.50),
           "p99_us" => q(resp, 0.99),
