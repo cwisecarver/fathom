@@ -128,10 +128,64 @@ overlap. `normal` stays the default. Two things this shows:
 - p99 is still 140-270 ms at 74% load, with single 10 s windows up to 418 ms, and it varies run to
   run by 2x. That tail is not replication priority; its cause is not yet known.
 
+### The open-loop tail is disk writes, and half of them were a fourth follower (2026-10-27)
+
+Same open loop (3,000 txn/s, 1024 tenants), one run per row, fresh VM, 0 errors and 0 `clock
+lags` in every run. `tpc_driver.exs` now reports p99 per second with a wall-clock anchor
+(`c8439275`), and the VM was sampled every second (`/proc/stat`, `/proc/pressure`, `Dirty`), so a
+slow second can be lined up with what the VM was doing.
+
+| arm | p50 | p99 | read |
+|---|---|---|---|
+| replication off | 6 ms | 13 ms | the floor |
+| replication on (as measured above) | 24 ms | 175 ms | |
+| replication on, 2,000 txn/s | 9 ms | 92 ms | lower load helps but does not remove it |
+| **replication on, `/data/replicas` on tmpfs** | 19 ms | **54 ms** | the follower writes are most of the tail |
+| replication on, `REPLICATION_FSYNC=true` | — | collapsed (1,918 txn/s offered 3,000) | followers cannot fsync every push |
+| replication on, `dirty_expire_centisecs=200`, `dirty_writeback_centisecs=100` | 32 ms | 220 ms | constant writeback is worse |
+
+With replication on, the worst seconds are the ones where `/proc/pressure/io` full-stall rises, iowait
+rises, CPU idle rises and ~400 MB of dirty page cache is written back at once: the primaries'
+`synchronous=FULL` fsyncs wait behind follower writeback on the one virtual disk.
+
+Where the bytes come from, counted with bpftrace in the VM (`vfs_write` by file, `block_bio_queue`
+by submitting thread), 409,600 transactions:
+
+| what | KB per transaction |
+|---|---|
+| follower `-wal` writes (4 followers x the primary's WAL) | 66.8 |
+| primary `-wal` writes | 16.7 |
+| everything else at the file level (`.db`, `-shm`, container logs, Postgres, MinIO) | ~4 |
+| **on the disk:** writeback (`kworker`) / ext4 journal (`jbd2`) / fsync-driven (`erts_dios`) | 67.8 / 43.3 / 23.6 = **136.5** |
+
+Every node shipped every shard to all four peers while a commit waits for two. The primary WAL
+also sees ~2 fsyncs per transaction (841,920 for 409,600), not 1; that drives most of the journal's
+43 KB and is not explained yet.
+
+Three followers instead of four (a ring: `fathomN` ships to the next three), three alternated runs
+a side:
+
+| followers | p99 per run | p99 avg | p50 avg | commit_total mean | io full-stall |
+|---|---|---|---|---|---|
+| 4 | 151 / 164 / 175 ms | 164 ms | 24 ms | 6.6 ms | 18% |
+| **3** | **143 / 125 / 132 ms** | **133 ms** | **19 ms** | **5.0 ms** | **14%** |
+
+Every three-follower run beat every four-follower run on p50 and p99. The rig now runs three
+(`deploy/chaos/docker-compose.yml`). It costs one copy: each shard lives on four machines, not
+five. A takeover node that is not one of the shard's followers recovers from a peer:
+`./chaos.sh rpo` passed on this configuration with exactly that case (holders fathom1, fathom2,
+fathom5; fathom2's copy erased; fathom2 pulled the acked write from fathom5 and promoted it), and a
+30-minute all-faults Jepsen run was 16 of 16 valid (`docs/reviews/jepsen-2026-10-24.md`).
+
+For a deployment this is the `REPLICATION_FOLLOWERS` list with the default `static` membership.
+`REPLICATION_MEMBERSHIP=roster` ships to every node the roster lists, with no cap; capping it
+would be a code change, not made here.
+
 ## Limits
 
 One VM runs all five nodes, so the absolute txn/s is CPU-bound by one box. Replication traffic
 crosses a container network, not a real one. The writeback rows are single runs; the worker and
 priority comparisons are three runs a side. Logs: `logs/tpc-fleet-1024-qf*.log`,
-`logs/disc-{X,Y,Z,G1,M256}/`, `logs/disc-pr{N,A}-{1,2,3}/`, `logs/disc-ol{N,A}-{1,2,3}/` (local, not
-committed).
+`logs/disc-{X,Y,Z,G1,M256}/`, `logs/disc-pr{N,A}-{1,2,3}/`, `logs/disc-ol{N,A}-{1,2,3}/`,
+`logs/disc-sec*/`, `logs/disc-bpfN-5/`, `logs/disc-f{3,4}-{1,2,3}/`, `logs/chaos-rpo-f3b.log`,
+`logs/jepsen-f3.log` (local, not committed). The tmpfs, fsync and writeback arms are single runs.

@@ -97,8 +97,16 @@ x-fathom-env: &fathom-env
   #
   # Shipping is per-scenario: OFF by default so the rig runs exactly as before, and flipped for
   # a run with `REPLICATION_ENABLED=true ./chaos.sh replication`. REPLICATION_FOLLOWERS is set
-  # PER NODE below (each node's four peers, never itself) — a shared list would have every node
-  # shipping its own shards to its own listener, which works but muddies every result.
+  # PER NODE below (never itself) — a shared list would have every node shipping its own shards to
+  # its own listener, which works but muddies every result.
+  #
+  # THREE followers per node, as a ring (fathomN ships to the next three), since 2026-10-27. With
+  # quorum 2 a fourth follower only adds a write per commit: every byte a primary writes to its WAL
+  # was written again by four followers, 67 of the 137 KB per transaction the VM disk took, and
+  # those writes stall the primaries' fsyncs. At a fixed 3,000 txn/s (1024 tenants) three followers
+  # gave p99 133 ms against 164 ms and p50 19 ms against 24 ms, every run better
+  # (docs/reviews/tpc-fleet-repl-on-2026-10-26.md). A takeover node that is not one of a shard's
+  # followers still finds the best copy: peer recovery asks every peer.
   #
   # Pinned to an explicit `:-false` (not empty) since 2026-08-29: prod now defaults
   # `:replication_enabled` ON (config/config.exs), and an empty value would inherit that default
@@ -378,7 +386,7 @@ services:
       S3_ENDPOINT: http://toxiproxy:21001
       NODE_KEY: fathom1
       REPLICATION_ADVERTISE_HOST: fathom1
-      REPLICATION_FOLLOWERS: "fathom2@fathom2:9100,fathom3@fathom3:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
+      REPLICATION_FOLLOWERS: "fathom2@fathom2:9100,fathom3@fathom3:9100,fathom4@fathom4:9100"
     ports:
       - "18081:8080" # direct Hrana (bypasses the LB; zombie/steal experiments)
       - "18091:8081" # direct health
@@ -391,7 +399,7 @@ services:
       S3_ENDPOINT: http://toxiproxy:21002
       NODE_KEY: fathom2
       REPLICATION_ADVERTISE_HOST: fathom2
-      REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom3@fathom3:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
+      REPLICATION_FOLLOWERS: "fathom3@fathom3:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
     ports:
       - "18082:8080"
       - "18092:8081"
@@ -404,7 +412,7 @@ services:
       S3_ENDPOINT: http://toxiproxy:21003
       NODE_KEY: fathom3
       REPLICATION_ADVERTISE_HOST: fathom3
-      REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
+      REPLICATION_FOLLOWERS: "fathom4@fathom4:9100,fathom5@fathom5:9100,fathom1@fathom1:9100"
     ports:
       - "18083:8080"
       - "18093:8081"
@@ -421,7 +429,7 @@ services:
       S3_ENDPOINT: http://toxiproxy:21004
       NODE_KEY: fathom4
       REPLICATION_ADVERTISE_HOST: fathom4
-      REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom3@fathom3:9100,fathom5@fathom5:9100"
+      REPLICATION_FOLLOWERS: "fathom5@fathom5:9100,fathom1@fathom1:9100,fathom2@fathom2:9100"
     ports:
       - "18084:8080"
       - "18094:8081"
@@ -434,7 +442,7 @@ services:
       S3_ENDPOINT: http://toxiproxy:21005
       NODE_KEY: fathom5
       REPLICATION_ADVERTISE_HOST: fathom5
-      REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom3@fathom3:9100,fathom4@fathom4:9100"
+      REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom3@fathom3:9100"
     ports:
       - "18085:8080"
       - "18095:8081"
