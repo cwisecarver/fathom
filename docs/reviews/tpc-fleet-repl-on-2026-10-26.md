@@ -163,8 +163,22 @@ Every node shipped every shard to all four peers while a commit waits for two. (
 `/data` sits on the container's overlayfs root, so each `fsync` reaches `vfs_fsync_range` once on
 overlay and once on ext4. Counting `sys_enter_fsync` in an exqlite probe gave 100 syscalls for 100
 commits.) The exqlite build calls `fsync`, not `fdatasync` (no `HAVE_FDATASYNC`), so every commit
-also journals the WAL's inode. That probably drives much of the ext4 journal's 43 KB; not yet
-measured.
+also journals the WAL's inode.
+
+That is not where the journal comes from. Two images built exqlite from source
+(`config :exqlite, force_build: true`), identical except `EXQLITE_SYSTEM_CFLAGS=-DHAVE_FDATASYNC=1`
+on one; three alternated open-loop runs a side at 3,000 txn/s, three followers, 0 errors, no clock
+lags (2026-10-27):
+
+| build | p99 per run | p99 avg | p50 | journal KB/txn | disk KB/txn |
+|---|---|---|---|---|---|
+| `fsync` | 155 / 130 / 130 ms | 138 ms | 17-18 ms | 38.6 | ~114 |
+| `fdatasync` | 118 / 127 / 119 ms | 121 ms | 17-18 ms | 36.2 | ~111.5 |
+
+`fdatasync` removed 2.4 KB/txn of journal (6%) and 2% of disk bytes; writeback and fsync-driven
+bytes did not move. The p99 is 12% lower and the ranges just separate (127 vs 130 ms), but that is
+under the 20% noise bar and 2% of bytes does not explain it. Not adopted: it would mean compiling
+SQLite from source in every build instead of exqlite's precompiled NIF.
 
 Three followers instead of four (a ring: `fathomN` ships to the next three), three alternated runs
 a side:
