@@ -3198,9 +3198,19 @@ defmodule Fathom.Bench do
 
     ports = peer_call(peer, __MODULE__, :start_peer_followers, [names, root, wire_env])
 
-    keys = [:replication_enabled, :replication_followers, :replication_quorum]
+    # `:replication_recovery_symmetric`: the bench's followers ARE every other node, and under
+    # MIX_ENV=prod the recovery boot guard (`Fleet.recovery_peers_problem/0`) would otherwise refuse
+    # this `Fleet.start_link/1` and crash every replication-ON metric.
+    keys = [
+      :replication_enabled,
+      :replication_followers,
+      :replication_quorum,
+      :replication_recovery_symmetric
+    ]
+
     prev = Map.new(keys, &{&1, Application.get_env(:fathom, &1)})
     Application.put_env(:fathom, :replication_enabled, true)
+    Application.put_env(:fathom, :replication_recovery_symmetric, true)
     Application.put_env(:fathom, :replication_quorum, 1)
 
     Application.put_env(
