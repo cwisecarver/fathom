@@ -168,6 +168,12 @@ survived it.
   `c6id`, `i4i`) carry ephemeral NVMe: it survives a reboot but is **destroyed on stop/start and
   on terminate**. It is fine for the warm-follower cache (which is re-pullable by construction),
   not for the live data dir.
+- **Put `REPLICATION_DIR` on its own volume, not on the `:shard_data_dir` volume.** Every node is a
+  follower of its peers' shards, and follower writes sharing the primaries' disk made primaries'
+  `synchronous=FULL` fsyncs wait behind them: on the chaos rig a second disk for the replicas cut
+  open-loop p99 from ~131 to ~49 ms (`docs/reviews/tpc-fleet-repl-on-2026-10-26.md`). The rig's two
+  disks share one host SSD; two EBS volumes on one instance share its EBS bandwidth and IOPS limit,
+  which is unmeasured.
 
 **What this buys:** a reboot, an OS patch, or a redeploy becomes **lossless** — the returning node
 re-adopts its own file and flushes the un-flushed tail up. This holds *regardless of

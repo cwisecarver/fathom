@@ -1,6 +1,24 @@
 # Opt-in rig overlay: each node's received replicas live on a SECOND virtio disk (mounted in the
 # colima VM at /mnt/lima-replicadisk), so follower writes and primaries' fsyncs use different block
-# devices. Set up once: see docs/reviews/tpc-fleet-repl-on-2026-10-26.md (second-disk arm).
+# devices. Results: docs/reviews/tpc-fleet-repl-on-2026-10-26.md (second-disk arm).
+#
+# One-time setup (non-destructive: does not recreate the colima profile; Lima 2.2 / colima 0.10):
+#   export LIMA_HOME=~/.colima/_lima
+#   limactl disk create replicadisk --size 40GiB --format raw   # a bare `40` is read as 40 BYTES
+#   limactl disk ls                                             # check SIZE reads 40GiB
+#   cat > ~/.colima/_lima/_config/override.yaml <<'EOF'
+#   additionalDisks:
+#     - name: replicadisk
+#       format: true
+#       fsType: ext4
+#   EOF
+#   colima restart        # the disk appears as /mnt/lima-replicadisk
+#
+# Before EVERY `up` (the containers run as `app`; Docker would create root-owned bind sources, and a
+# disk that survives `down` keeps the last run's replicas, which the next run must not inherit):
+#   colima ssh -- sh -c 'sudo rm -rf /mnt/lima-replicadisk/fathom*; for i in 1 2 3 4 5; do
+#     sudo mkdir -p /mnt/lima-replicadisk/fathom$i; sudo chmod 777 /mnt/lima-replicadisk/fathom$i; done'
+#
 #   COMPOSE_FILE=docker-compose.yml:docker-compose.replicadisk.yml ./chaos.sh up
 services:
   fathom1:

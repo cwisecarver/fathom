@@ -265,9 +265,14 @@ every second over the whole 330 s window, idle time included. Dirty page cache p
 `vm.dirty_background_bytes` cap in both arms, so the global dirty threshold did not couple the two
 disks enough to matter here.
 
-Limits: both virtio disks are files on the same host SSD, so a deployment with two independent
-devices should do at least as well; one VM, so the absolute numbers are the rig's. Each arm is three
-runs and the flag-off, 4096-page baseline is the same one as above. Not run: replication-off under
+Limits: both virtio disks are files on the same host SSD, so this isolates the guest's page cache,
+writeback and journal, not host I/O. A deployment whose two devices do not share a queue or a
+bandwidth cap (a second local NVMe) is the case this approximates; two EBS volumes on one instance
+share its EBS bandwidth and IOPS limit, and that case is unmeasured. One VM, so the absolute numbers
+are the rig's. Each arm is three runs and the flag-off, 4096-page baseline is the same one as above.
+Replica files were confirmed on the second disk after a short run (140-172 files, 59-73 MB per
+node, containers running as `app`).
+Not run: replication-off under
 the same layout, a second disk for `/data` instead of the replicas, Jepsen on this layout (it moves
 bytes between devices and changes no code path, but that is not a measurement).
 
