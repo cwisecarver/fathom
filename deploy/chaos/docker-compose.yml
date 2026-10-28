@@ -116,6 +116,9 @@ x-fathom-env: &fathom-env
   # normal | hubs | all (expert review 2026-10-21 r7 #12). Defaults to production's `normal`; the
   # priority A/B sets it per fleet.
   REPLICATION_PROCESS_PRIORITY: "${REPLICATION_PROCESS_PRIORITY:-normal}"
+  # Deferred WAL fdatasync (expert review 2026-10-21 #7). OFF in production defaults; the rig A/B
+  # flips it per fleet. Inert unless REPLICATION_ENABLED is also true.
+  REPLICATION_DEFERRED_WAL_SYNC: "${REPLICATION_DEFERRED_WAL_SYNC:-false}"
   # The lineage-carrying seed frame (2026-08-24 #12), ON here and OFF in production defaults.
   #
   # The flag exists because a peer one deploy behind cannot parse the new frame and closes the

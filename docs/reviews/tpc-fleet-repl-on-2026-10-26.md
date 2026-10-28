@@ -199,6 +199,49 @@ For a deployment this is the `REPLICATION_FOLLOWERS` list with the default `stat
 `REPLICATION_MEMBERSHIP=roster` ships to every node the roster lists, with no cap; capping it
 would be a code change, not made here.
 
+### Deferred WAL sync and page size, open loop (2026-10-27)
+
+Same open loop (3,000 txn/s, 1024 tenants, three followers, `SHARD_FLUSH_INTERVAL_MS=30000`), fresh
+`colima restart` per run, 0 errors, 0 `clock lags`. The compose file now passes
+`REPLICATION_DEFERRED_WAL_SYNC` through (it did not before, so the flag had never run on the rig).
+Each run checked the flag live with `WalSync.deferred?()` over rpc on **fathom1 only**; the other
+four nodes were not checked.
+
+| arm | p99 per run (excl. first 10 s) | p99 avg | p50 |
+|---|---|---|---|
+| `REPLICATION_DEFERRED_WAL_SYNC=false` | 140 / 124 / 126 ms | 130 ms | 19-21 ms |
+| `REPLICATION_DEFERRED_WAL_SYNC=true` | 116 / 118 / 109 ms | 114 ms | 20-22 ms |
+
+The page-size runs below also ran with the flag OFF and 4096-byte pages, which makes two more
+off-arm baselines on the same code (117 / 137 ms). Over the five off runs p99 spans 117-140 ms; the
+three on runs span 109-118 ms. The ranges touch (117 off, 118 on), so this is a likely ~10% effect
+inside the rig's run-to-run noise, not a demonstrated win. Hot shard
+(`./chaos.sh tpcc 1 8 3000 0.02`, 8 threads on one shard, three runs a side): tpmC 4,140 -> 4,351
+(+5%), new-order p99 unchanged (~90 ms). Not adopted: the flag stays OFF. It changes the sync mode
+of every tenant handle, and the rig keeps its data on the container's overlayfs while the flag is
+supported only on ext4/xfs (`WalSync` moduledoc), so a rig Jepsen pass is weak evidence for it. The
+`rpo`, crash and Jepsen gates named in `19b02045` have not been run on this flag.
+
+`PRAGMA page_size` on NEW shards (an experiment hook, since reverted), two runs a side, flag OFF.
+The header of a tenant file on fathom1 was read to confirm each arm (`16 0` = 4096, `8 0` = 2048,
+`4 0` = 1024); a first attempt set the pragma on only one of the two open paths and measured 4096 in
+every arm, so its numbers were discarded:
+
+| page size | p99 per run | `du -sk /data` on fathom1, after the run |
+|---|---|---|
+| 4096 | 117 / 137 ms | 1.26 GB |
+| 2048 | 119 / 104 ms | 2.13 GB |
+| 1024 | 122 / 128 ms | 1.10 GB |
+
+No difference outside the run-to-run spread. WAL or journal bytes per transaction were NOT measured
+in these arms, so this does not show that fewer bytes fail to move p99, only that these page sizes
+did not. The `du` column is one node's whole data directory (shards, WALs, temp files) at one
+instant; 2048 using more than 4096 is unexplained here and not investigated. Dropped. If revisited:
+`session.ex`'s hard-coded `@frame_bytes 4096 + 24` would have to follow the page size, and
+`PRAGMA page_size` must not run on existing files. Probed 2026-10-27: on a 4096-byte WAL database,
+`PRAGMA page_size=2048` followed by `VACUUM INTO` wrote a 2048-byte output file while the source
+stayed 4096. Logs: `logs/ds/` (local, not committed).
+
 ## Limits
 
 One VM runs all five nodes, so the absolute txn/s is CPU-bound by one box. Replication traffic
