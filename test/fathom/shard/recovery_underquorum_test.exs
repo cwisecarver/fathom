@@ -35,6 +35,7 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
     :replication_promote_on_open,
     :replication_recover_from_peers,
     :replication_followers,
+    :replication_recovery_peers,
     :replication_quorum,
     :replication_recovery_underquorum_window_ms,
     :replication_recovery_refusal_ttl_ms,
@@ -378,6 +379,52 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
                  quorum: 2,
                  previous_owner: p_key <> "#a1b2c3d4"
                )
+    end
+  end
+
+  # -- a takeover's own followers are not the dead owner's (Jepsen 2026-10-27) -----------------
+  #
+  # SYMPTOM: on the chaos rig each node ships to the NEXT THREE of five (a ring). fathom5 acked four
+  # appends, then fathom3, fathom1 and fathom5 were killed together. fathom3 took the shard over and
+  # asked ITS OWN followers (4, 5, 1): fathom5 was the dead owner (excluded), fathom1 was still
+  # booting (silent), fathom4 said "I hold nothing". With itself that is two definite answers, and
+  # the floor over three peers with Q=2 is two, so recovery returned `:none` and the shard opened
+  # from the stale S3 object. The acked tail was on fathom5's followers (1, 2, 3); fathom2 held it
+  # and was never asked. Four acked writes lost, no refusal, no error.
+  #
+  # The floor `N - Q + 1` only guarantees a holder is read when N is the dead owner's follower set.
+  # A node cannot know that from its own config, so `:replication_recovery_peers` names every other
+  # node. These tests pin the decision, not the lease: it is the same in `:legacy` and `:heartbeat`
+  # liveness (nothing here touches a lease), so they are not parameterized over the two modes.
+  describe "recovery peers (REPLICATION_RECOVERY_PEERS)" do
+    @stamp %{epoch: 3, wal_gen: 0, wal_ordinal: 2, offset: 0}
+
+    test "the floor is counted over the recovery peers, so a down holder refuses the open", %{
+      id: id
+    } do
+      # The same cluster state with the holder DOWN. Over the ring's own followers [live, dead,
+      # dead] two answers (this node, the live peer) meet the floor of 2 and the open proceeds from
+      # the object. Over every other node it needs 3, and 2 is not enough.
+      peers!([live(), dead(1), dead(2)])
+
+      Application.put_env(:fathom, :replication_recovery_peers, [
+        live(),
+        dead(3),
+        dead(4),
+        dead(5)
+      ])
+
+      assert {:refuse, %UnderQuorum{answered: 2, needed: 3}} =
+               Recovery.best_replica(id, @stamp, quorum: 2)
+    end
+
+    test "unset, recovery asks this node's own followers, as before", %{id: id} do
+      peers = [live(), dead(1), dead(2)]
+      peers!(peers)
+      Application.delete_env(:fathom, :replication_recovery_peers)
+
+      assert Recovery.peers() == peers
+      assert :none = Recovery.best_replica(id, @stamp, quorum: 2)
     end
   end
 

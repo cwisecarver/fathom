@@ -95,6 +95,14 @@ defmodule Fathom.Shard.Replication.Fleet do
   defp normalise({host, port}), do: {"#{to_string(host)}:#{port}", host, port}
 
   @doc """
+  The nodes a takeover asks for a newer copy of a shard, normalised to `{node_key, host, port}`:
+  `:replication_recovery_peers` when set, else `[]` (the caller falls back to its own followers).
+  """
+  @spec recovery_endpoints() :: [{String.t(), String.t() | charlist(), :inet.port_number()}]
+  def recovery_endpoints,
+    do: Enum.map(Application.get_env(:fathom, :replication_recovery_peers, []), &normalise/1)
+
+  @doc """
   Parse `REPLICATION_FOLLOWERS` — `node_key@host:port` pairs, comma separated.
 
   The `node_key@` prefix is optional. Raises on anything it cannot parse, because the alternative

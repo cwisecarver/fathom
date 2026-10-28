@@ -286,6 +286,10 @@ x-fathom-node: &fathom-node
         export REPLICATION_FOLLOWERS="$$(printf '%s' "$$REPLICATION_FOLLOWERS" | sed -E 's/@fathom([0-9]):9100/@toxiproxy:2910\1/g')"
         echo "replication via toxiproxy: $$REPLICATION_FOLLOWERS"
       fi
+      if [ "$$REPL_VIA_TOXI" = "1" ] && [ -n "$$REPLICATION_RECOVERY_PEERS" ]; then
+        export REPLICATION_RECOVERY_PEERS="$$(printf '%s' "$$REPLICATION_RECOVERY_PEERS" | sed -E 's/@fathom([0-9]):9100/@toxiproxy:2910\1/g')"
+        echo "recovery peers via toxiproxy: $$REPLICATION_RECOVERY_PEERS"
+      fi
       exec /app/bin/fathom start
 
 services:
@@ -390,6 +394,7 @@ services:
       NODE_KEY: fathom1
       REPLICATION_ADVERTISE_HOST: fathom1
       REPLICATION_FOLLOWERS: "fathom2@fathom2:9100,fathom3@fathom3:9100,fathom4@fathom4:9100"
+      REPLICATION_RECOVERY_PEERS: "fathom2@fathom2:9100,fathom3@fathom3:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
     ports:
       - "18081:8080" # direct Hrana (bypasses the LB; zombie/steal experiments)
       - "18091:8081" # direct health
@@ -403,6 +408,7 @@ services:
       NODE_KEY: fathom2
       REPLICATION_ADVERTISE_HOST: fathom2
       REPLICATION_FOLLOWERS: "fathom3@fathom3:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
+      REPLICATION_RECOVERY_PEERS: "fathom1@fathom1:9100,fathom3@fathom3:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
     ports:
       - "18082:8080"
       - "18092:8081"
@@ -416,6 +422,7 @@ services:
       NODE_KEY: fathom3
       REPLICATION_ADVERTISE_HOST: fathom3
       REPLICATION_FOLLOWERS: "fathom4@fathom4:9100,fathom5@fathom5:9100,fathom1@fathom1:9100"
+      REPLICATION_RECOVERY_PEERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom4@fathom4:9100,fathom5@fathom5:9100"
     ports:
       - "18083:8080"
       - "18093:8081"
@@ -433,6 +440,7 @@ services:
       NODE_KEY: fathom4
       REPLICATION_ADVERTISE_HOST: fathom4
       REPLICATION_FOLLOWERS: "fathom5@fathom5:9100,fathom1@fathom1:9100,fathom2@fathom2:9100"
+      REPLICATION_RECOVERY_PEERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom3@fathom3:9100,fathom5@fathom5:9100"
     ports:
       - "18084:8080"
       - "18094:8081"
@@ -446,6 +454,9 @@ services:
       NODE_KEY: fathom5
       REPLICATION_ADVERTISE_HOST: fathom5
       REPLICATION_FOLLOWERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom3@fathom3:9100"
+      # Every OTHER node: recovery's responder floor needs the dead owner's followers among the nodes
+      # asked, and a ring's own follower list does not guarantee that (Jepsen 2026-10-27).
+      REPLICATION_RECOVERY_PEERS: "fathom1@fathom1:9100,fathom2@fathom2:9100,fathom3@fathom3:9100,fathom4@fathom4:9100"
     ports:
       - "18085:8080"
       - "18095:8081"

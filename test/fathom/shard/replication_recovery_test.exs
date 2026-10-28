@@ -352,6 +352,69 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
            "the pulled replica carries no ordinal, so it can never be promoted"
   end
 
+  # SYMPTOM (Jepsen 2026-10-27, docs/reviews/jepsen-2026-10-27.md): on a ring (each node ships to the
+  # next three of five) the takeover asked only ITS OWN followers, none of which held the dead
+  # owner's acked tail, so recovery returned `:none` and the shard opened from the stale object.
+  # `:replication_recovery_peers` names every other node, so the holder is asked and pulled even
+  # though it is not one of this node's followers.
+  test "a holder that is not one of this node's followers is asked and pulled, via recovery peers",
+       %{id: id} do
+    {source, source_port} = start_follower("recov_ring_src")
+    {_empty, empty_port} = start_follower("recov_ring_empty")
+    {survivor, _} = start_follower("recov_ring_surv")
+
+    db = :crypto.strong_rand_bytes(12_288)
+    wal = wal_bytes(5, 0xDEADBEEF, :crypto.strong_rand_bytes(8_192))
+    plant_replica(source, id, 9, 5, 0xDEADBEEF, db, wal)
+    assert is_nil(Follower.state_of(survivor, id))
+
+    prev_followers = Application.get_env(:fathom, :replication_followers)
+    prev_recovery = Application.get_env(:fathom, :replication_recovery_peers)
+    prev_running = Fathom.Shard.Replication.Fleet.running()
+
+    on_exit(fn ->
+      Fathom.Shard.Replication.Fleet.publish(prev_running)
+
+      for {k, v} <- [
+            replication_followers: prev_followers,
+            replication_recovery_peers: prev_recovery
+          ] do
+        if is_nil(v),
+          do: Application.delete_env(:fathom, k),
+          else: Application.put_env(:fathom, k, v)
+      end
+    end)
+
+    Fathom.Shard.Replication.Fleet.publish([])
+
+    # This node's own followers: one that holds nothing, two that are down. Over them the floor is
+    # N - Q + 1 = 2, and this node plus the empty one meet it.
+    Application.put_env(:fathom, :replication_followers, [
+      {"empty", "127.0.0.1", empty_port},
+      {"gone1", "127.0.0.1", 1},
+      {"gone2", "127.0.0.1", 2}
+    ])
+
+    assert :none = Recovery.best_replica(id, stamp(9, 5, 0), follower: survivor, quorum: 2),
+           "control: the ring's own followers cannot see the holder"
+
+    # Every OTHER node: the holder, the empty one, and two that are down. N = 4, floor 3: this node,
+    # the empty peer and the holder answer.
+    Application.put_env(:fathom, :replication_recovery_peers, [
+      {"src", "127.0.0.1", source_port},
+      {"empty", "127.0.0.1", empty_port},
+      {"gone1", "127.0.0.1", 1},
+      {"gone2", "127.0.0.1", 2}
+    ])
+
+    assert {:ok, installed} =
+             Recovery.best_replica(id, stamp(9, 5, 0), follower: survivor, quorum: 2)
+
+    assert File.read!(Follower.db_path(survivor, id)) == db
+    assert File.read!(Follower.wal_path(survivor, id)) == wal
+    assert installed == Follower.state_of(survivor, id)
+  end
+
   test "a survivor already holding the freshest copy asks nobody", %{id: id} do
     {survivor, _} = start_follower("recov_surv")
 

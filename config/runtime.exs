@@ -856,6 +856,20 @@ if spec = System.get_env("REPLICATION_FOLLOWERS") do
   config :fathom, :replication_followers, Fathom.Shard.Replication.Fleet.parse_followers!(spec)
 end
 
+# The nodes a TAKEOVER asks for a newer copy of a shard (promote-on-open / recover-from-peers), as
+# `node_key@host:port` pairs, the same form as REPLICATION_FOLLOWERS. Unset (default) = this node's
+# own follower set. SET IT whenever REPLICATION_FOLLOWERS is not "every other node": recovery's
+# responder floor (`Recovery` moduledoc) is only a guarantee when the nodes asked include the dead
+# owner's followers, and a node knows only ITS OWN follower list, not the owner's. With
+# REPLICATION_FOLLOWERS a subset of the fleet, a takeover asking just its own followers can count
+# two "I hold nothing" answers as a quorum of silence, open from the stale S3 object and lose acked
+# writes (Jepsen 2026-10-27, docs/reviews/jepsen-2026-10-27.md). List EVERY other node.
+if spec = System.get_env("REPLICATION_RECOVERY_PEERS") do
+  config :fathom,
+         :replication_recovery_peers,
+         Fathom.Shard.Replication.Fleet.parse_followers!(spec)
+end
+
 # Acks required before a tenant's commit returns. MUST be < the follower count, and
 # `Fleet.validate_quorum!/0` refuses to boot otherwise: Q=N tolerates zero follower failures and
 # inherits the slowest replica's latency — measured 32× worse with one straggler on loopback and

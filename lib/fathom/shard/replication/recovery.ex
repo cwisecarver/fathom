@@ -774,16 +774,34 @@ defmodule Fathom.Shard.Replication.Recovery do
   defp query_timeout_ms(opts), do: Keyword.get(opts, :query_timeout_ms, query_timeout_ms())
 
   @doc """
-  The nodes to ask: the live shipper set when this node is replicating, else the configured list.
+  The nodes to ask: `:replication_recovery_peers` when configured, else the live shipper set when
+  this node is replicating, else the configured followers.
 
-  Deliberately the membership set rather than a new discovery mechanism. In a symmetric fleet every
-  node follows every other, so the nodes this node would ship to are exactly the nodes that were
-  following the one that died. It is also the only peer set that is already maintained, validated
-  and swapped safely (`Membership`); inventing a second one would give recovery a different view of
-  the fleet from replication, and the two disagreeing is worse than either being slightly stale.
+  The default is deliberately the membership set rather than a new discovery mechanism. In a
+  symmetric fleet every node follows every other, so the nodes this node would ship to are exactly
+  the nodes that were following the one that died. It is also the only peer set that is already
+  maintained, validated and swapped safely (`Membership`); inventing a second one would give
+  recovery a different view of the fleet from replication.
+
+  **That default is only correct in a symmetric fleet**, and a node cannot tell from its own config
+  whether it is in one. When the follower lists are a subset of the fleet (a ring: each node ships
+  to the next three of five), a takeover's own followers overlap the dead owner's followers in
+  only some of their members. The responder floor (`N - Q + 1`) is then computed over the wrong
+  N: the takeover and one non-follower answering "I hold nothing" reach it while the nodes that
+  hold the acked tail are down or unasked, and the open proceeds from the stale object. Jepsen
+  2026-10-27 lost four acked writes exactly this way. `:replication_recovery_peers`
+  (`REPLICATION_RECOVERY_PEERS`) names every other node explicitly, which restores the guarantee for
+  any follower topology.
   """
   @spec peers() :: [endpoint()]
   def peers do
+    case Fleet.recovery_endpoints() do
+      [] -> shipper_peers()
+      configured -> configured
+    end
+  end
+
+  defp shipper_peers do
     case Fleet.running() do
       [] -> Fleet.endpoints()
       running -> Enum.map(running, fn {key, host, port, _name} -> {key, host, port} end)
