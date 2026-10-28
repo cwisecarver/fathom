@@ -1,0 +1,20 @@
+# Opt-in rig overlay: each node's received replicas live on a SECOND virtio disk (mounted in the
+# colima VM at /mnt/lima-replicadisk), so follower writes and primaries' fsyncs use different block
+# devices. Set up once: see docs/reviews/tpc-fleet-repl-on-2026-10-26.md (second-disk arm).
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.replicadisk.yml ./chaos.sh up
+services:
+  fathom1:
+    volumes:
+      - /mnt/lima-replicadisk/fathom1:/data/replicas
+  fathom2:
+    volumes:
+      - /mnt/lima-replicadisk/fathom2:/data/replicas
+  fathom3:
+    volumes:
+      - /mnt/lima-replicadisk/fathom3:/data/replicas
+  fathom4:
+    volumes:
+      - /mnt/lima-replicadisk/fathom4:/data/replicas
+  fathom5:
+    volumes:
+      - /mnt/lima-replicadisk/fathom5:/data/replicas

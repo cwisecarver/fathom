@@ -242,6 +242,35 @@ instant; 2048 using more than 4096 is unexplained here and not investigated. Dro
 `PRAGMA page_size=2048` followed by `VACUUM INTO` wrote a 2048-byte output file while the source
 stayed 4096. Logs: `logs/ds/` (local, not committed).
 
+### Replicas on a second block device (2026-10-27)
+
+The tmpfs arm above was an upper bound for isolating follower writes; this is the real thing. The
+colima VM got a second virtio disk (`limactl disk create replicadisk --size 40G`, attached through
+`~/.colima/_lima/_config/override.yaml` `additionalDisks`, ext4 at `/mnt/lima-replicadisk`), and
+`deploy/chaos/docker-compose.replicadisk.yml` bind-mounts a directory of it at each node's
+`/data/replicas`. `df` inside fathom1 confirmed `/data/replicas` on `/dev/vdb1` in the `disk` arm
+and on the overlay root in the `base` arm. Flag off, 4096 pages, open loop 3,000 txn/s, 1024 tenants,
+three followers, a fresh `colima restart` per run and the replica directories wiped before each run,
+three runs a side alternated, 0 errors, 0 `clock lags`, 2,997-2,999 txn/s achieved.
+
+| replicas on | p99 per run (excl. first 10 s) | p99 avg | p50 |
+|---|---|---|---|
+| the root disk (`base`) | 122 / 133 / 138 ms | 131 ms | 17.5-18.3 ms |
+| a second virtio disk (`disk`) | 45 / 49 / 55 ms | 49 ms | 16.1-17.1 ms |
+
+Every `disk` run beat every `base` run by a wide margin (-62% on the average), well outside the
+spread of either arm, and it lands on the tmpfs figure (54 ms). The VM's `/proc/pressure/io`
+full-stall avg10 fell from a mean of 1.6-1.7 (max 4.5-4.7) to 1.0-1.1 (max 2.9-3.4), sampled
+every second over the whole 330 s window, idle time included. Dirty page cache peaked near the 1 GB
+`vm.dirty_background_bytes` cap in both arms, so the global dirty threshold did not couple the two
+disks enough to matter here.
+
+Limits: both virtio disks are files on the same host SSD, so a deployment with two independent
+devices should do at least as well; one VM, so the absolute numbers are the rig's. Each arm is three
+runs and the flag-off, 4096-page baseline is the same one as above. Not run: replication-off under
+the same layout, a second disk for `/data` instead of the replicas, Jepsen on this layout (it moves
+bytes between devices and changes no code path, but that is not a measurement).
+
 ## Limits
 
 One VM runs all five nodes, so the absolute txn/s is CPU-bound by one box. Replication traffic
