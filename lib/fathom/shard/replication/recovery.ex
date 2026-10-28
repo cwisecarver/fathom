@@ -455,8 +455,59 @@ defmodule Fathom.Shard.Replication.Recovery do
   # Enough answers: any under-quorum episode is over, and the choice is the ordinary one.
   defp settle(shard_id, object_stamp, local, follower, answers, needed, opts) do
     if needed > 1, do: clear_underquorum(shard_id)
-    act(shard_id, choose(local, object_stamp, offers(answers)), local, follower, opts)
+    decide(shard_id, object_stamp, local, follower, answers, needed, opts)
   end
+
+  defp decide(shard_id, object_stamp, local, follower, answers, needed, opts) do
+    choice = choose(local, object_stamp, offers(answers))
+    log_takeover(shard_id, choice, local, answers, needed, opts)
+    act(shard_id, choice, local, follower, opts)
+  end
+
+  # A takeover's recovery decision used to log nothing when it chose the stored object, so a lost
+  # acked tail could not be traced to who was asked and what they said (Jepsen 2026-10-27: shards
+  # 10, 13 and 15 stayed unattributed for exactly this reason). Takeovers only, so an ordinary
+  # cold open of a replicating shard adds no line.
+  defp log_takeover(shard_id, choice, local, answers, needed, opts) do
+    case Keyword.get(opts, :previous_owner) do
+      nil -> :ok
+      prev -> Logger.info(decision_line(shard_id, prev, choice, local, answers, needed))
+    end
+  end
+
+  @doc """
+  The one-line record of a takeover's recovery decision: the choice, the floor, this node's own
+  replica and every answer consumed before the decision (peers cut off by the early exit are not
+  listed). Pure, for the test.
+  """
+  @spec decision_line(
+          String.t(),
+          String.t(),
+          :none | :local | {:pull, endpoint(), position()},
+          position() | nil,
+          [{endpoint(), term()}],
+          number()
+        ) :: String.t()
+  def decision_line(shard_id, prev, choice, local, answers, needed) do
+    peers =
+      Enum.map_join(answers, " ", fn
+        {{key, _h, _p}, {:answered, pos}} -> "#{key}=#{fmt_pos(pos)}"
+        {{key, _h, _p}, other} -> "#{key}=#{inspect(other)}"
+      end)
+
+    "shard #{shard_id}: takeover from #{prev} recovery chose #{fmt_choice(choice)} " <>
+      "(needed #{needed}; local=#{fmt_pos(local)}; peers: #{if peers == "", do: "none", else: peers})"
+  end
+
+  defp fmt_choice({:pull, {key, _h, _p}, pos}), do: "pull from #{key} at #{fmt_pos(pos)}"
+  defp fmt_choice(other), do: inspect(other)
+
+  defp fmt_pos(nil), do: "nil"
+
+  defp fmt_pos(%{} = pos),
+    do: "L#{pos[:lineage]}/O#{pos[:wal_ordinal]}@#{pos[:next_offset]}"
+
+  defp fmt_pos(other), do: inspect(other)
 
   defp under_quorum(shard_id, object_stamp, local, follower, peers, needed, answers, opts) do
     case underquorum_step(shard_id) do
@@ -498,7 +549,7 @@ defmodule Fathom.Shard.Replication.Recovery do
           )
 
           emit_underquorum(giving_up, :opened_best_effort)
-          act(shard_id, choose(local, object_stamp, offers(answers)), local, follower, opts)
+          decide(shard_id, object_stamp, local, follower, answers, needed, opts)
         end
     end
   end

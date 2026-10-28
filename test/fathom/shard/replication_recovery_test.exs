@@ -465,6 +465,71 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     assert is_nil(Follower.state_of(survivor, id))
   end
 
+  describe "the takeover decision line" do
+    # Symptom (Jepsen 2026-10-27): a takeover that chose the stored object logged nothing, so three
+    # shards that lost acked writes could not be traced to who recovery asked and what each said.
+    # The invariant: every takeover's recovery decision leaves one line naming the choice, the
+    # floor and each answer. `config/test.exs` runs at :warning, so the level is raised here.
+    setup do
+      level = Logger.level()
+      Logger.configure(level: :info)
+      on_exit(fn -> Logger.configure(level: level) end)
+    end
+
+    test "a takeover that opens from the stored object logs who answered", %{id: id} do
+      {source, source_port} = start_follower("recov_src")
+      {survivor, _} = start_follower("recov_surv")
+      assert is_nil(Follower.state_of(source, id))
+
+      log =
+        ExUnit.CaptureLog.capture_log([level: :info], fn ->
+          assert :none =
+                   Recovery.best_replica(id, stamp(9, 5, 0),
+                     follower: survivor,
+                     peers: [{"src", "127.0.0.1", source_port}],
+                     previous_owner: "dead_owner#1"
+                   )
+        end)
+
+      assert log =~ "shard #{id}: takeover from dead_owner#1 recovery chose :none"
+      assert log =~ "local=nil"
+      assert log =~ "src=nil"
+    end
+
+    test "an open that is not a takeover adds no line", %{id: id} do
+      {source, source_port} = start_follower("recov_src")
+      {survivor, _} = start_follower("recov_surv")
+      assert is_nil(Follower.state_of(source, id))
+
+      log =
+        ExUnit.CaptureLog.capture_log([level: :info], fn ->
+          assert :none =
+                   Recovery.best_replica(id, stamp(9, 5, 0),
+                     follower: survivor,
+                     peers: [{"src", "127.0.0.1", source_port}]
+                   )
+        end)
+
+      refute log =~ "recovery chose"
+    end
+
+    test "decision_line names a pull, the floor and silent peers" do
+      line =
+        Recovery.decision_line(
+          "s1",
+          "n1#3",
+          {:pull, peer("n2"), at(9, 3, 8_240)},
+          nil,
+          [{peer("n2"), {:answered, at(9, 3, 8_240)}}, {peer("n4"), :silent}],
+          3
+        )
+
+      assert line ==
+               "shard s1: takeover from n1#3 recovery chose pull from n2 at L9/O4@8240 " <>
+                 "(needed 3; local=nil; peers: n2=L9/O4@8240 n4=:silent)"
+    end
+  end
+
   test "a peer BEHIND the stored object is not pulled from", %{id: id} do
     {source, source_port} = start_follower("recov_src")
     {survivor, _} = start_follower("recov_surv")
