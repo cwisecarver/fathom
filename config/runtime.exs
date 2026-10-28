@@ -870,6 +870,16 @@ if spec = System.get_env("REPLICATION_RECOVERY_PEERS") do
          Fathom.Shard.Replication.Fleet.parse_followers!(spec)
 end
 
+# Assert that REPLICATION_FOLLOWERS is EVERY other node (a full mesh), so a takeover's own follower
+# list is the dead owner's follower set and recovery's responder floor is a real guarantee. This is
+# an operator's statement, not a check: nothing verifies it. It only satisfies the prod boot guard
+# (`Fleet.recovery_peers_problem/0`); with a subset it is simply wrong, so prefer
+# REPLICATION_RECOVERY_PEERS, which makes recovery ask every node without relying on the claim.
+case env_bool.("REPLICATION_RECOVERY_SYMMETRIC") do
+  nil -> :ok
+  v -> config :fathom, :replication_recovery_symmetric, v
+end
+
 # Acks required before a tenant's commit returns. MUST be < the follower count, and
 # `Fleet.validate_quorum!/0` refuses to boot otherwise: Q=N tolerates zero follower failures and
 # inherits the slowest replica's latency — measured 32× worse with one straggler on loopback and

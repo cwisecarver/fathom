@@ -290,7 +290,10 @@ defmodule Fathom.Shard.Replication.Fleet do
 
   @impl true
   def init(_opts) do
-    if replicating?(), do: validate_quorum!()
+    if replicating?() do
+      validate_quorum!()
+      validate_recovery_peers!()
+    end
 
     # Start from empty and let `Membership` publish the first real set inside its own `init/1`.
     # Cleared rather than left alone because `:persistent_term` outlives the supervisor: a Fleet
@@ -520,5 +523,57 @@ defmodule Fathom.Shard.Replication.Fleet do
       true ->
         :ok
     end
+  end
+
+  # A takeover asks `Recovery.peers/0` for a newer copy of a shard. Unless `:replication_recovery_peers`
+  # names every other node, that is THIS node's own follower list, and the responder floor over it
+  # only guarantees an acked write is read when the lists are symmetric (every node follows every
+  # other). A node cannot tell from its own config whether they are, and a ring (each node ships to
+  # the next three of five) is not: Jepsen 2026-10-27 lost acked writes exactly that way. So a prod
+  # node that could run recovery over a subset must say it does not: set
+  # `REPLICATION_RECOVERY_PEERS` (every other node), or assert a full mesh with
+  # `REPLICATION_RECOVERY_SYMMETRIC=true`, or run `REPLICATION_MEMBERSHIP=roster` (which ships to
+  # every advertising node). Off in dev/test (`:replication_recovery_guard`), on in prod, the same
+  # convention as the other replication boot guards.
+  defp validate_recovery_peers! do
+    case recovery_peers_problem() do
+      nil -> :ok
+      message -> raise ArgumentError, message
+    end
+  end
+
+  @doc """
+  Why this node must not boot with its current recovery configuration, or `nil` when it may.
+
+  Public so a test can read the verdict without booting the supervisor. Pure over application
+  config; nothing is started or contacted.
+  """
+  @spec recovery_peers_problem() :: String.t() | nil
+  def recovery_peers_problem do
+    cond do
+      Application.get_env(:fathom, :replication_recovery_guard, false) != true -> nil
+      not replicating?() -> nil
+      # Recovery pulls a replica through THIS node's follower, so a node that is not listening never
+      # runs it (`Recovery.fleet_reachable?/1`): nothing to guard.
+      not listening?() -> nil
+      not Fathom.Shard.Replication.Recovery.enabled?() -> nil
+      Application.get_env(:fathom, :replication_promote_on_open, true) != true -> nil
+      recovery_endpoints() != [] -> nil
+      Application.get_env(:fathom, :replication_recovery_symmetric, false) == true -> nil
+      Fathom.Shard.Replication.Membership.source() == :roster -> nil
+      true -> recovery_peers_message()
+    end
+  end
+
+  defp recovery_peers_message do
+    ":replication_recovery_peers is unset, so a takeover asks only this node's own " <>
+      "#{length(followers())} REPLICATION_FOLLOWERS before opening a shard. That is a correct " <>
+      "responder floor only when every node follows every other; with a follower SUBSET (a ring) " <>
+      "it can open from a stale S3 object and lose quorum-acked writes (Jepsen 2026-10-27, " <>
+      "docs/reviews/jepsen-2026-10-27.md). Set REPLICATION_RECOVERY_PEERS to every other node " <>
+      "(node_key@host:port, comma separated), or REPLICATION_RECOVERY_SYMMETRIC=true if " <>
+      "REPLICATION_FOLLOWERS already is every other node, or REPLICATION_MEMBERSHIP=roster. " <>
+      "To run without peer recovery, REPLICATION_RECOVER_FROM_PEERS=false (failover may then lose " <>
+      "acked writes)."
   end
 end

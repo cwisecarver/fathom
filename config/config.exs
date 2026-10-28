@@ -49,6 +49,12 @@ config :fathom, :fence_writes_when_stealable, config_env() == :prod
 config :fathom, :replication_listen, config_env() == :prod
 config :fathom, :replication_enabled, config_env() == :prod
 
+# Boot guard for peer recovery over a follower SUBSET (Fleet.recovery_peers_problem/0): a prod node
+# that runs promote-on-open + peer recovery with neither REPLICATION_RECOVERY_PEERS nor
+# REPLICATION_RECOVERY_SYMMETRIC=true nor roster membership FAILS TO BOOT. Jepsen 2026-10-27 lost acked
+# writes on a follower ring with exactly that configuration. Off in dev/test, like the guards above.
+config :fathom, :replication_recovery_guard, config_env() == :prod
+
 # Per-stream SQLite connection pooling (docs/pooling-spike-plan.md). ON in prod, off in dev/test —
 # matching the replication convention above. The 2026-09-17 A2 blocker (a pooled handle held a
 # SQLite connection open on an idle shard, leaving the WAL un-checkpointed so the empty-WAL
