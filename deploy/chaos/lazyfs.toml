@@ -1,0 +1,21 @@
+# LazyFS config for the LAZYFS=1 rig overlay (docker-compose.lazyfs.yml).
+#
+# LazyFS keeps every write in its own page cache until the writer fsyncs it. When the container is
+# SIGKILLed, the lazyfs process dies with it and the cache is gone: exactly the bytes a power
+# failure would lose. The FIFO takes `lazyfs::cache-checkpoint` (write the cache through without an
+# fsync), which the Jepsen nemesis sends before an ordinary :kill so a process crash keeps the
+# page cache the way a real kernel would.
+[faults]
+fifo_path="/tmp/lazyfs.fifo"
+
+[cache]
+# Evict like a real page cache when full: an evicted dirty page is written through, not dropped.
+apply_eviction=true
+
+[cache.simple]
+custom_size="1gb"
+blocks_per_page=1
+
+[filesystem]
+log_all_operations=false
+logfile="/tmp/lazyfs.log"

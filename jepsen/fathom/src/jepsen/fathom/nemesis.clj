@@ -21,11 +21,23 @@
     :repl-slow       200-1000 ms of latency on the link into the node's follower port
     :rolling-restart kill and revive every node in turn, like a bad deploy
     :lb-restart      restart nginx
+    :power-loss      SIGKILL the container with LazyFS under /data, so every write
+                     the node had not fsynced is gone, as after a power failure.
+                     Needs the LAZYFS=1 overlay (deploy/chaos/docker-compose.lazyfs.yml).
+                     At most one node is power-lost at a time: followers ack from
+                     RAM by design (:replication_fsync off), and durability comes
+                     from the replica count, so a simultaneous power loss of a
+                     shard's quorum is outside what fathom claims to survive.
     :clock-back      step the VM clock 20-60 s BACKWARD, then forward to the host's
     :clock-jump      step the VM clock 20-60 s forward, then back to the host's.
                      Every container shares one kernel clock, so this jumps ALL
                      nodes and MinIO together; per-node skew is not possible on
                      this rig (no CAP_SYS_TIME in the containers)
+
+  On a LazyFS rig, :kill (and the kills inside :kill-majority and
+  :rolling-restart) first writes LazyFS's cache through, so it stays a process
+  crash that keeps the page cache. Writes in the moment between that flush and
+  the SIGKILL are lost, which is harsher than a real crash, never gentler.
 
   The repl-* faults need the rig brought up with REPL_VIA_TOXI=1, or replication
   bypasses toxiproxy and they are inert.
@@ -46,8 +58,9 @@
 (def network "fathom-chaos_default")
 (defn cname [node] (str "fathom-chaos-" node "-1"))
 
-(def node-faults #{:kill :pause :isolate :s3-cut :s3-blackhole :s3-slow :repl-cut :repl-blackhole
+(def node-faults #{:kill :power-loss :pause :isolate :s3-cut :s3-blackhole :s3-slow :repl-cut :repl-blackhole
                    :flap :s3-reset :s3-truncate :repl-slow})
+(def lazyfs-faults #{:power-loss})
 (def solo-faults #{:kill-majority :minio-pause :postgres-pause :clock-jump :clock-back
                    :rolling-restart :lb-restart})
 
@@ -129,7 +142,32 @@
   (docker! "network" "connect" "--alias" node network (cname node))
   (log-ip! node))
 
-(defn kill! [node] (disconnect! node) (docker! "kill" (cname node)))
+;; Set at setup!: true when every node's /data is a LazyFS mount.
+(defonce ^:private lazyfs? (atom false))
+
+(defn lazyfs-mounted? [node]
+  (let [{:keys [exit]} (sh docker "exec" (cname node) "mountpoint" "-q" "/data")]
+    (zero? exit)))
+
+(defn- lazyfs! [node cmd]
+  (docker! "exec" (cname node) "sh" "-c" (str "echo " cmd " > /tmp/lazyfs.fifo")))
+
+(defn kill!
+  "A process crash. On a LazyFS rig the cache is written through first, since a
+  real kernel keeps a dead process's dirty pages."
+  [node]
+  (disconnect! node)
+  (when @lazyfs?
+    (lazyfs! node "lazyfs::cache-checkpoint")
+    (Thread/sleep 500))
+  (docker! "kill" (cname node)))
+
+(defn power-off!
+  "A power failure: SIGKILL takes LazyFS down with the node, and its cache (every
+  un-fsynced write) with it."
+  [node]
+  (disconnect! node)
+  (docker! "kill" (cname node)))
 ;; `docker start` keeps the env the container was created with, so a revived
 ;; node cannot come back with replication silently off (the trap chaos.sh's rpo
 ;; arm documents for `compose up`).
@@ -153,6 +191,7 @@
   (let [node (first nodes)]
     (case f
       :kill           (kill! node)
+      :power-loss     (power-off! node)
       :pause          (docker! "pause" (cname node))
       :isolate        (disconnect! node)
       :s3-cut         (proxy-enabled! test (str "s3-" node) false)
@@ -179,7 +218,7 @@
 (defn stop-fault! [test f nodes]
   (let [node (first nodes)]
     (case f
-      :kill           (revive! node)
+      (:kill :power-loss) (revive! node)
       :pause          (docker! "unpause" (cname node))
       :isolate        (connect! node)
       :s3-cut         (proxy-enabled! test (str "s3-" node) true)
@@ -205,7 +244,11 @@
   (let [faults (vec (:faults test))
         busy   (set (mapcat second active))
         free   (remove busy (:nodes test))
-        solo?  (some (comp solo-faults first) active)]
+        solo?  (some (comp solo-faults first) active)
+        ;; One power-lost node at a time; see :power-loss in the ns doc.
+        faults (if (some (comp #{:power-loss} first) active)
+                 (vec (remove #{:power-loss} faults))
+                 faults)]
     (when (and (not solo?) (< (count active) (:max-concurrent-faults test)))
       (let [choices (filter #(or (and (node-faults %) (seq free))
                                  (and (solo-faults %) (empty? active)))
@@ -218,7 +261,16 @@
 
 (defrecord RigNemesis [active]
   nemesis/Nemesis
-  (setup! [this test] (doseq [n (:nodes test)] (log-ip! n)) this)
+  (setup! [this test]
+    (doseq [n (:nodes test)] (log-ip! n))
+    (let [mounted (filter lazyfs-mounted? (:nodes test))]
+      (reset! lazyfs? (= (count mounted) (count (:nodes test))))
+      (info "lazyfs on" (vec mounted))
+      (when (and (:power-loss (:faults test)) (not @lazyfs?))
+        (throw (ex-info (str ":power-loss needs LazyFS under /data on every node; mounted on "
+                             (vec mounted) ". Bring the rig up with the LAZYFS=1 overlay.")
+                        {:mounted mounted}))))
+    this)
   (invoke! [this test op]
     (case (:f op)
       :start (if-let [[f nodes :as fault] (pick-fault test @active)]

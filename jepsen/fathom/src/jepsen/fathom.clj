@@ -19,7 +19,10 @@
             [jepsen.fathom.client :as fclient]
             [jepsen.fathom.nemesis :as fnemesis]))
 
-(def all-faults (into fnemesis/node-faults fnemesis/solo-faults))
+(def all-faults (apply disj (into fnemesis/node-faults fnemesis/solo-faults) fnemesis/lazyfs-faults))
+;; Faults that need the LazyFS overlay. Not in "all", so `--faults all` still
+;; runs on a plain rig; ask for them by name (`--faults all,power-loss`).
+(def known-faults (into all-faults fnemesis/lazyfs-faults))
 (def default-faults #{:kill :pause :isolate :s3-cut})
 
 (defrecord FinalReads [tracker]
@@ -65,7 +68,7 @@
            opts
            {:name         (str "fathom-" (name (:target opts)) "-"
                                (cond
-                                 (:hard opts)         "hard"
+                                 (:hard opts)         (if (:power-loss (:faults opts)) "hard-power" "hard")
                                  (seq (:faults opts)) (str/join "+" (map name (sort (:faults opts))))
                                  :else                "none"))
             ;; The rig's fixed fleet; the client-thread count must be a
@@ -94,20 +97,19 @@
                             (gen/clients (->FinalReads tracker)))})))
 
 (defn parse-faults [s]
-  (cond
-    (#{"" "none"} s) #{}
-    (= "all" s)      all-faults
-    :else            (set (map keyword (str/split s #",")))))
+  (if (#{"" "none"} s)
+    #{}
+    (set (mapcat #(if (= "all" %) all-faults [(keyword %)]) (str/split s #",")))))
 
 (def cli-opts
   [[nil "--target TARGET" ":lb (through nginx, like a real client) or :direct (random node, forces lease contention)"
     :default :lb
     :parse-fn keyword
     :validate [#{:lb :direct :mixed} "must be lb, direct or mixed"]]
-   [nil "--faults LIST" (str "Comma list of " (str/join "," (sort (map name all-faults))) ", all, or none")
+   [nil "--faults LIST" (str "Comma list of " (str/join "," (sort (map name known-faults))) ", all, or none; all excludes power-loss")
     :default default-faults
     :parse-fn parse-faults
-    :validate [#(every? all-faults %) "unknown fault"]]
+    :validate [#(every? known-faults %) "unknown fault"]]
    [nil "--hard" "Shifting fault combinations (up to --max-concurrent-faults at once, 3-30 s each) instead of one fault per interval"
     :default false]
    [nil "--max-concurrent-faults N" "With --hard: faults allowed active at once"

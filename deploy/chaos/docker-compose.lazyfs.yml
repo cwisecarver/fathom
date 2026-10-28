@@ -1,0 +1,45 @@
+# Opt-in rig overlay: each node's /data sits on LazyFS (lazyfs.toml, lazyfs-mount.sh), so killing a
+# node's container loses every write it had not fsynced, as a power failure would. The Jepsen
+# :power-loss fault is that kill; with this overlay the nemesis also flushes LazyFS's cache before
+# an ordinary :kill, so a process crash still keeps the page cache. Without the overlay there is no
+# LazyFS and :power-loss is refused.
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.lazyfs.yml REPLICATION_ENABLED=true ./chaos.sh up
+#
+# Root is needed to mount; the entrypoint drops to `app` before starting fathom.
+services:
+  fathom1:
+    user: root
+    environment:
+      LAZYFS: "1"
+    devices: ["/dev/fuse"]
+    cap_add: [SYS_ADMIN]
+    security_opt: ["apparmor:unconfined"]
+  fathom2:
+    user: root
+    environment:
+      LAZYFS: "1"
+    devices: ["/dev/fuse"]
+    cap_add: [SYS_ADMIN]
+    security_opt: ["apparmor:unconfined"]
+  fathom3:
+    user: root
+    environment:
+      LAZYFS: "1"
+    devices: ["/dev/fuse"]
+    cap_add: [SYS_ADMIN]
+    security_opt: ["apparmor:unconfined"]
+  fathom4:
+    user: root
+    environment:
+      LAZYFS: "1"
+    devices: ["/dev/fuse"]
+    cap_add: [SYS_ADMIN]
+    security_opt: ["apparmor:unconfined"]
+  fathom5:
+    user: root
+    environment:
+      LAZYFS: "1"
+    devices: ["/dev/fuse"]
+    cap_add: [SYS_ADMIN]
+    security_opt: ["apparmor:unconfined"]

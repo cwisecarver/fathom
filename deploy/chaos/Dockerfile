@@ -95,13 +95,32 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/fathom/native/fathom_udf/target \
     mix release
 
+# LazyFS (https://github.com/dsrhaslab/lazyfs), the FUSE filesystem Jepsen uses to lose un-fsynced
+# writes. Only the LAZYFS=1 overlay (docker-compose.lazyfs.yml) mounts it; a plain `up` never runs
+# it. Pinned to a tag so a rebuild cannot change what "power loss" means under the test.
+FROM ${RUNNER_IMAGE} AS lazyfs
+RUN apt-get update -y && apt-get install -y g++ cmake git libfuse3-dev pkg-config \
+  && apt-get clean && rm -f /var/lib/apt/lists/*_*
+RUN git clone --depth 1 --branch 0.3.1 https://github.com/dsrhaslab/lazyfs /lazyfs \
+  && cd /lazyfs/libs/libpcache && ./build.sh \
+  && cd /lazyfs/lazyfs && ./build.sh \
+  && mkdir -p /out/lib && cp /lazyfs/lazyfs/build/lazyfs /out/ \
+  && find /lazyfs/libs/libpcache/build -name '*.so*' -exec cp -a {} /out/lib/ \;
+
 FROM ${RUNNER_IMAGE}
 
-# curl: compose healthchecks + in-container debugging.
+# curl: compose healthchecks + in-container debugging. fuse3: LazyFS (see the lazyfs stage).
 RUN apt-get update -y && \
-  apt-get install -y libstdc++6 openssl libncurses6 locales ca-certificates curl && \
+  apt-get install -y libstdc++6 openssl libncurses6 locales ca-certificates curl fuse3 && \
   apt-get clean && rm -f /var/lib/apt/lists/*_* && \
-  sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+  sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen && \
+  sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
+
+COPY --from=lazyfs /out/lazyfs /usr/local/bin/lazyfs
+COPY --from=lazyfs /out/lib/ /usr/local/lib/
+RUN ldconfig && ! ldd /usr/local/bin/lazyfs | grep 'not found'
+COPY fathom/deploy/chaos/lazyfs.toml /etc/lazyfs.toml
+COPY fathom/deploy/chaos/lazyfs-mount.sh /usr/local/bin/lazyfs-mount
 
 ENV LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8
 

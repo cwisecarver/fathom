@@ -94,6 +94,8 @@ x-fathom-env: &fathom-env
   # REPL_VIA_TOXI=1 on `up` routes every follower link through toxiproxy (see the entrypoint) so
   # `./chaos.sh repl-latency <ms>` can inject a cross-AZ / cross-region replication hop. Off by default.
   REPL_VIA_TOXI: "${REPL_VIA_TOXI:-}"
+  # Set to 1 only by docker-compose.lazyfs.yml (it needs root, /dev/fuse and CAP_SYS_ADMIN too).
+  LAZYFS: "${LAZYFS:-}"
   #
   # Shipping is per-scenario: OFF by default so the rig runs exactly as before, and flipped for
   # a run with `REPLICATION_ENABLED=true ./chaos.sh replication`. REPLICATION_FOLLOWERS is set
@@ -276,6 +278,9 @@ x-fathom-node: &fathom-node
     - /bin/sh
     - -c
     - |
+      # LAZYFS=1 (docker-compose.lazyfs.yml, which also runs this as root): mount LazyFS over
+      # /data first, so a SIGKILL of the container loses every un-fsynced write.
+      if [ "$$LAZYFS" = "1" ]; then lazyfs-mount || exit 1; fi
       export REPLICATION_BIND_IP="$$(hostname -i | awk '{print $$1}')"
       echo "replication bind ip: $$REPLICATION_BIND_IP"
       # REPL_VIA_TOXI=1 routes every follower link through this node's toxiproxy repl proxy so
@@ -289,6 +294,9 @@ x-fathom-node: &fathom-node
       if [ "$$REPL_VIA_TOXI" = "1" ] && [ -n "$$REPLICATION_RECOVERY_PEERS" ]; then
         export REPLICATION_RECOVERY_PEERS="$$(printf '%s' "$$REPLICATION_RECOVERY_PEERS" | sed -E 's/@fathom([0-9]):9100/@toxiproxy:2910\1/g')"
         echo "recovery peers via toxiproxy: $$REPLICATION_RECOVERY_PEERS"
+      fi
+      if [ "$$(id -u)" = "0" ]; then
+        exec setpriv --reuid=app --regid=app --init-groups env HOME=/home/app /app/bin/fathom start
       fi
       exec /app/bin/fathom start
 

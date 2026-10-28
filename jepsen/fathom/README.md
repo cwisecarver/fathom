@@ -38,8 +38,28 @@ faults. Then every key each shard touched is read back.
 | `minio-pause` / `postgres-pause` | SIGSTOP the object store / the control plane |
 | `lb-restart` | restart nginx |
 | `clock-jump` / `clock-back` | step the VM clock 20-60 s forward / back: every node and MinIO at once |
+| `power-loss` | SIGKILL a node whose `/data` is on LazyFS, losing every write it had not fsynced; one node at a time (needs the LazyFS overlay, below) |
 
-`--faults all` selects every fault. The default is `kill,pause,isolate,s3-cut`.
+`--faults all` selects every fault except `power-loss`. Add it by name: `--faults all,power-loss`.
+The default is `kill,pause,isolate,s3-cut`.
+
+### Power loss (LazyFS)
+
+A plain `kill` keeps the page cache, because the colima kernel outlives the container. To lose
+un-fsynced writes the way a power failure does, bring the rig up with `/data` on
+[LazyFS](https://github.com/dsrhaslab/lazyfs), the filesystem Jepsen's own analyses use for this:
+
+```sh
+cd ../../deploy/chaos
+COMPOSE_FILE=docker-compose.yml:docker-compose.lazyfs.yml REPLICATION_ENABLED=true REPL_VIA_TOXI=1 ./chaos.sh up
+```
+
+LazyFS holds every write in its own cache until it is fsynced, so SIGKILLing the container drops
+whatever was not. On this rig `kill` first writes the cache through (`lazyfs::cache-checkpoint`),
+so it stays a process crash. `power-loss` hits one node at a time: followers ack from RAM by design
+(`:replication_fsync` off) and take durability from the replica count, so a quorum losing power
+together is outside what fathom claims to survive. The test refuses `power-loss` unless every
+node's `/data` is a LazyFS mount.
 
 ## Targets
 
