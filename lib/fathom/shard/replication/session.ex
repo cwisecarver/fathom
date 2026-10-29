@@ -3116,13 +3116,25 @@ defmodule Fathom.Shard.Replication.Session do
   # `deliver/7` with no time left and failed `{:no_quorum, :timeout}` before sending anything —
   # the shard refused writes for the rest of the run while all three followers were up (rig,
   # 2026-10-29: entries 44-220 s old on followers whose shippers held no waiter for the shard).
-  # Past the bound the follower is pushed to, as the planner already does, and its shipper decides.
+  #
+  # BUT NOT AT THE PLANNER'S BOUND ITSELF (CI 2026-10-29, `replication_seed_test` "waits for in-flight
+  # stragglers"). A commit that fails `{:no_quorum, :timeout}` returns exactly `timeout()` after its
+  # pushes, so the NEXT commit starts with entries right at that age whose shippers still hold the
+  # waiter (the follower is slow, not silent). Counting those free skipped the wait, the pushes were
+  # refused `:already_in_flight`, and the commit failed `:impossible` — the 2026-10-02 failure this
+  # wait exists to prevent, back on a coin flip. So a lost reply frees its follower after
+  # `2 * timeout()`: long past any reply a live waiter can still produce, and still bounded.
   @doc false
-  # Public only so the agreement with `in_flight?/3` can be pinned without staging a lost reply.
+  # Public only so the bound can be pinned without staging a lost reply.
   def free_followers(state, now \\ System.monotonic_time(:millisecond)) do
     Enum.count(shippers(), fn s ->
-      not in_flight?(state, s, now) and not Map.has_key?(state.seeding, s)
+      not awaiting_reply?(state, s, now) and not Map.has_key?(state.seeding, s)
     end)
+  end
+
+  defp awaiting_reply?(state, shipper, now) do
+    Map.has_key?(state.inflight, shipper) and
+      now - Map.get(state.inflight_at, shipper, 0) < 2 * timeout()
   end
 
   defp drain_late_replies(state, wal_path),

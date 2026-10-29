@@ -1,7 +1,7 @@
 defmodule Fathom.Shard.Replication.SessionFreeFollowersTest do
   @moduledoc """
-  A follower whose reply was lost stops counting as busy once its push is older than the
-  Session's `timeout()` (Jepsen 2026-10-28/29, the stuck-quorum runs).
+  A follower whose reply was lost stops counting as busy once its push is older than
+  `2 * timeout()` (Jepsen 2026-10-28/29, the stuck-quorum runs), and not before (CI 2026-10-29).
 
   ## The defect
 
@@ -15,8 +15,14 @@ defmodule Fathom.Shard.Replication.SessionFreeFollowersTest do
 
   ## What is pinned
 
-  The free count agrees with the planner at every age: an entry younger than `timeout()` is busy,
-  one at or past it is free, and a seed in flight is busy whatever its age.
+  An entry younger than `2 * timeout()` is busy, one at or past it is free, and a seed in flight
+  is busy whatever its age.
+
+  The bound is NOT the planner's `timeout()`. A commit that times out returns exactly `timeout()`
+  after its pushes, so the next commit meets entries at that age whose shippers still hold the
+  waiter. Freeing them at `timeout()` skipped the straggler wait and the commit failed
+  `{:no_quorum, :impossible}` on `:already_in_flight` (`replication_seed_test`, "a commit waits for
+  in-flight stragglers", red on CI and about 2 local runs in 5).
   """
   use ExUnit.Case, async: false
 
@@ -59,10 +65,16 @@ defmodule Fathom.Shard.Replication.SessionFreeFollowersTest do
     assert Session.free_followers(state(f1: fresh, f2: fresh), @now) == 1
   end
 
-  test "the boundary is the planner's: busy below timeout(), free at it" do
+  test "a push just past timeout() is still busy: its waiter may be live" do
+    # The previous commit timed out at exactly this age; its stragglers are slow, not lost.
     t = Session.timeout()
-    assert Session.free_followers(state(f1: t - 1), @now) == 2
-    assert Session.free_followers(state(f1: t), @now) == 3
+    assert Session.free_followers(state(f1: t, f2: t + 200), @now) == 1
+  end
+
+  test "the boundary is 2 * timeout(): busy below it, free at it" do
+    t2 = 2 * Session.timeout()
+    assert Session.free_followers(state(f1: t2 - 1), @now) == 2
+    assert Session.free_followers(state(f1: t2), @now) == 3
   end
 
   test "a seed in flight keeps its follower busy at any age" do
