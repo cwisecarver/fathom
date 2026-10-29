@@ -147,6 +147,8 @@ fi
 compose() { "$DOCKER" compose "$@"; }
 cname() { echo "fathom-chaos-$1-1"; }
 netname() { echo "fathom-chaos_default"; }
+# The fixed address docker-compose.yml gives fathomN; a reconnect must ask for it back.
+nodeip() { echo "10.200.0.1${1#fathom}"; }
 
 now_ms() { /usr/bin/python3 -c 'import time; print(int(time.time()*1000))'; }
 
@@ -397,7 +399,14 @@ check_lb_port() {
   echo "      lsof -nP -iTCP:$LB_PORT -sTCP:LISTEN"
   echo "  Then free the port, or re-run on another one:  LB_PORT=18080 ./chaos.sh up"
 }
-cmd_down()  { compose down -v --remove-orphans; }
+# Abort every FUSE connection in the VM first. On the LazyFS rig a node whose app is blocked in a
+# FUSE request while lazyfs dies can wedge in a half-frozen cgroup that `docker stop` cannot finish
+# (Jepsen 2026-10-28: a leftover zombie fathom5 then broke the next run's `up`). Aborting the
+# connection fails the blocked request, and the container exits. A no-op on a plain rig.
+cmd_down()  {
+  colima ssh -- sh -c 'for f in /sys/fs/fuse/connections/*/abort; do echo 1 | sudo tee "$f" >/dev/null; done' >/dev/null 2>&1 || true
+  compose down -v --remove-orphans
+}
 # Prints and exits by default. `-f` follows, which never returns: a script that captured node
 # logs with the old always-follow form hung for a day waiting on it (2026-10-11).
 cmd_logs()  { compose logs "$@"; }
@@ -491,7 +500,7 @@ revive() {
   local node=$1
   # --alias: without it the revived container has no DNS name on the network, so peers dialling
   # "<node>" get nxdomain and peer recovery hears one answer too few (seen on the 2026-10-13 rig run).
-  "$DOCKER" network connect --alias "$node" "$(netname)" "$(cname "$node")" 2>/dev/null
+  "$DOCKER" network connect --alias "$node" --ip "$(nodeip "$node")" "$(netname)" "$(cname "$node")" 2>/dev/null
   compose up -d "$node" >/dev/null 2>&1
 }
 

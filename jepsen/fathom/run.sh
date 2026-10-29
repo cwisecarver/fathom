@@ -43,6 +43,21 @@ running=$("$DOCKER" ps --filter name=fathom-chaos-fathom --format '{{.Names}}' |
   exit 1
 }
 
+# A rig whose `up` half-failed still has 5 "running" nodes when one is a leftover from the last
+# run, and every op then fails with connection refused, which reads as a fathom liveness failure
+# (2026-10-28, the S3 run). Each node must be healthy and the LB must answer as nginx.
+for _ in $(seq 1 30); do
+  unhealthy=$("$DOCKER" ps --filter name=fathom-chaos-fathom --format '{{.Names}} {{.Status}}' | grep -v '(healthy)')
+  [ -z "$unhealthy" ] && break
+  sleep 2
+done
+[ -z "$unhealthy" ] || { echo "refusing: nodes not healthy:" >&2; echo "$unhealthy" >&2; exit 1; }
+lb_server=$(curl -s -o /dev/null -D - "http://localhost:${LB_PORT:-8080}/" 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="server"{print $2}')
+case "$lb_server" in
+  nginx*) ;;
+  *) echo "refusing: the LB on port ${LB_PORT:-8080} is not answering as nginx (Server: '${lb_server}')" >&2; exit 1 ;;
+esac
+
 # Ask the node, not this shell: the setting is baked in at container boot.
 repl=$("$DOCKER" exec fathom-chaos-fathom1-1 /app/bin/fathom rpc \
   'IO.puts(Fathom.Shard.Replication.Fleet.replicating?())' 2>/dev/null | tr -d '\r\n ')

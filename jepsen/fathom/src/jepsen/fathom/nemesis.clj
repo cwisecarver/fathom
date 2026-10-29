@@ -3,7 +3,10 @@
   and the toxiproxy API rather than over SSH. Same mechanics as chaos.sh:
 
     :kill            network-disconnect then SIGKILL, so peers see a hang, not a RST
-    :pause           SIGSTOP the whole container: the zombie-owner case
+    :pause           SIGSTOP the whole container: the zombie-owner case. On a LazyFS
+                     rig, SIGSTOP of the app only (PID 1): freezing the cgroup while
+                     the app is inside a FUSE request can wedge the freeze, leaving
+                     the node half-frozen for the rest of the run (2026-10-28)
     :isolate         disconnect from the compose network: no LB, peers, S3 or Postgres
     :s3-cut          disable the node's toxiproxy S3 proxy: connections refused
     :s3-blackhole    the node's S3 proxy swallows traffic: requests hang, no RST
@@ -141,8 +144,14 @@
                            (str "{{(index .NetworkSettings.Networks \"" network "\").IPAddress}}")
                            (cname node))))
 
+;; The fixed address deploy/chaos/docker-compose.yml gives the node. Without --ip a
+;; reconnected node could take another node's freed address (2026-10-28: fathom1
+;; came back as fathom3's IP), leaving the LB and the node's own replication bind
+;; address pointing at the wrong container.
+(defn node-ip [node] (str "10.200.0.1" (subs node (count "fathom"))))
+
 (defn connect! [node]
-  (docker! "network" "connect" "--alias" node network (cname node))
+  (docker! "network" "connect" "--alias" node "--ip" (node-ip node) network (cname node))
   (log-ip! node))
 
 ;; Set at setup!: true when every node's /data is a LazyFS mount.
@@ -183,6 +192,21 @@
 ;; `docker start` keeps the env the container was created with, so a revived
 ;; node cannot come back with replication silently off (the trap chaos.sh's rpo
 ;; arm documents for `compose up`).
+(defn pause!
+  "The zombie owner: the node's app stops, its sockets stay open. A cgroup freeze
+  (docker pause) on a plain rig; on a LazyFS rig a SIGSTOP of the app (PID 1)
+  instead, since the freeze can wedge on the app's in-flight FUSE request and
+  leave the node half-frozen, with docker then refusing the unpause."
+  [node]
+  (if @lazyfs?
+    (docker! "kill" "-s" "STOP" (cname node))
+    (docker! "pause" (cname node))))
+
+(defn unpause! [node]
+  (if @lazyfs?
+    (docker! "kill" "-s" "CONT" (cname node))
+    (docker! "unpause" (cname node))))
+
 (defn revive! [node] (connect! node) (docker! "start" (cname node)))
 
 (defn- flap! [node run?]
@@ -204,7 +228,7 @@
     (case f
       :kill           (kill! node)
       :power-loss     (power-off! node)
-      :pause          (docker! "pause" (cname node))
+      :pause          (pause! node)
       :isolate        (disconnect! node)
       :s3-cut         (proxy-enabled! test (str "s3-" node) false)
       :s3-blackhole   (add-toxic! test (str "s3-" node) "timeout" "{\"timeout\":0}")
@@ -234,7 +258,7 @@
   (let [node (first nodes)]
     (case f
       (:kill :power-loss) (revive! node)
-      :pause          (docker! "unpause" (cname node))
+      :pause          (unpause! node)
       :isolate        (connect! node)
       :s3-cut         (proxy-enabled! test (str "s3-" node) true)
       (:s3-blackhole :s3-slow) (clear-toxics! test (str "s3-" node))

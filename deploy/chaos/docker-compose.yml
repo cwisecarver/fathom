@@ -396,6 +396,9 @@ services:
 
   fathom1:
     <<: *fathom-node
+    networks:
+      default:
+        ipv4_address: 10.200.0.11
     environment:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21001
@@ -410,6 +413,9 @@ services:
 
   fathom2:
     <<: *fathom-node
+    networks:
+      default:
+        ipv4_address: 10.200.0.12
     environment:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21002
@@ -424,6 +430,9 @@ services:
 
   fathom3:
     <<: *fathom-node
+    networks:
+      default:
+        ipv4_address: 10.200.0.13
     environment:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21003
@@ -442,6 +451,9 @@ services:
   # single-node cut rather than a fleet-wide one.
   fathom4:
     <<: *fathom-node
+    networks:
+      default:
+        ipv4_address: 10.200.0.14
     environment:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21004
@@ -456,6 +468,9 @@ services:
 
   fathom5:
     <<: *fathom-node
+    networks:
+      default:
+        ipv4_address: 10.200.0.15
     environment:
       <<: *fathom-env
       S3_ENDPOINT: http://toxiproxy:21005
@@ -546,3 +561,18 @@ services:
       nofile:
         soft: 65536
         hard: 524288
+
+# FIXED NODE ADDRESSES (Jepsen 2026-10-28). With compose's automatic addressing, a node cut off
+# (`isolate`, `kill`, `flap`) and reconnected could come back with ANOTHER node's freed address:
+# fathom1 returned as fathom3's old IP, the LB (which resolves upstreams once) sent fathom3's shards
+# to fathom1, and each node's REPLICATION_BIND_IP (`hostname -i` at boot) went stale, so its
+# follower listened on an address nobody could reach. Shards then refused writes for the rest of
+# the run, which read as a fathom bug. The nodes keep 10.200.0.1N for the rig's life, reconnects pass
+# `--ip` (chaos.sh revive, the Jepsen nemesis), and every other container draws from `ip_range`,
+# so none can take a node's address while it is disconnected.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.200.0.0/16
+          ip_range: 10.200.1.0/24
