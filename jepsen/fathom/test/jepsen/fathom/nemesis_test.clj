@@ -31,3 +31,15 @@
         (is (not= "fathom1" n)))))
   (testing "alone, it is picked"
     (is (= :power-loss (first (pick-fault (test-map #{:power-loss}) []))))))
+
+(deftest kill-all-takes-every-node-on-a-quiet-cluster
+  ;; A coordinated crash is only one if every node goes down together, and a
+  ;; solo fault never stacks on another.
+  (testing "it targets all five nodes"
+    (is (= [:kill-all ["fathom1" "fathom2" "fathom3" "fathom4" "fathom5"]]
+           (pick-fault (test-map #{:kill-all}) []))))
+  (testing "it never joins an active fault"
+    (dotimes [_ 200]
+      (is (nil? (pick-fault (test-map #{:kill-all}) [[:pause ["fathom1"]]])))))
+  (testing "it is in `all`"
+    (is (contains? (fathom/parse-faults "all") :kill-all))))

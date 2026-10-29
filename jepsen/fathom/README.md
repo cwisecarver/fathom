@@ -14,6 +14,10 @@ fathom promises one writer per shard (one SQLite file). So each shard's history 
   only if `COMMIT` did not.
 - Elle checks each shard on its own and reports lost writes, stale reads, G1 (dirty or
   aborted reads) and G2 (cycles).
+- A liveness check (`jepsen.fathom.liveness`) fails the run when a shard takes no ok write
+  after the faults are healed. Elle judges only what completed, so a shard stuck refusing
+  writes used to pass, or come back `:unknown`. `--recovery-deadline SECS` also fails a
+  shard that took longer than that to write again.
 
 ## Faults
 
@@ -34,6 +38,7 @@ faults. Then every key each shard touched is read back.
 | `s3-reset` / `s3-truncate` | one node's S3 connections are reset / closed after 4-64 KB |
 | `repl-cut` / `repl-blackhole` / `repl-slow` | the link into one node's follower port refuses / hangs / adds latency (needs `REPL_VIA_TOXI=1`) |
 | `kill-majority` | kill 3 of 5 nodes |
+| `kill-all` | kill all 5 nodes at once, then start them all (a coordinated crash; must lose nothing) |
 | `rolling-restart` | kill and revive every node in turn |
 | `minio-pause` / `postgres-pause` | SIGSTOP the object store / the control plane |
 | `lb-restart` | restart nginx |

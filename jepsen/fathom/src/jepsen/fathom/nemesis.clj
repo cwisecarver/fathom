@@ -12,6 +12,9 @@
                      primary can ship to it and no recovering peer can ask it
     :repl-blackhole  the same link swallows traffic instead of refusing it
     :kill-majority   kill 3 of 5 nodes at once: no follower quorum is reachable
+    :kill-all        kill all 5 nodes at once, then start them all: a coordinated
+                     crash (Jepsen's MariaDB Galera finding). A process crash keeps
+                     the page cache, so fathom must lose nothing
     :minio-pause     SIGSTOP the object store itself: every node's S3 hangs at once
     :postgres-pause  SIGSTOP the control-plane database
     :flap            cut and restore the node's network every 1-3 s until healed
@@ -34,7 +37,7 @@
                      nodes and MinIO together; per-node skew is not possible on
                      this rig (no CAP_SYS_TIME in the containers)
 
-  On a LazyFS rig, :kill (and the kills inside :kill-majority and
+  On a LazyFS rig, :kill (and the kills inside :kill-majority, :kill-all and
   :rolling-restart) first writes LazyFS's cache through, so it stays a process
   crash that keeps the page cache. Writes in the moment between that flush and
   the SIGKILL are lost, which is harsher than a real crash, never gentler.
@@ -61,7 +64,7 @@
 (def node-faults #{:kill :power-loss :pause :isolate :s3-cut :s3-blackhole :s3-slow :repl-cut :repl-blackhole
                    :flap :s3-reset :s3-truncate :repl-slow})
 (def lazyfs-faults #{:power-loss})
-(def solo-faults #{:kill-majority :minio-pause :postgres-pause :clock-jump :clock-back
+(def solo-faults #{:kill-majority :kill-all :minio-pause :postgres-pause :clock-jump :clock-back
                    :rolling-restart :lb-restart})
 
 ;; Background fault loops (:flap, :rolling-restart), keyed by [fault node].
@@ -210,6 +213,9 @@
       :repl-cut       (proxy-enabled! test (str "repl-" node) false)
       :repl-blackhole (add-toxic! test (str "repl-" node) "timeout" "{\"timeout\":0}")
       :kill-majority  (doseq [n nodes] (kill! n))
+      ;; In parallel, so the nodes die within a moment of each other rather than
+      ;; one LazyFS checkpoint (500 ms) apart.
+      :kill-all       (dorun (pmap kill! nodes))
       :minio-pause    (docker! "pause" "fathom-chaos-minio-1")
       :postgres-pause (docker! "pause" "fathom-chaos-postgres-1")
       :clock-jump     (set-vm-clock! (+ (now-s) 20 (rand-int 41)) true)
@@ -234,7 +240,7 @@
       (:s3-blackhole :s3-slow) (clear-toxics! test (str "s3-" node))
       :repl-cut       (proxy-enabled! test (str "repl-" node) true)
       :repl-blackhole (clear-toxics! test (str "repl-" node))
-      :kill-majority  (doseq [n nodes] (revive! n))
+      (:kill-majority :kill-all) (doseq [n nodes] (revive! n))
       :minio-pause    (docker! "unpause" "fathom-chaos-minio-1")
       :postgres-pause (docker! "unpause" "fathom-chaos-postgres-1")
       (:clock-jump :clock-back) (set-vm-clock! (now-s))
@@ -264,8 +270,9 @@
                             faults)]
         (when (seq choices)
           (let [f (rand-nth (vec choices))]
-            [f (if (= :kill-majority f)
-                 (vec (take 3 (shuffle (:nodes test))))
+            [f (case f
+                 :kill-majority (vec (take 3 (shuffle (:nodes test))))
+                 :kill-all      (vec (:nodes test))
                  (if (node-faults f) [(rand-nth (vec free))] []))]))))))
 
 (defrecord RigNemesis [active]

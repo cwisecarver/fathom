@@ -17,6 +17,7 @@
             [jepsen.tests.cycle.append :as append]
             [elle.list-append :as la]
             [jepsen.fathom.client :as fclient]
+            [jepsen.fathom.liveness :as liveness]
             [jepsen.fathom.nemesis :as fnemesis]))
 
 (def all-faults (apply disj (into fnemesis/node-faults fnemesis/solo-faults) fnemesis/lazyfs-faults))
@@ -84,6 +85,7 @@
             :nemesis      (fnemesis/nemesis)
             :checker      (checker/compose
                             {:append     (:checker w)
+                             :liveness   (liveness/checker (:recovery-deadline opts))
                              :stats      (checker/stats)
                              :exceptions (checker/unhandled-exceptions)})
             :generator    (gen/phases
@@ -120,6 +122,8 @@
     :parse-fn parse-long]
    [nil "--quiet-period SECS" "Fault-free seconds at the end, so reads can see what survived"
     :default 30
+    :parse-fn parse-long]
+   [nil "--recovery-deadline SECS" "Seconds after the heal by which every shard must write again (default: by the end of the run)"
     :parse-fn parse-long]
    [nil "--shards N" "Shards under test at once"
     :default 8
