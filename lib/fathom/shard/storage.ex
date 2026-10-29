@@ -100,6 +100,13 @@ defmodule Fathom.Shard.Storage do
           # The request for that marker, set on the lease by `with_dirty_release/1` and turned
           # into `:dirty` when the release writes its marker.
           optional(:dirty_release) => true,
+          # On a released marker: the owner whose answer the next opener's recovery floor must not
+          # count (Jepsen 2026-10-28 power-loss run). See `released_marker/2`. On a lease stolen from
+          # a marker, the same value copied off it, so `floor_owner/1` can name that holder.
+          optional(:released_by) => String.t(),
+          # Set by `with_clean_touch/1`: this holder wrote nothing, so its marker names the holder
+          # before it as `released_by`. Client-side only, never serialized.
+          optional(:clean_release) => true,
           # A fresh create that followed a 412 on a lock which then vanished (S3 `acquire_existing/4`
           # `:not_found`): a holder released mid-acquire, so the open re-checks its pre-lease pull
           # (expert review 2026-10-17 #1). Client-side only, never serialized.
@@ -934,9 +941,41 @@ defmodule Fathom.Shard.Storage do
           marker
       end
 
+    marker =
+      case released_by(lease) do
+        by when is_binary(by) -> Map.put(marker, :released_by, by)
+        _ -> marker
+      end
+
     case lease do
       %{dirty_release: true} -> Map.put(marker, :dirty, true)
       _ -> marker
+    end
+  end
+
+  # WHO THE NEXT OPENER MUST NOT COUNT (Jepsen 2026-10-28, power-loss run, shard 15). Recovery
+  # excludes the previous owner from its responder floor, because a node that held the lease was
+  # never its own follower: its "I hold nothing" says nothing about the tail it wrote. A steal of a
+  # released marker used to name only the sentinel, so the floor counted the real last writer's
+  # empty answer. Observed: fathom2 wrote, its flush failed, fathom3 stole and REFUSED under quorum
+  # (releasing clean), and fathom3's retry stole its own marker, counted fathom2's nil, met the floor
+  # without the one live acker, and opened from the object over a quorum-acked write.
+  #
+  # A holder that wrote (or may have) names ITSELF. A clean holder wrote nothing, so it passes on
+  # whoever it took the lease from, which chains through any number of clean visitors.
+  defp released_by(%{clean_release: true} = lease), do: floor_owner(lease)
+  defp released_by(lease), do: Map.get(lease, :owner)
+
+  @doc """
+  The owner a recovery under `lease` must exclude from its responder floor: the owner the lease was
+  stolen from, or, when that was a released marker, the holder the marker names (`:released_by`).
+  `nil` for a fresh create or a marker that names nobody. Pure.
+  """
+  @spec floor_owner(map()) :: String.t() | nil
+  def floor_owner(lease) do
+    case Map.get(lease, :prev_owner) do
+      @released_owner -> Map.get(lease, :released_by)
+      prev -> prev
     end
   end
 
@@ -1000,13 +1039,15 @@ defmodule Fathom.Shard.Storage do
   """
   @spec with_clean_touch(map()) :: map()
   def with_clean_touch(%{touch_post_etag: to} = lease) when is_binary(to) do
+    lease = Map.put(lease, :clean_release, true)
+
     case Map.get(lease, :touch_origin_etag) || Map.get(lease, :touch_pre_etag) do
       from when is_binary(from) -> Map.put(lease, :clean_touch, {from, to})
       _ -> lease
     end
   end
 
-  def with_clean_touch(lease), do: lease
+  def with_clean_touch(lease), do: Map.put(lease, :clean_release, true)
 
   @doc """
   The ORIGIN of a steal-touch that rotated the object from `pre` (expert review 2026-10-12 #10): the
@@ -1286,6 +1327,12 @@ defmodule Fathom.Shard.Storage do
     # A dirty released marker (expert review 2026-10-13 #7); absent otherwise.
     base = if Map.get(lease, :dirty) == true, do: Map.put(base, "dirty", true), else: base
 
+    base =
+      case Map.get(lease, :released_by) do
+        by when is_binary(by) -> Map.put(base, "released_by", by)
+        _ -> base
+      end
+
     # Touch provenance rides only on a released marker (expert review 2026-10-12 #10); absent
     # otherwise, so every other lock body is byte-identical to before.
     case lease do
@@ -1312,6 +1359,12 @@ defmodule Fathom.Shard.Storage do
           end
 
         lease = if Map.get(m, "dirty") == true, do: Map.put(lease, :dirty, true), else: lease
+
+        lease =
+          case Map.get(m, "released_by") do
+            by when is_binary(by) -> Map.put(lease, :released_by, by)
+            _ -> lease
+          end
 
         case m do
           %{"touched_from" => from, "touched_to" => to} when is_binary(from) and is_binary(to) ->

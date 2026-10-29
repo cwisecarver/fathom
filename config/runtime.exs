@@ -897,6 +897,14 @@ if System.get_env("REPLICATION_FSYNC") in ~w(true 1) do
   config :fathom, :replication_fsync, true
 end
 
+# Where a follower reads the OS boot id, to tell a reboot (which can drop frames acked from RAM)
+# from a process restart (which cannot). Default /proc/sys/kernel/random/boot_id; the chaos rig's
+# LazyFS overlay points it at a file its power-loss fault rewrites. See
+# `Follower.hold_torn_after_reboot/2`.
+if path = System.get_env("REPLICATION_BOOT_ID_PATH") do
+  config :fathom, :replication_boot_id_path, path
+end
+
 # How long a commit waits for its quorum before failing with 503 FILO_NO_QUORUM. This is a
 # ceiling on tenant write latency when followers are unreachable, not a target — the quorum
 # reports :impossible and returns early as soon as too few followers remain, so this only binds

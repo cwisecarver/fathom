@@ -189,8 +189,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
       prefetch_hook(path)
       mark_recovering(path)
 
-      {:asked,
-       Recovery.best_replica(shard_id, stamp, previous_owner: Map.get(lease, :prev_owner))}
+      {:asked, Recovery.best_replica(shard_id, stamp, previous_owner: Storage.floor_owner(lease))}
     end
   end
 
@@ -362,7 +361,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
 
     with {:head, {:ok, head}} <- {:head, decision_head(shard_id, prefetched)},
          {:ok, replica} <-
-           ask_answer(ask, shard_id, path, position_of(head), Map.get(lease, :prev_owner)),
+           ask_answer(ask, shard_id, path, position_of(head), Storage.floor_owner(lease)),
          true <- Promote.fresher?(replica, position_of(head)),
          :ok <- recheck_object(shard_id, head, replica, started) do
       promote_replica(shard_id, path, lease, etag, replica, position_of(head), lineage)

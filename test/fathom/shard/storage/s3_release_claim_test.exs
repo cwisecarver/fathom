@@ -52,11 +52,14 @@ defmodule Fathom.Shard.Storage.S3ReleaseClaimTest do
     {:ok, a} = S3.acquire_lease(@shard, "a@node#1", 30_000)
     assert :ok = S3.release_lease_keeping_claim(@shard, a, 5)
 
+    # `released_by` names the holder (it may have written), so a steal of this marker still
+    # excludes it from the recovery floor (Jepsen 2026-10-28, see released_by_floor_test.exs).
     assert lock(store) == %{
              owner: Storage.released_owner(),
              epoch: a.epoch,
              expires_at_ms: 0,
-             claim: 5
+             claim: 5,
+             released_by: "a@node#1"
            }
 
     assert S3.lease_holder(@shard) == :free

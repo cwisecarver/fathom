@@ -159,11 +159,14 @@ defmodule Fathom.Shard.ReleaseLineageClaimTest do
     {:ok, lease} = Storage.Local.acquire_lease(id, "a@node#1", 60_000)
     assert :ok = Storage.Local.release_lease_keeping_claim(id, lease, 7)
 
+    # `released_by` names the holder, so a steal of this marker still excludes it from the
+    # recovery floor (Jepsen 2026-10-28, see released_by_floor_test.exs).
     assert lock_body(id) == %{
              "owner" => Storage.released_owner(),
              "epoch" => lease.epoch,
              "expires_at_ms" => 0,
-             "claim" => 7
+             "claim" => 7,
+             "released_by" => "a@node#1"
            }
 
     assert Storage.Local.lease_holder(id) == :free

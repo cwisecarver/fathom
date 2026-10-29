@@ -2697,6 +2697,9 @@ defmodule Fathom.Shard.Storage.S3 do
                        # Who we stole from, so promote-on-open can exclude that node from the
                        # recovery responder floor (expert review 2026-10-13 #14).
                        |> Map.put(:prev_owner, other)
+                       # A released marker's last holder, for `Storage.floor_owner/1` (Jepsen
+                       # 2026-10-28 power-loss run).
+                       |> Map.merge(Map.take(dead_lock, [:released_by]))
                        |> Map.put(:touch_pre_etag, pre)
                        |> Map.put(:touch_post_etag, post)
                        |> Map.put(:touch_origin_etag, Storage.touch_origin(dead_lock, pre))}

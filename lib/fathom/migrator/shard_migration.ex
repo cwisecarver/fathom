@@ -1131,7 +1131,7 @@ defmodule Fathom.Migrator.ShardMigration do
   # Gated off, it answers `:no` and this is a no-op, so single-node and replication-off fleets never
   # snooze here.
   defp refuse_if_replica_ahead(shard_id, lease) do
-    case PromoteOnOpen.replica_ahead?(shard_id, lease[:prev_owner]) do
+    case PromoteOnOpen.replica_ahead?(shard_id, Storage.floor_owner(lease)) do
       :no ->
         :ok
 

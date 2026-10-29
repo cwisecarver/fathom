@@ -12,6 +12,9 @@ services:
     user: root
     environment:
       LAZYFS: "1"
+      # A power loss is a reboot: the fault rewrites this file (a fresh "boot id") so the follower
+      # holds its RAM-acked replicas torn (Follower.hold_torn_after_reboot/2). A plain :kill does not.
+      REPLICATION_BOOT_ID_PATH: /var/lib/fathom/boot_id
     devices: ["/dev/fuse"]
     cap_add: [SYS_ADMIN]
     security_opt: ["apparmor:unconfined"]
@@ -19,6 +22,9 @@ services:
     user: root
     environment:
       LAZYFS: "1"
+      # A power loss is a reboot: the fault rewrites this file (a fresh "boot id") so the follower
+      # holds its RAM-acked replicas torn (Follower.hold_torn_after_reboot/2). A plain :kill does not.
+      REPLICATION_BOOT_ID_PATH: /var/lib/fathom/boot_id
     devices: ["/dev/fuse"]
     cap_add: [SYS_ADMIN]
     security_opt: ["apparmor:unconfined"]
@@ -26,6 +32,9 @@ services:
     user: root
     environment:
       LAZYFS: "1"
+      # A power loss is a reboot: the fault rewrites this file (a fresh "boot id") so the follower
+      # holds its RAM-acked replicas torn (Follower.hold_torn_after_reboot/2). A plain :kill does not.
+      REPLICATION_BOOT_ID_PATH: /var/lib/fathom/boot_id
     devices: ["/dev/fuse"]
     cap_add: [SYS_ADMIN]
     security_opt: ["apparmor:unconfined"]
@@ -33,6 +42,9 @@ services:
     user: root
     environment:
       LAZYFS: "1"
+      # A power loss is a reboot: the fault rewrites this file (a fresh "boot id") so the follower
+      # holds its RAM-acked replicas torn (Follower.hold_torn_after_reboot/2). A plain :kill does not.
+      REPLICATION_BOOT_ID_PATH: /var/lib/fathom/boot_id
     devices: ["/dev/fuse"]
     cap_add: [SYS_ADMIN]
     security_opt: ["apparmor:unconfined"]
@@ -40,6 +52,9 @@ services:
     user: root
     environment:
       LAZYFS: "1"
+      # A power loss is a reboot: the fault rewrites this file (a fresh "boot id") so the follower
+      # holds its RAM-acked replicas torn (Follower.hold_torn_after_reboot/2). A plain :kill does not.
+      REPLICATION_BOOT_ID_PATH: /var/lib/fathom/boot_id
     devices: ["/dev/fuse"]
     cap_add: [SYS_ADMIN]
     security_opt: ["apparmor:unconfined"]

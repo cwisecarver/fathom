@@ -164,10 +164,19 @@
 
 (defn power-off!
   "A power failure: SIGKILL takes LazyFS down with the node, and its cache (every
-  un-fsynced write) with it."
+  un-fsynced write) with it. Then a fresh boot id, as a real power cycle gives the
+  node (the overlay points REPLICATION_BOOT_ID_PATH at this file)."
   [node]
   (disconnect! node)
-  (docker! "kill" (cname node)))
+  (docker! "kill" (cname node))
+  (let [f (java.io.File/createTempFile "boot_id" "")]
+    (try
+      (spit f (str (java.util.UUID/randomUUID) "\n"))
+      ;; docker cp keeps the mode, and a temp file is 0600: fathom runs as `app`
+      ;; and would read no boot id at all, which silently turns the check off.
+      (.setReadable f true false)
+      (docker! "cp" (.getPath f) (str (cname node) ":/var/lib/fathom/boot_id"))
+      (finally (.delete f)))))
 ;; `docker start` keeps the env the container was created with, so a revived
 ;; node cannot come back with replication silently off (the trap chaos.sh's rpo
 ;; arm documents for `compose up`).

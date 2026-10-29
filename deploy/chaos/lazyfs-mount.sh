@@ -10,6 +10,12 @@ if [ ! -e "$root.seeded" ]; then
   cp -a /data/. "$root/"
   touch "$root.seeded"
 fi
+# The node's stand-in for the kernel boot id (REPLICATION_BOOT_ID_PATH): every container shares the
+# VM's real one, so a container restart can never look like a reboot. The Jepsen :power-loss fault
+# overwrites this file while the node is down; created once here, so a plain restart keeps it.
+mkdir -p /var/lib/fathom
+[ -s /var/lib/fathom/boot_id ] || cat /proc/sys/kernel/random/uuid > /var/lib/fathom/boot_id
+chmod 644 /var/lib/fathom/boot_id
 rm -f /tmp/lazyfs.fifo
 lazyfs /data --config-path /etc/lazyfs.toml -o allow_other -o modules=subdir -o subdir="$root"
 i=0

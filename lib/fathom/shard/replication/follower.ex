@@ -141,6 +141,9 @@ defmodule Fathom.Shard.Replication.Follower do
   # `seed_temp_dir/1`.
   @seed_temp_subdir ".seed-temps"
 
+  # The OS boot this replica directory was last opened under; see `hold_torn_after_reboot/2`.
+  @boot_id_file ".boot_id"
+
   @typedoc "Proof of holding a shard's lock, handed back to `unlock_shard/2`."
   @type lock_token :: {:held, {String.t(), pid(), integer()}} | :reentrant
 
@@ -621,6 +624,10 @@ defmodule Fathom.Shard.Replication.Follower do
       ])
 
     :ets.insert(tab, {:__dir__, dir})
+
+    # Before any row can be derived or any peer asked: rows derive lazily from the files, so the
+    # torn markers must already be on disk when the first `state_of/2` runs.
+    hold_torn_after_reboot(name, dir)
 
     # Owned here for the same reason as the state table: it dies with this process, and a holder
     # whose release then raises is rescued (`unlock_shard/2`). See the lock section above.
@@ -2568,6 +2575,71 @@ defmodule Fathom.Shard.Replication.Follower do
   # RAW (expert review 2026-10-21 r7 #10): `File.ls/1` is a `file_server_2` call that builds the
   # whole name list in that shared process and copies it to the caller; `:prim_file` does the
   # readdir in the calling process.
+  # A FOLLOWER THAT LOST POWER FORGETS WHAT IT ACKED (Jepsen 2026-10-28, the first power-loss run,
+  # shard 15). Followers ack from RAM (`:replication_fsync` off), so after an OS crash a replica can
+  # hold LESS than it acked, yet its files still describe a coherent, rankable position. Recovery
+  # counted that position as a definite answer toward its `N - Q + 1` floor, and the floor's whole
+  # argument is that some answer comes from a follower that still holds the acked tail. fathom3 acked
+  # a write, lost power, came back at an older position, took the shard over, counted its own stale
+  # answer, and opened without the write the other (paused) acker still held.
+  #
+  # A process crash keeps the page cache, so a BEAM restart, a SIGKILL and a deploy keep every
+  # replica trusted, exactly as before. Only a new OS BOOT (the kernel's boot id changed since this
+  # directory was last opened) can have dropped acked frames, and then every replica here is held
+  # TORN: unrankable, `:torn` (silent) to a peer, never counted toward the floor, and re-seeded on its
+  # next push, which is the existing machinery for "these files no longer prove what was acked". The
+  # cost lands once per reboot: one durable marker per replica.
+  #
+  # No readable boot id (not Linux) turns the check off. A directory with no recorded boot (first
+  # start, or the first start of a release with this check) has nothing to compare and is trusted.
+  defp hold_torn_after_reboot(name, dir) do
+    case boot_id() do
+      nil ->
+        :ok
+
+      current ->
+        recorded = Path.join(dir, @boot_id_file)
+
+        case File.read(recorded) do
+          {:ok, ^current} ->
+            :ok
+
+          {:ok, previous} ->
+            ids =
+              for entry <- list_dir(dir),
+                  String.ends_with?(entry, ".db"),
+                  do: String.replace_suffix(entry, ".db", "")
+
+            Enum.each(ids, fn id -> :ok = sync_torn_marker(name, id, %{torn: true}) end)
+
+            Logger.warning(
+              "replication follower: the OS rebooted since #{dir} was last opened (boot " <>
+                "#{previous} -> #{current}); holding #{length(ids)} replica(s) torn until " <>
+                "re-seeded, since frames acked from RAM may be gone"
+            )
+
+            :ok = Fathom.Shard.Storage.atomic_write(recorded, current)
+
+          {:error, :enoent} ->
+            :ok = Fathom.Shard.Storage.atomic_write(recorded, current)
+        end
+    end
+  end
+
+  @doc false
+  # The kernel's boot id, or nil where there is none. The path is configurable so the chaos rig's
+  # LazyFS power-loss fault can stand in for a reboot (`:replication_boot_id_path`).
+  @spec boot_id() :: String.t() | nil
+  def boot_id do
+    path =
+      Application.get_env(:fathom, :replication_boot_id_path, "/proc/sys/kernel/random/boot_id")
+
+    case File.read(path) do
+      {:ok, id} -> if String.trim(id) == "", do: nil, else: String.trim(id)
+      {:error, _} -> nil
+    end
+  end
+
   defp list_dir(dir) do
     case :prim_file.list_dir(dir) do
       {:ok, entries} -> Enum.map(entries, &IO.chardata_to_string/1)
