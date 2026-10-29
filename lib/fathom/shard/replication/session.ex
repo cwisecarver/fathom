@@ -3107,9 +3107,21 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  defp free_followers(state) do
+  # "FREE" MUST MEAN WHAT THE PLANNER MEANS (Jepsen 2026-10-28, the stuck-quorum runs). `in_flight?/3`
+  # bounds "in flight" to `timeout()` since the push, because an `inflight` entry can outlive its
+  # push: a reply that never comes (lost with a link, or one this Session consumed elsewhere) leaves
+  # the entry behind for good, since nothing else clears it. This count used to test the bare map,
+  # so such an entry kept its follower "busy" forever. Two of them on one shard and every commit
+  # sat here for its whole deadline waiting for replies that were never coming, then reached
+  # `deliver/7` with no time left and failed `{:no_quorum, :timeout}` before sending anything —
+  # the shard refused writes for the rest of the run while all three followers were up (rig,
+  # 2026-10-29: entries 44-220 s old on followers whose shippers held no waiter for the shard).
+  # Past the bound the follower is pushed to, as the planner already does, and its shipper decides.
+  @doc false
+  # Public only so the agreement with `in_flight?/3` can be pinned without staging a lost reply.
+  def free_followers(state, now \\ System.monotonic_time(:millisecond)) do
     Enum.count(shippers(), fn s ->
-      not Map.has_key?(state.inflight, s) and not Map.has_key?(state.seeding, s)
+      not in_flight?(state, s, now) and not Map.has_key?(state.seeding, s)
     end)
   end
 

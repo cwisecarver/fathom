@@ -129,7 +129,7 @@ defmodule Fathom.Shard.Replication do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     if remaining <= 0 do
-      {:error, {:no_quorum, :timeout, rejects}}
+      timed_out(shard_id, acked, rejects, expected)
     else
       receive do
         {:repl_reply, from, {:ack, ^shard_id, next}} ->
@@ -164,7 +164,7 @@ defmodule Fathom.Shard.Replication do
             expected
           )
       after
-        remaining -> {:error, {:no_quorum, :timeout, rejects}}
+        remaining -> timed_out(shard_id, acked, rejects, expected)
       end
     end
   end
@@ -219,6 +219,34 @@ defmodule Fathom.Shard.Replication do
 
   defp settle({:pending, q}, shard, deadline, tally, expected),
     do: collect(q, shard, deadline, tally, expected)
+
+  # A quorum lost to SILENCE names who stayed silent (stuck-quorum hunt, Jepsen 2026-10-28): the
+  # followers a push went to that neither acked nor refused. Without it a shard that missed every
+  # quorum for minutes logged only `{:no_quorum, :timeout}`, which says nothing about which link
+  # or follower held it. Rate-limited like the IMPOSSIBLE warning above.
+  defp timed_out(shard, acked, rejects, expected) do
+    case Fathom.LogLimiter.check(:quorum_timeout) do
+      :suppress ->
+        :ok
+
+      verdict ->
+        extra =
+          case verdict do
+            {:log, n} -> " (#{n} similar warnings suppressed in the previous second)"
+            :log -> ""
+          end
+
+        answered = MapSet.new(acked ++ Enum.map(rejects, &elem(&1, 0)))
+        silent = for {from, _} <- expected, not MapSet.member?(answered, from), do: from
+
+        Logger.warning(
+          "replication quorum TIMED OUT for #{shard}: silent=#{inspect(silent)} " <>
+            "acked=#{inspect(acked)} rejects=#{inspect(rejects)}" <> extra
+        )
+    end
+
+    {:error, {:no_quorum, :timeout, rejects}}
+  end
 
   # `:offset_mismatch` is the routine one — a lost or reordered push, retryable by rewinding — so
   # it does not deserve the same volume as a fence trip. `:stale_epoch` means a deposed primary is
