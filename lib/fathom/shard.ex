@@ -6609,7 +6609,7 @@ defmodule Fathom.Shard do
   # #13a). Every branch is identical to what the inline version did — only WHERE the check_lease
   # GET ran changed. No storage I/O here by construction.
   defp apply_lapse_verdict({:ok, updates}, state) do
-    {:noreply, clear_write_fence(Map.merge(state, updates))}
+    {:noreply, state |> Map.merge(updates) |> clear_write_fence() |> rearm_lapse_if_stale()}
   end
 
   defp apply_lapse_verdict(:superseded, state) do
@@ -6647,7 +6647,31 @@ defmodule Fathom.Shard do
   # timer (expert review 2026-10-12 #9), and the lapse broadcast itself now starts the clock when the
   # status already reads `:not_valid` (2026-10-12 #24, `note_lapse_edge/2`), so neither a write nor
   # this jittered verdict is needed for the fence to arm.
-  defp apply_lapse_verdict(:skip, state), do: {:noreply, note_not_valid(state)}
+  defp apply_lapse_verdict(:skip, state),
+    do: {:noreply, state |> note_not_valid() |> rearm_lapse_if_stale()}
+
+  # A LAPSE EPISODE MUST END IN A REVALIDATION THAT WORKED (Jepsen 2026-10-29, Tier 0 hard-3: shard 4
+  # refused every write for the last 6 minutes of the run, 601 `:ownership_unconfirmed`, with every
+  # node up and the heartbeat valid). The broadcast arms ONE re-check per episode, and nothing else
+  # retries it on a clean shard: the flush fence runs only while dirty, the write-fence re-check
+  # leaves `:revalidate` to "the fence paths", and the Session's refresh re-reads this coordinator's
+  # stale `acquire_gen`. So a re-check that fails (`:skip` from a renew blip just after a partition
+  # heals), or one whose reply lands after a coalesced later lapse moved the generation again, left
+  # `acquire_gen` behind the heartbeat for good, and every commit read `:revalidate` forever.
+  #
+  # Re-arm while the heartbeat is valid but the generation still differs (`:revalidate`). A
+  # `:not_valid` heartbeat does not re-arm: the episode-closing broadcast does that. The retry waits
+  # at least a second, so a shard whose lock PUT keeps failing costs one PUT a second, not a spin.
+  defp rearm_lapse_if_stale(%{lapse_revalidate_pending: false} = state) do
+    if write_fence_recheck(state) == :revalidate do
+      Process.send_after(self(), :revalidate_lapse, 1_000 + :rand.uniform(lapse_jitter_ms()))
+      %{state | lapse_revalidate_pending: true}
+    else
+      state
+    end
+  end
+
+  defp rearm_lapse_if_stale(state), do: state
 
   # Renew well inside the TTL (every third) so a couple of transient failures
   # don't lapse the lease.

@@ -170,6 +170,74 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
     :ok = ShardExecutor.close(conn)
   end
 
+  # A FAILED LAPSE RE-CHECK IS RETRIED (Jepsen 2026-10-29, Tier 0 hard-3). The broadcast arms one
+  # re-check per episode. When that one renew failed just after a partition healed, nothing retried
+  # it on a clean shard, so `acquire_gen` stayed behind a VALID heartbeat for good, and every commit
+  # read `:revalidate` and was refused `:ownership_unconfirmed` for the rest of the run (shard 4,
+  # 601 refusals in 6 minutes, every node up). Invariant: while the heartbeat is valid and the
+  # generation still differs, the coordinator keeps re-checking until one succeeds.
+  test "a failed lapse revalidation is retried until ownership is reconfirmed", %{
+    shard: shard,
+    hb: hb
+  } do
+    prev_storage = Application.get_env(:fathom, :shard_storage)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    # The setup's 50 ms idle-stop would end the coordinator mid-test; this one must stay open.
+    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+
+    on_exit(fn ->
+      Application.delete_env(:fathom, :faulty_renew_lease)
+      Application.delete_env(:fathom, :faulty_renew_lease_result)
+
+      if prev_storage,
+        do: Application.put_env(:fathom, :shard_storage, prev_storage),
+        else: Application.delete_env(:fathom, :shard_storage)
+    end)
+
+    capture_log(fn ->
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+      {:ok, coordinator} = Shards.ensure(shard)
+      # Clean, as the stuck shard was: no flush fence will run to rescue it.
+      :ok = Shards.flush(shard)
+
+      assert is_integer(:sys.get_state(coordinator).acquire_gen),
+             "fixture: the coordinator must be in HEARTBEAT mode"
+
+      test_pid = self()
+      Application.put_env(:fathom, :faulty_renew_lease, fn -> send(test_pid, :renew_attempt) end)
+      Application.put_env(:fathom, :faulty_renew_lease_result, {:error, {:transient, :blip}})
+
+      # A closed episode: the generation moved, and the heartbeat is VALID again (not lapsed).
+      :sys.replace_state(hb, fn st ->
+        Heartbeat.publish_status(%{st | generation: st.generation + 1, lapsed: false})
+      end)
+
+      assert Heartbeat.valid_for_write?(:sys.get_state(coordinator).acquire_gen) == :revalidate,
+             "fixture: the heartbeat must read :revalidate (valid, generation moved)"
+
+      send(coordinator, :revalidate_lapse)
+      assert_receive :renew_attempt, 2_000
+
+      # The blip is over. Pre-fix nothing ever asked again.
+      Application.delete_env(:fathom, :faulty_renew_lease_result)
+      assert_receive :renew_attempt, 5_000
+
+      # The hook runs BEFORE the renew result, so the verdict may still be in flight; wait for it.
+      deadline = System.monotonic_time(:millisecond) + 2_000
+
+      verdict =
+        Stream.repeatedly(fn ->
+          Heartbeat.valid_for_write?(:sys.get_state(coordinator).acquire_gen)
+        end)
+        |> Enum.find(&(&1 == :ok or System.monotonic_time(:millisecond) > deadline))
+
+      assert verdict == :ok, "the coordinator never reconfirmed ownership after the blip"
+
+      :ok = ShardExecutor.close(conn)
+    end)
+  end
+
   # Expert review #34: the Heartbeat moduledoc promised a lapse "broadcasts so
   # coordinators can revalidate proactively instead of waiting for their next flush" —
   # but nothing subscribed, so a superseded coordinator kept accepting writes it would
