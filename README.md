@@ -22,6 +22,7 @@ Deleting a tenant deletes a file. Forking one is a copy.
                          ▲ pull on cold start / checkpoint+flush+drop on idle
    Fathom.Shard (coordinator: tracks conns, dirty flag, idle)
                          │
+                         ├── Fathom.Shard.Replication (WAL frames to followers, quorum before ack)
                          ├── Fathom.Shard.Storage (Local | S3 via Req sigv4)
                          └── Fathom.Shard.Heartbeat (per-node liveness, O(nodes))
 
@@ -41,8 +42,9 @@ Deleting a tenant deletes a file. Forking one is a copy.
   object, not a `deleted_at` flag you hope nothing else reads. Portability is a download.
 - **Forking a tenant is a copy.** Clone production into staging in one object copy —
   measured ~21× faster than migrating a fresh shard.
-- **One writer per tenant, enforced by a lease.** Cross-node safety through S3, with no
-  consensus system to operate.
+- **One writer per tenant, enforced by a lease; a quorum behind every write.** Cross-node
+  safety goes through S3, and each commit reaches 2 of 3 followers before the client gets an
+  ack. There is no consensus system to operate.
 - **Density is the business model.** ~16 KiB of RAM per idle tenant, and a stored-but-idle
   tenant costs object storage rather than memory — so a long tail of small tenants is cheap.
 
@@ -54,9 +56,10 @@ docs say so.
 | Claim | Measured | Evidence |
 |---|---|---|
 | Tenant density | **29,956 shards held across 3 nodes** (of 30,000 minted — 0.15% drops), ~16 KiB RSS each idle, spread 1.22×; stress-pushed to 105,530 held | [`fleet-density-2026-07-10.md`](docs/reviews/fleet-density-2026-07-10.md), [`served-data-2026-07-23.md`](docs/reviews/served-data-2026-07-23.md) |
-| Throughput | **4,096 concurrent tenants, 3,414 txn/s, zero errors**; load follows the shard partition | [`tpc-fleet-elixir-driver-2026-07-24.md`](docs/reviews/tpc-fleet-elixir-driver-2026-07-24.md) |
+| Throughput, replication on | **1,024 tenants, 4,317 txn/s, zero errors**, every commit quorum-replicated (5-node rig on one VM) | [`tpc-fleet-repl-on-2026-10-26.md`](docs/reviews/tpc-fleet-repl-on-2026-10-26.md) |
+| Correctness under faults | Our own Jepsen test (Elle, strict serializability) with power loss, kills, pauses, partitions and S3 cuts: **clean**, every tenant writing again within 10.5 s of the faults healing. It found 11 bugs on the way; all are fixed | [`jepsen-2026-10-29.md`](docs/reviews/jepsen-2026-10-29.md) |
 | Autonomous rebalancing | Against a genuine imbalance, the policy proposed a move and the control loop ran the handoff **autonomously** (warm → pin → LB flip → drain), isolation intact | [`chaos-run-2026-07-09.md`](docs/reviews/chaos-run-2026-07-09.md) |
-| Durability (RPO) | Bounded and **measured**: 452 rows p50 / 800 p99 lost at the 5 s default under 200 writes/s | [`durability.md`](docs/durability.md) |
+| Node-loss RPO | **~0 with replication on**: `chaos.sh rpo` kills the owner of an acked write that never reached S3, and the new owner pulls it from a follower | [`a2-quorum-replication.md`](docs/a2-quorum-replication.md) |
 | Cold-open latency | **~1 S3 round-trip** — 26 / 70 / 133 ms at 10 / 30 / 60 ms one-way | [`latency-cost-2026-07-23.md`](docs/reviews/latency-cost-2026-07-23.md) |
 | vs. Turso's own server | **On par per-DB** against `sqld` on the same box and wire — while carrying the lease fence and multi-tenant routing | [`turso-headtohead-2026-07-10.md`](docs/reviews/turso-headtohead-2026-07-10.md) |
 
@@ -180,9 +183,9 @@ Full story: [`docs/tenant-lifecycle.md`](docs/tenant-lifecycle.md).
 
 A JSON control plane under `/api` (on `:4000`, separate from the Hrana data port) lets a platform operator create/list/get/delete tenants, suspend/resume, fork, flush, mint/rotate/revoke tokens, manage snapshots/restore, and read `/api/migrations/status` (the deploy gate a CI/CD reads). It's guarded by **scoped API keys** (`read < manage < destroy`, `mix fathom.apikey`) with the shared admin BasicAuth as a legacy fallback, a per-IP brute-force / rate-limit throttle, and an append-only audit trail of every mutating action. The realtime `/admin` LiveView dashboard rides the same auth — see [`docs/runbooks/admin-dashboard.md`](docs/runbooks/admin-dashboard.md).
 
-### Warm standby (Phase 2, A1)
+### Live WAL replication (A2)
 
-`Fathom.Shard.WarmFollower` (gated by `:warm_follower`, off by default) pre-pulls the fleet's recently-active shards this node doesn't own into a separate cache dir — no lease, no serving. On failover the coordinator promotes the warm copy only after a freshness check (`Storage.pull_if_changed/3`, a conditional `If-None-Match` GET), so a stale copy is never served. The warm win is the object **body transfer avoided**, so it scales with shard size × bandwidth-delay and is marginal for a small shard on a fat pipe — the warm path still pays one S3 round-trip for the freshness check either way. Measured 2026-07-01 (dev build, MinIO + toxiproxy, relative) at 1 MB / 30 ms one-way / **100 Mbps cap**: cold ~162 ms → warm ~72 ms, ≈2.3×. With **no** bandwidth cap the two paths converge (2026-07-23 A/B at 30 ms: cold 607 ms / warm 619 ms) because the avoided body transfer is ~free on loopback. Those absolutes also predate the steal-touch takeover machinery, so don't compare them across dates — the *shape* (warm wins in proportion to size × bandwidth-delay) is the durable claim. Warm capacity is disk-bound (~0 BEAM/fd per cached shard), so a standby warms far more than it can serve open. Full story: [`docs/warm-standby.md`](docs/warm-standby.md).
+`Fathom.Shard.Replication.*` ships each commit's WAL frames to the node's followers (three on the rig) over A2's own socket protocol and acks the client only once a quorum of two holds them. On a takeover, the new owner asks its peers for their replica positions and promotes the newest copy over the stored object, so an acked write that never reached S3 survives the loss of its node. **On by default in prod** (off in dev/test): a prod node without `REPLICATION_FOLLOWERS`, `REPLICATION_BIND_IP` and a frame-auth key refuses to boot, and `REPLICATION_ENABLED=false` opts a single node out. Full story: [`docs/a2-quorum-replication.md`](docs/a2-quorum-replication.md).
 
 ### Dynamic rebalancing (Phase 2, B1)
 
@@ -190,18 +193,19 @@ A JSON control plane under `/api` (on `:4000`, separate from the Hrana data port
 
 ### Bench and scale harnesses
 
-- `mix fathom.bench` (+ `scripts/benchmark.sh`, regression-gated via `scripts/commit_with_bench.sh`) measures the hot paths: `cold_open_p50_us`, `cold_open_s3_p50_us` (opt-in), `dir_resolve_p50_us`, `copy_rows_per_s`, `fanout_kb_per_shard`.
+- `mix fathom.bench` (+ `scripts/benchmark.sh`, regression-gated via `scripts/commit_with_bench.sh`) measures the hot paths, among them cold open (`cold_open_p50_us`, `cold_open_s3_p50_us`), Hrana round trips (`hrana_rt_us`, `hrana_ws_rt_us`), flush, failover promotion (`failover_promote_p50_us`) and memory per served shard (`served_kb_per_shard`). The full catalog is the appendix of [`docs/benchmark-plan.md`](docs/benchmark-plan.md).
 - `mix fathom.scale [--shards N] [--shard-size-mb S]` provisions realistically-sized shards and measures cold-open latency at size and fan-out node density. `--ramp` opens empty shards to find the fd ceiling.
-- `mix fathom.rpo` quantifies the node-loss window (lost rows/seconds vs the flush interval).
+- `mix fathom.rpo` quantifies the node-loss window without replication (lost rows/seconds vs the flush interval).
+- `jepsen/fathom` is a Jepsen test against the chaos rig: Elle's list-append checker plus a liveness check, under combined faults including LazyFS power loss. The push gate for replication, lease and flush changes is in [`docs/jepsen-run-plan.md`](docs/jepsen-run-plan.md).
 
 See [`docs/benchmark-plan.md`](docs/benchmark-plan.md) for the full harness description. Other operator tasks: `mix fathom.shard` (pull/inspect/fork), `mix fathom.snapshot` (PITR snapshots), `mix fathom.directory` (cross-store DR reconcile).
 
 
 ## What's next
 
-Phase 2 is scoped in [`docs/phase2-scoping.md`](docs/phase2-scoping.md). Warm standby (A1) and dynamic rebalancing (B1) are **built** (see above), as is the affinity-aware placement piece of locality (C) — all gated off by default.
+Phase 2 is scoped in [`docs/phase2-scoping.md`](docs/phase2-scoping.md). Live WAL replication (A2) is built and on by default in prod; dynamic rebalancing (B1) and the affinity-aware placement piece of locality (C) are built and gated off by default. Warm standby (A1) was built and then removed, because A2 replaced it.
 
-Not on `main`: **live WAL streaming** (A2 — no longer deferred; **working on the `a2-quorum-replication` branch** and not merged here. The blocker, "exqlite exposes no WAL seam," was disproved 2026-08-09: a loadable extension reaches `sqlite3_wal_hook`, the same move as the Django UDFs. Proven end to end on the chaos rig 2026-08-11 — `smoke` passes with replication on, every write quorum-replicated. Node-loss RPO ~300 s → ~0, at +225 µs per write when on and noise when off), the remaining locality work (**C1** rendezvous/bounded-load hashing, **C2** multi-region affinity), a **`fathom_native`** Rust NIF, and a **cached / PubSub-invalidated directory resolve** on the request path.
+Not built yet: the remaining locality work (**C1** rendezvous/bounded-load hashing, **C2** multi-region affinity), a **cached / PubSub-invalidated directory resolve** on the request path, and an A2 measurement on separate machines rather than one VM ([`docs/a2-bare-metal-plan.md`](docs/a2-bare-metal-plan.md)).
 
 ## Contributing
 
