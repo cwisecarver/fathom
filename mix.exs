@@ -165,7 +165,8 @@ defmodule Fathom.MixProject do
       # below 1.0.0 the MINOR number carries breaking changes. So this must not float
       # to 0.4.0 on its own. (0.3.0 added the per-connection store_sql/cursor caps —
       # expert review #23.) 0.4.1 runs one-shot pipelines in the request process
-      # (expert review 2026-10-17 #9).
+      # (expert review 2026-10-17 #9). 0.4.3 is the encode/decode performance round from the
+      # 2026-10-20 to 2026-10-22 expert reviews (wire_server_rows_per_s +15.6%).
       #
       # Co-developing both repos? Point FILO_PATH at your checkout — no mix.exs edit,
       # so the path dep can never be committed by accident:
@@ -187,7 +188,7 @@ defmodule Fathom.MixProject do
 
   defp filo_dep do
     case System.get_env("FILO_PATH") do
-      nil -> "~> 0.4.2"
+      nil -> "~> 0.4.3"
       path -> [path: path, override: true]
     end
   end
