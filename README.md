@@ -56,7 +56,7 @@ docs say so.
 | Claim | Measured | Evidence |
 |---|---|---|
 | Tenant density | **29,956 shards held across 3 nodes** (of 30,000 minted — 0.15% drops), ~16 KiB RSS each idle, spread 1.22×; stress-pushed to 105,530 held | [`fleet-density-2026-07-10.md`](docs/reviews/fleet-density-2026-07-10.md), [`served-data-2026-07-23.md`](docs/reviews/served-data-2026-07-23.md) |
-| Throughput, replication on | **1,024 tenants, 4,317 txn/s, zero errors**, every commit quorum-replicated (5-node rig on one VM) | [`tpc-fleet-repl-on-2026-10-26.md`](docs/reviews/tpc-fleet-repl-on-2026-10-26.md) |
+| Throughput, replication on | **1,024 tenants, 4,343 txn/s, zero errors, p99 385 ms**, every commit quorum-replicated (5-node rig on one VM) | [`tpc-fleet-repl-on-2026-10-30.md`](docs/reviews/tpc-fleet-repl-on-2026-10-30.md) |
 | Correctness under faults | Our own Jepsen test (Elle, strict serializability) with power loss, kills, pauses, partitions and S3 cuts: **clean**, every tenant writing again within 10.5 s of the faults healing. It found 11 bugs on the way; all are fixed | [`jepsen-2026-10-29.md`](docs/reviews/jepsen-2026-10-29.md) |
 | Autonomous rebalancing | Against a genuine imbalance, the policy proposed a move and the control loop ran the handoff **autonomously** (warm → pin → LB flip → drain), isolation intact | [`chaos-run-2026-07-09.md`](docs/reviews/chaos-run-2026-07-09.md) |
 | Node-loss RPO | **~0 with replication on**: `chaos.sh rpo` kills the owner of an acked write that never reached S3, and the new owner pulls it from a follower | [`a2-quorum-replication.md`](docs/a2-quorum-replication.md) |
