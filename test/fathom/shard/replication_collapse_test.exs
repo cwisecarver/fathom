@@ -195,8 +195,37 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
       "the released follower's reply never settled: " <>
         inspect(
           Map.take(:sys.get_state(session), [:inflight, :inflight_at, :followers, :seeding])
-        )
+        ) <> "\nshippers: " <> inspect(shipper_diag(session))
     )
+  end
+
+  # Unreproduced CI flake (run 41007398964, OTP 29, test #6): `a`'s entry stayed in `inflight` for
+  # 3 s after a commit whose other two followers had answered, with `followers` empty — no ack ever
+  # settled. 25 local runs alone and 60 under 18 busy-looping cores all passed. What each owed
+  # shipper holds says which side lost the reply: a waiter still registered for the shard means the
+  # follower never answered; no waiter means the Shipper answered and the Session lost it.
+  defp shipper_diag(session) do
+    %{inflight: inflight, shard_id: shard} = :sys.get_state(session)
+
+    for {shipper, _} <- inflight, into: %{} do
+      diag =
+        case Process.whereis(shipper) do
+          nil ->
+            :not_running
+
+          pid ->
+            st = :sys.get_state(pid)
+
+            %{
+              waiter_for_shard: Map.has_key?(st.waiters, shard),
+              waiters: map_size(st.waiters),
+              mailbox: Process.info(pid, :message_queue_len),
+              budget_queued: Fathom.Shard.Replication.Budget.queued(shipper)
+            }
+        end
+
+      {shipper, diag}
+    end
   end
 
   defp await_queue!(pid, n, timeout \\ 3_000) do

@@ -25,7 +25,7 @@ defmodule Fathom.HranaListenerOptionsTest do
 
     # Bind a concrete port: with several listen sockets, port 0 would give each a different
     # ephemeral port and there would be nothing single to connect to.
-    port = 49_000 + :erlang.phash2(self(), 500)
+    {probe, port} = reserve_port!()
 
     start_supervised!(
       {Bandit,
@@ -37,6 +37,8 @@ defmodule Fathom.HranaListenerOptionsTest do
          thousand_island_options: opts
        ]}
     )
+
+    :ok = :gen_tcp.close(probe)
 
     assert {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 2_000)
     :ok = :gen_tcp.send(sock, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -54,7 +56,7 @@ defmodule Fathom.HranaListenerOptionsTest do
   # so neither chaos driver ever advertised an encoding and the whole tpc-fleet / hotspots corpus
   # measured the UNCOMPRESSED path. Asking for gzip explicitly is the only way to see it.
   test "the listener does not compress, even when the client asks for it" do
-    port = 49_600 + :erlang.phash2(self(), 300)
+    {probe, port} = reserve_port!()
 
     start_supervised!({Bandit,
      [
@@ -72,6 +74,7 @@ defmodule Fathom.HranaListenerOptionsTest do
        websocket_options: Fathom.Application.hrana_websocket_options()
      ]})
 
+    :ok = :gen_tcp.close(probe)
     assert {:ok, sock} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 2_000)
 
     :ok =
@@ -131,5 +134,17 @@ defmodule Fathom.HranaListenerOptionsTest do
     refute Keyword.has_key?(opts[:transport_options], :reuseport),
            "the single-socket fallback must not pass reuseport — ThousandIsland FAILS STARTUP " <>
              "when the platform refuses it, so this is the escape hatch from a boot loop"
+  end
+
+  # A port the kernel handed out and that is still held, so nothing else can take it before Bandit
+  # binds it; `reuseport` on both sides lets Bandit's listen sockets join it. The tests used to pick
+  # `49_000 + phash2(self(), 500)`, inside Linux's ephemeral range (32768-60999), and a CI run
+  # failed `:eaddrinuse` when another socket in the suite had been given that port (CI
+  # 41007398964, OTP 29). Close the probe after Bandit is up and before connecting, so the
+  # connection cannot land in the probe's accept queue.
+  defp reserve_port! do
+    {:ok, probe} = :gen_tcp.listen(0, ip: {127, 0, 0, 1}, reuseport: true)
+    {:ok, port} = :inet.port(probe)
+    {probe, port}
   end
 end
