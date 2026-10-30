@@ -47,3 +47,20 @@ the 10 s windows here have no spike:
 
 The number to quote for the current code is the 0.4.3 row: **4,343 txn/s, 0 errors, p99 385 ms**,
 replication on, on the one-VM rig.
+
+## Replicas on a second disk, re-run
+
+The second-disk comparison from `tpc-fleet-repl-on-2026-10-26.md` ("Replicas on a second block
+device"), repeated on `5d9d23e7` with the same method: open loop at 3,000 txn/s, 1024 tenants, three
+followers, `docker-compose.replicadisk.yml` for the `disk` arm, a fresh `colima restart` and wiped
+replica directories before every run, three runs a side alternated. `df` in fathom1 showed
+`/data/replicas` on `/dev/vdb1` in every `disk` run and on the overlay root in every `base` run.
+0 errors, 0 `clock lags`, 2,998.6-2,999.2 txn/s achieved. Script: `logs/ds/secdisk.sh`.
+
+| replicas on | p99 per run (excl. first 10 s) | p99 avg | p50 |
+|---|---|---|---|
+| the root disk (`base`) | 115.8 / 131.0 / 129.0 ms | 125 ms | 17.1-19.0 ms |
+| a second virtio disk (`disk`) | 49.6 / 48.6 / 43.1 ms | 47 ms | 15.2-18.3 ms |
+
+Every `disk` run beat every `base` run, and the averages match 2026-10-27 (131 and 49 ms). Same
+limit as then: both virtio disks are files on one host SSD.
