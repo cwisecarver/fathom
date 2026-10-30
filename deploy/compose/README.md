@@ -78,7 +78,7 @@ curl -s -X POST http://localhost:8080/v2/pipeline \
   -H 'Host: acme.localhost' -H 'content-type: application/json' \
   -d '{"requests":[
         {"type":"execute","stmt":{"sql":"CREATE TABLE IF NOT EXISTS hello (msg TEXT)"}},
-        {"type":"execute","stmt":{"sql":"INSERT INTO hello VALUES (\"from fathom\")"}},
+        {"type":"execute","stmt":{"sql":"INSERT INTO hello VALUES ('"'"'from fathom'"'"')"}},
         {"type":"execute","stmt":{"sql":"SELECT msg FROM hello"}},
         {"type":"close"}
       ]}'

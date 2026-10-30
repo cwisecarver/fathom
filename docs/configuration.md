@@ -216,8 +216,10 @@ tenant write**.
 > That fail-closed boot **is** the enforcement of "not optional". **The staged order in the steps
 > below now matters only for a future rolling upgrade across a wire-format change** — fathom is
 > greenfield, so the first prod deploy carries the whole shape to a fleet with no version boundary. To
-> deliberately run a single node without replication, set `REPLICATION_ENABLED=false` and
-> `REPLICATION_LISTEN=false`; to roll a wire change onto an existing fleet, force the new-shape flags
+> deliberately run a single node without replication, set `REPLICATION_ENABLED=false`,
+> `REPLICATION_LISTEN=false`, `REPLICATION_SIGN_FRAMES=false` and `REPLICATION_HMAC_REQUIRED=false`
+> (the last two, or a frame-auth key, because signing defaults on and refuses to boot without one;
+> `deploy/compose` does exactly this); to roll a wire change onto an existing fleet, force the new-shape flags
 > `=false` on the first deploy, then remove the override.
 
 1. Set `REPLICATION_LISTEN=true` (plus `REPLICATION_BIND_IP`, `REPLICATION_DIR`) **everywhere**, and

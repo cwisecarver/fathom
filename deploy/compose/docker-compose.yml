@@ -27,6 +27,11 @@ x-fathom-env: &fathom-env
   S3_BUCKET: fathom-shards
   S3_ENDPOINT: http://minio:9000
   S3_PATH_STYLE: "true"
+  # MinIO does not implement conditional DELETE (a stale-etag If-Match DELETE answers 204, not 412),
+  # so the boot fence self-test refuses it. This opts out, as deploy/chaos does. The lock-release
+  # fence it protects matters when two nodes contend for a shard; this stack has one. Leave it
+  # UNSET on real S3.
+  SHARD_STORAGE_ALLOW_WEAK_CONDITIONAL_DELETE: "true"
   AWS_ACCESS_KEY_ID: fathom
   AWS_SECRET_ACCESS_KEY: fathom-secret
   SHARD_DATA_DIR: /data/shards
@@ -45,6 +50,15 @@ x-fathom-env: &fathom-env
   # mint tokens with `bin/fathom eval 'Fathom.HranaAuth.token_for(...)'` or the
   # /api/tenants/:id/token endpoint. See docs/auth.md.
   HRANA_AUTH: disabled
+  # Prod turns A2 quorum replication ON by default, and a prod node with it on refuses to boot
+  # without REPLICATION_FOLLOWERS, REPLICATION_BIND_IP and a frame-auth key. A single node has no
+  # followers to ship to, so this stack turns off all four replication switches: shipping, the
+  # follower listener, and frame signing / requiring (which would otherwise need a key).
+  # See docs/a2-quorum-replication.md for a fleet.
+  REPLICATION_ENABLED: "false"
+  REPLICATION_LISTEN: "false"
+  REPLICATION_SIGN_FRAMES: "false"
+  REPLICATION_HMAC_REQUIRED: "false"
 
 services:
   postgres:
@@ -59,27 +73,35 @@ services:
       timeout: 2s
       retries: 30
 
+  # minio/minio and minio/mc are gone from Docker Hub, so this uses Chainguard's MinIO image (as
+  # deploy/chaos does). It has no curl and no web console; the health check speaks HTTP over bash's
+  # /dev/tcp, and minio-init reuses the same image, which ships mc.
   minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
+    image: ${FATHOM_MINIO_IMAGE:-cgr.dev/chainguard/minio:latest}
+    command: server /data
     environment:
       MINIO_ROOT_USER: fathom
       MINIO_ROOT_PASSWORD: fathom-secret
-    ports:
-      - "9001:9001" # MinIO console (optional; browse the shard objects)
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/9000 && printf "GET /minio/health/live HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3 && read -r status <&3 && [[ $$status == *" 200 "* ]]'
       interval: 2s
       timeout: 2s
       retries: 30
 
   minio-init:
-    image: minio/mc
+    image: ${FATHOM_MINIO_IMAGE:-cgr.dev/chainguard/minio:latest}
     depends_on:
       minio:
         condition: service_healthy
+    environment:
+      # The image runs as uid 65532 with no writable home; give mc a config dir it can write.
+      MC_CONFIG_DIR: /tmp/.mc
     entrypoint: >
-      /bin/sh -c "mc alias set local http://minio:9000 fathom fathom-secret &&
+      bash -c "mc alias set local http://minio:9000 fathom fathom-secret &&
                   mc mb -p local/fathom-shards"
 
   migrate:
@@ -100,8 +122,10 @@ services:
     restart: "no"
 
   fathom:
+    # Built once, by `migrate`. Giving this service its own `build:` made compose build the same
+    # tag twice in parallel, and the second export failed: image "fathom:eval" already exists.
     image: fathom:eval
-    build: *fathom-build
+    pull_policy: never
     environment: *fathom-env
     ports:
       - "4000:4000" # admin dashboard + control-plane API (BasicAuth)
