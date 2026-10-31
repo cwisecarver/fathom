@@ -84,6 +84,10 @@ defmodule Fathom.Shards do
   @admit_flight_wait_ms 15_000
   @admit_flight_rejoins 3
 
+  # How long an `:inline` migrate-on-touch checkout waits for a `Fathom.Shard.BackgroundScanGate`
+  # permit before degrading to the async rollout (expert review 2026-10-29 #3). A tenant is waiting.
+  @inline_scan_wait_ms 3_000
+
   @typedoc """
   A held checkout: the coordinator, the ref that identifies THIS checkout, and the local file path.
 
@@ -545,7 +549,11 @@ defmodule Fathom.Shards do
   end
 
   defp run_inline_migration(shard_id, head) do
-    case Fathom.Migrator.ShardMigration.run(shard_id, head) do
+    # A TENANT is waiting on this checkout, so a scan permit gets a few seconds, not the two minutes
+    # an Oban job gets: past it the migration degrades to the async rollout (below).
+    case Fathom.Shard.BackgroundScanGate.with_wait_ms(@inline_scan_wait_ms, fn ->
+           Fathom.Migrator.ShardMigration.run(shard_id, head)
+         end) do
       :ok ->
         :ok
 
@@ -568,6 +576,12 @@ defmodule Fathom.Shards do
       # Streams opened on it between the check above and the drain: serve it, hand it to the
       # async rollout (see the comment on lazy_migrate/1).
       {:retry, :shard_busy} ->
+        enqueue_migrate_on_touch(shard_id)
+
+      # No background-scan permit within `@inline_scan_wait_ms` (expert review 2026-10-29 #3): the
+      # node's migration scan budget is spent. Not a failure and not worth an error log: the same
+      # degrade as `:shard_busy`, hand it to the async job (which snoozes on this) and serve now.
+      {:error, :background_scan_busy} ->
         enqueue_migrate_on_touch(shard_id)
 
       # Another worker holds it — the caller retries.

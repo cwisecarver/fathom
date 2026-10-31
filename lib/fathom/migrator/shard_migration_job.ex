@@ -239,6 +239,10 @@ defmodule Fathom.Migrator.ShardMigrationJob do
   end
 
   def transient?(reason) when reason in [:timeout, :closed, :econnrefused, :unavailable], do: true
+
+  # No `BackgroundScanGate` permit within `:background_scan_wait_ms`: the node's dirty-IO scan budget
+  # is spent on other migrations / drills (expert review 2026-10-29 #3). Says nothing about the shard.
+  def transient?(:background_scan_busy), do: true
   def transient?(_), do: false
 
   # `{:s3_get_status, 503}` etc.: 5xx, 429 and 408 are the store being unwell; 4xx (404, 403, 412)

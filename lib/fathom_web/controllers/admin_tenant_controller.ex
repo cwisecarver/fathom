@@ -74,6 +74,15 @@ defmodule FathomWeb.AdminTenantController do
         |> put_resp_content_type("text/plain")
         |> send_resp(503, "could not flush #{id}'s latest writes in time; try again")
 
+      # The integrity check could not get a background-scan permit (expert review 2026-10-29 #3): the
+      # node's whole-shard scan budget is busy with migrations / the restore drill. Not corruption.
+      {:error, :background_scan_busy} ->
+        Fathom.Audit.log(conn, "export", id, "error", %{reason: "scan_busy"})
+
+        conn
+        |> put_resp_content_type("text/plain")
+        |> send_resp(503, "the node is busy scanning other shards; try again")
+
       {:error, _reason} ->
         Fathom.Audit.log(conn, "export", id, "error")
 

@@ -490,6 +490,13 @@ if raw = System.get_env("FLUSH_SERIALIZE_MAX_BYTES") do
   end
 end
 
+# Node-wide permits for the NON-flush whole-shard scans (migration replay + verify, restore drill,
+# tenant export; expert review 2026-10-29 #3, `Fathom.Shard.BackgroundScanGate`). Unset = a quarter
+# of `+SDio` (2 on the default 10), 0 = the gate off. Separate from the flush `ScanGate` (SDio-2).
+if n = env_nonneg_int.("BACKGROUND_SCAN_PERMITS") do
+  config :fathom, :background_scan_permits, n
+end
+
 # The WAL's on-disk size bound in bytes (expert review 2026-10-10 #30; default 64 MiB, see
 # `Fathom.Shard.Connection.maybe_journal_size_limit/1`). -1 turns it off. The chaos rig sets 0 to
 # make every log reset truncate, which is the A2 stress case.

@@ -39,7 +39,7 @@ defmodule Fathom.RestoreDrillJob do
   require Logger
 
   alias Fathom.Directory
-  alias Fathom.Shard.{Connection, Integrity, SqliteHeader, Storage}
+  alias Fathom.Shard.{BackgroundScanGate, Connection, Integrity, SqliteHeader, Storage}
 
   # Outcomes that mean the durable object is bad/unreachable (the alertable set) vs merely
   # "no data yet" (absent/sentinel — a brand-new tenant that never flushed). `:lost` is an absent
@@ -47,7 +47,12 @@ defmodule Fathom.RestoreDrillJob do
   @failures [:corrupt, :schema_mismatch, :error, :lost]
 
   # Per-shard drill bounds (expert review 2026-10-13 #26); see `bounded/4`.
-  @drill_concurrency 8
+  # Sized to the scan gate, not to S3 (expert review 2026-10-29 #3). Every `integrity_check` and
+  # row count below takes a `BackgroundScanGate` permit (2 on the default `+SDio 10`), so more workers
+  # than permits only queue on it, and that queueing counts against the per-shard deadline below: a
+  # healthy shard behind a slow neighbour's scan would be killed and recorded as `:error`. Two workers
+  # still overlap one shard's S3 pull with another's scan.
+  @drill_concurrency 2
   @drill_timeout_ms 120_000
   # A full drill forks (server-side object copy) then pulls both sides, so it gets a longer leash.
   @full_drill_timeout_ms 600_000
@@ -343,7 +348,7 @@ defmodule Fathom.RestoreDrillJob do
             :absent
 
           {:ok, _} ->
-            case Integrity.verify_full(tmp) do
+            case BackgroundScanGate.queued(fn -> Integrity.verify_full(tmp) end) do
               :ok -> :ok
               {:error, _} -> :corrupt
             end
@@ -400,7 +405,7 @@ defmodule Fathom.RestoreDrillJob do
 
         {:ok, _etag} ->
           # `{:ok, etag}` means bytes were written, so the temp exists; no File.exists? guard.
-          case Integrity.verify_full(tmp) do
+          case BackgroundScanGate.queued(fn -> Integrity.verify_full(tmp) end) do
             :ok -> check_schema(id, tmp, schema_version)
             {:error, _reason} -> :corrupt
           end
@@ -645,26 +650,30 @@ defmodule Fathom.RestoreDrillJob do
   # `sqlite_%` is excluded: internal tables differ between a freshly-written copy and a long-lived
   # original for reasons that are not data loss.
   defp counts_from_file(path) do
-    {:ok, conn} = Connection.open(path)
+    # `count(*)` per table is a whole-b-tree scan on one dirty-IO thread: one permit across the
+    # whole read (expert review 2026-10-29 #3).
+    BackgroundScanGate.queued(fn ->
+      {:ok, conn} = Connection.open(path)
 
-    try do
-      {:ok, %{rows: rows}} =
-        Connection.query(
-          conn,
-          "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-          []
-        )
+      try do
+        {:ok, %{rows: rows}} =
+          Connection.query(
+            conn,
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            []
+          )
 
-      counts =
-        Map.new(rows, fn [table] ->
-          {:ok, %{rows: [[n]]}} = Connection.query(conn, count_sql(table), [])
-          {table, n}
-        end)
+        counts =
+          Map.new(rows, fn [table] ->
+            {:ok, %{rows: [[n]]}} = Connection.query(conn, count_sql(table), [])
+            {table, n}
+          end)
 
-      {:ok, counts}
-    after
-      Connection.close(conn)
-    end
+        {:ok, counts}
+      after
+        Connection.close(conn)
+      end
+    end)
   end
 
   # The three-place version stamp is `django_migrations` (Django's own ledger — the TRUTH),

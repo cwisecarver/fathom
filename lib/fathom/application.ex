@@ -1072,6 +1072,10 @@ defmodule Fathom.Application do
       # Scan-only permit (quick_check + VACUUM INTO), SDio-2: keeps a flush wave from holding every
       # dirty-IO thread (expert review 2026-10-20 #19). Fails open if not running.
       Fathom.Shard.ScanGate,
+      # Separate permit for the NON-flush whole-shard scans (migration replay + verify, restore drill,
+      # tenant export), a quarter of SDio (expert review 2026-10-29 #3). Independent of ScanGate so a
+      # rollout can neither starve flushes nor be starved by them. Fails open if not running.
+      Fathom.Shard.BackgroundScanGate,
       # Owns the node-wide idle pooled-handle budget (perf review 2026-10-14 #16). Before the shard
       # supervisor so it outlives every coordinator's terminate-time pool close.
       Fathom.Shard.PoolBudget,

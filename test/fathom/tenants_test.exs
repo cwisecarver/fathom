@@ -515,6 +515,60 @@ defmodule Fathom.TenantsTest do
       assert {:error, {:corrupt_export, _}} = Tenants.export(id, flush: false)
     end
 
+    # Expert review 2026-10-29 #3: the export's `integrity_check` is a whole-shard scan on a dirty-IO
+    # thread and takes a BackgroundScanGate permit. A node whose permits are all taken answers BUSY
+    # (the controller's 503), never `:corrupt_export`, and leaves no export directory behind.
+    test "a saturated background scan gate answers busy, not corrupt, and then succeeds",
+         %{id: id} do
+      write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('flushed')"])
+      assert :ok = Shards.flush(id)
+
+      prev = Application.fetch_env(:fathom, :background_scan_permits)
+      Application.put_env(:fathom, :background_scan_permits, 1)
+
+      on_exit(fn ->
+        case prev do
+          {:ok, v} -> Application.put_env(:fathom, :background_scan_permits, v)
+          :error -> Application.delete_env(:fathom, :background_scan_permits)
+        end
+      end)
+
+      test_pid = self()
+
+      holder =
+        spawn(fn ->
+          :ok = Fathom.Shard.BackgroundScanGate.acquire(:infinity)
+          send(test_pid, :holding)
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      on_exit(fn -> Process.exit(holder, :kill) end)
+      assert_receive :holding
+
+      scratch = Fathom.Shard.TempReaper.scratch_dir()
+      before = Path.wildcard(Path.join(scratch, "fathom_export_*")) |> MapSet.new()
+
+      assert {:error, :background_scan_busy} = Tenants.export(id, flush: false, scan_wait_ms: 30)
+
+      after_ = Path.wildcard(Path.join(scratch, "fathom_export_*")) |> MapSet.new()
+
+      assert MapSet.difference(after_, before) == MapSet.new(),
+             "export dir leaked on a busy answer"
+
+      ref = Process.monitor(holder)
+      send(holder, :stop)
+      assert_receive {:DOWN, ^ref, :process, ^holder, _}
+
+      assert {:ok, %{path: path, dir: dir}} =
+               Tenants.export(id, flush: false, scan_wait_ms: 5_000)
+
+      on_exit(fn -> File.rm_rf(dir) end)
+      assert File.exists?(path)
+    end
+
     # #22 rides the #14 fix: a flush timeout must FAIL the export, not silently ship stale bytes.
     test "surfaces a flush timeout instead of exporting stale", %{id: id} do
       prev_timeout = Application.get_env(:fathom, :flush_now_timeout_ms)

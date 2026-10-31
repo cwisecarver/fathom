@@ -26,7 +26,7 @@ defmodule Fathom.Migrator.ShardMigration do
   require Logger
 
   alias Fathom.Migrator.{Copy, Ledger, RetirementJob}
-  alias Fathom.Shard.{Connection, PromoteOnOpen, Storage}
+  alias Fathom.Shard.{BackgroundScanGate, Connection, PromoteOnOpen, Storage}
   alias Fathom.{Directory, Migrator, Repo, Shards}
   alias Fathom.Shards.MigrationGate
 
@@ -1170,9 +1170,15 @@ defmodule Fathom.Migrator.ShardMigration do
   # old version either way; what differs is whether an operator is told the data is bad.
   defp verify_migrated(shard_id, path) do
     if Application.get_env(:fathom, :verify_flush_integrity, true) do
-      case Fathom.Shard.verify_integrity(path) do
+      # Whole-file `quick_check` on one dirty-IO thread: take a background-scan permit
+      # (expert review 2026-10-29 #3). Busy is NOT corruption: it is passed through untouched so the
+      # job snoozes (`ShardMigrationJob.transient?/1`) instead of logging a corrupt-copy error.
+      case BackgroundScanGate.with_permit(fn -> Fathom.Shard.verify_integrity(path) end) do
         :ok ->
           :ok
+
+        {:error, :background_scan_busy} = busy ->
+          busy
 
         {:error, reason} ->
           Logger.error(

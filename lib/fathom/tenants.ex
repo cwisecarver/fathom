@@ -47,6 +47,10 @@ defmodule Fathom.Tenants do
   # has no coordinator, and a busy one means dst is genuinely in use (refuse rather than clobber).
   @fork_drain_ms 5_000
 
+  # How long an export's `integrity_check` waits for a `BackgroundScanGate` permit (expert review
+  # 2026-10-29 #3). An admin's HTTP request is waiting: past it the export answers busy (503).
+  @export_scan_wait_ms 10_000
+
   # Per-shard Oban workers a delete must cancel so a queued migration/revert/retirement/
   # handoff can't run against (or resurrect) a shard being erased. The DeleteJob itself is
   # excluded — it must not cancel its own kind.
@@ -330,7 +334,9 @@ defmodule Fathom.Tenants do
   tenant. The export lands in a fresh 0700 directory (`dir`) holding `path`. The CALLER owns that
   directory and must `File.rm_rf/1` it after use (the admin download does, so an exported copy
   never lingers on disk). Returns `{:error, :not_stored}` if the shard has
-  no stored object (never flushed, or already deleted), or `{:error, :invalid_shard_id}`.
+  no stored object (never flushed, or already deleted), `{:error, :background_scan_busy}` if the
+  integrity check could not get a `Fathom.Shard.BackgroundScanGate` permit in time (retry; the wait
+  is `scan_wait_ms:`, default 10 s), or `{:error, :invalid_shard_id}`.
   """
   @spec export(String.t(), keyword()) ::
           {:ok, %{path: Path.t(), dir: Path.t(), filename: String.t()}} | {:error, term()}
@@ -346,7 +352,7 @@ defmodule Fathom.Tenants do
       # The 0700 dir holds a full tenant copy: remove it on EVERY non-success path, including a
       # raise in Storage.pull/verify_integrity (expert review 2026-10-10 fix-review R4-2).
       try do
-        case export_pull(id, dir, tmp) do
+        case export_pull(id, dir, tmp, Keyword.get(opts, :scan_wait_ms, @export_scan_wait_ms)) do
           {:ok, _} = ok ->
             ok
 
@@ -366,7 +372,7 @@ defmodule Fathom.Tenants do
     end
   end
 
-  defp export_pull(id, dir, tmp) do
+  defp export_pull(id, dir, tmp, scan_wait_ms) do
     case Storage.pull(id, tmp) do
       # No bytes written: no object, or a steal sentinel (expert review 2026-08-01 #24).
       # Previously a sentinel arrived as `{:ok, <etag>}` and fell through to the success
@@ -377,13 +383,26 @@ defmodule Fathom.Tenants do
       {:ok, _etag} ->
         # integrity_check, not quick_check (expert review 2026-10-15 #11): VACUUM INTO copies a
         # divergent index verbatim and only the full check sees it. Export is off the hot path.
-        case Fathom.Shard.Integrity.verify_full(tmp) do
+        #
+        # Holds a background-scan permit (expert review 2026-10-29 #3): it is O(rows) on one
+        # dirty-IO thread, and an admin can start several exports at once. An admin's HTTP request
+        # is waiting, so the wait is seconds (`@export_scan_wait_ms`), not an Oban job's two minutes.
+        # Busy is NOT corruption: it is returned as-is (the controller answers 503 "try again"),
+        # never `:corrupt_export`.
+        case Fathom.Shard.BackgroundScanGate.with_permit(
+               fn -> Fathom.Shard.Integrity.verify_full(tmp) end,
+               Fathom.Shard.BackgroundScanGate,
+               scan_wait_ms
+             ) do
           :ok ->
             # verify_full opened the temp (WAL mode) for a read-only quick_check; drop any
             # empty WAL siblings it left so the returned file is a self-contained db the caller
             # can read + delete cleanly.
             for s <- ["-wal", "-shm"], do: File.rm(tmp <> s)
             {:ok, %{path: tmp, dir: dir, filename: "#{id}.db"}}
+
+          {:error, :background_scan_busy} = busy ->
+            busy
 
           {:error, reason} ->
             # A corrupt stored object must never be handed to the tenant as their portability

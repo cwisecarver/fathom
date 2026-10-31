@@ -594,4 +594,66 @@ defmodule Fathom.RestoreDrillJobTest do
       assert Repo.get_by!(DirShard, shard_id: id).last_verify_status == "ok"
     end
   end
+
+  describe "its scans take a BackgroundScanGate permit (expert review 2026-10-29 #3)" do
+    # `integrity_check` is O(rows) on one dirty-IO thread. The drill used to run eight of them at
+    # once with no bound; its verify now waits for a permit. Pre-fix nothing ever queued on the gate,
+    # so `waiting` never reached 1 and this fails at the first assertion.
+    test "a saturated gate holds the verify back until a permit frees up", %{id: id} do
+      seed(id, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
+
+      prev = Application.fetch_env(:fathom, :background_scan_permits)
+      Application.put_env(:fathom, :background_scan_permits, 1)
+
+      on_exit(fn ->
+        case prev do
+          {:ok, v} -> Application.put_env(:fathom, :background_scan_permits, v)
+          :error -> Application.delete_env(:fathom, :background_scan_permits)
+        end
+      end)
+
+      test_pid = self()
+
+      holder =
+        spawn(fn ->
+          :ok = Fathom.Shard.BackgroundScanGate.acquire(:infinity)
+          send(test_pid, :holding)
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      on_exit(fn -> Process.exit(holder, :kill) end)
+      assert_receive :holding
+
+      task = Task.async(fn -> RestoreDrillJob.run_drill(10) end)
+      wait_until(fn -> Fathom.Shard.BackgroundScanGate.stats().waiting >= 1 end)
+      assert Task.yield(task, 50) == nil, "the drill scanned without a permit"
+
+      send(holder, :stop)
+      assert {:ok, summary} = Task.await(task, 10_000)
+
+      assert summary[:ok] >= 1,
+             "the drill did not finish once a permit freed: #{inspect(summary)}"
+
+      assert %{held: 0, waiting: 0} = Fathom.Shard.BackgroundScanGate.stats()
+    end
+  end
+
+  defp wait_until(fun, tries \\ 400) do
+    cond do
+      fun.() ->
+        :ok
+
+      tries == 0 ->
+        flunk("condition never held")
+
+      true ->
+        receive do
+        after
+          5 -> wait_until(fun, tries - 1)
+        end
+    end
+  end
 end

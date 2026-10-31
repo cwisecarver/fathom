@@ -384,6 +384,59 @@ defmodule Fathom.LazyMigrateTest do
     assert_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard, target: 2})
   end
 
+  # Expert review 2026-10-29 #3: the inline migration's replay and verify take a BackgroundScanGate
+  # permit. A TENANT is waiting on this checkout, so with every permit taken it waits a few seconds
+  # (`@inline_scan_wait_ms`), not an Oban job's two minutes, and then degrades like `:shard_busy`:
+  # serve the shard at its current version and hand it to the async rollout. Not an ERROR log: the
+  # shard is healthy and the node is merely busy scanning.
+  test "an inline migration that finds the scan gate full serves the shard and hands it to the rollout",
+       %{shard: shard} do
+    Application.put_env(:fathom, :migrate_on_touch, :inline)
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    Migrator.HeadCache.refresh()
+
+    prev = Application.fetch_env(:fathom, :background_scan_permits)
+    Application.put_env(:fathom, :background_scan_permits, 1)
+
+    on_exit(fn ->
+      case prev do
+        {:ok, v} -> Application.put_env(:fathom, :background_scan_permits, v)
+        :error -> Application.delete_env(:fathom, :background_scan_permits)
+      end
+    end)
+
+    test_pid = self()
+
+    holder =
+      spawn(fn ->
+        :ok = Fathom.Shard.BackgroundScanGate.acquire(:infinity)
+        send(test_pid, :holding)
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn -> Process.exit(holder, :kill) end)
+    assert_receive :holding
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, conn} = ShardExecutor.open(shard),
+               "a busy scan gate must not fail the tenant's checkout"
+
+        assert {:ok, %StmtResult{rows: [[1, "alice"]]}} =
+                 exec(conn, "SELECT id, name FROM app_thing")
+
+        ShardExecutor.close(conn)
+      end)
+
+    refute log =~ "FAILED", "a busy gate is a deferral, not a failed migration"
+    assert {:ok, %{schema_version: 1, status: "active"}} = Directory.get(shard)
+    assert_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard, target: 2})
+  end
+
   # `mark_migrating/1` runs just before the copy and had no counterpart, so a failed migration left
   # the row `migrating` forever. Every laggard/reconcile query filters `status == "active"`, so the
   # shard went invisible to every sweep until the hourly `reclaim_stuck_migrating` — it self-healed
