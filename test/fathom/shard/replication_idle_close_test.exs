@@ -6,7 +6,7 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
   ## The bug
 
   When a shard's last stream checks in, the coordinator keeps its pooled handle for `drain_grace_ms`
-  (250 ms in prod) and then closes it. That close is SQLite's last-connection checkpoint: every
+  (2000 ms in prod since 2026-10-31, 250 ms before) and then closes it. That close is SQLite's last-connection checkpoint: every
   frame is backfilled into the `.db` and `-wal` is unlinked, so the next write starts a NEW WAL.
   The replication `Session` survives the gap (it lives as long as the coordinator) and documented
   that close as deliberately uncovered.

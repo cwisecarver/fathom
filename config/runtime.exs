@@ -534,7 +534,9 @@ if bytes = System.get_env("SHARD_RETAIN_MIN_BYTES") do
 end
 
 # Perf review 2026-10-14 #4: how long an idle shard keeps its pooled SQLite handle after its last
-# stream closes (default 250 ms), so a serial client's next request reuses it. 0 = drain on close.
+# stream closes (default 2000 ms; was 250 until 2026-10-31), so a serial client's next request reuses
+# it. 0 = drain on close. A tenant whose gaps are longer than the grace pays the close-time checkpoint
+# and a new replication WAL generation on every request.
 if ms = System.get_env("POOL_DRAIN_GRACE_MS") do
   config :fathom, :connection_pool_opts, drain_grace_ms: String.to_integer(ms)
 end

@@ -2897,7 +2897,7 @@ defmodule Fathom.Shard do
       HandlePool.new(
         max_per_scope: Keyword.get(cfg, :max_per_scope, 1),
         ttl_ms: Keyword.get(cfg, :ttl_ms, 30_000),
-        drain_grace_ms: Keyword.get(cfg, :drain_grace_ms, 250),
+        drain_grace_ms: Keyword.get(cfg, :drain_grace_ms, 2_000),
         shrink_idle_ms: Keyword.get(cfg, :shrink_idle_ms, 5_000)
       )
     else
@@ -3196,7 +3196,7 @@ defmodule Fathom.Shard do
   end
 
   # THE POOL DRAIN GRACE (perf review 2026-10-14 #4). On the idle transition the pool is kept for
-  # `drain_grace_ms` (HandlePool, default 250 ms; 0 is the old drain-on-close), so a serial client's
+  # `drain_grace_ms` (HandlePool, default 2000 ms since 2026-10-31, was 250; 0 is the old drain-on-close), so a serial client's
   # next request is a pool HIT that skips the open (the `-shm` rebuild was ~176 of the ~230 us) and
   # adopts the previous stream's statement cache (#10), and the shard takes ONE close-time
   # checkpoint per idle gap instead of one per request (with A2, one new WAL generation per gap).

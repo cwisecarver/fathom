@@ -40,14 +40,15 @@ defmodule Fathom.Shard.HandlePool do
   defstruct idle: %{ro: [], rw: []},
             max_per_scope: 1,
             ttl_ms: 30_000,
-            drain_grace_ms: 250,
+            drain_grace_ms: 2_000,
             shrink_idle_ms: 5_000
 
   @doc """
   A new empty pool. `:max_per_scope` caps idle handles held per scope (default 1); `:ttl_ms` is how
   long an idle handle may sit before `sweep/2` closes it (default 30_000); `:drain_grace_ms` is how
   long the coordinator keeps the pool after the shard's LAST stream checks in before it drains it
-  (default 250; 0 drains on that checkin, the pre-2026-10-14 behaviour). The grace is the
+  (default 2_000; 0 drains on that checkin, the pre-2026-10-14 behaviour; raised from 250 on
+  2026-10-31 after the sparse-tenant rig arm, docs/reviews/rig-arms-2026-10-31.md). The grace is the
   coordinator's to enforce (`Fathom.Shard`); this module only carries the setting.
   `:shrink_idle_ms` (default 5_000; 0 = off) is how long a handle sits idle before
   `begin_shrink/2` offers it for `PRAGMA shrink_memory` (expert review 2026-10-21 #15).
@@ -58,7 +59,7 @@ defmodule Fathom.Shard.HandlePool do
       idle: %{ro: [], rw: []},
       max_per_scope: Keyword.get(opts, :max_per_scope, 1),
       ttl_ms: Keyword.get(opts, :ttl_ms, 30_000),
-      drain_grace_ms: Keyword.get(opts, :drain_grace_ms, 250),
+      drain_grace_ms: Keyword.get(opts, :drain_grace_ms, 2_000),
       shrink_idle_ms: Keyword.get(opts, :shrink_idle_ms, 5_000)
     }
   end

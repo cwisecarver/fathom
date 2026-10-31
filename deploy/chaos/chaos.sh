@@ -2857,7 +2857,7 @@ cmd_pool_gap() {
 # This arm gives every tenant ONE one-shot write (UPDATE + SELECT, a stream open + close) per think_ms,
 # OPEN LOOP (the driver's --think-ms: arrivals do not wait for the server, response time runs from the
 # intended instant), so each gap is ~think_ms. Rounds alternate the pool's drain_grace_ms over
-# graces_csv - 250 (the shipped default: every gap drains) vs 5000 (a handle held across the gap: no
+# graces_csv - 250 (the pre-2026-10-31 default: every gap drains) vs 5000 (a handle held across the gap: no
 # close checkpoint) - ABAB on one VM so drift hits both arms. The grace is set with put_env on every
 # node before the round, which is the same as booting with POOL_DRAIN_GRACE_MS=<ms> because a
 # coordinator reads :connection_pool_opts at init, and each round uses its own shard namespace

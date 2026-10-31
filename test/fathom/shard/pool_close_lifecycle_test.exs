@@ -25,13 +25,19 @@ defmodule Fathom.Shard.PoolCloseLifecycleTest do
 
   setup do
     prev_pool = Application.get_env(:fathom, :connection_pool)
+    prev_opts = Application.get_env(:fathom, :connection_pool_opts)
     prev_idle = Application.get_env(:fathom, :shard_idle_ms)
     Application.put_env(:fathom, :shard_idle_ms, 60_000)
     Application.put_env(:fathom, :connection_pool, true)
+    # These tests were written against a 250 ms drain grace, and they wait 2 s for the first idle
+    # transition's close to START. They pin it rather than inherit the default, which became 2000 ms
+    # on 2026-10-31 (docs/reviews/rig-arms-2026-10-31.md).
+    Application.put_env(:fathom, :connection_pool_opts, drain_grace_ms: 250)
     shard = "pool_close_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
       restore(:connection_pool, prev_pool)
+      restore(:connection_pool_opts, prev_opts)
       restore(:shard_idle_ms, prev_idle)
       Application.delete_env(:fathom, :shard_pool_close_hook)
       :erlang.trace_pattern({Sqlite3, :close, 1}, false, [])

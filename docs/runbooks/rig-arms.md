@@ -183,13 +183,13 @@ node before the round, which equals booting with `POOL_DRAIN_GRACE_MS` because a
 pool options at init and each round uses its own shard namespace. It prints per round the ops/s against
 the offered rate, p50/p95/p99/max, errors, the fleet pool_take `hit%`, the `clock lags` count and the A2
 commit histogram groups. It pins the rebalancer off and idle-stop at 900 s for the run and restores both
-(and the grace) at the end. The prod default of `POOL_DRAIN_GRACE_MS` is not touched; changing it needs a
-Jepsen run (review #2).
+(and the grace) at the end. The grace default was 250 ms until 2026-10-31 and is 2000 ms since (results:
+`docs/reviews/rig-arms-2026-10-31.md`); this arm always sets the grace explicitly per round.
 
 **The intended A/B.** Two axes:
 
-- `POOL_DRAIN_GRACE_MS` 250 (the shipped default: every gap drains) vs 5000 (a handle survives a 1 s gap, so
-  no close checkpoint): one `up` carries both, as ABAB rounds.
+- `POOL_DRAIN_GRACE_MS` 250 (the pre-2026-10-31 default: every gap over 250 ms drains) vs 5000 (a handle
+  survives a 1 s gap, so no close checkpoint): one `up` carries both, as ABAB rounds.
 - Replicas on the same disk vs a second disk (`docker-compose.replicadisk.yml`, with or without
   `RIG_DISK_CAP`, section 1): a different `up`, so a fresh `colima restart` each.
 
