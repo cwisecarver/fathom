@@ -221,7 +221,7 @@ noted).
 - **[reviews/rig-arms-2026-10-31.md](reviews/rig-arms-2026-10-31.md)** — first run of the
   `rig-arms` runbook: sparse tenants with replication on (`tpc-sparse`): `POOL_DRAIN_GRACE_MS` 250
   gives p99 0.42 s then 3.4-4.0 s on the second round, 1100-5000 gives **~6 ms p99**, repeatable
-  across fresh VMs (the shipped default is unchanged; Jepsen-gated and a memory trade). Also the
+  across fresh VMs (the default moved from 250 to 2000 ms on 2026-10-31, Jepsen and `rpo` green). Also the
   gp3-capped disk: the cap binds at 3,000 txn/s, and its low-rate ladder is confounded by the
   sparse path. The auth arm has not been run.
 - **[reviews/tpc-fleet-elixir-driver-2026-07-24.md](reviews/tpc-fleet-elixir-driver-2026-07-24.md)** —
