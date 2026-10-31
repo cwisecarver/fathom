@@ -44,6 +44,7 @@ defmodule Fathom.Telemetry do
            {Fathom.Admin.Measurements, :flush_gate, []},
            {Fathom.Admin.Measurements, :schedulers, []},
            {Fathom.Admin.Measurements, :memory_breakdown, []},
+           {Fathom.Admin.Measurements, :host, []},
            {Fathom.Admin.Measurements, :recorder, []},
            {Fathom.Admin.LeaseHealth, :measure, []},
            {Fathom.Shard.Replication.LagGauge, :measure, []}
@@ -1595,6 +1596,87 @@ defmodule Fathom.Telemetry do
         measurement: :rss,
         unit: :byte,
         description: "Process resident set size from /proc/self/status (Linux only)"
+      ),
+      # Host-level tail attribution (expert review 2026-10-29 #1 / #17). Linux only: absent off Linux.
+      last_value("fathom.node.vm_dirty_background_bytes",
+        event_name: [:fathom, :node, :vm_dirty],
+        measurement: :background_bytes,
+        unit: :byte,
+        description:
+          "Effective vm.dirty_background_{bytes,ratio} threshold (dirty_background_bytes if set, else ratio x MemAvailable). Far above ~1 GB on a replicating node means writeback is batched into bursts every synchronous=FULL commit fsync waits behind; measure, do not assume lower is better (64 MB and 256 MB were worse than 1 GB on the rig)"
+      ),
+      last_value("fathom.node.host_memory.dirty",
+        event_name: [:fathom, :node, :host_memory],
+        measurement: :dirty,
+        unit: :byte,
+        description:
+          "/proc/meminfo Dirty: page cache not yet written back. A sawtooth that climbs for ~30 s then collapses is a writeback burst"
+      ),
+      last_value("fathom.node.host_memory.writeback",
+        event_name: [:fathom, :node, :host_memory],
+        measurement: :writeback,
+        unit: :byte,
+        description: "/proc/meminfo Writeback: pages being written to disk right now"
+      ),
+      last_value("fathom.node.io_pressure.some_avg10",
+        event_name: [:fathom, :node, :io_pressure],
+        measurement: :some_avg10,
+        description:
+          "/proc/pressure/io some avg10: percent of the last 10 s in which at least one task stalled on I/O"
+      ),
+      last_value("fathom.node.io_pressure.full_avg10",
+        event_name: [:fathom, :node, :io_pressure],
+        measurement: :full_avg10,
+        description:
+          "/proc/pressure/io full avg10: percent of the last 10 s in which every non-idle task stalled on I/O"
+      ),
+      counter("fathom.node.long_schedule.count",
+        event_name: [:fathom, :node, :long_schedule],
+        tags: [:kind],
+        description:
+          "A process or port held a normal scheduler over 20 ms without yielding (:erlang.system_monitor long_schedule). Does not see dirty NIFs"
+      ),
+      sum("fathom.node.long_schedule.duration_ms",
+        event_name: [:fathom, :node, :long_schedule],
+        measurement: :duration_ms,
+        tags: [:kind],
+        description: "Total reported duration of long_schedule events, ms"
+      ),
+      counter("fathom.node.long_gc.count",
+        event_name: [:fathom, :node, :long_gc],
+        description: "A garbage collection took over 50 ms (:erlang.system_monitor long_gc)"
+      ),
+      sum("fathom.node.long_gc.duration_ms",
+        event_name: [:fathom, :node, :long_gc],
+        measurement: :duration_ms,
+        description: "Total reported duration of long_gc events, ms"
+      ),
+      distribution("fathom.node.fsync_probe.duration_us",
+        event_name: [:fathom, :node, :fsync_probe],
+        measurement: :duration,
+        reporter_options: [
+          buckets: [
+            250,
+            500,
+            1_000,
+            2_000,
+            5_000,
+            10_000,
+            25_000,
+            50_000,
+            100_000,
+            250_000,
+            500_000,
+            1_000_000,
+            2_500_000
+          ]
+        ],
+        description:
+          "FSYNC_PROBE only: 4 KiB write + fdatasync to <shard_data_dir>/.fsync_probe once a second, microseconds. The wait a synchronous=FULL commit sees behind writeback"
+      ),
+      counter("fathom.node.fsync_probe_error.count",
+        event_name: [:fathom, :node, :fsync_probe_error],
+        description: "FSYNC_PROBE only: probe rounds whose write or fdatasync failed"
       ),
       last_value("fathom.directory.recorder.buffered",
         event_name: [:fathom, :directory, :recorder],

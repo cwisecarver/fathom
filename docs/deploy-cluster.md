@@ -200,6 +200,77 @@ Two dead ends, named so nobody spends a week on them: **io2 Multi-Attach** allow
 but requires a cluster-aware filesystem — SQLite on shared block storage corrupts. **EFS/NFS**
 cannot host a WAL-mode SQLite file safely (`-shm` shared memory + NFS locking).
 
+### Host writeback: `vm.dirty_background_bytes` (Linux)
+
+Fathom's follower writes are not fsynced, so every node's page cache fills with other nodes' WAL
+frames, and every primary `synchronous=FULL` commit fsync then waits behind whatever the kernel is
+writing back. With the default `vm.dirty_background_ratio` (10% of RAM) a large-RAM host does not
+start writeback until the 30 s `dirty_expire_centisecs` expiry, and the flush lands as one burst.
+
+**What the rig measured** (replication on, 1024 tenants, one run per row, 94 GB colima VM;
+`docs/reviews/tpc-fleet-repl-on-2026-10-26.md`):
+
+| `vm.dirty_background_bytes` | txn/s | p99 | worst 10 s window |
+|---|---|---|---|
+| default (ratio 10% = 9.4 GB, never reached) | 4,317 | 598 ms | 1,191 ms |
+| **1 GB** | 4,008 | **417 ms** | 454 ms |
+| 256 MB | 3,404 | 485 ms | 523 ms |
+| 64 MB | 2,273 | 762 ms | 853 ms |
+
+Dirty pages climbed to ~7.9 GB and were flushed in bursts at ~30 s and ~60 s; those windows were
+the spikes, and 1 GB removed them. **Do not read this as "lower is better"**: 256 MB and 64 MB were
+worse than 1 GB on every column, because constant writeback slows every fsync and every follower
+write. Each row is a single run on one VM, so 1 GB is the rig's direction, not a calibrated optimum.
+The best value depends on RAM size and dirty rate, and a container memory limit (cgroup) moves the
+throttle point; the rig has neither a cgroup limit nor a capped disk (a gp3 volume is capped), so
+its number does not transfer. Treat 1 GB as a starting point to measure, not a setting to copy.
+
+The same report measured the other host-side lever: a second disk for the replicas (the previous
+section) cut open-loop p99 from ~131 to ~49 ms, and the 2026-10-30 re-run on current code
+(`docs/reviews/tpc-fleet-repl-on-2026-10-30.md`) gave 125 vs 47 ms. Both disks were files on one host
+SSD. With the replicas on their own volume the writeback cap matters less, but it is not measured
+off.
+
+**Check and set it**
+
+```sh
+cat /proc/sys/vm/dirty_background_bytes /proc/sys/vm/dirty_background_ratio   # bytes 0 = ratio in use
+sudo sysctl -w vm.dirty_background_bytes=1073741824    # live; setting bytes zeroes the ratio
+echo 'vm.dirty_background_bytes = 1073741824' | sudo tee /etc/sysctl.d/90-fathom-writeback.conf
+```
+
+Put it in the AMI / provisioning, not by hand on one node. Kernel rule: `dirty_background_bytes`
+and `dirty_background_ratio` are mutually exclusive, and a non-zero bytes value is the live one.
+
+**Boot check.** In prod on Linux the node logs one `config warning: the effective
+vm.dirty_background threshold is N GiB` when that threshold is above 2 GB (twice the only value the
+rig found good). It is warn-only, never blocks boot, and does nothing off Linux. It reads
+`MemAvailable` for the ratio case and does not see a cgroup limit.
+
+**Reading the gauges** (all from the 10 s poller; Linux only, absent elsewhere):
+
+| Metric | Reads |
+|---|---|
+| `fathom.node.vm_dirty_background_bytes` | the effective threshold above |
+| `fathom.node.host_memory.dirty` / `.writeback` | `/proc/meminfo` Dirty / Writeback, bytes. A sawtooth that climbs for ~30 s and collapses is a writeback burst; line its drops up with the p99 spikes |
+| `fathom.node.io_pressure.some_avg10` / `.full_avg10` | `/proc/pressure/io` (PSI), % of the last 10 s stalled on I/O. Needs a kernel with PSI; absent otherwise |
+| `fathom.node.long_schedule.count` / `.duration_ms` | a process or port held a normal scheduler over 20 ms (`:erlang.system_monitor`). Does **not** see dirty NIFs, which is where an fsync behind writeback sits, so a quiet `long_schedule` with a rising `run_queue.dirty_io` points at disk |
+| `fathom.node.long_gc.count` / `.duration_ms` | a garbage collection over 50 ms |
+| `fathom.node.fsync_probe.duration_us` | only with `FSYNC_PROBE=true`: the 4 KiB write + fdatasync wait, once a second |
+
+`SYSTEM_MONITOR` (default on in prod) installs the VM-global `:erlang.system_monitor`; if another
+tool already owns it, fathom logs a warning and leaves it alone, so the counters stay at zero. Set
+`SYSTEM_MONITOR=false` to leave it free for that tool.
+
+**The probe is off by default.** `FSYNC_PROBE=true` writes 4 KiB to `<SHARD_DATA_DIR>/.fsync_probe`
+and `fdatasync`s it once a second. It is the closest single number to a primary commit's fsync wait,
+but it adds a small constant write load and holds one dirty-IO thread for each fsync, and it has not
+been validated on the rig. Use it to attribute a tail: run the same load with default sysctls and
+with `dirty_background_bytes` set; if the probe does not show the 30 s / 60 s bursts in the first, it
+is not explaining the tail and should be turned off. It overwrites one block, so it does not include
+the journal commit that a file-extending append pays. Nothing else treats the file as a shard: shard
+ids cannot contain a dot.
+
 ## The load balancer
 
 Start from [`deploy/lb/fathom.nginx.conf`](../deploy/lb/fathom.nginx.conf). The

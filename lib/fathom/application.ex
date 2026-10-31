@@ -33,6 +33,7 @@ defmodule Fathom.Application do
     check_replication_exposure!()
     check_replication_frame_auth!()
     check_replication_disk!()
+    check_vm_dirty_background!()
     check_replication_flush_interval!()
     check_pool_fd_budget!()
     check_soft_heap_budget!()
@@ -483,6 +484,42 @@ defmodule Fathom.Application do
     end
   end
 
+  # Expert review 2026-10-29 #1: a large-RAM Linux host with the default `vm.dirty_background_ratio`
+  # never starts background writeback until the 30 s `dirty_expire_centisecs` expiry, and fathom's
+  # unfsynced follower writes fill the page cache fast. The flush then lands as one burst that every
+  # `synchronous=FULL` commit fsync waits behind. On the chaos rig (94 GB VM, 9.4 GB threshold)
+  # that was p99 598 ms with 1.1-1.2 s windows every 30 s / 60 s; `dirty_background_bytes` = 1 GB
+  # gave p99 417 ms and flat windows (docs/reviews/tpc-fleet-repl-on-2026-10-26.md).
+  #
+  # WARN-ONLY and never fatal, like every sibling above: a node's sysctls are the operator's call
+  # and the optimum depends on RAM, dirty rate and cgroup limit. The wording is "measure", not
+  # "lower": the same sweep found 256 MB (p99 485 ms) and 64 MB (p99 762 ms) WORSE than 1 GB, so a
+  # "set it as low as you can" warning would send operators the wrong way. Prod-only; a no-op where
+  # `/proc` has no answer (non-Linux). The gauge is published by the poller
+  # (`Measurements.host/0`), not here: the reporters attach after this runs.
+  @doc false
+  @spec check_vm_dirty_background!(Fathom.Admin.Measurements.reader()) :: nil
+  def check_vm_dirty_background!(read \\ &Fathom.FS.read/1) do
+    with :prod <- Application.get_env(:fathom, :env),
+         bytes when is_integer(bytes) <- Fathom.Admin.Measurements.vm_dirty_background_bytes(read),
+         true <- bytes > Fathom.Host.Proc.warn_above_bytes() do
+      Logger.warning(
+        "config warning: the effective vm.dirty_background threshold is " <>
+          "#{Float.round(bytes / 1_073_741_824, 1)} GiB, so the kernel will not start background " <>
+          "writeback until that much page cache is dirty. Fathom's unfsynced replica writes fill " <>
+          "it quickly, and the eventual flush burst stalls every synchronous=FULL commit fsync " <>
+          "(on the chaos rig, 94 GB RAM and a 9.4 GB threshold: p99 598 ms with 30 s / 60 s " <>
+          "spikes; vm.dirty_background_bytes=1GB gave p99 417 ms, 2026-10-26). This is a host " <>
+          "setting to INVESTIGATE AND MEASURE, not a rule that lower is better: 256 MB (p99 485 " <>
+          "ms) and 64 MB (p99 762 ms) were worse than 1 GB on that rig. Watch " <>
+          "fathom.node.host_memory.dirty and fathom.node.io_pressure.* and see " <>
+          "docs/deploy-cluster.md (expert review 2026-10-29 #1)."
+      )
+    end
+
+    nil
+  end
+
   # THE FLUSH INTERVAL IS ALSO A REPLICATION THROUGHPUT SETTING (expert review 2026-08-20 #33).
   #
   # A durability flush CHECKPOINTS the WAL; a checkpoint starts a new GENERATION; and
@@ -883,7 +920,24 @@ defmodule Fathom.Application do
       # table + sweeps it), so it comes up early, before the endpoint accepts requests.
       Fathom.RateLimiter,
       {Oban, Application.fetch_env!(:fathom, Oban)}
-    ]
+    ] ++ host_monitor_children()
+  end
+
+  # Host-level tail attribution (expert review 2026-10-29 #17): `:erlang.system_monitor` stall
+  # counters (default on in prod, `SYSTEM_MONITOR`) and the 1 Hz fsync probe (opt-in,
+  # `FSYNC_PROBE`). Both only emit telemetry, and neither belongs to a data-plane restart budget.
+  defp host_monitor_children do
+    system_monitor =
+      if Application.get_env(:fathom, :system_monitor, false),
+        do: [Fathom.Host.SystemMonitor],
+        else: []
+
+    fsync_probe =
+      if Application.get_env(:fathom, :fsync_probe, false),
+        do: [Fathom.Host.FsyncProbe],
+        else: []
+
+    system_monitor ++ fsync_probe
   end
 
   # Control plane (the orchestration store's readers/writers). Needs Repo (Infra) up.

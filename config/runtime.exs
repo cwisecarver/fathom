@@ -639,6 +639,22 @@ case env_bool.("SHARD_LOAD") do
     config :fathom, :shard_load, on?
 end
 
+# Host-level tail attribution (expert review 2026-10-29 #17; docs/deploy-cluster.md "Host writeback").
+# SYSTEM_MONITOR: the `:erlang.system_monitor` long_schedule (20 ms) / long_gc (50 ms) counters. On in
+# prod, off elsewhere (the monitor is VM-global, so dev/test must not own it). `false` leaves the
+# monitor free for an operator's own tool; if something already owns it the counters stay at zero.
+case env_bool.("SYSTEM_MONITOR") do
+  nil -> if config_env() == :prod, do: config(:fathom, :system_monitor, true)
+  on? -> config :fathom, :system_monitor, on?
+end
+
+# FSYNC_PROBE: a 1 Hz 4 KiB write + fdatasync to `<SHARD_DATA_DIR>/.fsync_probe`, into a histogram.
+# OFF by default in every env: it is a diagnostic to turn on while attributing a tail, not a
+# standing probe. Only `true`/`1` enable it.
+if env_bool.("FSYNC_PROBE") == true do
+  config :fathom, :fsync_probe, true
+end
+
 # Tenant handles open SQLite NOMUTEX (expert review 2026-10-21 r7 #16): skips a recursive mutex
 # enter/leave on every sqlite3_column_* call (19% of execute-only on Linux, ~5% of a wire row
 # metric). Default OFF; TENANT_NOMUTEX=true|1 turns it on. See Fathom.Shard.Connection and the r7

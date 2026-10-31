@@ -313,6 +313,93 @@ defmodule Fathom.Admin.Measurements do
     end
   end
 
+  @meminfo_path "/proc/meminfo"
+  @dirty_bytes_path "/proc/sys/vm/dirty_background_bytes"
+  @dirty_ratio_path "/proc/sys/vm/dirty_background_ratio"
+  @io_pressure_path "/proc/pressure/io"
+
+  @typedoc "A file reader: `Fathom.FS.read/1` in production, a stub in the tests."
+  @type reader :: (Path.t() -> {:ok, binary()} | {:error, term()})
+
+  @doc """
+  Host-level writeback attribution gauges, Linux only (expert review 2026-10-29 #17b).
+
+  A p99 spike that comes from the kernel's page-cache writeback is invisible from inside the BEAM:
+  every `synchronous=FULL` commit fsync simply waits behind it. These make it attributable from the
+  node's own metrics:
+
+    * `[:fathom, :node, :host_memory]` `dirty` / `writeback` bytes (`/proc/meminfo`). A sawtooth
+      that climbs for ~30 s and collapses is the burst the 2026-10-26 rig report describes.
+    * `[:fathom, :node, :io_pressure]` `some_avg10` / `full_avg10` (`/proc/pressure/io`, PSI, %).
+    * `[:fathom, :node, :vm_dirty]` `background_bytes`: the effective `vm.dirty_background_*`
+      threshold. Published here rather than at boot because the metric reporters attach after the
+      boot-time preflight (`Fathom.Application.check_vm_dirty_background!/1`) has run.
+
+  A file that cannot be read (not Linux, PSI compiled out) is skipped silently, as is an event with
+  no readable measurement: off Linux this emits nothing.
+  """
+  @spec host() :: :ok
+  @spec host(reader()) :: :ok
+  def host(read \\ &Fathom.FS.read/1) do
+    meminfo = read_meminfo(read)
+
+    emit_present([:fathom, :node, :host_memory], %{
+      dirty: meminfo["Dirty"],
+      writeback: meminfo["Writeback"]
+    })
+
+    emit_present([:fathom, :node, :vm_dirty], %{
+      background_bytes: background_bytes(read, meminfo)
+    })
+
+    emit_present([:fathom, :node, :io_pressure], read_pressure(read))
+    :ok
+  end
+
+  @doc """
+  The effective `vm.dirty_background_*` threshold in bytes, or `nil` where it cannot be read (not
+  Linux). Used by the boot preflight.
+  """
+  @spec vm_dirty_background_bytes(reader()) :: non_neg_integer() | nil
+  def vm_dirty_background_bytes(read \\ &Fathom.FS.read/1),
+    do: background_bytes(read, read_meminfo(read))
+
+  defp background_bytes(read, meminfo) do
+    Fathom.Host.Proc.effective_background_bytes(%{
+      bytes: read_int(read, @dirty_bytes_path),
+      ratio: read_int(read, @dirty_ratio_path),
+      meminfo: meminfo
+    })
+  end
+
+  defp read_meminfo(read) do
+    case read.(@meminfo_path) do
+      {:ok, body} -> Fathom.Host.Proc.parse_meminfo(body)
+      {:error, _} -> %{}
+    end
+  end
+
+  defp read_int(read, path) do
+    case read.(path) do
+      {:ok, body} -> Fathom.Host.Proc.parse_int(body)
+      {:error, _} -> nil
+    end
+  end
+
+  defp read_pressure(read) do
+    case read.(@io_pressure_path) do
+      {:ok, body} -> Fathom.Host.Proc.parse_pressure(body)
+      {:error, _} -> %{}
+    end
+  end
+
+  defp emit_present(event, measurements) do
+    case Map.reject(measurements, fn {_k, v} -> is_nil(v) end) do
+      present when map_size(present) > 0 -> :telemetry.execute(event, present, %{})
+      _ -> :ok
+    end
+  end
+
   @doc "Directory.Recorder buffer depth and flush freshness (expert review 2026-10-15 #17)."
   @spec recorder() :: :ok
   def recorder do
