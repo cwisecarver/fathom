@@ -114,6 +114,188 @@ defmodule Fathom.Admin.PrometheusScrapeTest do
     assert [{"fathom_thing", %{}, 1.0}] = PrometheusScrape.parse(text)
   end
 
+  # expert review 2026-10-29 #12: `parse/1` gained a binary-pattern fast path for canonical lines.
+  # It must be a pure speed-up: the same text yields the same samples, line for line, as the
+  # regex/split parser it replaced. `legacy_parse/1` below IS that old implementation, kept here
+  # verbatim as the oracle. NOTE this does not prove the fast path is taken (a parser that always
+  # fell back would also pass); the speed is measured, not asserted (commit message).
+  describe "parse/1 fast path equals the legacy regex parser (expert review 2026-10-29 #12)" do
+    @legacy_line ~r/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(.+)$/
+
+    defp legacy_parse(text) when is_binary(text) do
+      text |> String.split("\n", trim: true) |> Enum.flat_map(&legacy_line/1)
+    end
+
+    defp legacy_line("#" <> _), do: []
+
+    defp legacy_line(line) do
+      case Regex.run(@legacy_line, String.trim(line)) do
+        [_, name, labels, value] ->
+          case legacy_value(value) do
+            {:ok, v} -> [{name, legacy_labels(labels), v}]
+            :error -> []
+          end
+
+        _ ->
+          []
+      end
+    rescue
+      _ -> []
+    end
+
+    defp legacy_value("+Inf"), do: {:ok, :infinity}
+    defp legacy_value("-Inf"), do: {:ok, :neg_infinity}
+    defp legacy_value("NaN"), do: :error
+
+    defp legacy_value(v) do
+      case Float.parse(v) do
+        {f, _} -> {:ok, f}
+        :error -> :error
+      end
+    end
+
+    defp legacy_labels("{}"), do: %{}
+
+    defp legacy_labels(braces) do
+      braces
+      |> String.trim_leading("{")
+      |> String.trim_trailing("}")
+      |> String.split(",", trim: true)
+      |> Enum.flat_map(fn pair ->
+        case String.split(pair, "=", parts: 2) do
+          [k, v] -> [{String.trim(k), v |> String.trim() |> String.trim("\"")}]
+          _ -> []
+        end
+      end)
+      |> Map.new()
+    end
+
+    # Canonical lines, as the reporters print them, plus every shape the fast path must hand to the
+    # slow parser (or reject the same way): whitespace variants, odd label values, odd numbers.
+    @corpus [
+      ~s(fathom_s3_op_count{op="get",status_class="2xx"} 10),
+      ~s(fathom_shard_query_duration_milliseconds_bucket{le="0.25"} 2),
+      ~s(fathom_shard_query_duration_milliseconds_bucket{le="+Inf"} 10),
+      ~s(fathom_shard_query_duration_milliseconds_sum 33.0),
+      ~s(fathom_shard_query_duration_milliseconds_sum 1.2345e-5),
+      ~s(fathom_x_sum 1.0e20),
+      ~s(fathom_x{a="1"} -3.5),
+      ~s(fathom_x{a="1"} +Inf),
+      ~s(fathom_x{a="1"} -Inf),
+      ~s(fathom_x{a="1"} NaN),
+      ~s(fathom_x{a="1"} nan),
+      ~s(fathom_x{} 4),
+      ~s(fathom_x{}  4),
+      ~s(fathom_x{a="1",} 4),
+      ~s(fathom_x{,a="1"} 4),
+      ~s(fathom_x{a="1",a="2"} 4),
+      ~s(fathom_x{a=""} 4),
+      ~s(fathom_x{a=" b "} 4),
+      ~s(fathom_x{a="b c"} 4),
+      ~s(fathom_x{a="b,c"} 4),
+      ~s(fathom_x{a="b=c"} 4),
+      ~s(fathom_x{a="b}c"} 4),
+      ~s(fathom_x{a="b{c"} 4),
+      ~s(fathom_x{a="b\\"c"} 4),
+      ~s(fathom_x{a="b\\\\c"} 4),
+      ~s(fathom_x{a="b\\nc"} 4),
+      ~s(fathom_x{a="é"} 4),
+      ~s(fathom_x{a-b="c"} 4),
+      ~s(fathom_x{ a="b"} 4),
+      ~s(fathom_x{a ="b"} 4),
+      ~s(fathom_x{a= "b"} 4),
+      ~s(fathom_x{a='b'} 4),
+      ~s(fathom_x{a=b} 4),
+      ~s(fathom_x{bogus} 4),
+      ~s(fathom_x{a="1"}4),
+      ~s(fathom_x{a="1"}),
+      ~s(fathom_x{a="1"} ),
+      ~s(fathom_x{a="1"}  4),
+      ~s(fathom_x{a="1"}\t4),
+      ~s(fathom_x\t4),
+      ~s(fathom_x  4),
+      ~s(fathom_x 4 ),
+      ~s(fathom_x 4\t),
+      ~s(fathom_x 4\r),
+      "fathom_x 4\u00A0",
+      "\u00A0fathom_x 4",
+      ~s( fathom_x 4),
+      ~s(\tfathom_x 4),
+      ~s(fathom_x 4 5),
+      ~s(fathom_x 4x),
+      ~s(fathom_x x4),
+      ~s(fathom_x 1e),
+      ~s(fathom_x --1),
+      ~s(fathom_x .5),
+      ~s(fathom_x 5.),
+      ~s(fathom_x +5),
+      ~s(fathom_x 1e5),
+      ~s(fathom_x 0x10),
+      ~s(fathom_x),
+      ~s(fathom_x ),
+      ~s(9fathom_x 4),
+      ~s(:colon:name_1 4),
+      ~s(_under 4),
+      ~s(fathom-x 4),
+      ~s(fathom.x 4),
+      ~s(# HELP fathom_x some text 4),
+      ~s(#fathom_x 4),
+      ~s( # fathom_x 4),
+      "",
+      " ",
+      "{}",
+      ~s({a="b"} 4),
+      ~s(fathom_x{a="1"} 4 # comment)
+    ]
+
+    test "every corpus line parses the same as the legacy parser, alone and in one text" do
+      for line <- @corpus do
+        assert PrometheusScrape.parse(line) == legacy_parse(line), "diverged on #{inspect(line)}"
+      end
+
+      text = Enum.join(@corpus, "\n")
+      assert PrometheusScrape.parse(text) == legacy_parse(text)
+      assert PrometheusScrape.parse(text <> "\n") == legacy_parse(text <> "\n")
+    end
+
+    test "a blank scrape stays [] (the collector's hold-the-baselines sentinel)" do
+      for blank <- ["", "\n", "\n\n\n"] do
+        assert PrometheusScrape.parse(blank) == []
+        assert legacy_parse(blank) == []
+      end
+
+      assert PrometheusScrape.parse(:not_a_binary) == []
+    end
+
+    test "the whole @scrape fixture parses the same, and in the same order" do
+      assert PrometheusScrape.parse(@scrape) == legacy_parse(@scrape)
+      assert [_ | _] = PrometheusScrape.parse(@scrape)
+    end
+
+    # Seeded, so a failure reproduces: 30k lines drawn from the bytes the parser branches on, half
+    # of them random soup and half a canonical line with one byte mutated.
+    test "fuzz: random and mutated lines parse the same as the legacy parser" do
+      :rand.seed(:exsss, {2026, 10, 29})
+      alphabet = ~c(aZ_:{}=",\\ \t09.eE+-InfNa\r#é) ++ [0xA0, 0x85, ?\n]
+      canonical = for l <- @corpus, String.starts_with?(l, "fathom_"), do: l
+
+      soup = fn ->
+        for _ <- 1..Enum.random(1..20), into: <<>>, do: <<Enum.random(alphabet)::utf8>>
+      end
+
+      mutate = fn line ->
+        i = :rand.uniform(byte_size(line)) - 1
+        <<pre::binary-size(^i), _::binary-size(1), rest::binary>> = line
+        pre <> <<Enum.random(alphabet)::utf8>> <> rest
+      end
+
+      for n <- 1..30_000 do
+        line = if rem(n, 2) == 0, do: soup.(), else: mutate.(Enum.random(canonical))
+        assert PrometheusScrape.parse(line) == legacy_parse(line), "diverged on #{inspect(line)}"
+      end
+    end
+  end
+
   describe "index (expert review 2026-10-15 #23)" do
     test "every lookup gives the same answer on the index as on the flat list" do
       samples = PrometheusScrape.parse(@scrape)

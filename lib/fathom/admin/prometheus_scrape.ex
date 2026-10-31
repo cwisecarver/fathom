@@ -27,11 +27,28 @@ defmodule Fathom.Admin.PrometheusScrape do
 
   @line ~r/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?\s+(.+)$/
 
-  @doc "Parse exposition text into a list of `{name, labels, value}` samples (HELP/TYPE lines skipped)."
+  @doc """
+  Parse exposition text into a list of `{name, labels, value}` samples (HELP/TYPE lines skipped).
+
+  Every line first goes through `fast_line/1`, a binary-pattern matcher for the CANONICAL shape
+  the in-process reporters print (`name`, optional `{k="v",...}`, ONE space, a numeric token), and
+  falls back to the regex/split parser (`slow_line/1`) for anything else. The regex path measured
+  ~1.8 µs and ~2.6 KiB of garbage per sample against ~0.6 µs and ~1 KiB here, and this runs on
+  every collector tick over several hundred samples (expert review 2026-10-29 #12). The fast path
+  never guesses: it accepts a line only when the slow path provably returns the same sample, so
+  output is identical by construction (pinned against the old implementation in
+  `prometheus_scrape_test.exs`).
+
+  The review's recommended fix was to read FastHistogram/ETS directly and skip the text. Not done:
+  `TelemetryMetricsPrometheus.Core` folds its distributions inside `scrape/1` through
+  `@moduledoc false` modules (`Aggregator.aggregate/3`, a destructive `:ets.take` the `/metrics`
+  scrape shares), so a direct read would re-implement that dependency's internals, and the ~1.4 ms
+  of Core's own render per tick would remain either way. Parsing was the other ~55% of the cost.
+  """
   @spec parse(binary()) :: [sample()]
   def parse(text) when is_binary(text) do
     text
-    |> String.split("\n", trim: true)
+    |> :binary.split("\n", [:global, :trim_all])
     |> Enum.flat_map(&parse_line/1)
   end
 
@@ -40,6 +57,91 @@ defmodule Fathom.Admin.PrometheusScrape do
   defp parse_line("#" <> _), do: []
 
   defp parse_line(line) do
+    case fast_line(line) do
+      {:ok, sample} -> [sample]
+      :slow -> slow_line(line)
+    end
+  end
+
+  defguardp name_start?(c) when c in ?a..?z or c in ?A..?Z or c == ?_ or c == ?:
+  defguardp name_char?(c) when name_start?(c) or c in ?0..?9
+  defguardp key_char?(c) when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_
+  # Label-value bytes the fast path will carry verbatim. Anything else (`,` `\` `}` `{` `=`
+  # whitespace, non-ASCII, a quote) is a value the slow parser's split/trim logic may treat
+  # specially, so such a line is left to it.
+  defguardp val_char?(c)
+            when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c in [?_, ?., ?:, ?/, ?+, ?-]
+
+  defguardp num_char?(c) when c in ?0..?9 or c in [?., ?e, ?E, ?+, ?-]
+
+  # `name value` or `name{labels} value`, exactly one space, no leading/trailing whitespace.
+  defp fast_line(<<c, rest::binary>> = line) when name_start?(c), do: fast_name(rest, line, 1)
+  defp fast_line(_), do: :slow
+
+  defp fast_name(<<c, rest::binary>>, line, n) when name_char?(c),
+    do: fast_name(rest, line, n + 1)
+
+  defp fast_name(<<?\s, value::binary>>, line, n),
+    do: fast_value(binary_part(line, 0, n), %{}, value)
+
+  defp fast_name(<<?{, ?}, ?\s, value::binary>>, line, n),
+    do: fast_value(binary_part(line, 0, n), %{}, value)
+
+  defp fast_name(<<?{, rest::binary>>, line, n) do
+    case fast_labels(rest, %{}) do
+      {:ok, labels, value} -> fast_value(binary_part(line, 0, n), labels, value)
+      :slow -> :slow
+    end
+  end
+
+  defp fast_name(_, _, _), do: :slow
+
+  # `k="v"` pairs up to `} ` — a later duplicate key wins, as `Map.new/1` does on the slow path.
+  defp fast_labels(<<c, _::binary>> = rest, acc) when key_char?(c) do
+    {klen, after_key} = key_run(rest, 0)
+
+    with <<?=, ?", after_eq::binary>> <- after_key,
+         {vlen, <<?", after_val::binary>>} <- val_run(after_eq, 0) do
+      acc = Map.put(acc, binary_part(rest, 0, klen), binary_part(after_eq, 0, vlen))
+
+      case after_val do
+        <<?,, more::binary>> -> fast_labels(more, acc)
+        <<?}, ?\s, value::binary>> -> {:ok, acc, value}
+        _ -> :slow
+      end
+    else
+      _ -> :slow
+    end
+  end
+
+  defp fast_labels(_, _), do: :slow
+
+  # Length of the leading run of bytes of one class, and the rest after it. One function per class
+  # (not a shared predicate fun): this is the per-byte loop of a once-a-second 600-sample parse.
+  defp key_run(<<c, rest::binary>>, n) when key_char?(c), do: key_run(rest, n + 1)
+  defp key_run(bin, n), do: {n, bin}
+
+  defp val_run(<<c, rest::binary>>, n) when val_char?(c), do: val_run(rest, n + 1)
+  defp val_run(bin, n), do: {n, bin}
+
+  defp num_only?(<<c, rest::binary>>) when num_char?(c), do: num_only?(rest)
+  defp num_only?(<<>>), do: true
+  defp num_only?(_), do: false
+
+  defp fast_value(name, labels, "+Inf"), do: {:ok, {name, labels, :infinity}}
+
+  defp fast_value(name, labels, <<c, _::binary>> = value) when num_char?(c) do
+    with true <- num_only?(value),
+         {:ok, v} <- parse_value(value) do
+      {:ok, {name, labels, v}}
+    else
+      _ -> :slow
+    end
+  end
+
+  defp fast_value(_, _, _), do: :slow
+
+  defp slow_line(line) do
     case Regex.run(@line, String.trim(line)) do
       [_, name, labels, value] ->
         case parse_value(value) do
