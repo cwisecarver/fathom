@@ -618,9 +618,15 @@ defmodule Fathom.Test.FaultyStorage do
   @impl true
   def put_token_floor(shard_id, version), do: Local.put_token_floor(shard_id, version)
   @impl true
-  def read_token_floor(shard_id) do
+  def read_token_floor(shard_id), do: read_token_floor(shard_id, [])
+
+  # `:faulty_before` `{:read_token_floor, fun}` runs inside the backend call (so a test can stall or
+  # count it); `fun` is handed the shard id. The budgeted /2 is what `Revocations` calls on the
+  # hello path, so the hook sees every cold-miss storage read.
+  @impl true
+  def read_token_floor(shard_id, opts) do
     run_before(:read_token_floor, shard_id)
-    Local.read_token_floor(shard_id)
+    Local.read_token_floor(shard_id, opts)
   end
 
   @impl true

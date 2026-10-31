@@ -71,6 +71,23 @@ until the directory is readable again. `:fail_closed` returns `:unavailable` and
 never answers from the storage floor, which can lag the directory. A last-known-good cached value is
 served under both postures. Set it with `HRANA_REVOCATION_ON_ERROR=fail_open|fail_closed` (unset ⇒ `fail_open`; any other value refuses to boot).
 
+**The cold-miss storage floor read is bounded and shared (expert review 2026-10-29 #20).** A shard
+this node has never cached reads the directory floor *and* the durable per-shard storage floor (the
+PITR backstop; a Postgres restore can lower the directory's `token_version`) concurrently, at
+`hello`, before checkout. The storage read is **one attempt, no retries**, capped at
+`:hrana_storage_floor_budget_ms` (default 3000; `HRANA_STORAGE_FLOOR_BUDGET_MS`, a positive integer
+of ms, anything else refuses to boot). It used to wait forever on Req's default retried GET, about a
+minute against a stalled store. If it cannot be read inside the budget (timeout, transport error or
+error status) the `:hrana_revocation_on_error` posture decides, exactly as for a directory read
+error: `:fail_closed` returns `:unavailable` and refuses the token; `:fail_open` serves the
+directory floor it already holds, **uncached** so the backstop is consulted again on the next
+hello, with no second GET (it counts in `fathom.hrana.revocation.floor_error.count`). When the
+directory also fails under `:fail_open`, the same single read's answer is used if it arrived, else
+floor `0`. N concurrent hellos for one cold shard share one storage read and one directory read; a
+claimant that dies mid-read hands over to a waiter. A fast storage *error* is treated like a
+timeout (a stalled store surfaces as either, and the caller cannot tell them apart), which is
+stricter under `:fail_closed` than the previous "storage error reads as floor 0".
+
 ## Token lifecycle: rotate, revoke, scope (#24)
 
 A token embeds the shard's **version** (`v`), and `verify` accepts it while `v` clears the shard's

@@ -1555,6 +1555,20 @@ if config_env() == :prod do
       raise "HRANA_REVOCATION_ON_ERROR must be \"fail_open\" or \"fail_closed\", got: #{inspect(other)}"
   end
 
+  # Budget for the durable storage-floor read on a cold hello (expert review 2026-10-29 #20; see
+  # Fathom.HranaAuth.Revocations): ONE attempt, no retries, this many ms of wire time. Unset leaves
+  # the key unwritten so the module default (3000) stands. A stall past it maps to the
+  # HRANA_REVOCATION_ON_ERROR posture.
+  if ms = System.get_env("HRANA_STORAGE_FLOOR_BUDGET_MS") do
+    case Integer.parse(ms) do
+      {n, ""} when n > 0 ->
+        config :fathom, :hrana_storage_floor_budget_ms, n
+
+      _ ->
+        raise "HRANA_STORAGE_FLOOR_BUDGET_MS must be a positive integer (ms), got: #{inspect(ms)}"
+    end
+  end
+
   # Per-node open-shard cap (finding #14). config.exs sets a conservative finite default; operators
   # tune it to their node's measured fd/RSS density (mix fathom.scale --ramp) here.
   if cap = System.get_env("MAX_OPEN_SHARDS") do

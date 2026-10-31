@@ -587,6 +587,10 @@ defmodule Fathom.Shard.Storage.Local do
     end
   end
 
+  # No wire to bound; the budget is an HTTP-backend concern (see the `Storage` callback).
+  @impl true
+  def read_token_floor(shard_id, _opts), do: read_token_floor(shard_id)
+
   # Only ever fed `File.read/1`'s `{:ok, body}`, so `body` is always a binary — a
   # `parse_token_floor(_), do: nil` catch-all here was unreachable and is gone. The guard stays
   # because it documents the input; the `_ -> nil` INSIDE handles unparseable content, which is the

@@ -20,6 +20,21 @@ defmodule Fathom.HranaAuth.Revocations do
       With no prior value at all, `:hrana_revocation_on_error` decides: `:fail_open` (default)
       returns floor `0`; `:fail_closed` returns `:unavailable` and the token is refused.
 
+  A COLD miss (no cached value at all) also unions the durable per-shard STORAGE floor, the PITR
+  backstop, read concurrently with the directory. That read sits on the `hello` critical path, so
+  it is bounded and shared (expert review 2026-10-29 #20):
+
+    * ONE attempt, no retries, capped at `:hrana_storage_floor_budget_ms` (default 3 s;
+      `HRANA_STORAGE_FLOOR_BUDGET_MS`). It used to be an unbounded wait over Req's default retried
+      GET, ~60 s against a stalled store.
+    * If it cannot be read in budget (timeout or error) the same posture applies as for a directory
+      error: `:fail_closed` returns `:unavailable`; `:fail_open` serves the directory floor it
+      already holds, UNCACHED (so the backstop is retried on the next hello, never replaced by a
+      cached directory-only answer), without a second GET. On the success path the storage floor is
+      always unioned in.
+    * N concurrent hellos for one cold shard share one storage read and one directory read
+      (per-shard single-flight; a crashed claimant hands over to a waiter).
+
   `put/2` (revoke) and `put/3` (rotate) are called on the acting node so it sees the change
   immediately; other nodes converge within the TTL (or instantly via the notifier push).
 
@@ -62,6 +77,20 @@ defmodule Fathom.HranaAuth.Revocations do
 
   @table __MODULE__
   @default_ttl_ms 30_000
+  # Single-flight state for cold-miss read-throughs (expert review 2026-10-29 #20): the claim per
+  # shard (`{shard_id, claimant_pid}`), and the followers waiting on it (`{shard_id, ref, pid}`).
+  # Owned by this GenServer like `@table`, but only ever written by the callers.
+  @flights Module.concat(__MODULE__, Flights)
+  @followers Module.concat(__MODULE__, Followers)
+  @flight_attempts 3
+  # The durable storage floor is read as ONE attempt of at most this many ms (no retries). Sized from
+  # the heartbeat's per-attempt budget, `renew_ms / 3` of a 30 s TTL ≈ 3.3 s: the same "give up on
+  # one S3 attempt well inside the cadence that needs the answer" reasoning, here the client's
+  # hello. Override with `:hrana_storage_floor_budget_ms` (`HRANA_STORAGE_FLOOR_BUDGET_MS`).
+  @default_floor_budget_ms 3_000
+  # A follower's own bound on waiting for a claimant: the directory read (Repo `timeout`, 15 s by
+  # default) plus the storage budget, with slack. The claimant normally answers far sooner.
+  @follow_grace_ms 20_000
   @bulk_marker :__bulk_ok__
   @max_entries 200_000
   @full_page 5_000
@@ -153,6 +182,12 @@ defmodule Fathom.HranaAuth.Revocations do
   def init(_opts) do
     # public read_concurrency: verify/2 runs in the stream process and reads directly.
     :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
+
+    # Cold-miss single-flight (expert review 2026-10-29 #20). Keyed per shard, so no cross-shard
+    # contention; `write_concurrency` because every cold miss writes.
+    :ets.new(@flights, [:set, :public, :named_table, write_concurrency: true])
+    :ets.new(@followers, [:bag, :public, :named_table, write_concurrency: true])
+
     # Verify-result cache for `HranaAuth` (expert review 2026-10-17 #17); this process owns it.
     :ets.new(Fathom.HranaAuth.verify_cache_table(), [
       :set,
@@ -255,94 +290,290 @@ defmodule Fathom.HranaAuth.Revocations do
     ArgumentError -> :miss
   end
 
+  # A warm-but-lapsed entry re-reads only the directory (never storage, as before) and is not
+  # single-flighted: it needs the bulk marker stale too, and one point-read each is the old cost.
+  # A genuine COLD miss is the expensive one (directory read + a storage GET, on the `hello`
+  # critical path), so N concurrent hellos for one cold shard share ONE of each (expert review
+  # 2026-10-29 #20).
   defp read_through(shard_id, now) do
-    # On a genuine COLD miss (no cached value) the directory floor and the durable storage floor are
-    # INDEPENDENT reads, so they run concurrently (perf review 2026-10-14 #23): wall time is
-    # max(PG, S3) instead of PG + S3. Both are still always consulted, so the union is unchanged.
-    # A warm-but-lapsed entry never reads storage, as before.
-    stale = stale_floor(shard_id)
-    storage_task = if stale == :none, do: Task.async(fn -> storage_floor(shard_id) end)
+    case stale_floor(shard_id) do
+      :none -> single_flight(shard_id, now, @flight_attempts)
+      stale -> fetch(shard_id, now, stale)
+    end
+  end
 
-    try do
-      {dir_version, dir_bumped} = Directory.token_floor_info(shard_id)
-      dir_version = dir_version || 0
+  # SINGLE-FLIGHT, per shard, with no process in the middle. `@flights` is `{shard_id, claimant}`
+  # (`insert_new` is the claim); `@followers` is a bag of `{shard_id, ref, pid}` waiting on it. The
+  # claimant runs `fetch/3` in its own (stream) process and then sends every follower the result.
+  # Different shards touch different keys, so nothing here serializes across shards.
+  #
+  # Crash-safety, because the claimant is a stream/socket process that dies when its client
+  # disconnects: followers MONITOR the claimant, and a DOWN clears the (never-released) claim and
+  # retries, so one of them becomes the next claimant. A follower also bounds its own wait
+  # (`follow_timeout_ms/0`) and, on exhausting its retries or timing out, reads for itself — the
+  # worst case is the old unshared behaviour, never a wedge.
+  defp single_flight(shard_id, now, attempts_left) do
+    case claim(shard_id) do
+      :claimed -> lead(shard_id, now)
+      {:held_by, claimant} when attempts_left > 0 -> follow(shard_id, claimant, attempts_left)
+      # Retries spent, or the tables are not up (a bench harness without this GenServer).
+      _ -> fetch(shard_id, now, :none)
+    end
+  end
 
-      # Monotonic + DR backstop (expert review #6). A Postgres point-in-time restore can LOWER the
-      # directory's token_version, un-revoking tokens. So never drop below what this node already
-      # cached (protects a running node across a restore at zero storage cost — the floor only ever
-      # rises legitimately); and on a cold miss union the durable storage floor so the revocation
-      # survives.
-      {version, bumped_at} =
-        case stale do
-          {:ok, {cached, cached_bumped}} when cached >= dir_version -> {cached, cached_bumped}
-          {:ok, _} -> {dir_version, dir_bumped}
-          :none -> {max(dir_version, Task.await(storage_task, :infinity)), dir_bumped}
+  defp claim(shard_id) do
+    if :ets.insert_new(@flights, {shard_id, self()}) do
+      :claimed
+    else
+      case :ets.lookup(@flights, shard_id) do
+        [{^shard_id, claimant}] -> {:held_by, claimant}
+        # Released between the failed insert and the lookup: take another turn.
+        [] -> claim(shard_id)
+      end
+    end
+  rescue
+    ArgumentError -> :no_table
+  end
+
+  defp lead(shard_id, now) do
+    result = fetch(shard_id, now, :none)
+    release(shard_id, result)
+    result
+  end
+
+  # Release the claim BEFORE draining the followers. A follower registers and THEN re-checks the
+  # claim: seeing it still held proves its registration precedes this drain (so it will be served);
+  # seeing it gone, it withdraws, and `withdraw/2` tells it whether we already took it. A vanished
+  # table (restarted owner) is not worth failing a hello over.
+  defp release(shard_id, result) do
+    :ets.delete_object(@flights, {shard_id, self()})
+    for {_shard, ref, pid} <- :ets.take(@followers, shard_id), do: send(pid, {ref, result})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp follow(shard_id, claimant, attempts_left) do
+    ref = make_ref()
+    mon = Process.monitor(claimant)
+    :ets.insert(@followers, {shard_id, ref, self()})
+
+    held? = :ets.lookup(@flights, shard_id) == [{shard_id, claimant}]
+
+    if held? or not withdraw(shard_id, ref) do
+      await_lead(shard_id, claimant, ref, mon, attempts_left)
+    else
+      Process.demonitor(mon, [:flush])
+      retry_follow(shard_id, attempts_left)
+    end
+  rescue
+    ArgumentError -> fetch(shard_id, System.monotonic_time(:millisecond), :none)
+  end
+
+  # `true` if our registration was still there (the claimant never drained it, and now will not);
+  # `false` if the claimant already took it, so a result is on its way.
+  defp withdraw(shard_id, ref) do
+    :ets.select_delete(@followers, [{{shard_id, ref, self()}, [], [true]}]) == 1
+  end
+
+  defp await_lead(shard_id, claimant, ref, mon, attempts_left) do
+    receive do
+      {^ref, result} ->
+        Process.demonitor(mon, [:flush])
+        result
+
+      {:DOWN, ^mon, :process, _pid, _reason} ->
+        # The claimant died without releasing (killed, or its client went away mid-read). Clear its
+        # claim so the next claim can succeed, drop our registration, and go again.
+        :ets.delete_object(@flights, {shard_id, claimant})
+        withdraw(shard_id, ref)
+        retry_follow(shard_id, attempts_left)
+    after
+      follow_timeout_ms() ->
+        Process.demonitor(mon, [:flush])
+
+        # Taken but not yet delivered: absorb it so no stray message lands in the caller's mailbox.
+        if not withdraw(shard_id, ref) do
+          receive do
+            {^ref, _result} -> :ok
+          after
+            1_000 -> :ok
+          end
         end
 
-      insert(shard_id, version, bumped_at, now)
-      {version, bumped_at}
-    after
-      # A directory error must not leave the storage task's reply in the caller's mailbox.
-      if storage_task, do: Task.shutdown(storage_task, :brutal_kill)
+        fetch(shard_id, System.monotonic_time(:millisecond), :none)
     end
+  end
+
+  # After a lead finished (or died), its answer is in the cache when it succeeded; otherwise this
+  # caller claims and reads. `attempts_left` bounds the loop so a pathological claim churn degrades
+  # to an unshared read rather than spinning.
+  defp retry_follow(shard_id, attempts_left) do
+    now = System.monotonic_time(:millisecond)
+
+    case lookup(shard_id, now) do
+      {:hit, info} -> info
+      :miss -> single_flight(shard_id, now, attempts_left - 1)
+    end
+  end
+
+  # One read-through: on a COLD miss (`stale == :none`) the directory floor and the durable storage
+  # floor are INDEPENDENT reads, so they run concurrently (perf review 2026-10-14 #23): wall time is
+  # max(PG, S3) instead of PG + S3. Both are still always consulted, so the union is unchanged.
+  #
+  # The storage read is BOUNDED (expert review 2026-10-29 #20): one attempt, no retries, capped at
+  # `:hrana_storage_floor_budget_ms` of wire time (`Storage.read_token_floor/2`) and, as a second
+  # wall, abandoned by `Task.yield` at the same instant. It used to be `Task.await(…, :infinity)`
+  # over Req's default GET (3 retries, 15 s receive / 5 s pool per attempt): a stalled store held a
+  # hello ~60 s, before checkout and before the coordinator's own pull budget even started. The
+  # deadline is taken at task start, so the directory read and the storage read still overlap and
+  # the worst case is max(directory, budget), not their sum.
+  #
+  # Never raises: every failure maps to `read_error_fallback/3` or `storage_unreadable/2`.
+  defp fetch(shard_id, now, stale) do
+    budget = floor_budget_ms()
+    deadline = System.monotonic_time(:millisecond) + budget
+    storage_task = if stale == :none, do: Task.async(fn -> storage_floor(shard_id, budget) end)
+    dir = read_directory(shard_id)
+
+    storage =
+      cond do
+        is_nil(storage_task) -> :skipped
+        # Nothing will consult the answer: a stale value is served as-is, and `:fail_closed` never
+        # serves the storage floor (see `read_error_fallback/3`). Don't wait out a budget for it.
+        dir == :error and fail_closed?() -> discard(storage_task)
+        true -> await_storage(storage_task, deadline)
+      end
+
+    resolve(shard_id, now, stale, dir, storage)
+  end
+
+  defp read_directory(shard_id) do
+    {dir_version, dir_bumped} = Directory.token_floor_info(shard_id)
+    {:ok, {dir_version || 0, dir_bumped}}
   rescue
     e ->
       Logger.warning("revocation floor read failed for #{shard_id}: #{Exception.message(e)}")
-      read_error_fallback(shard_id)
+      :error
   catch
     :exit, reason ->
       Logger.warning("revocation floor read failed for #{shard_id}: #{inspect(reason)}")
-      read_error_fallback(shard_id)
+      :error
+  end
+
+  # `{:ok, floor}` (0 when the store holds none) or `:unreadable` — a timeout, an error status, a
+  # transport error and a dead task are all the same answer to the caller: the PITR backstop could
+  # not be consulted.
+  defp await_storage(task, deadline) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    case Task.yield(task, remaining) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {:ok, floor}} when is_integer(floor) -> {:ok, floor}
+      {:ok, {:ok, nil}} -> {:ok, 0}
+      _ -> :unreadable
+    end
+  end
+
+  defp discard(task) do
+    Task.shutdown(task, :brutal_kill)
+    :skipped
+  end
+
+  # A directory floor in hand.
+  defp resolve(shard_id, now, stale, {:ok, {dir_version, dir_bumped}}, storage) do
+    # Monotonic + DR backstop (expert review #6). A Postgres point-in-time restore can LOWER the
+    # directory's token_version, un-revoking tokens. So never drop below what this node already
+    # cached (protects a running node across a restore at zero storage cost — the floor only ever
+    # rises legitimately); and on a cold miss union the durable storage floor so the revocation
+    # survives. The storage floor is never dropped on the SUCCESS path.
+    case {stale, storage} do
+      {{:ok, {cached, cached_bumped}}, _} when cached >= dir_version ->
+        cache(shard_id, cached, cached_bumped, now)
+
+      {{:ok, _}, _} ->
+        cache(shard_id, dir_version, dir_bumped, now)
+
+      {:none, {:ok, storage_floor}} ->
+        cache(shard_id, max(dir_version, storage_floor), dir_bumped, now)
+
+      {:none, :unreadable} ->
+        storage_unreadable(shard_id, {dir_version, dir_bumped})
+    end
+  end
+
+  defp resolve(shard_id, _now, stale, :error, storage),
+    do: read_error_fallback(shard_id, stale, storage)
+
+  defp cache(shard_id, version, bumped_at, now) do
+    insert(shard_id, version, bumped_at, now)
+    {version, bumped_at}
+  end
+
+  # The directory answered but the durable storage floor could not be read in budget, on a cold
+  # miss. The same posture as a directory read error (`read_error_fallback/3`): `:fail_closed`
+  # refuses (`:unavailable`) — the operator asked for no acceptance without full floor knowledge —
+  # and `:fail_open` serves the directory floor it already holds. That answer is NOT cached: it
+  # would stand in for the storage floor for a whole TTL (longer under a fresh bulk marker) and
+  # turn a brownout into a window in which a PITR-lowered floor is believed. The next hello for the
+  # shard reads storage again (one bounded attempt, shared by concurrent hellos). Never a second
+  # GET inside this call.
+  #
+  # A fast storage ERROR is classed with the timeout, not served as floor 0 as it was before: with
+  # `receive_timeout` equal to the wall, a stalled store surfaces as a transport error as often as
+  # a `Task.yield` timeout, and the two cannot be told apart by the caller.
+  defp storage_unreadable(shard_id, dir_info) do
+    floor_error(shard_id)
+    Logger.warning("revocation storage floor unreadable for #{shard_id}")
+    if fail_closed?(), do: :unavailable, else: dir_info
   end
 
   # See floor_info/1 (round-2 #25). Expired entries are never deleted, only overwritten, so the
   # last-known-good value is still in the table to serve stale.
-  defp read_error_fallback(shard_id) do
-    :telemetry.execute([:fathom, :hrana, :revocation, :floor_error], %{count: 1}, %{
-      shard_id: shard_id
-    })
+  defp read_error_fallback(shard_id, stale, storage) do
+    floor_error(shard_id)
 
-    case stale_floor(shard_id) do
+    case stale do
       {:ok, info} ->
         info
 
       :none ->
         # The directory (Postgres) is unreadable and this node has no cached floor. Under
         # `:fail_open` the durable storage floor is an INDEPENDENT source (mirrored on every
-        # revoke), so consult it before taking the blind posture (expert review 2026-10-10 #7): a
+        # revoke), so use it before taking the blind posture (expert review 2026-10-10 #7): a
         # PG blip on a cold shard (a failover/rebalance target) used to serve floor 0 and re-accept
         # every revoked token even though S3 knew the floor. A positive storage floor is used as-is
-        # (not cached, like every error-path answer).
+        # (not cached, like every error-path answer). It is the answer of THIS call's one bounded
+        # read (`fetch/3` started it before the directory read failed): no second GET, so a
+        # storage stall cannot be paid twice (expert review 2026-10-29 #20).
         #
         # Under `:fail_closed` the storage floor is NOT served (expert review 2026-10-10 fix-review
         # R4-1): it is best-effort and may LAG the directory, so answering from it would admit
         # tokens a revoke the directory already knows about invalidated -- the opposite of what an
         # operator choosing fail_closed asked for. The answer stays `:unavailable`.
-        case Application.get_env(:fathom, :hrana_revocation_on_error, :fail_open) do
-          :fail_closed ->
-            :unavailable
-
-          _ ->
-            case storage_floor_result(shard_id) do
-              {:ok, v} when is_integer(v) and v > 0 -> {v, nil}
-              _ -> {0, nil}
-            end
+        if fail_closed?() do
+          :unavailable
+        else
+          case storage do
+            {:ok, floor} when floor > 0 -> {floor, nil}
+            _ -> {0, nil}
+          end
         end
     end
   end
 
-  # The durable token-revocation floor from storage (the #6 DR backstop), read only on a cold miss.
-  # Best-effort: any error → 0, so a storage blip just falls back to the directory floor and never
-  # locks out valid traffic (the running-node monotonic guard already covers the common restore case).
-  defp storage_floor(shard_id) do
-    case storage_floor_result(shard_id) do
-      {:ok, v} when is_integer(v) -> v
-      _ -> 0
-    end
+  defp floor_error(shard_id) do
+    :telemetry.execute([:fathom, :hrana, :revocation, :floor_error], %{count: 1}, %{
+      shard_id: shard_id
+    })
   end
 
-  defp storage_floor_result(shard_id) do
-    Fathom.Shard.Storage.read_token_floor(shard_id)
+  defp fail_closed?,
+    do: Application.get_env(:fathom, :hrana_revocation_on_error, :fail_open) == :fail_closed
+
+  # The durable token-revocation floor from storage (the #6 DR backstop), read only on a cold miss,
+  # as ONE attempt of at most `budget` ms of wire time (see `fetch/3`).
+  defp storage_floor(shard_id, budget) do
+    Fathom.Shard.Storage.read_token_floor(shard_id, budget_ms: budget)
   rescue
     _ -> {:error, :storage_floor_read_failed}
   catch
@@ -530,4 +761,9 @@ defmodule Fathom.HranaAuth.Revocations do
   end
 
   defp ttl_ms, do: Application.get_env(:fathom, :hrana_revocation_ttl_ms, @default_ttl_ms)
+
+  defp floor_budget_ms,
+    do: Application.get_env(:fathom, :hrana_storage_floor_budget_ms, @default_floor_budget_ms)
+
+  defp follow_timeout_ms, do: floor_budget_ms() + @follow_grace_ms
 end

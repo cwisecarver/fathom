@@ -74,6 +74,14 @@ From the 2026-10-14 performance round and the bugs its rig run found:
 
 ### Changed
 
+- **The cold-`hello` token-floor read is bounded and single-flight** (expert review 2026-10-29
+  #20). The durable storage floor read took an unbounded wait over a retried GET (~60 s against a
+  stalled store) and ran once per concurrent hello. It is now one un-retried attempt capped at
+  `HRANA_STORAGE_FLOOR_BUDGET_MS` (default 3000), shared by concurrent hellos for the same shard.
+  A read that cannot finish follows `HRANA_REVOCATION_ON_ERROR`: `fail_closed` refuses
+  (`:unavailable`), `fail_open` serves the directory floor uncached. Behaviour change: under
+  `fail_closed` a storage-floor *error* on a cold shard now refuses instead of reading as floor 0.
+  See `docs/auth.md`.
 - **Filo now comes from Hex** (`{:filo, "~> 0.2.0"}`) instead of a `path: "../filo"`
   dep. A clone of fathom no longer needs filo checked out as a sibling — `mix deps.get`
   is enough. Pinned to the patch range, not `~> 0.2`: filo is pre-1.0, where the minor

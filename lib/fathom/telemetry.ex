@@ -1038,7 +1038,7 @@ defmodule Fathom.Telemetry do
       counter("fathom.hrana.revocation.floor_error.count",
         event_name: [:fathom, :hrana, :revocation, :floor_error],
         description:
-          "Revocation-floor reads that failed and fell back to the last-known-good (STALE) floor — a revoke issued after that value was cached is not being enforced on this node. Serving stale beats failing closed on every request, but sustained > 0 means the revocation contract is degraded"
+          "Revocation-floor reads that failed and fell back to the last-known-good (STALE) floor — a revoke issued after that value was cached is not being enforced on this node — or, on a cold shard whose durable storage floor could not be read within `:hrana_storage_floor_budget_ms`, to the directory floor alone (or :unavailable under fail_closed). Serving stale beats failing closed on every request, but sustained > 0 means the revocation contract is degraded"
       ),
       counter("fathom.hrana.revocation.bulk.count",
         event_name: [:fathom, :hrana, :revocation, :bulk],

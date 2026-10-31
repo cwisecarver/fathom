@@ -2463,8 +2463,27 @@ defmodule Fathom.Shard.Storage.S3 do
   end
 
   @impl true
-  def read_token_floor(shard_id) do
-    case Req.get(req(), url: url_path(token_floor_key(shard_id))) do
+  def read_token_floor(shard_id), do: read_token_floor(shard_id, [])
+
+  # With `:budget_ms` this is ONE bounded attempt (expert review 2026-10-29 #20), for
+  # `HranaAuth.Revocations` on the `hello` path. The shared `build_req/1` defaults give a GET Req's
+  # `:safe_transient` retries (50/200/800 ms delays) and the 15 s `receive_timeout` / 5 s
+  # `pool_timeout`, so a stalled store held a hello for ~4 x 15 s. These are PER-CALL options on
+  # this one GET: `build_req/1` is shared with the lease/flush/heartbeat traffic and is deliberately
+  # not touched. `finch:` must re-state the pool name because `Req.merge` replaces it wholesale (see
+  # `finch_opts/1`); the same two-part bound as `renew_heartbeat/3`.
+  @impl true
+  def read_token_floor(shard_id, opts) do
+    bounded =
+      case Keyword.get(opts, :budget_ms) do
+        ms when is_integer(ms) and ms > 0 ->
+          [retry: false, receive_timeout: ms, finch: finch_opts(pool_timeout: ms)]
+
+        _ ->
+          []
+      end
+
+    case Req.get(req(), [url: url_path(token_floor_key(shard_id))] ++ bounded) do
       {:ok, %{status: 200, body: body}} -> {:ok, parse_token_floor(body)}
       {:ok, %{status: 404}} -> {:ok, nil}
       {:ok, %{status: status}} -> {:error, {:s3_get_status, status}}

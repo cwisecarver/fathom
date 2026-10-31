@@ -92,6 +92,7 @@ config; diff from it.
 | `HRANA_TOKEN_MAX_AGE` | unset (tokens don't expire) | Optional token expiry (seconds). | Unset ⇒ revoke only by rotation; a boot warning fires when `required` runs with infinite max-age. |
 | `HRANA_REVOCATION_ON_ERROR` | `fail_open` (unset ⇒ `fail_open`) | Posture for a revocation-floor read that fails when the node has no cached floor for the shard: `fail_open` consults the durable storage floor, else floor 0; `fail_closed` refuses the token. An unknown value fails the boot. | `fail_open` keeps the data plane up through a directory outage, but a revoked token can be accepted until the directory is readable again. `fail_closed` refuses those tokens instead. See [auth.md](auth.md#revocation--expiry). |
 | `HRANA_BIND_IP` | unset (all interfaces) | Pins the Hrana listener to the private interface the LB reaches. | Defense-in-depth for the `disabled`-auth posture; unset relies on network isolation alone. |
+| `HRANA_STORAGE_FLOOR_BUDGET_MS` | `3000` | Wire-time budget (ms, positive integer) for the ONE un-retried read of the durable per-shard token floor on a cold `hello` (expert review 2026-10-29 #20). A stall past it follows the `HRANA_REVOCATION_ON_ERROR` posture. A non-integer or non-positive value fails the boot. | Too low turns normal S3 latency into `fail_closed` refusals (or, under `fail_open`, a directory-only floor that skips the PITR backstop for that hello); too high lets a stalled store hold a hello that long. See [auth.md](auth.md#revocation--expiry). |
 
 ## Admission & limits (safety-critical)
 

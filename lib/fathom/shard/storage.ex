@@ -587,6 +587,15 @@ defmodule Fathom.Shard.Storage do
   @callback read_token_floor(shard_id :: String.t()) ::
               {:ok, non_neg_integer() | nil} | {:error, term()}
 
+  # Same read, bounded for a caller on the `hello` critical path (expert review 2026-10-29 #20).
+  # `opts[:budget_ms]` makes it ONE attempt: no retries, and the wire time (`receive_timeout` and
+  # `pool_timeout` for an HTTP backend) capped at the budget. Without it the read is Req's default
+  # GET (up to 3 retries, 15 s receive / 5 s pool per attempt) — fine for the DR sweep, which has
+  # no client waiting. The option is per-call; the request defaults shared with lease/flush/
+  # heartbeat traffic are untouched. A backend that does no I/O (Local) ignores it.
+  @callback read_token_floor(shard_id :: String.t(), opts :: keyword()) ::
+              {:ok, non_neg_integer() | nil} | {:error, term()}
+
   @doc "Pulls the shard's stored file to `local_path`, returning its etag (`nil` if absent)."
   # `{:absent, _}` was missing here while the `@callback` above has carried it since expert review
   # 2026-08-01 #24 — the delegating spec contradicted the contract it delegates to, and callers
@@ -1298,6 +1307,14 @@ defmodule Fathom.Shard.Storage do
   @doc "Reads `shard_id`'s durable token-revocation floor (`nil` if none) — the boot/cold-read union (#6)."
   @spec read_token_floor(String.t()) :: {:ok, non_neg_integer() | nil} | {:error, term()}
   def read_token_floor(shard_id), do: backend().read_token_floor(shard_id)
+
+  @doc """
+  `read_token_floor/1` bounded to a single attempt of `opts[:budget_ms]` milliseconds of wire time
+  (no retries). Used by `HranaAuth.Revocations` on the `hello` path (expert review 2026-10-29 #20).
+  """
+  @spec read_token_floor(String.t(), keyword()) ::
+          {:ok, non_neg_integer() | nil} | {:error, term()}
+  def read_token_floor(shard_id, opts), do: backend().read_token_floor(shard_id, opts)
 
   @doc """
   Aggregate storage footprint — `{object_count, total_bytes}` of the live shard objects — for the
