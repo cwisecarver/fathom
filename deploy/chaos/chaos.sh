@@ -87,8 +87,9 @@
 #                                 ~1k-conn ceiling. Build it once: `./chaos.sh build-driver`.
 #   TPC_DRIVER=elixir ./chaos.sh tpc-sparse [tenants ops think_ms graces_csv]  SPARSE-TENANT arm (expert
 #                                 review 2026-10-29 #2): one one-shot write per tenant per think_ms
-#                                 (open loop, default 1000 ms, so every gap outlives the 250 ms pool
-#                                 drain grace), rounds alternating POOL_DRAIN_GRACE_MS over graces_csv
+#                                 (open loop, default 1000 ms; keep it above the pool drain grace, which is
+#                                 2000 ms by default since 2026-10-31, so pass graces_csv below the think time
+#                                 to see drains), rounds alternating POOL_DRAIN_GRACE_MS over graces_csv
 #                                 (default 250,5000,250,5000); p99, pool hit% and A2 commit histograms
 #   RIG_DISK_CAP=gp3|gp3-split ./chaos.sh up   cap each node's disk at gp3 (3000 IOPS / 125 MiB/s; see
 #                                 docker-compose.gp3*.yml) - `gp3`: data+replicas share one cap,
@@ -2849,7 +2850,7 @@ cmd_pool_gap() {
 
 # -- tpc-sparse: the sparse-tenant write path, replication ON (expert review 2026-10-29 #2) -----------
 # Every other arm drives tenants back to back, so no shard is ever idle past the pool's drain grace
-# (POOL_DRAIN_GRACE_MS, default 250 ms) and the idle-drain path is never measured: after the grace the
+# (POOL_DRAIN_GRACE_MS, default 2000 ms since 2026-10-31, 250 before) and the idle-drain path is never measured: after the grace the
 # last close runs SQLite's close-time checkpoint (WAL fsync, backfill, DB fsync, unlink of -wal/-shm),
 # the next write recreates them (and, under FULL, dirsyncs the directory), and with A2 each gap starts
 # a new WAL generation. The real tenant population is sparse, so that is the common request.

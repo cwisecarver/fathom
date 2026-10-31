@@ -494,15 +494,15 @@ defmodule Tpc do
   # (`chaos.sh pool-fleet` prints both).
   #
   # THINK TIME (`--think-ms T`, expert review 2026-10-29 #2): the SPARSE-tenant arm. Every other arm
-  # runs back to back, so no shard is ever idle past the pool's `drain_grace_ms` (250 ms) and the
+  # runs back to back, so no shard is ever idle past the pool's `drain_grace_ms` (2000 ms since 2026-10-31, 250 before) and the
   # idle-drain path (close-time checkpoint, `-wal`/`-shm` unlink, a new WAL generation under A2 on
   # the next write) is never on the measured path, although the real tenant population is sparse.
   # With T > 0 each worker is OPEN LOOP at one op per T ms: op k is INTENDED at
   # `start + phase + (k - 1) * T` (phase random in [0, T), so tenants do not fire in lockstep) and
   # its response time runs from that intended instant, so a stall shows up as queueing delay
   # instead of vanishing (the same coordinated-omission rule as tpcb's `--rate`). The gap between
-  # one op's close and the next op's open is then ~T minus the service time; keep T well above 250
-  # (the default `POOL_DRAIN_GRACE_MS`) or the pool never drains and this measures nothing new. T = 0
+  # one op's close and the next op's open is then ~T minus the service time; keep T above the grace
+  # (`POOL_DRAIN_GRACE_MS`, 2000 by default; `tpc-sparse` sets it per round) or the pool never drains and this measures nothing new. T = 0
   # (the default) is the old closed loop, unchanged. `--streams 1` is the sparse shape: K >= 2
   # streams on one tenant shrink each tenant's gaps to ~T/K.
   def mode_oneshot_fleet(args) do

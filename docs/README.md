@@ -222,8 +222,8 @@ noted).
   `rig-arms` runbook: sparse tenants with replication on (`tpc-sparse`): `POOL_DRAIN_GRACE_MS` 250
   gives p99 0.42 s then 3.4-4.0 s on the second round, 1100-5000 gives **~6 ms p99**, repeatable
   across fresh VMs (the default moved from 250 to 2000 ms on 2026-10-31, Jepsen and `rpo` green). Also the
-  gp3-capped disk: the cap binds at 3,000 txn/s, and its low-rate ladder is confounded by the
-  sparse path. The auth arm has not been run.
+  gp3-capped disk: the cap binds at 3,000 txn/s; its low-rate ladder is confounded by an unexplained
+  intermittent ~2 s tail that is independent of the grace. The auth arm has not been run.
 - **[reviews/tpc-fleet-elixir-driver-2026-07-24.md](reviews/tpc-fleet-elixir-driver-2026-07-24.md)** —
   the current multi-tenant throughput result: **4,096 concurrent tenant shards, 3,414 txn/s, zero
   errors**, driven from one process; 7,168 tenant shards over the sweep, 5.08M queries, consistent-hash
