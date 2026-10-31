@@ -156,6 +156,11 @@ what actually shipped (some plan assumptions were superseded).
   tenants or revoked tokens.
 - **[runbooks/lock-repair.md](runbooks/lock-repair.md)** — a shard whose lease lock is undecodable
   fails closed on both backends; repairing it with `mix fathom.lock.repair` (epoch never moves back).
+- **[runbooks/rig-arms.md](runbooks/rig-arms.md)** — three opt-in chaos-rig arms (expert review
+  2026-10-29 #16/#18/#2): a gp3-capped disk (`RIG_DISK_CAP`, replicas shared vs on their own capped
+  device), the prod auth posture (`TPC_AUTH=required`, with a node-restart phase), and sparse tenants
+  with replication on (`tpc-sparse`, `POOL_DRAIN_GRACE_MS` 250 vs 5000). Exact commands, what to read,
+  and what result falsifies each. *Built, not yet run.*
 
 ## Reviews & run reports
 

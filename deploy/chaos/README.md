@@ -24,6 +24,11 @@ MinIO — inject latency first); a container kill still RSTs sockets (use the
 `failover` command's disconnect-then-kill for silent death); real clock skew can't
 be produced (the `steal_margin_ms` guard keeps its unit tests).
 
+Opt-in measurement arms that change what the rig models, all off unless their variable is set
+(`RIG_DISK_CAP=gp3|gp3-split` caps each node's disk at the gp3 prod target, `TPC_AUTH=required` runs the
+prod auth posture, `chaos.sh tpc-sparse` drives sparse tenants with replication on):
+[`docs/runbooks/rig-arms.md`](../../docs/runbooks/rig-arms.md).
+
 ## Usage
 
 ```bash

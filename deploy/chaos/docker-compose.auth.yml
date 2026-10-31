@@ -1,0 +1,41 @@
+# Opt-in rig overlay: the prod auth posture on the data path (expert review 2026-10-29 #18). Every
+# node runs HRANA_AUTH=required, so every stream open must present a per-shard Phoenix.Token, and the
+# in-network driver gets the minted tokens through a read-only bind mount. Use it through
+# `TPC_AUTH=required ./chaos.sh <arm>` (chaos.sh stacks this file onto COMPOSE_FILE and mints the
+# tokens before each run); the runbook is docs/runbooks/rig-arms.md.
+#
+# Why an overlay and not a base-file default: the rig's baseline runs with HRANA_AUTH=disabled and
+# every number in docs/reviews/ was taken that way; flipping the default would orphan the series.
+#
+# HRANA_TOKEN_MAX_AGE is REQUIRED here: the prod release refuses to boot under :required without a
+# finite token lifetime (Fathom.HranaAuth.check_config!/0, expert review #37). The default is a day so
+# a run does not hit the expiry cliff; set it SHORTER than the run (e.g. HRANA_TOKEN_MAX_AGE=90) to
+# see that cliff on purpose: tokens minted at the start of the run stop verifying mid-run.
+#
+# The tokens are signed with the node's SECRET_KEY_BASE (the rig sets no HRANA_TOKEN_SECRET), and are
+# minted on fathom1 by the real issuance path, Fathom.HranaAuth.token_for/1, so each mint also writes
+# the issuance ledger like a prod mint does. ./tpc-auth is where chaos.sh leaves them (gitignored).
+services:
+  fathom1:
+    environment:
+      HRANA_AUTH: required
+      HRANA_TOKEN_MAX_AGE: "${HRANA_TOKEN_MAX_AGE:-86400}"
+  fathom2:
+    environment:
+      HRANA_AUTH: required
+      HRANA_TOKEN_MAX_AGE: "${HRANA_TOKEN_MAX_AGE:-86400}"
+  fathom3:
+    environment:
+      HRANA_AUTH: required
+      HRANA_TOKEN_MAX_AGE: "${HRANA_TOKEN_MAX_AGE:-86400}"
+  fathom4:
+    environment:
+      HRANA_AUTH: required
+      HRANA_TOKEN_MAX_AGE: "${HRANA_TOKEN_MAX_AGE:-86400}"
+  fathom5:
+    environment:
+      HRANA_AUTH: required
+      HRANA_TOKEN_MAX_AGE: "${HRANA_TOKEN_MAX_AGE:-86400}"
+  driver:
+    volumes:
+      - ./tpc-auth:/tpc-auth:ro

@@ -1,0 +1,57 @@
+# Opt-in rig overlay: cap each fathom node's block I/O at the documented prod target, an AWS gp3 EBS
+# volume (baseline 3,000 IOPS / 125 MiB/s; docs/deploy-cluster.md "Node disk"). The rig's virtio disk
+# has no cap, so it cannot show the fsync queueing a throttled volume adds (expert review 2026-10-29
+# #16). Use it through `RIG_DISK_CAP=gp3 ./chaos.sh up` (chaos.sh resolves the device, sets
+# COMPOSE_FILE and exports the variables below); the runbook is docs/runbooks/rig-arms.md.
+#
+# THIS FILE = ONE SHARED CAP PER NODE. Everything a node writes under /data (primary shards, the
+# replicas it holds for its peers, the warm cache) lands on the one VM disk behind /var/lib/docker, so
+# one cap on that device is the "replicas on the same EBS volume as the data" case. For the "replicas
+# on their own volume" case use docker-compose.gp3-split.yml INSTEAD of this file.
+#
+# What the cap is, precisely. docker turns `blkio_config` into the container cgroup's `io.max`
+# (cgroup v2: rbps/wbps/riops/wiops per device), so it is PER CONTAINER, i.e. per node. That is the
+# right shape: in prod every node has its own gp3 volume, so each node gets its own budget and the
+# five nodes do not compete for one. It is not an instance-wide EBS bandwidth limit (two volumes on one
+# EC2 instance share that; io.max cannot express a limit across two devices, so that case stays
+# unmeasured). Three limits of the mechanism, so a result is read correctly:
+#   * io.max applies to the whole disk's request queue, so the path MUST be the whole disk (e.g. /dev/vdc),
+#     never a partition (/dev/vdc1): the kernel's io.max is a per-disk control, so a partition path is
+#     refused or does not throttle the queue the I/O uses. `./chaos.sh disk-cap show` checks it.
+#   * It throttles the container's own submitted I/O and the writeback of pages the container dirtied
+#     (cgroup-v2 writeback accounting). The ext4 journal thread (jbd2) is a kernel thread outside the
+#     container's cgroup, so journal commits are expected NOT to be throttled (unmeasured);
+#     `./chaos.sh disk-cap probe` shows the cap binding on direct writes before a run is trusted.
+#   * One IOPS here is one block-layer request (up to the device's max request size), not AWS's
+#     256 KiB-normalised I/O. For small synced WAL writes the two agree; for large sequential writes
+#     the bandwidth cap is the one that binds.
+#
+# Variables (chaos.sh sets them; RIG_CAP_BPS is RIG_CAP_MIBPS x 1048576):
+#   RIG_DATA_DEV   whole-disk device backing /var/lib/docker inside the colima VM (REQUIRED; chaos.sh resolves it)
+#   RIG_CAP_BPS    bytes/s for read and write (default 131072000 = 125 MiB/s)
+#   RIG_CAP_IOPS   IOPS for read and write (default 3000)
+x-gp3-cap: &gp3-cap
+  device_read_bps:
+    - path: "${RIG_DATA_DEV:?RIG_DATA_DEV unset - see docs/runbooks/rig-arms.md}"
+      rate: "${RIG_CAP_BPS:-131072000}"
+  device_write_bps:
+    - path: "${RIG_DATA_DEV:?RIG_DATA_DEV unset - see docs/runbooks/rig-arms.md}"
+      rate: "${RIG_CAP_BPS:-131072000}"
+  device_read_iops:
+    - path: "${RIG_DATA_DEV:?RIG_DATA_DEV unset - see docs/runbooks/rig-arms.md}"
+      rate: "${RIG_CAP_IOPS:-3000}"
+  device_write_iops:
+    - path: "${RIG_DATA_DEV:?RIG_DATA_DEV unset - see docs/runbooks/rig-arms.md}"
+      rate: "${RIG_CAP_IOPS:-3000}"
+
+services:
+  fathom1:
+    blkio_config: *gp3-cap
+  fathom2:
+    blkio_config: *gp3-cap
+  fathom3:
+    blkio_config: *gp3-cap
+  fathom4:
+    blkio_config: *gp3-cap
+  fathom5:
+    blkio_config: *gp3-cap

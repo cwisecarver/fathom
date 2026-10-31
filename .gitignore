@@ -73,6 +73,10 @@ npm-debug.log
 # (expert review 2026-08-01 #23) — a content hash, regenerated per reload, machine-local.
 deploy/chaos/lb-runtime/*.applied
 
+# Per-tenant Hrana bearer tokens minted by `TPC_AUTH=required ./chaos.sh <arm>` for the rig's driver
+# (deploy/chaos/docker-compose.auth.yml mounts it). Rig-only secrets; regenerated per run.
+deploy/chaos/tpc-auth/
+
 # Built by mix compile.fathom_udf from native/fathom_udf — a platform-specific
 # shared library, never committed.
 /priv/sqlite_ext/

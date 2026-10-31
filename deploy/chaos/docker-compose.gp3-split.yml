@@ -1,0 +1,54 @@
+# Opt-in rig overlay: the gp3 cap (docker-compose.gp3.yml) on EACH of two devices, for the "replicas on
+# their own EBS volume" variant of expert review 2026-10-29 #16. Use it through
+# `RIG_DISK_CAP=gp3-split ./chaos.sh up`, which stacks docker-compose.replicadisk.yml (replicas
+# bind-mounted from the second virtio disk, one-time setup in that file's header) and this file, and
+# resolves both devices.
+#
+# Use this file INSTEAD of docker-compose.gp3.yml, never with it: it is self-contained (data device +
+# replica device, the same rate on each), so it does not depend on how compose merges the two lists.
+#
+# The comparison is only valid with the SAME cap on both sides:
+#   shared   RIG_DISK_CAP=gp3          data + replicas behind ONE 3,000 IOPS / 125 MiB/s cap
+#   split    RIG_DISK_CAP=gp3-split    data behind one cap, replicas behind another, same rates
+# Capping only the replica device (or only the data device) would make the split arm look worse or
+# better than it is, because the uncapped path then absorbs the load the capped one sheds
+# (the audit's Trap on #16).
+#
+# Variables (chaos.sh sets them and auto-detects both devices):
+#   RIG_DATA_DEV      whole-disk device backing /var/lib/docker in the colima VM (default /dev/vda)
+#   RIG_REPLICA_DEV   whole-disk device mounted at /mnt/lima-replicadisk (REQUIRED; chaos.sh resolves it)
+#   RIG_CAP_BPS       bytes/s for read and write, per device (default 131072000 = 125 MiB/s)
+#   RIG_CAP_IOPS      IOPS for read and write, per device (default 3000)
+x-gp3-cap-split: &gp3-cap-split
+  device_read_bps:
+    - path: "${RIG_DATA_DEV:?RIG_DATA_DEV unset - see docs/runbooks/rig-arms.md}"
+      rate: "${RIG_CAP_BPS:-131072000}"
+    - path: "${RIG_REPLICA_DEV:?RIG_REPLICA_DEV unset - see docs/runbooks/rig-arms.md}"
+      rate: "${RIG_CAP_BPS:-131072000}"
+  device_write_bps:
+    - path: "${RIG_DATA_DEV:?RIG_DATA_DEV unset - see docs/runbooks/rig-arms.md}"
+      rate: "${RIG_CAP_BPS:-131072000}"
+    - path: "${RIG_REPLICA_DEV:?RIG_REPLICA_DEV unset - see docs/runbooks/rig-arms.md}"
+      rate: "${RIG_CAP_BPS:-131072000}"
+  device_read_iops:
+    - path: "${RIG_DATA_DEV:?RIG_DATA_DEV unset - see docs/runbooks/rig-arms.md}"
+      rate: "${RIG_CAP_IOPS:-3000}"
+    - path: "${RIG_REPLICA_DEV:?RIG_REPLICA_DEV unset - see docs/runbooks/rig-arms.md}"
+      rate: "${RIG_CAP_IOPS:-3000}"
+  device_write_iops:
+    - path: "${RIG_DATA_DEV:?RIG_DATA_DEV unset - see docs/runbooks/rig-arms.md}"
+      rate: "${RIG_CAP_IOPS:-3000}"
+    - path: "${RIG_REPLICA_DEV:?RIG_REPLICA_DEV unset - see docs/runbooks/rig-arms.md}"
+      rate: "${RIG_CAP_IOPS:-3000}"
+
+services:
+  fathom1:
+    blkio_config: *gp3-cap-split
+  fathom2:
+    blkio_config: *gp3-cap-split
+  fathom3:
+    blkio_config: *gp3-cap-split
+  fathom4:
+    blkio_config: *gp3-cap-split
+  fathom5:
+    blkio_config: *gp3-cap-split

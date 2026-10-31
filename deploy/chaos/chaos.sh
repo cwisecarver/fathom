@@ -85,6 +85,21 @@
 #   TPC_NET=container TPC_DRIVER=elixir ./chaos.sh tpcb|tpc-fleet  run that driver IN-NETWORK
 #                                 (compose run driver → LB as http://lb), past the host forwarder's
 #                                 ~1k-conn ceiling. Build it once: `./chaos.sh build-driver`.
+#   TPC_DRIVER=elixir ./chaos.sh tpc-sparse [tenants ops think_ms graces_csv]  SPARSE-TENANT arm (expert
+#                                 review 2026-10-29 #2): one one-shot write per tenant per think_ms
+#                                 (open loop, default 1000 ms, so every gap outlives the 250 ms pool
+#                                 drain grace), rounds alternating POOL_DRAIN_GRACE_MS over graces_csv
+#                                 (default 250,5000,250,5000); p99, pool hit% and A2 commit histograms
+#   RIG_DISK_CAP=gp3|gp3-split ./chaos.sh up   cap each node's disk at gp3 (3000 IOPS / 125 MiB/s; see
+#                                 docker-compose.gp3*.yml) - `gp3`: data+replicas share one cap,
+#                                 `gp3-split`: replicas on the second disk, the same cap on EACH device
+#   RIG_DISK_CAP=... ./chaos.sh disk-cap [show|probe]  prove the cap is applied to the device that backs
+#                                 /data (io.max vs the VM's major:minor) and that it binds (dd probe)
+#   TPC_AUTH=required ./chaos.sh up   nodes run HRANA_AUTH=required (docker-compose.auth.yml); the same
+#                                 variable on any elixir-driver arm mints one token per tenant and
+#                                 sends it (rtt|tpcb|oneshot-fleet arms: tpc-fleet, tpc-tail, pool-*, tpc-sparse)
+#   TPC_RESTART_NODE=fathom3 [TPC_RESTART_AT_S=60] ./chaos.sh tpc-tail ...  `compose restart` that node
+#                                 mid-run (tpcb / oneshot-fleet driver runs only); with TPC_AUTH the cold-auth phase
 #   ./chaos.sh rollout [tenants limit timeout_s]  fleet SCHEMA-MIGRATION throughput: seed N tenants
 #                                 at v1, release v2, run the sweep, measure shards/s + the rate/ETA
 #                                 status/0 reports + the per-node split from shard_migrated telemetry
@@ -149,6 +164,92 @@ cname() { echo "fathom-chaos-$1-1"; }
 netname() { echo "fathom-chaos_default"; }
 # The fixed address docker-compose.yml gives fathomN; a reconnect must ask for it back.
 nodeip() { echo "10.200.0.1${1#fathom}"; }
+
+# Descriptor 3 = the terminal's stderr, saved before any caller's `2>/dev/null`. The tpc arms run the
+# driver as `json=$(tpc_run ... 2>/dev/null)`, which would swallow a note written from inside
+# tpc_run (the restart timestamps); `>&3` goes around that.
+exec 3>&2
+
+# -- opt-in rig overlays (expert review 2026-10-29 #16, #18) ------------------------------------------
+# Everything below is OFF unless asked for, so a plain `./chaos.sh up` is exactly what it was. Runbook:
+# docs/runbooks/rig-arms.md.
+#
+#   RIG_DISK_CAP=gp3         docker-compose.gp3.yml: every node's block I/O capped at a gp3 volume
+#   RIG_DISK_CAP=gp3-split   docker-compose.replicadisk.yml + docker-compose.gp3-split.yml: replicas on
+#                            the second virtio disk, the same cap on EACH device
+#   TPC_AUTH=required        docker-compose.auth.yml: nodes run HRANA_AUTH=required (the tpc arms then
+#                            mint and send a token per tenant, see tpc_run)
+#
+# Overlays stack on COMPOSE_FILE (docker compose's own mechanism, which the replicadisk header already
+# documents), exported here so every compose call in this script - up, exec, run driver - sees the
+# same project. A COMPOSE_FILE the caller already set is kept and extended.
+rig_add_compose_file() {
+  local f=$1
+  : "${COMPOSE_FILE:=docker-compose.yml}"
+  case ":$COMPOSE_FILE:" in
+    *":$f:"*) ;;
+    *) COMPOSE_FILE="$COMPOSE_FILE:$f" ;;
+  esac
+  export COMPOSE_FILE
+}
+
+# rig_vm_disk <path>: the WHOLE-DISK device that backs <path> inside the colima VM, e.g. /dev/vdc for a
+# /var/lib/docker on /dev/vdc1 (on the 2026-10-30 rig it is colima's data disk vdc, NOT the root disk
+# vda). io.max (what docker's blkio_config becomes) is a whole-disk control: naming the partition is
+# refused, and the cap would not be on the queue the I/O goes through anyway. `findmnt -T` resolves the
+# filesystem holding <path> (stripping the `[/docker]` bind-subpath suffix); `lsblk PKNAME` walks a
+# partition up to its disk. The script goes through `sh -c` as separate args: `colima ssh -- "<script>"`
+# treats the whole string as one command name.
+rig_vm_disk() {
+  command -v colima >/dev/null 2>&1 || return 1
+  local script="d=\$(findmnt -no SOURCE -T $1 2>/dev/null | head -n1); d=\${d%%\\[*}; [ -n \"\$d\" ] || exit 1; p=\$(lsblk -no PKNAME \"\$d\" 2>/dev/null | head -n1); if [ -n \"\$p\" ]; then echo \"/dev/\$p\"; else echo \"\$d\"; fi"
+  colima ssh -- sh -c "$script" 2>/dev/null | tr -d '\r'
+}
+
+# rig_vm_majmin <device>: the device's major:minor inside the VM (what io.max is keyed by).
+rig_vm_majmin() {
+  colima ssh -- sh -c "lsblk -dno MAJ:MIN $1" 2>/dev/null | tr -d '\r '
+}
+
+case "${RIG_DISK_CAP:-}" in
+  "") ;;
+  gp3|gp3-split)
+    # gp3 baseline: 3,000 IOPS and 125 MiB/s (an external AWS figure, docs/deploy-cluster.md).
+    # RIG_CAP_MIBPS / RIG_CAP_IOPS change both devices' rate together, which is the point of the A/B.
+    export RIG_CAP_IOPS=${RIG_CAP_IOPS:-3000}
+    export RIG_CAP_BPS=${RIG_CAP_BPS:-$(( ${RIG_CAP_MIBPS:-125} * 1048576 ))}
+    if [ -z "${RIG_DATA_DEV:-}" ]; then
+      RIG_DATA_DEV=$(rig_vm_disk /var/lib/docker)
+      [ -n "$RIG_DATA_DEV" ] || { echo "RIG_DISK_CAP=$RIG_DISK_CAP: could not resolve the disk behind /var/lib/docker in the colima VM; set RIG_DATA_DEV=/dev/<whole disk> (docs/runbooks/rig-arms.md, 'Finding the device')" >&2; exit 1; }
+    fi
+    export RIG_DATA_DEV
+    if [ "$RIG_DISK_CAP" = gp3-split ]; then
+      if [ -z "${RIG_REPLICA_DEV:-}" ]; then
+        RIG_REPLICA_DEV=$(rig_vm_disk /mnt/lima-replicadisk)
+        [ -n "$RIG_REPLICA_DEV" ] || { echo "RIG_DISK_CAP=gp3-split: could not resolve the disk behind /mnt/lima-replicadisk; set up the second disk (docker-compose.replicadisk.yml header) or set RIG_REPLICA_DEV" >&2; exit 1; }
+      fi
+      # A replica mount that is not its own disk resolves to the root disk, and a "split" arm that is
+      # really the shared arm would be reported as a null result.
+      [ "$RIG_REPLICA_DEV" != "$RIG_DATA_DEV" ] || { echo "RIG_DISK_CAP=gp3-split: /mnt/lima-replicadisk is on $RIG_DATA_DEV, the same disk as /var/lib/docker, so there is no second device to cap (is the colima additionalDisks entry applied? docker-compose.replicadisk.yml header)" >&2; exit 1; }
+      export RIG_REPLICA_DEV
+      rig_add_compose_file docker-compose.replicadisk.yml
+      rig_add_compose_file docker-compose.gp3-split.yml
+      echo "rig disk cap: gp3-split - data $RIG_DATA_DEV and replicas $RIG_REPLICA_DEV, EACH capped at $((RIG_CAP_BPS / 1048576)) MiB/s and $RIG_CAP_IOPS IOPS per node" >&3
+    else
+      rig_add_compose_file docker-compose.gp3.yml
+      echo "rig disk cap: gp3 - data and replicas share $RIG_DATA_DEV, capped at $((RIG_CAP_BPS / 1048576)) MiB/s and $RIG_CAP_IOPS IOPS per node" >&3
+    fi
+    ;;
+  *) echo "RIG_DISK_CAP must be gp3 or gp3-split, got: $RIG_DISK_CAP" >&2; exit 64 ;;
+esac
+
+# TPC_AUTH=required: see tpc_run. The overlay gives the nodes HRANA_AUTH=required and the in-network
+# driver its read-only token mount; ./tpc-auth must exist first or docker creates it root-owned.
+case "${TPC_AUTH:-}" in
+  "") ;;
+  required) mkdir -p tpc-auth; rig_add_compose_file docker-compose.auth.yml ;;
+  *) echo "TPC_AUTH must be 'required' (or unset), got: $TPC_AUTH" >&2; exit 64 ;;
+esac
 
 now_ms() { /usr/bin/python3 -c 'import time; print(int(time.time()*1000))'; }
 
@@ -1827,21 +1928,139 @@ tpc_prewarm() {
   elixir tpc_driver.exs rtt --lb "$LB" --domain "$DOMAIN" --shard prewarm --samples 1 >/dev/null 2>&1 || true
 }
 
+# TPC_AUTH=required (expert review 2026-10-29 #18): the PROD auth posture on the load path. Every p99
+# in docs/reviews/ was taken with HRANA_AUTH=disabled, so none included token verification, the
+# revocation-floor lookup (cold on a node's first sight of a shard: the unbounded S3 read-through of
+# review #20), or the per-statement version/expiry re-check. With the variable set, tpc_run mints one
+# token per tenant the run will open (the real issuance path, Fathom.HranaAuth.token_for/1, on fathom1)
+# and the driver sends it as the libSQL authToken. Bring the fleet up with the same variable so
+# docker-compose.auth.yml puts the nodes on HRANA_AUTH=required.
+#
+# The preflight asserts the posture instead of trusting it: a run that sends tokens to nodes that
+# ignore them measures nothing, and a run that sends none to nodes that need them fails in a way that
+# reads like a fleet error. Messages go to fd 3 (the callers silence stderr).
+tpc_auth_preflight() {
+  local mode code
+  [ "$TPC_DRIVER" = elixir ] || { echo "TPC_AUTH=required needs TPC_DRIVER=elixir (the python driver sends no token)" >&3; return 1; }
+  mode=$(rpc "${NODES[0]}" 'IO.puts(Application.get_env(:fathom, :hrana_auth))' | tr -d '\r\n ')
+  if [ "$mode" != required ]; then
+    echo "TPC_AUTH=required, but ${NODES[0]} reports hrana_auth=${mode:-unreadable}: bring the fleet up with the same variable (TPC_AUTH=required ./chaos.sh up) so docker-compose.auth.yml applies" >&3
+    return 1
+  fi
+  # An unauthenticated stream open through the LB must be refused. SELECT 1 opens a stream; a bare
+  # `close` would not reach the authorize step.
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 -X POST "$LB/v2/pipeline" \
+    -H "Host: authprobe.$DOMAIN" -H "Content-Type: application/json" \
+    -d '{"requests":[{"type":"execute","stmt":{"sql":"SELECT 1"}},{"type":"close"}]}' 2>/dev/null || echo ERR)
+  [ "$code" = 401 ] || { echo "TPC_AUTH=required, but a request with no token through the LB answered HTTP $code, not 401: auth is not enforced on this path, so the run would not exercise it" >&3; return 1; }
+}
+
+# tpc_mint_tokens <mode> [driver flags...]: mint one token per tenant shard the driver run will open,
+# on the first node, into ./tpc-auth/<file> (tab-separated `<shard id>\t<token>`). The shard ids follow
+# the driver's own authority rule (tpc_driver.exs `authority/2`): tpcb and rtt use `<shard>_<i>` when
+# there is more than one client and the bare `<shard>` for one; oneshot-fleet always `<shard>_<i>`; rtt
+# opens only tenant 0. Sets TPC_TOK_HOST (to delete after the run) and TPC_TOK_DRIVER (the same file as
+# the driver sees it: /tpc-auth/... in the container, the host path otherwise). It fails unless every
+# token was written.
+tpc_mint_tokens() {
+  local mode=$1 shard=tpc clients=8 count single=0 name expr got
+  shift
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --shard) shard=${2:-$shard}; shift ;;
+      --clients) clients=${2:-$clients}; shift ;;
+    esac
+    shift
+  done
+  case $mode in
+    rtt) count=1; [ "$clients" -gt 1 ] || single=1 ;;
+    tpcb) count=$clients; [ "$clients" -gt 1 ] || single=1 ;;
+    oneshot-fleet) count=$clients ;;
+    *) echo "TPC_AUTH=required: the driver mode '$mode' has no token support (rtt|tpcb|oneshot-fleet only)" >&3; return 1 ;;
+  esac
+  expr=$(cat <<EOF
+labels = if $single == 1, do: ["$shard"], else: for(i <- 0..$((count - 1)), do: "${shard}_#{i}")
+Enum.each(labels, fn l -> {:ok, t} = Fathom.HranaAuth.token_for(l); IO.puts(l <> "\t" <> t) end)
+EOF
+)
+  mkdir -p tpc-auth
+  name="t$(date +%s)-$$-$RANDOM.tsv"
+  TPC_TOK_HOST="tpc-auth/$name"
+  rpc "${NODES[0]}" "$expr" | grep "$(printf '\t')" > "$TPC_TOK_HOST"
+  got=$(wc -l < "$TPC_TOK_HOST" | tr -d ' ')
+  if [ "$got" != "$count" ]; then
+    echo "TPC_AUTH=required: minted $got of $count tokens on ${NODES[0]} (Fathom.HranaAuth.token_for/1; is hrana_auth configured with a signing secret?)" >&3
+    rm -f "$TPC_TOK_HOST"
+    return 1
+  fi
+  if [ "$TPC_NET" = container ]; then TPC_TOK_DRIVER="/tpc-auth/$name"; else TPC_TOK_DRIVER="$PWD/tpc-auth/$name"; fi
+}
+
+# tpc_restart_later <node> <after_s>: `compose restart` <node> after <after_s> seconds, with wall-clock
+# stamps (the same clock as the driver JSON's t0_wall_ms and per-second p99 series) so the restart
+# can be lined up with the slow seconds. A graceful restart: SIGTERM, flush within -t seconds, the
+# container (and its fixed address) is reused. rpc-pinned settings on that node (rebalancer off,
+# idle-drop frozen) revert to the boot values, which is part of what a real restart does.
+tpc_restart_later() {
+  local node=$1 after_s=$2 t0 t1
+  sleep "$after_s"
+  t0=$(now_ms)
+  echo "  [restart] $node: compose restart issued at wall_ms=$t0 (driver start +${after_s}s)" >&3
+  if compose restart -t "${TPC_RESTART_GRACE_S:-30}" "$node" >/dev/null 2>&1; then
+    t1=$(now_ms)
+    echo "  [restart] $node: back at wall_ms=$t1 ($((t1 - t0)) ms)" >&3
+  else
+    echo "  [restart] $node: compose restart FAILED (is '$node' a rig node?)" >&3
+  fi
+}
+
 # Dispatch one driver run. tpc_run OWNS the --lb (the host $LB, or the in-network service name for a
 # containerized driver), so callers pass only the mode + workload flags. For elixir, keep only the
 # final JSON line — insurance against Mix.install / compose chatter on a cold cache.
+#
+# Two opt-in additions, both off by default: TPC_AUTH=required (tokens, above) and TPC_RESTART_NODE
+# (+ TPC_RESTART_AT_S, default 60; TPC_RESTART_GRACE_S, default 30): restart that node mid-run during
+# a tpcb / oneshot-fleet driver run. Combine with TPC_TAIL_ARMS=open and one run so there is ONE
+# restart: every matching driver run triggers its own.
 tpc_run() { # tpc_run <mode> [flags...]
-  local mode=$1
+  local mode=$1 rc restart_pid="" t_start
   shift
+  local tok=()
+  TPC_TOK_HOST=""
+  if [ "${TPC_AUTH:-}" = required ]; then
+    tpc_auth_preflight && tpc_mint_tokens "$mode" "$@" || return 1
+    tok=(--tokens-file "$TPC_TOK_DRIVER")
+  fi
+  t_start=$SECONDS
+  if [ -n "${TPC_RESTART_NODE:-}" ] && { [ "$mode" = tpcb ] || [ "$mode" = oneshot-fleet ]; }; then
+    # stdout to /dev/null: the caller captures this function's stdout with $(...), which would
+    # otherwise wait for the background sleep to exit.
+    tpc_restart_later "$TPC_RESTART_NODE" "${TPC_RESTART_AT_S:-60}" >/dev/null &
+    restart_pid=$!
+  fi
   if [ "$TPC_DRIVER" = elixir ]; then
     if [ "$TPC_NET" = container ]; then
-      compose run --rm -T driver "$mode" --lb "$LB_NET" "$@" | grep -E '^\{.*\}$' | tail -1
+      compose run --rm -T driver "$mode" --lb "$LB_NET" "$@" ${tok[@]+"${tok[@]}"} | grep -E '^\{.*\}$' | tail -1
     else
-      elixir tpc_driver.exs "$mode" --lb "$LB" "$@" | grep -E '^\{.*\}$' | tail -1
+      elixir tpc_driver.exs "$mode" --lb "$LB" "$@" ${tok[@]+"${tok[@]}"} | grep -E '^\{.*\}$' | tail -1
     fi
   else
     python3 tpc_driver.py "$mode" --lb "$LB" "$@"
   fi
+  rc=$?
+  if [ -n "$restart_pid" ]; then
+    if [ $(( SECONDS - t_start )) -lt "${TPC_RESTART_AT_S:-60}" ]; then
+      # The run ended before the restart was due: a restart now would hit an idle fleet, and the run
+      # would not have crossed one.
+      pkill -P "$restart_pid" 2>/dev/null   # its `sleep`, or it lingers holding the terminal
+      kill "$restart_pid" 2>/dev/null
+      echo "  [restart] the driver run ended before TPC_RESTART_AT_S=${TPC_RESTART_AT_S:-60}; NO restart happened during it (lower TPC_RESTART_AT_S or lengthen the run)" >&3
+    else
+      wait "$restart_pid"
+    fi
+  fi
+  [ -z "$TPC_TOK_HOST" ] || rm -f "$TPC_TOK_HOST"
+  return $rc
 }
 
 cmd_tpcb() {
@@ -2469,6 +2688,17 @@ cmd_tpc_tail() {
   echo "  Open-loop p99 > closed-loop p99 at the same code means the closed loop was hiding queueing."
 }
 
+# Fleet-wide pool_take counters (hit miss), summed over nodes, from each node's Prometheus scrape.
+# Shared by pool-fleet and tpc-sparse.
+pool_takes() {
+  local h=0 m=0 nh nm n
+  for n in "${NODES[@]}"; do
+    read -r nh nm <<< "$(rpc "$n" 's = Fathom.Telemetry.scrape(); f = fn r -> case Regex.run(~r/fathom_shard_pool_take_count\{result="#{r}"\} (\d+)/, s) do [_, v] -> v; _ -> "0" end end; IO.puts("#{f.("hit")} #{f.("miss")}")')"
+    h=$(( h + ${nh:-0} )); m=$(( m + ${nm:-0} ))
+  done
+  echo "$h $m"
+}
+
 # -- pool-fleet: the connection pool under K concurrent one-shot streams per shard -------------------
 # tpc-fleet holds ONE long-lived stream per tenant, so a stream opens once per run and the per-shard
 # connection pool (Fathom.Shard.HandlePool) is never on the measured path. This arm runs `streams`
@@ -2490,16 +2720,6 @@ cmd_pool_fleet() {
   echo "  connection_pool on fathom1: $(rpc "${NODES[0]}" 'IO.puts(inspect(Application.get_env(:fathom, :connection_pool)))')" >&2
 
   tpc_prewarm
-
-  # Fleet-wide pool_take counters (hit miss), summed over nodes, from each node's Prometheus scrape.
-  pool_takes() {
-    local h=0 m=0 nh nm
-    for n in "${NODES[@]}"; do
-      read -r nh nm <<< "$(rpc "$n" 's = Fathom.Telemetry.scrape(); f = fn r -> case Regex.run(~r/fathom_shard_pool_take_count\{result="#{r}"\} (\d+)/, s) do [_, v] -> v; _ -> "0" end end; IO.puts("#{f.("hit")} #{f.("miss")}")')"
-      h=$(( h + ${nh:-0} )); m=$(( m + ${nm:-0} ))
-    done
-    echo "$h $m"
-  }
 
   printf "  %-6s %4s %8s %10s %8s %8s %6s %7s\n" round cap ops "ops/s" "p50 ms" "p99 ms" errs "hit%"
   local IFS=,
@@ -2625,6 +2845,154 @@ cmd_pool_gap() {
   for n in "${NODES[@]}"; do
     rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, true); Application.put_env(:fathom, :shard_idle_ms, 20_000)' >/dev/null
   done
+}
+
+# -- tpc-sparse: the sparse-tenant write path, replication ON (expert review 2026-10-29 #2) -----------
+# Every other arm drives tenants back to back, so no shard is ever idle past the pool's drain grace
+# (POOL_DRAIN_GRACE_MS, default 250 ms) and the idle-drain path is never measured: after the grace the
+# last close runs SQLite's close-time checkpoint (WAL fsync, backfill, DB fsync, unlink of -wal/-shm),
+# the next write recreates them (and, under FULL, dirsyncs the directory), and with A2 each gap starts
+# a new WAL generation. The real tenant population is sparse, so that is the common request.
+#
+# This arm gives every tenant ONE one-shot write (UPDATE + SELECT, a stream open + close) per think_ms,
+# OPEN LOOP (the driver's --think-ms: arrivals do not wait for the server, response time runs from the
+# intended instant), so each gap is ~think_ms. Rounds alternate the pool's drain_grace_ms over
+# graces_csv - 250 (the shipped default: every gap drains) vs 5000 (a handle held across the gap: no
+# close checkpoint) - ABAB on one VM so drift hits both arms. The grace is set with put_env on every
+# node before the round, which is the same as booting with POOL_DRAIN_GRACE_MS=<ms> because a
+# coordinator reads :connection_pool_opts at init, and each round uses its own shard namespace
+# (`sp<tag>r<round>_*`) so every coordinator starts under that round's grace. Per round: ops/s against
+# the offered rate, p50/p95/p99/max, errors, the fleet pool_take hit% (the proof the grace took: ~0%
+# at 250 with a 1 s gap, ~100% at 5000), the `clock lags` count that invalidates a round (AGENTS.md),
+# and the A2 commit histogram groups for the round.
+#
+# Falsifier (the review's): if p99 does not move between 250 and 5000, the close checkpoint is not the
+# cost and the finding drops. Replicas on the same vs a second disk is a separate axis: bring the rig
+# up with docker-compose.replicadisk.yml / RIG_DISK_CAP (see docs/runbooks/rig-arms.md) and rerun.
+#
+# Usage: TPC_NET=container TPC_DRIVER=elixir REPLICATION_ENABLED=true ./chaos.sh tpc-sparse [tenants ops think_ms graces_csv]
+#   defaults 512 120 1000 "250,5000,250,5000" - each round is ops x think_ms (2 min) plus the seed.
+cmd_tpc_sparse() {
+  local tenants=${1:-512} ops=${2:-120} think_ms=${3:-1000} graces_csv=${4:-"250,5000,250,5000"}
+  local n
+  [ "$TPC_DRIVER" = elixir ] || { echo "tpc-sparse needs TPC_DRIVER=elixir (the python driver has no oneshot mode)" >&2; return 1; }
+  [ "$think_ms" -ge 500 ] 2>/dev/null || echo "WARNING: think_ms=$think_ms leaves gaps near the 250 ms default grace; use >= 500 so every gap outlives it" >&2
+  echo "tpc-sparse: $tenants tenants x $ops one-shot writes, one per ${think_ms} ms each (open loop, ~$(awk -v t="$tenants" -v m="$think_ms" 'BEGIN{printf "%.0f", t*1000/m}') ops/s fleet-wide), drain grace over $graces_csv ms ($TPC_NET $TPC_DRIVER driver)" >&2
+
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, false); Application.put_env(:fathom, :shard_idle_ms, 900_000)' >/dev/null
+  done
+  local repl; repl=$(rpc "${NODES[0]}" 'IO.puts(Fathom.Shard.Replication.Fleet.replicating?())' | tr -d '\r\n ')
+  echo "  replicating on ${NODES[0]}: $repl" >&2
+  [ "$repl" = true ] || echo "  WARNING: replication is OFF; this arm is meant to run with it ON (REPLICATION_ENABLED=true ./chaos.sh up) - the new-WAL-generation cost is absent" >&2
+
+  tpc_prewarm
+
+  printf "  %-5s %6s %8s %8s %8s %8s %8s %8s %8s %6s %7s %6s\n" round grace ops "ops/s" offered "p50 ms" "p95 ms" "p99 ms" "max ms" errs "hit%" clock
+  local IFS=,
+  set -f; set -- $graces_csv; set +f
+  unset IFS
+  local round=0 grace run_tag json h0 m0 h1 m1 hits t0 secs clock hb ha
+  run_tag=$(date +%H%M%S)
+  for grace in "$@"; do
+    round=$(( round + 1 ))
+    for n in "${NODES[@]}"; do
+      rpc "$n" "Application.put_env(:fathom, :connection_pool_opts, Keyword.put(Application.get_env(:fathom, :connection_pool_opts, []), :drain_grace_ms, $grace))" >/dev/null
+    done
+    read -r h0 m0 <<< "$(pool_takes)"
+    hb=$(mktemp); repl_hist_dump "$hb"
+    t0=$(date +%s)
+    json=$(tpc_run oneshot-fleet --domain "$DOMAIN" --shard "sp${run_tag}r$round" \
+      --worker-timeout "${TPC_WORKER_TIMEOUT:-$(( ops * think_ms + 120000 ))}" --accounts 1000 \
+      --clients "$tenants" --streams 1 --think-ms "$think_ms" --txns $(( tenants * ops )) 2>/dev/null)
+    secs=$(( $(date +%s) - t0 + 2 ))
+    read -r h1 m1 <<< "$(pool_takes)"
+    ha=$(mktemp); repl_hist_dump "$ha"
+    clock=$(compose logs --since "${secs}s" "${NODES[@]}" 2>/dev/null | grep -c "clock lags" || true)
+    hits=$(awk -v h=$(( h1 - h0 )) -v m=$(( m1 - m0 )) 'BEGIN{printf "%.1f", (h+m>0)?100*h/(h+m):0}')
+    printf "  %-5s %6s %8s %8s %8s %8s %8s %8s %8s %6s %7s %6s\n" "$round" "$grace" \
+      "$(printf '%s' "$json" | jq -r '.ops // 0')" \
+      "$(printf '%s' "$json" | jq -r '.oneshot_tps // 0')" \
+      "$(printf '%s' "$json" | jq -r '.offered_ops_per_s // 0 | round')" \
+      "$(printf '%s' "$json" | jq -r '(.oneshot_p50_us // 0) / 1000 | . * 100 | round / 100')" \
+      "$(printf '%s' "$json" | jq -r '(.oneshot_p95_us // 0) / 1000 | . * 100 | round / 100')" \
+      "$(printf '%s' "$json" | jq -r '(.oneshot_p99_us // 0) / 1000 | . * 100 | round / 100')" \
+      "$(printf '%s' "$json" | jq -r '(.oneshot_max_us // 0) / 1000 | . * 10 | round / 10')" \
+      "$(printf '%s' "$json" | jq -r '.errors // 0')" "$hits" "$clock"
+    printf "  err reasons: %s\n" "$(printf '%s' "$json" | jq -c '.err_reasons // {}')"
+    repl_hist_report "$hb" "$ha" | grep -E '^  fathom_replication.* n=' | sed 's/^/    /'
+    rm -f "$hb" "$ha"
+    [ "$clock" -gt 0 ] && echo "  WARNING: $clock 'clock lags' lines in this round -- colima clock step, the round is INVALID"
+  done
+
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :connection_pool_opts, Keyword.delete(Application.get_env(:fathom, :connection_pool_opts, []), :drain_grace_ms)); Application.put_env(:fathom, :rebalancer_enabled, true); Application.put_env(:fathom, :shard_idle_ms, 20_000)' >/dev/null
+  done
+  echo ""
+  echo "  Read: p99 at grace 250 vs 5000, rounds of one grace first (their spread is the noise floor). hit% must be"
+  echo "  ~0 at 250 and ~100 at 5000 or the grace did not take and the rounds are not comparable. ops/s below"
+  echo "  'offered' means the fleet or the driver fell behind the schedule (p99 then includes that queueing)."
+}
+
+# disk-cap [show|probe]: check that RIG_DISK_CAP's cap is applied where it matters (expert review
+# 2026-10-29 #16). `show` (default) reads each node's cgroup `io.max` and compares the major:minor it
+# names with the major:minor of the whole-disk device in the colima VM (a cap on the wrong device, or
+# none, reads as OK in `compose ps` and silently measures the uncapped rig). `probe` then writes through
+# the cap from inside fathom1: 4 parallel direct writers of 1 MiB blocks (bandwidth; expect about the
+# cap, 125 MiB/s = ~131 MB/s as dd prints it) and of 4 KiB blocks (IOPS; expect at most the cap) on
+# /data and on /data/replicas. Unthrottled, the same probe on a virtio disk reads several times higher.
+# The probe writes ~1 GiB to a scratch file under /data and removes it; run it BEFORE the load, never
+# during. The IOPS figure is a ceiling check, not a calibration: a device that cannot reach the cap
+# at this queue depth reads below it for reasons unrelated to the cap.
+cmd_disk_cap() {
+  local sub=${1:-show} n dev mm iomax bad=0
+  [ -n "${RIG_DISK_CAP:-}" ] || echo "disk-cap: RIG_DISK_CAP is not set on this invocation, so the cap tested below is whatever the running containers were started with; RIG_DATA_DEV / RIG_REPLICA_DEV must be exported to name the device(s) to check" >&2
+  case $sub in
+    show)
+      [ -n "${RIG_DATA_DEV:-}" ] || { echo "disk-cap show: RIG_DATA_DEV is not set (RIG_DISK_CAP=gp3 resolves it)" >&2; return 1; }
+      for dev in "$RIG_DATA_DEV" "${RIG_REPLICA_DEV:-}"; do
+        [ -n "$dev" ] && echo "  VM device $dev -> major:minor $(rig_vm_majmin "$dev")"
+      done
+      for n in "${NODES[@]}"; do
+        iomax=$(compose exec -T "$n" sh -c 'cat /sys/fs/cgroup/io.max 2>/dev/null || cat /sys/fs/cgroup/blkio/blkio.throttle.write_bps_device 2>/dev/null' | tr -d '\r' | tr '\n' ';')
+        echo "  $n io.max: ${iomax:-<none: no cap applied>}"
+        for dev in "$RIG_DATA_DEV" "${RIG_REPLICA_DEV:-}"; do
+          [ -n "$dev" ] || continue
+          mm=$(rig_vm_majmin "$dev")
+          # cgroup v2 io.max: `<maj:min> rbps=N wbps=N riops=N wiops=N`; v1 write_bps_device: `<maj:min> N`.
+          case "$iomax" in
+            *"$mm "wbps=[0-9]*|*"$mm "[0-9]*|*"$mm "rbps=*" wbps="[0-9]*) ;;
+            *) echo "    MISMATCH: $n has no write cap on $dev ($mm)"; bad=1 ;;
+          esac
+        done
+      done
+      if [ "$bad" = 0 ]; then
+        echo "disk-cap: OK - every node's io.max names the capped device(s)"
+      else
+        echo "disk-cap: the cap is NOT applied as intended; do not trust a run on this fleet"
+        return 1
+      fi
+      ;;
+    probe)
+      local d
+      for d in /data /data/replicas; do
+        echo "  --- fathom1:$d on $(compose exec -T fathom1 sh -c "mkdir -p $d; df -P $d | tail -1" | tr -d '\r' | tr -s ' ' | cut -d' ' -f1,6)"
+        compose exec -T fathom1 sh -c "
+          s=\$(date +%s%N)
+          for i in 1 2 3 4; do dd if=/dev/zero of=$d/.cap-probe.\$i bs=1M count=64 oflag=direct 2>/dev/null & done; wait
+          e=\$(date +%s%N)
+          sz=\$(stat -c %s $d/.cap-probe.1 2>/dev/null)
+          [ \"\$sz\" = 67108864 ] || echo \"  probe write FAILED (size \${sz:-none}); O_DIRECT unsupported here?\"
+          echo \"  bandwidth: \$(( 256 * 1000000000 / (e - s) )) MiB/s over 4 x 64 MiB direct 1M writes (cap $((${RIG_CAP_BPS:-131072000} / 1048576)) MiB/s)\"
+          s=\$(date +%s%N)
+          for i in 1 2 3 4; do dd if=/dev/zero of=$d/.cap-probe.\$i bs=4k count=2000 oflag=direct 2>/dev/null & done; wait
+          e=\$(date +%s%N)
+          echo \"  iops:      \$(( 8000 * 1000000000 / (e - s) )) over 4 x 2000 direct 4k writes (cap ${RIG_CAP_IOPS:-3000})\"
+          rm -f $d/.cap-probe.*"
+      done
+      ;;
+    *) echo "usage: disk-cap [show|probe]" >&2; return 64 ;;
+  esac
 }
 
 # tpcc-fleet: the TPC-C analog of tpc-fleet — N concurrent TENANTS, each its own shard running a
@@ -3364,6 +3732,8 @@ case "${1:-}" in
   tpcc-fleet)  shift; cmd_tpcc_fleet "$@" ;;
   pool-fleet)  shift; cmd_pool_fleet "$@" ;;
   pool-gap)    shift; cmd_pool_gap "$@" ;;
+  tpc-sparse)  shift; cmd_tpc_sparse "$@" ;;
+  disk-cap)    shift; cmd_disk_cap "$@" ;;
   rebalance)   shift; cmd_rebalance "$@" ;;
   hotspots)    shift; cmd_hotspots "$@" ;;
   replication) shift; cmd_replication "$@" ;;

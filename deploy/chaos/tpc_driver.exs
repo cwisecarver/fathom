@@ -103,6 +103,9 @@ defmodule ErrTally do
     cond do
       String.contains?(s, "econnrefused") -> "econnrefused"
       String.contains?(s, "emfile") -> "emfile"
+      # TPC_AUTH=required arm (expert review 2026-10-29 #18): a refused token is its own bucket, or
+      # the `other:` fallback folds its digits and a 401 reads like every other HTTP status.
+      String.contains?(s, "auth_required") or String.contains?(s, "http 401") -> "http_401"
       String.contains?(s, "enfile") -> "enfile"
       String.contains?(s, "system_limit") -> "system_limit"
       String.contains?(s, "timeout") -> "timeout"
@@ -349,7 +352,7 @@ defmodule Tpc do
 
   # --- RTT probe -------------------------------------------------------------------------------
   def mode_rtt(a) do
-    {:ok, c} = Client.connect(a.lb, authority: authority(a, 0))
+    {:ok, c} = Client.connect(a.lb, connect_opts(a, authority(a, 0)))
     # warm the stream (open + cold-open), untimed
     c = exec!(c, "SELECT 1")
 
@@ -489,6 +492,19 @@ defmodule Tpc do
   # closing stream's handle can serve the next open. `max_per_scope` (expert review 2026-10-17 #19)
   # only matters when K >= 2 opens overlap; read the server's pool_take hit ratio beside the txn/s
   # (`chaos.sh pool-fleet` prints both).
+  #
+  # THINK TIME (`--think-ms T`, expert review 2026-10-29 #2): the SPARSE-tenant arm. Every other arm
+  # runs back to back, so no shard is ever idle past the pool's `drain_grace_ms` (250 ms) and the
+  # idle-drain path (close-time checkpoint, `-wal`/`-shm` unlink, a new WAL generation under A2 on
+  # the next write) is never on the measured path, although the real tenant population is sparse.
+  # With T > 0 each worker is OPEN LOOP at one op per T ms: op k is INTENDED at
+  # `start + phase + (k - 1) * T` (phase random in [0, T), so tenants do not fire in lockstep) and
+  # its response time runs from that intended instant, so a stall shows up as queueing delay
+  # instead of vanishing (the same coordinated-omission rule as tpcb's `--rate`). The gap between
+  # one op's close and the next op's open is then ~T minus the service time; keep T well above 250
+  # (the default `POOL_DRAIN_GRACE_MS`) or the pool never drains and this measures nothing new. T = 0
+  # (the default) is the old closed loop, unchanged. `--streams 1` is the sparse shape: K >= 2
+  # streams on one tenant shrink each tenant's gaps to ~T/K.
   def mode_oneshot_fleet(args) do
     k = max(1, args.streams)
     ops = max(1, div(args.txns, args.clients * k))
@@ -528,6 +544,10 @@ defmodule Tpc do
       "mode" => "oneshot_fleet",
       "tenant_shards" => a.clients,
       "streams_per_shard" => k,
+      "think_ms" => a.think_ms,
+      # What the schedule offered fleet-wide (ops/s); 0 = closed loop. Compare with oneshot_tps:
+      # a shortfall means the driver or the fleet could not keep the schedule.
+      "offered_ops_per_s" => if(a.think_ms > 0, do: a.clients * k * 1000 / a.think_ms, else: 0),
       "ops" => length(lat),
       "errors" => errs,
       "shed_tenants" => crashed,
@@ -561,7 +581,7 @@ defmodule Tpc do
   end
 
   defp oneshot_seed(a, auth, attempts) do
-    with {:ok, c} <- Client.connect(a.lb, authority: auth) do
+    with {:ok, c} <- Client.connect(a.lb, connect_opts(a, auth)) do
       try do
         c = exec!(c, "CREATE TABLE IF NOT EXISTS acct (id INTEGER PRIMARY KEY, bal INTEGER)")
 
@@ -594,25 +614,36 @@ defmodule Tpc do
     oneshot_seed(a, auth, attempts - 1)
   end
 
-  # One worker: its own HTTP connection, `ops` one-shot pipelines back to back. Each pipeline
-  # carries a null baton and ends in `close`, so every op is a stream open + close on the shard.
+  # One worker: its own HTTP connection, `ops` one-shot pipelines. Each pipeline carries a null baton
+  # and ends in `close`, so every op is a stream open + close on the shard. Back to back by default;
+  # open loop on the `--think-ms` schedule when that is set (see mode_oneshot_fleet).
   defp oneshot_worker(a, auth, seed) do
     :rand.seed(:exsss, {seed, 7, 13})
     t0 = System.monotonic_time(:microsecond)
     deadline = t0 + a.worker_timeout * 1000
+    think_us = a.think_ms * 1000
+    phase_us = if think_us > 0, do: trunc(:rand.uniform() * think_us), else: 0
 
-    case Client.connect(a.lb, authority: auth) do
+    case Client.connect(a.lb, connect_opts(a, auth)) do
       {:ok, c} ->
         {lat, e, c} =
-          Enum.reduce(1..a.ops, {[], 0, c}, fn _, {lat, e, c} ->
+          Enum.reduce(1..a.ops, {[], 0, c}, fn k, {lat, e, c} ->
+            intended = if think_us > 0, do: t0 + phase_us + (k - 1) * think_us
+
+            if intended do
+              wait = intended - System.monotonic_time(:microsecond)
+              if wait > 1000, do: Process.sleep(div(wait, 1000))
+            end
+
             start = System.monotonic_time(:microsecond)
+            origin = intended || start
 
             if start > deadline do
               {lat, e + 1, c}
             else
               case oneshot_op(c, a.accounts) do
                 {:ok, c} ->
-                  {[System.monotonic_time(:microsecond) - start | lat], e, c}
+                  {[System.monotonic_time(:microsecond) - origin | lat], e, c}
 
                 {:error, reason, c} ->
                   ErrTally.note(reason)
@@ -776,12 +807,63 @@ defmodule Tpc do
   defp authority(%{clients: n, shard: s, domain: d}, cid) when n > 1, do: "#{s}_#{cid}.#{d}"
   defp authority(%{shard: s, domain: d}, _cid), do: "#{s}.#{d}"
 
+  # AUTH (`--tokens-file <path>`, expert review 2026-10-29 #18). The prod posture is
+  # HRANA_AUTH=required, where every stream open must carry a per-shard bearer token. chaos.sh
+  # (`TPC_AUTH=required`) mints one token per tenant on fathom1 with the real issuance path,
+  # `Fathom.HranaAuth.token_for/1`, and writes `<tenant label>\t<token>` lines here; the label is the
+  # Host authority minus `.<domain>`, i.e. the shard id. The token rides `Filo.Client`'s
+  # `:auth_token` (an `Authorization: Bearer` header kept on the client, so `reconnect/1` re-sends it).
+  # Without the flag nothing changes: no header, as before.
+  defp connect_opts(%{tokens: nil}, authority), do: [authority: authority]
+
+  defp connect_opts(%{tokens: tokens} = a, authority),
+    do: [authority: authority, auth_token: Map.fetch!(tokens, tenant_label(a, authority))]
+
+  defp tenant_label(%{domain: d}, authority), do: String.replace_suffix(authority, "." <> d, "")
+
+  # Load the token file and check it covers EVERY tenant the run will open BEFORE any load starts: a
+  # tenant without a token would 401 and read as a fleet error instead of a harness mistake.
+  defp load_tokens(%{tokens_file: nil} = a, _mode), do: a
+
+  defp load_tokens(%{tokens_file: path} = a, mode) do
+    tokens =
+      path
+      |> File.stream!()
+      |> Enum.reduce(%{}, fn line, acc ->
+        case String.split(String.trim_trailing(line), "\t", parts: 2) do
+          [label, token] when token != "" -> Map.put(acc, label, token)
+          _ -> acc
+        end
+      end)
+
+    a = %{a | tokens: tokens}
+    missing = Enum.reject(token_labels(mode, a), &Map.has_key?(tokens, &1))
+
+    if missing != [] do
+      raise "--tokens-file #{path} has no token for #{length(missing)} tenant(s), e.g. " <>
+              "#{Enum.join(Enum.take(missing, 3), ", ")}"
+    end
+
+    a
+  end
+
+  defp token_labels("rtt", a), do: [tenant_label(a, authority(a, 0))]
+
+  defp token_labels("tpcb", a),
+    do: for(cid <- 0..(a.clients - 1), do: tenant_label(a, authority(a, cid)))
+
+  defp token_labels("oneshot-fleet", a),
+    do: for(tid <- 0..(a.clients - 1), do: "#{a.shard}_#{tid}")
+
+  defp token_labels(mode, _a),
+    do: raise("--tokens-file is not supported for mode #{mode} (rtt|tpcb|oneshot-fleet only)")
+
   # Open the stream and seed the shard, retrying the WHOLE thing (fresh connection) through a
   # transient failure — a connect refused by the herd, or a mid-seed `:closed` when the server drops
   # an idle-between-statements keepalive under load. The seed statements are idempotent
   # (CREATE TABLE IF NOT EXISTS / INSERT OR IGNORE), so re-running on a fresh connection is safe.
   defp establish(a, cid, attempts) do
-    with {:ok, c} <- Client.connect(a.lb, authority: authority(a, cid)),
+    with {:ok, c} <- Client.connect(a.lb, connect_opts(a, authority(a, cid))),
          {:ok, c} <- seed(c, a.accounts) do
       {:ok, c}
     else
@@ -899,10 +981,15 @@ defmodule Tpc do
       rate: 0,
       boot: 0,
       excl_s: 10,
-      tenant_hist: 0
+      tenant_hist: 0,
+      # oneshot-fleet think time in ms (0 = closed loop, back to back); see mode_oneshot_fleet.
+      think_ms: 0,
+      # --tokens-file: per-tenant bearer tokens (see connect_opts); tokens is the loaded map.
+      tokens_file: nil,
+      tokens: nil
     }
 
-    a = parse_opts(rest, defaults)
+    a = rest |> parse_opts(defaults) |> load_tokens(mode)
     ErrTally.start()
 
     out =
@@ -931,7 +1018,8 @@ defmodule Tpc do
     :rate,
     :boot,
     :excl_s,
-    :tenant_hist
+    :tenant_hist,
+    :think_ms
   ]
   @floats [:scale]
 

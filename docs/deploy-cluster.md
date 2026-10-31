@@ -173,7 +173,9 @@ survived it.
   `synchronous=FULL` fsyncs wait behind them: on the chaos rig a second disk for the replicas cut
   open-loop p99 from ~131 to ~49 ms (`docs/reviews/tpc-fleet-repl-on-2026-10-26.md`). The rig's two
   disks share one host SSD; two EBS volumes on one instance share its EBS bandwidth and IOPS limit,
-  which is unmeasured.
+  which is unmeasured. The per-volume gp3 cap (3,000 IOPS / 125 MiB/s on each of the two devices vs one
+  shared cap) has a rig arm, `RIG_DISK_CAP=gp3|gp3-split` ([runbooks/rig-arms.md](runbooks/rig-arms.md)),
+  built and not yet run; it still cannot model the instance-wide limit.
 
 **What this buys:** a reboot, an OS patch, or a redeploy becomes **lossless** — the returning node
 re-adopts its own file and flushes the un-flushed tail up. This holds *regardless of

@@ -144,6 +144,26 @@ gate compares only same-host, same-env baselines, so a macOS number never gates 
 Linux number and a dev run (file-I/O-bound, ~3x slower than prod) can never serve
 as the baseline for a prod gate.
 
+**The gate has no Linux/ext4 number, and `hrana_write_rt_us` cannot see a real device flush (expert
+review 2026-10-29 #19).** Every row in `scripts/perf_history.jsonl` is `host: darwin` (1,044 of 1,044
+at `dc5d150a`). On macOS plain `fsync` does not flush the device cache (`F_FULLFSYNC` does), and
+`hrana_write_rt_us` (gated, replication-ON autocommit `INSERT ... RETURNING`) runs on it. The code's
+own comment measured the same close-time checkpoint at 0.13 ms with plain `fsync` against 7 ms p50 /
+10 ms p99 with a real flush, "the cost Linux fsync pays" (`lib/fathom/shard.ex`, the idle-close
+comment). So a regression whose cost is device-flush or journal latency on ext4 is invisible to the
+gate: read a gated write-path pass as "no CPU/protocol regression", not "no fsync regression". The
+Linux write-path evidence lives on the chaos rig (`tpc-tail`, and `tpc-sparse` for the idle-gap path),
+which `RIG_DISK_CAP` can cap at the prod gp3 target ([runbooks/rig-arms.md](runbooks/rig-arms.md)).
+
+Not built, and why: the finding's watch-only `hrana_write_rt_p99` arm (colima, data dir on ext4, one
+unfsynced competing writer). It does not fit the existing harness cleanly. The arms live in
+`lib/fathom/bench.ex` and the gate runs natively on the macOS host (`scripts/benchmark.sh`); a Linux arm
+needs `mix fathom.bench` run inside the colima VM, a competing-writer fixture scoped to that one metric
+(the shared `setup/1` must not change, AGENTS.md § Benchmarking), a p99 field the bench does not emit
+today, and a Linux baseline series (the gate compares only same-host rows). That is a bench-harness
+change with its own series, not a rig/doc change, so it stays a follow-up. Until it exists, treat a
+Linux write-tail question as a rig question.
+
 **Host-drift caveat (native gate, recorded not hidden):** because fathom gates on
 the host rather than in a controlled container, the absolute numbers drift with
 machine load (cold-open and copy are file-I/O bound; a busy or thermally-throttled
