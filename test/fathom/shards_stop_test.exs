@@ -212,6 +212,9 @@ defmodule Fathom.ShardsStopTest do
     test_pid = self()
     handler = "dropflush-#{a}"
 
+    # Telemetry handlers are node-global, so forward only THIS shard's events. Unfiltered, a
+    # coordinator a previous test left draining reported its own flush failure here and failed
+    # the refute below (CI 41161928421: :local_file_missing from repl_commit_222403).
     :telemetry.attach_many(
       handler,
       [
@@ -219,8 +222,14 @@ defmodule Fathom.ShardsStopTest do
         [:fathom, :shard, :drop_flush, :route]
       ],
       fn
-        [:fathom, :shard, :flush, :failed], _m, meta, _ -> send(test_pid, {:flush_failed, meta})
-        [:fathom, :shard, :drop_flush, :route], _m, meta, _ -> send(test_pid, {:route, meta})
+        [:fathom, :shard, :flush, :failed], _m, %{shard_id: ^a} = meta, _ ->
+          send(test_pid, {:flush_failed, meta})
+
+        [:fathom, :shard, :drop_flush, :route], _m, %{shard_id: ^a} = meta, _ ->
+          send(test_pid, {:route, meta})
+
+        _event, _m, _meta, _ ->
+          :ok
       end,
       nil
     )
