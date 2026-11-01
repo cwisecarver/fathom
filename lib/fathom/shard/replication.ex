@@ -77,7 +77,8 @@ defmodule Fathom.Shard.Replication do
           keyword()
         ) ::
           {:ok, [pid()], [{pid(), atom(), non_neg_integer()}]}
-          | {:error, {:no_quorum, :impossible | :timeout, [{pid(), atom(), non_neg_integer()}]}}
+          | {:error,
+             {:no_quorum, :impossible | :timeout, [pid()], [{pid(), atom(), non_neg_integer()}]}}
   def ship_quorum(pushes, q, timeout \\ @default_timeout_ms, opts \\ []) do
     # `:skip` — `[{shipper, reason}]`: followers that belong to the quorum but are not sent
     # anything, counted as refusals up front. `:seeding`: a follower mid-seed can only refuse a
@@ -183,7 +184,14 @@ defmodule Fathom.Shard.Replication do
   #
   # Routine per-event, alarming in aggregate: exactly the shape that belongs at the decision point
   # rather than at the event.
-  defp settle({:impossible, _}, shard, _deadline, {_acked, rejects}, _expected) do
+  # A FAILED QUORUM STILL REPORTS WHO ACKED (CI 2026-11-01, collapse test #6). An ack this loop
+  # consumed is gone from the mailbox, and the follower's Shipper has already dropped its waiter, so
+  # no later drain will ever see it. This returned only the rejects, so the caller could neither
+  # advance nor forget those followers: each one stayed `inflight` in the Session with nothing left
+  # to clear it, read as mid-flight until `2 * timeout()` aged it out. That is the rig's "entries
+  # 44-220 s old on followers whose shippers held no waiter" (2026-10-29). It only happens when the
+  # ack lands BEFORE the rejects that make the quorum impossible, which is why it was a rare flake.
+  defp settle({:impossible, _}, shard, _deadline, {acked, rejects}, _expected) do
     # Rate-limited per node: this fires once per failed write (expert review 2026-10-19 #14; ~800-1000
     # `unknown_shard` lines per rig run). The no_quorum telemetry counter keeps the per-write signal.
     case Fathom.LogLimiter.check(:quorum_impossible) do
@@ -214,7 +222,7 @@ defmodule Fathom.Shard.Replication do
         )
     end
 
-    {:error, {:no_quorum, :impossible, rejects}}
+    {:error, {:no_quorum, :impossible, acked, rejects}}
   end
 
   defp settle({:pending, q}, shard, deadline, tally, expected),
@@ -245,7 +253,7 @@ defmodule Fathom.Shard.Replication do
         )
     end
 
-    {:error, {:no_quorum, :timeout, rejects}}
+    {:error, {:no_quorum, :timeout, acked, rejects}}
   end
 
   # `:offset_mismatch` is the routine one — a lost or reordered push, retryable by rewinding — so

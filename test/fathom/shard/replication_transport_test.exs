@@ -476,7 +476,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       started = System.monotonic_time(:millisecond)
 
       # The third element is the per-follower reject list, which Session turns into seeds.
-      assert {:error, {:no_quorum, :impossible, rejects}} =
+      assert {:error, {:no_quorum, :impossible, _acked, rejects}} =
                Replication.ship_quorum(fanout([live | dead], push("acme")), 2, 5_000)
 
       assert length(rejects) == 3,
@@ -625,7 +625,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
 
       started = System.monotonic_time(:millisecond)
 
-      assert {:error, {:no_quorum, :impossible, rejects}} =
+      assert {:error, {:no_quorum, :impossible, _acked, rejects}} =
                Replication.ship_quorum(fanout(ships, push("acme")), 2, 5_000)
 
       elapsed = System.monotonic_time(:millisecond) - started
@@ -656,7 +656,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       started = System.monotonic_time(:millisecond)
       for pid <- holes, do: send(pid, :die)
 
-      assert {:error, {:no_quorum, :impossible, rejects}} = Task.await(task, 5_000)
+      assert {:error, {:no_quorum, :impossible, _acked, rejects}} = Task.await(task, 5_000)
       elapsed = System.monotonic_time(:millisecond) - started
 
       assert length(rejects) == 3, "got #{inspect(rejects)}"
@@ -688,7 +688,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       ships = for i <- 1..4, do: Process.whereis(:"gss#{i}")
       for i <- 1..3, do: stop_supervised!(:"gsf#{i}")
 
-      assert {:error, {:no_quorum, :impossible, rejects}} =
+      assert {:error, {:no_quorum, :impossible, _acked, rejects}} =
                Replication.ship_quorum(fanout(ships, push("acme")), 2, 5_000)
 
       assert Enum.all?(rejects, fn {_s, r, _at} -> r == :internal end),
@@ -906,6 +906,50 @@ defmodule Fathom.Shard.ReplicationTransportTest do
   # The primary half of the same contract, and the half that cannot be reached with a real
   # `Shipper` — it is now the side that was fixed, so it always answers correctly. See
   # `Fathom.Test.IdentityShipper`.
+  # CI 2026-11-01 (OTP 29), collapse test #6. Symptom: a follower that ACKED a push whose quorum
+  # then became impossible stayed `inflight` in the Session for good. `ship_quorum/4` had consumed
+  # the ack from the mailbox (and the real Shipper had dropped its waiter), but its error result
+  # carried only the rejects, so nothing could advance or forget that follower. Here `a` acks and
+  # only THEN releases the two refusals that make the quorum impossible, so the ack is always
+  # consumed first. Pre-fix the error had no acked list at all.
+  describe "a failed quorum reports the acks it consumed" do
+    test "an ack received before the quorum turned impossible is in the error result" do
+      tag = System.unique_integer([:positive])
+      [a, b, c] = for n <- ~w(a b c), do: :"lost_ack_#{n}_#{tag}"
+
+      for {name, role} <- [{a, :ack}, {b, :reject}, {c, :reject}] do
+        pid = spawn(fn -> scripted_follower(name, role, [b, c]) end)
+        Process.register(pid, name)
+        on_exit(fn -> Process.exit(pid, :kill) end)
+      end
+
+      assert {:error, {:no_quorum, :impossible, acked, rejects}} =
+               Replication.ship_quorum(fanout([a, b, c], push("acme")), 2, 2_000)
+
+      assert acked == [a], "the ack consumed before the quorum failed was dropped"
+      assert Enum.sort(Enum.map(rejects, &elem(&1, 0))) == Enum.sort([b, c])
+    end
+  end
+
+  # `:ack` answers the push at once, then lets the refusers answer; `:reject` waits for that.
+  defp scripted_follower(name, role, refusers) do
+    receive do
+      {:"$gen_cast", {:push, %Push{} = p, from, _reserved}} ->
+        case role do
+          :ack ->
+            send(from, {:repl_reply, name, {:ack, p.shard_id, p.offset + byte_size(p.payload)}})
+            for r <- refusers, do: send(r, :go)
+
+          :reject ->
+            receive do
+              :go -> send(from, {:repl_reply, name, {:reject, p.shard_id, :disconnected, 0}})
+            end
+        end
+
+        scripted_follower(name, role, refusers)
+    end
+  end
+
   describe "ship_quorum keys expectations on the caller's term (#24)" do
     test "an ack that names the term the caller used is counted" do
       [a, b] = start_identity_shippers([:name, :name])
@@ -922,7 +966,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       # can guess a shard id vote in a quorum.
       [a, b] = start_identity_shippers([:pid, :pid])
 
-      assert {:error, {:no_quorum, _, _}} =
+      assert {:error, {:no_quorum, _, _, _}} =
                Replication.ship_quorum(fanout([a, b], identity_push()), 1, 300)
     end
   end

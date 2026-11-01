@@ -2152,7 +2152,14 @@ defmodule Fathom.Shard.Replication.Session do
         # not, reliably: the late-joiner test hung here.
         {:ok, reconcile(state, rejects), rejects}
 
-      {:error, {:no_quorum, why, rejects}} ->
+      # The followers that ACKED before the quorum failed hold the bytes exactly as the success path's
+      # do (`Replication.collect/5` checked each against what it sent), and their replies are spent:
+      # advance them here or nothing ever will, and they read as in flight until the entry ages out
+      # (CI 2026-11-01, collapse test #6; see `Replication.settle/5`). A late ack for the same push
+      # is advanced the same way by `settle_late_ack/3`, so a failed commit's acks are treated
+      # alike whichever side of the return they land on.
+      {:error, {:no_quorum, why, acked, rejects}} ->
+        state = Enum.reduce(acked, state, &advance(&2, &1))
         {:error, {:no_quorum, why}, reconcile(state, rejects), rejects}
     end
   end
