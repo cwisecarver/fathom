@@ -537,14 +537,31 @@ end
 # stream closes (default 2000 ms; was 250 until 2026-10-31), so a serial client's next request reuses
 # it. 0 = drain on close. A tenant whose gaps are longer than the grace pays the close-time checkpoint
 # and a new replication WAL generation on every request.
+#
+# Validated here, not with `String.to_integer/1`: that crashed the boot with a bare ArgumentError on
+# garbage ("2s") and ACCEPTED a negative, which only failed later, per shard, when the coordinator
+# armed its grace timer (review of bef51a2a, 2026-10-31).
 if ms = System.get_env("POOL_DRAIN_GRACE_MS") do
-  config :fathom, :connection_pool_opts, drain_grace_ms: String.to_integer(ms)
+  case Integer.parse(ms) do
+    {n, ""} when n >= 0 ->
+      config :fathom, :connection_pool_opts, drain_grace_ms: n
+
+    _ ->
+      raise "POOL_DRAIN_GRACE_MS must be a non-negative integer (ms), got: #{inspect(ms)}"
+  end
 end
 
 # Expert review 2026-10-21 #15: how long a POOLED idle handle sits before `PRAGMA shrink_memory`
 # releases its SQLite page cache (up to 2 MiB; nothing else returns it). Default 5000 ms; 0 = off.
+# Validated like POOL_DRAIN_GRACE_MS above, for the same reason.
 if ms = System.get_env("POOL_SHRINK_IDLE_MS") do
-  config :fathom, :connection_pool_opts, shrink_idle_ms: String.to_integer(ms)
+  case Integer.parse(ms) do
+    {n, ""} when n >= 0 ->
+      config :fathom, :connection_pool_opts, shrink_idle_ms: n
+
+    _ ->
+      raise "POOL_SHRINK_IDLE_MS must be a non-negative integer (ms), got: #{inspect(ms)}"
+  end
 end
 
 # Perf review 2026-10-14 #16: node-wide cap on idle pooled handles (default 8192). Over it a checkin

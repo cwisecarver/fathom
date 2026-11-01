@@ -212,17 +212,20 @@ defmodule Fathom.HranaAuthColdFloorTest do
     # connection open, for the length of the outage). After one failed read the shard now cools
     # down: the next hellos skip storage and answer at once with the same posture. Pre-fix the
     # second hello made a second storage read and blocked on it.
+    # These use an UNREVOKED shard (`cold_shard(0)`: a fresh shard's directory floor is 1) on purpose: the periodic bulk refresh (every TTL) caches every
+    # REVOKED shard's floor, so a floor-3 shard could be cached mid-test and turn the cold hellos
+    # into hits that pass for the wrong reason (seen once in a full precommit, seed 117157).
     test "fail_open: after a failed read, the next hellos skip storage instead of paying the budget" do
       Application.put_env(:fathom, :hrana_storage_floor_backoff_ms, 60_000)
-      shard = cold_shard(3)
+      shard = cold_shard(0)
       counter = hook_storage(shard, fn _ -> true end)
 
-      assert {_us, {3, nil}, _log} = timed_floor_info(shard)
+      assert {_us, {1, nil}, _log} = timed_floor_info(shard)
       assert calls(counter) == 1
 
       for _ <- 1..3 do
         {us, info, _log} = timed_floor_info(shard)
-        assert info == {3, nil}
+        assert info == {1, nil}
         assert us < 150_000, "a cooling-down hello waited on storage: #{us} us"
       end
 
@@ -235,7 +238,7 @@ defmodule Fathom.HranaAuthColdFloorTest do
     test "fail_closed: after a failed read, the next hellos answer :unavailable at once" do
       Application.put_env(:fathom, :hrana_revocation_on_error, :fail_closed)
       Application.put_env(:fathom, :hrana_storage_floor_backoff_ms, 60_000)
-      shard = cold_shard(3)
+      shard = cold_shard(0)
       counter = hook_storage(shard, fn _ -> true end)
 
       assert {_us, :unavailable, _log} = timed_floor_info(shard)
@@ -246,16 +249,53 @@ defmodule Fathom.HranaAuthColdFloorTest do
       assert calls(counter) == 1
     end
 
+    # Review of 9a97ec71 (2026-10-31). Symptom: a claimant whose read RAISED skipped `release/2`.
+    # If its process caught the raise and lived on (so no DOWN), the claim stayed held, and every
+    # later cold hello for the shard parked behind it until `follow_timeout_ms/0` (~20 s here)
+    # before reading for itself. A bad runtime budget raises an ArithmeticError inside the read.
+    # Pre-fix the second hello below took ~20 s.
+    test "a claimant that raises and survives does not leave its claim behind" do
+      shard = cold_shard(0)
+      Application.put_env(:fathom, :hrana_storage_floor_budget_ms, :not_a_number)
+      test = self()
+
+      claimant =
+        spawn(fn ->
+          raised =
+            try do
+              Revocations.floor_info(shard)
+              :no_raise
+            rescue
+              ArithmeticError -> :raised
+            end
+
+          send(test, {:claimant, raised})
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      on_exit(fn -> Process.exit(claimant, :kill) end)
+      assert_receive {:claimant, :raised}, 5_000
+
+      Application.put_env(:fathom, :hrana_storage_floor_budget_ms, 200)
+      {us, info, _log} = timed_floor_info(shard)
+
+      assert info == {1, nil}
+      assert us < 2_000_000, "the next hello parked behind a dead claim for #{us} us"
+    end
+
     # The cool-down is per shard: a failure on one shard must not stop another shard's backstop.
     # An invariant guard, not a regression test (it passes without the cool-down too): it fails if
     # the cool-down is ever widened into a node-wide breaker.
     test "the cool-down is per shard" do
       Application.put_env(:fathom, :hrana_storage_floor_backoff_ms, 60_000)
-      down = cold_shard(3)
+      down = cold_shard(0)
       hook_storage(down, fn _ -> true end)
-      assert {_us, {3, nil}, _log} = timed_floor_info(down)
+      assert {_us, {1, nil}, _log} = timed_floor_info(down)
 
-      up = cold_shard(3)
+      up = cold_shard(0)
       :ok = Storage.put_token_floor(up, 9)
       assert Revocations.floor_info(up) == {9, nil}
     end

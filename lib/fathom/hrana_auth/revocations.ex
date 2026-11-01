@@ -344,19 +344,46 @@ defmodule Fathom.HranaAuth.Revocations do
     ArgumentError -> :no_table
   end
 
+  # A claimant that RAISES must not keep the claim. `fetch/3` maps every expected failure to an
+  # answer, but anything it does not (a bad `:hrana_storage_floor_budget_ms` set at runtime is an
+  # ArithmeticError before the reads start) used to skip `release/2`. If the caller caught the
+  # raise and lived on, nothing ever cleared the claim: followers watch for the claimant's DOWN,
+  # which never came, so every cold hello for the shard waited out `follow_timeout_ms/0` (~23 s)
+  # before reading for itself (review of 9a97ec71, 2026-10-31). Now the claim is dropped, the
+  # parked followers are told to retry, and the raise continues to the caller unchanged.
   defp lead(shard_id, now) do
     result = fetch(shard_id, now, :none)
     release(shard_id, result)
     result
+  catch
+    kind, reason ->
+      abandon(shard_id)
+      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
   # Release the claim BEFORE draining the followers. A follower registers and THEN re-checks the
   # claim: seeing it still held proves its registration precedes this drain (so it will be served);
   # seeing it gone, it withdraws, and `withdraw/2` tells it whether we already took it. A vanished
   # table (restarted owner) is not worth failing a hello over.
+  #
+  # The followers drained here may include ones that registered behind the NEXT claimant (this one
+  # deleted its claim, another claimed, a follower registered under it, and then this drain took
+  # it). Left as is on purpose: the answer it gets is a just-read floor for the same shard, as fresh
+  # as the next claimant's, and the next claimant finds no one to send to. Keying followers by
+  # claimant would change nothing a caller can see (review of 9a97ec71, 2026-10-31).
   defp release(shard_id, result) do
     :ets.delete_object(@flights, {shard_id, self()})
     for {_shard, ref, pid} <- :ets.take(@followers, shard_id), do: send(pid, {ref, result})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  # `release/2` for a claimant with no answer: the same ordering, but each follower is told to go
+  # again (`await_lead/5` retries, exactly as on the claimant's DOWN).
+  defp abandon(shard_id) do
+    :ets.delete_object(@flights, {shard_id, self()})
+    for {_shard, ref, pid} <- :ets.take(@followers, shard_id), do: send(pid, {:abandoned, ref})
     :ok
   rescue
     ArgumentError -> :ok
@@ -391,6 +418,11 @@ defmodule Fathom.HranaAuth.Revocations do
         Process.demonitor(mon, [:flush])
         result
 
+      # The claimant raised and gave its claim up (`abandon/1`): go again, as on its DOWN.
+      {:abandoned, ^ref} ->
+        Process.demonitor(mon, [:flush])
+        retry_follow(shard_id, attempts_left)
+
       {:DOWN, ^mon, :process, _pid, _reason} ->
         # The claimant died without releasing (killed, or its client went away mid-read). Clear its
         # claim so the next claim can succeed, drop our registration, and go again.
@@ -405,6 +437,7 @@ defmodule Fathom.HranaAuth.Revocations do
         if not withdraw(shard_id, ref) do
           receive do
             {^ref, _result} -> :ok
+            {:abandoned, ^ref} -> :ok
           after
             1_000 -> :ok
           end

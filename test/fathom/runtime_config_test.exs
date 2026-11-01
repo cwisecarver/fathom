@@ -396,4 +396,30 @@ defmodule Fathom.RuntimeConfigTest do
       assert error.message =~ "JOURNAL_SIZE_LIMIT must be an integer"
     end
   end
+
+  # Review of bef51a2a (2026-10-31). Symptom: both were read with `String.to_integer/1`, so garbage
+  # crashed the boot with a bare ArgumentError and a NEGATIVE was accepted, failing only later, per
+  # shard, when the coordinator armed its grace timer. They now refuse to boot with a message naming
+  # the variable. 0 stays a value (drain on close / shrink off).
+  describe "POOL_DRAIN_GRACE_MS and POOL_SHRINK_IDLE_MS" do
+    for {var, key} <- [
+          {"POOL_DRAIN_GRACE_MS", :drain_grace_ms},
+          {"POOL_SHRINK_IDLE_MS", :shrink_idle_ms}
+        ] do
+      test "#{var}: N and 0 are values" do
+        for v <- ["1500", "0"] do
+          opts = Keyword.fetch!(fathom_config(%{unquote(var) => v}), :connection_pool_opts)
+          assert Keyword.fetch!(opts, unquote(key)) == String.to_integer(v)
+        end
+      end
+
+      test "#{var}: a negative or non-integer value refuses to boot, naming the variable" do
+        for v <- ["-1", "2s", "abc", ""] do
+          assert_raise RuntimeError, ~r/#{unquote(var)} must be a non-negative integer/, fn ->
+            fathom_config(%{unquote(var) => v})
+          end
+        end
+      end
+    end
+  end
 end
