@@ -23,9 +23,9 @@ defmodule Fathom.Migrator.BackgroundScanGateMigrationTest do
   ]
 
   # A transform runs INSIDE the replay, i.e. while the migrating process holds its permit. It takes
-  # the node's other permit and queues a second holder behind it, so the instant the replay releases,
-  # the queued one is granted and the node is saturated for `verify_migrated` -- the path that has no
-  # other way to be reached with the gate full. Runs in the migrating (test) process.
+  # the node's other permit and queues a second holder behind it, so if the run ever gave its permit
+  # up between the replay and `verify_migrated`, the queued holder would take it and the node would
+  # be full for the verify. Runs in the migrating (test) process.
   defmodule SaturateAfterReplay do
     @moduledoc false
     @behaviour Fathom.Migrator.Transform
@@ -216,7 +216,44 @@ defmodule Fathom.Migrator.BackgroundScanGateMigrationTest do
     assert %{held: 0, waiting: 0} = BackgroundScanGate.stats()
   end
 
-  test "verify_migrated takes its own permit; busy there is not reported as a corrupt copy",
+  # Expert review of e5f45291 (2026-10-31). Symptom: the replay and `verify_migrated` each waited
+  # for a permit INSIDE the lease, after the live coordinator was drained, so a busy node kept the
+  # tenant offline (`:shard_migrating`) for the whole wait, and each snooze re-did the drain and the
+  # S3 pull. The run now takes its permit before draining, so a busy node must leave the live
+  # coordinator untouched. Pre-fix the drain ran first and the coordinator went DOWN.
+  test "a saturated node answers busy BEFORE draining the live coordinator", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
+
+    prev_idle = Application.fetch_env(:fathom, :shard_idle_ms)
+    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+
+    on_exit(fn ->
+      case prev_idle do
+        {:ok, v} -> Application.put_env(:fathom, :shard_idle_ms, v)
+        :error -> Application.delete_env(:fathom, :shard_idle_ms)
+      end
+
+      Fathom.Shards.drain(shard, 2_000)
+    end)
+
+    {:ok, coord, ref, _path} = Fathom.Shards.checkout(shard)
+    :ok = Fathom.Shard.checkin(coord, ref)
+    mon = Process.monitor(coord)
+
+    holders = saturate!(1)
+
+    assert {:error, :background_scan_busy} = ShardMigration.run(shard, 2)
+    refute_receive {:DOWN, ^mon, :process, ^coord, _}, 200, "the run drained a served tenant"
+    assert {:ok, %{schema_version: 1, status: "active"}} = Directory.get(shard)
+
+    free_holders!(holders)
+  end
+
+  # The other half of the same fix: once a run holds its permit, the scans below it do not wait
+  # again. Pre-fix the replay released its permit, the node filled up, and `verify_migrated`
+  # answered busy with the tenant drained and the work thrown away.
+  test "a run keeps its permit through verify_migrated; a node filling up mid-run does not defer it",
        %{shard: shard} do
     seed_v1!(shard)
     Application.put_env(:fathom, :background_scan_permits, 2)
@@ -224,21 +261,19 @@ defmodule Fathom.Migrator.BackgroundScanGateMigrationTest do
     {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
     :ok = Migrator.attach_transform(2, SaturateAfterReplay)
 
-    log =
-      capture_log(fn ->
-        assert {:error, :background_scan_busy} = ShardMigration.run(shard, 2)
-      end)
+    {result, log} = with_log(fn -> ShardMigration.run(shard, 2) end)
 
-    # The replay finished (its permit was released for the queued holder) and the verify step is the
-    # one that found the node full. That is a deferral, not a verdict on the bytes.
-    refute log =~ "failed quick_check"
-    assert {:ok, %{schema_version: 1, status: "active"}} = Directory.get(shard)
-    assert live_user_version!(shard) == 1
-
+    # Reap the transform's holders before any assertion can fail: a leaked holder keeps the app's
+    # global gate full and wedges every later test in the run.
     for _ <- 1..2 do
       assert_receive {:holder, pid}
       on_exit(fn -> Process.exit(pid, :kill) end)
     end
+
+    assert {:ok, %{from: 1, to: 2}} = result
+    refute log =~ "failed quick_check"
+    assert {:ok, %{schema_version: 2, status: "active"}} = Directory.get(shard)
+    assert live_user_version!(shard) == 2
   end
 
   defp wait_until(fun, tries \\ 200) do

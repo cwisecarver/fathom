@@ -36,15 +36,23 @@ defmodule Fathom.Shard.BackgroundScanGate do
     * `with_permit/3` waits at most `:background_scan_wait_ms` (default 120 s) and returns
       `{:error, :background_scan_busy}`. The migration job treats that as TRANSIENT
       (`ShardMigrationJob.transient?/1`): it snoozes without burning an attempt, the same
-      back-pressure shape as a held lease or a busy shard. The wait is long on purpose: the job has
-      already pulled the object, so giving up early throws away an S3 GET of the whole shard.
+      back-pressure shape as a held lease or a busy shard. The migration waits BEFORE it drains
+      the tenant or pulls the object, so the wait costs neither a served tenant nor an S3 GET.
     * `queued/1` waits with no deadline of its own, for callers that already run under one (the
       restore drill's `Task.async_stream` per-shard `:kill_task` timeout). A killed waiter is removed
       from the queue by its monitor.
 
   A GenServer with monitors, like `ScanGate`: the permit is tied to the holder's monitor so a killed
-  Oban job or Task cannot leak it. NOT re-entrant: a process that holds a permit must not acquire
-  another (it would wait on itself once the cap is reached).
+  Oban job or Task cannot leak it.
+
+  `with_permit/3` and `queued/2` are RE-ENTRANT within one process: inside a `fun` that already
+  holds a permit they just run the inner `fun`. That lets a caller take the permit EARLY, before
+  it starts something a wait would make expensive, and keep it across the scans below. The
+  migration takes it before it drains the live coordinator and holds the lease. Waiting inside
+  the lease kept a drained tenant offline for the whole wait (expert review of e5f45291,
+  2026-10-31). The restore drill takes it before its per-shard deadline starts. `acquire/2`
+  is NOT re-entrant: a process that holds a permit and calls it waits on itself once the cap
+  is reached.
 
   Fails open when the gate is not running (a script or test without the application) or is disabled:
   the scan simply runs.
@@ -53,6 +61,7 @@ defmodule Fathom.Shard.BackgroundScanGate do
 
   @default_wait_ms 120_000
   @wait_key {__MODULE__, :wait_ms}
+  @held_key {__MODULE__, :held}
 
   @doc false
   def start_link(opts),
@@ -112,15 +121,16 @@ defmodule Fathom.Shard.BackgroundScanGate do
   @doc """
   Run `fun` holding a permit, waiting at most `wait_ms` for one. Returns `fun`'s result, or
   `{:error, :background_scan_busy}` (fun NOT run) if none came free in time. `fun` runs unpermitted
-  if the gate is disabled or not running.
+  if the gate is disabled or not running, and runs at once if this process already holds a permit.
   """
   @spec with_permit((-> result), GenServer.server(), non_neg_integer()) ::
           result | {:error, :background_scan_busy}
         when result: var
   def with_permit(fun, gate \\ __MODULE__, wait_ms \\ wait_ms()) do
-    case acquire(wait_ms, gate) do
-      :ok -> run_holding(fun, gate)
-      :timeout -> {:error, :background_scan_busy}
+    cond do
+      held?() -> fun.()
+      acquire(wait_ms, gate) == :ok -> run_holding(fun, gate)
+      true -> {:error, :background_scan_busy}
     end
   end
 
@@ -130,13 +140,21 @@ defmodule Fathom.Shard.BackgroundScanGate do
   """
   @spec queued((-> result), GenServer.server()) :: result when result: var
   def queued(fun, gate \\ __MODULE__) do
-    :ok = acquire(:infinity, gate)
-    run_holding(fun, gate)
+    if held?() do
+      fun.()
+    else
+      :ok = acquire(:infinity, gate)
+      run_holding(fun, gate)
+    end
   end
 
+  defp held?, do: Process.get(@held_key, false)
+
   defp run_holding(fun, gate) do
+    Process.put(@held_key, true)
     fun.()
   after
+    Process.delete(@held_key)
     release(gate)
   end
 

@@ -49,9 +49,7 @@ defmodule Fathom.RestoreDrillJob do
   # Per-shard drill bounds (expert review 2026-10-13 #26); see `bounded/4`.
   # Sized to the scan gate, not to S3 (expert review 2026-10-29 #3). Every `integrity_check` and
   # row count below takes a `BackgroundScanGate` permit (2 on the default `+SDio 10`), so more workers
-  # than permits only queue on it, and that queueing counts against the per-shard deadline below: a
-  # healthy shard behind a slow neighbour's scan would be killed and recorded as `:error`. Two workers
-  # still overlap one shard's S3 pull with another's scan.
+  # than permits only queue on it. Each worker holds its permit for the whole shard (see `bounded/4`).
   @drill_concurrency 2
   @drill_timeout_ms 120_000
   # A full drill forks (server-side object copy) then pulls both sides, so it gets a longer leash.
@@ -116,24 +114,58 @@ defmodule Fathom.RestoreDrillJob do
   # deadline, `:kill_task`. A killed shard is recorded as `:error` (durably, via
   # `record_verification`, plus telemetry) so it reads as a failed drill rather than vanishing, and
   # the other shards still verify. `:restore_drill_shard_timeout_ms` overrides both deadlines (tests).
+  #
+  # The deadline starts when the shard GETS its `BackgroundScanGate` permit, not when its worker
+  # starts. A rollout can hold every permit for minutes. When the time spent waiting counted
+  # against the deadline, healthy shards were killed in the queue and durably recorded as `"error"`,
+  # so a busy gate raised a false durability alarm (expert review of e5f45291, 2026-10-31). The
+  # wait itself has no deadline here: the Oban job's `timeout/1` bounds it, and a shard it cuts
+  # off is simply not drilled this run (its verification stays the oldest, so the next run samples
+  # it first).
   defp bounded(items, fun, default_timeout_ms, on_killed) do
+    timeout = Application.get_env(:fathom, :restore_drill_shard_timeout_ms, default_timeout_ms)
+
     items
-    |> Task.async_stream(fun,
+    |> Task.async_stream(&permitted_with_deadline(fun, &1, timeout),
       max_concurrency: @drill_concurrency,
-      timeout: Application.get_env(:fathom, :restore_drill_shard_timeout_ms, default_timeout_ms),
-      on_timeout: :kill_task,
+      timeout: :infinity,
       ordered: true
     )
     |> Stream.zip(items)
     |> Enum.map(fn
-      {{:ok, status}, _item} ->
+      {{:ok, {:done, status}}, _item} ->
         status
 
-      {{:exit, reason}, item} ->
-        Logger.error("restore drill: #{item.shard_id} did not finish (#{inspect(reason)})")
+      {{:ok, :timeout}, item} ->
+        Logger.error("restore drill: #{item.shard_id} did not finish (:timeout)")
         on_killed.(item)
         :error
     end)
+  end
+
+  # Runs `fun.(item)` in a worker that holds ONE permit across the whole shard. Its scans'
+  # `queued/2` calls are then re-entrant and do not wait. `timeout` starts once the permit is held.
+  defp permitted_with_deadline(fun, item, timeout) do
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        BackgroundScanGate.queued(fn ->
+          send(parent, {:drill_permit, self()})
+          fun.(item)
+        end)
+      end)
+
+    pid = task.pid
+
+    receive do
+      {:drill_permit, ^pid} -> :ok
+    end
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, status} -> {:done, status}
+      _ -> :timeout
+    end
   end
 
   defp record_killed(id, telemetry_event) do

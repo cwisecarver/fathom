@@ -79,11 +79,20 @@ defmodule Fathom.Migrator.ShardMigration do
         # BUILDABILITY ONLY — the chain itself is re-read inside `do_run/3` after the shard is marked
         # `migrating` (expert review 2026-09-29 #12). See the note there.
         case statement_chain(v, target) do
+          # The scan permit is taken BEFORE `with_lease` drains the live coordinator, and held to
+          # the end. The replay and `verify_migrated` used to wait for it inside the lease, so a busy
+          # node kept a DRAINED tenant answering `:shard_migrating` for the whole wait (up to
+          # `:background_scan_wait_ms`, twice per attempt), and each snooze re-did the drain + pull.
+          # Waiting here costs nothing: the tenant is still served. The inner `with_permit` calls
+          # then run without waiting (the gate is re-entrant per process). The cost: a node runs at
+          # most `BackgroundScanGate.cap/0` migrations at once, S3 pull and upload included.
           {:ok, _buildable} ->
-            with_lease(shard_id, token, fn lease ->
-              with :ok <- refuse_if_replica_ahead(shard_id, lease) do
-                do_run(shard_id, target, lease)
-              end
+            BackgroundScanGate.with_permit(fn ->
+              with_lease(shard_id, token, fn lease ->
+                with :ok <- refuse_if_replica_ahead(shard_id, lease) do
+                  do_run(shard_id, target, lease)
+                end
+              end)
             end)
 
           {:error, _} = err ->

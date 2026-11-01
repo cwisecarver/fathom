@@ -639,6 +639,52 @@ defmodule Fathom.RestoreDrillJobTest do
 
       assert %{held: 0, waiting: 0} = Fathom.Shard.BackgroundScanGate.stats()
     end
+
+    # Expert review of e5f45291 (2026-10-31). Symptom: the time a shard spent queued for a permit
+    # counted against its per-shard deadline, so a rollout holding the gate got healthy shards
+    # killed and durably recorded as "error": a false durability alarm. Here the gate stays full for
+    # longer than the whole per-shard deadline. Pre-fix the shard is killed in the queue (:error).
+    test "time spent waiting for a permit does not count against the per-shard deadline",
+         %{id: id} do
+      seed(id, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
+
+      keys = [:background_scan_permits, :restore_drill_shard_timeout_ms]
+      prev = for k <- keys, do: {k, Application.get_env(:fathom, k)}
+      on_exit(fn -> for {k, v} <- prev, do: restore(k, v) end)
+
+      Application.put_env(:fathom, :background_scan_permits, 1)
+      Application.put_env(:fathom, :restore_drill_shard_timeout_ms, 2_000)
+
+      test_pid = self()
+
+      holder =
+        spawn(fn ->
+          :ok = Fathom.Shard.BackgroundScanGate.acquire(:infinity)
+          send(test_pid, :holding)
+
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      on_exit(fn -> Process.exit(holder, :kill) end)
+      assert_receive :holding
+
+      task = Task.async(fn -> RestoreDrillJob.run_drill(10) end)
+      wait_until(fn -> Fathom.Shard.BackgroundScanGate.stats().waiting >= 1 end)
+
+      # Past the whole deadline, with the shard still queued.
+      assert Task.yield(task, 2_500) == nil
+      send(holder, :stop)
+
+      assert {:ok, summary} = Task.await(task, 10_000)
+
+      refute summary[:error],
+             "a queued shard was killed and recorded as a failure: #{inspect(summary)}"
+
+      assert summary[:ok] >= 1
+      assert Repo.get_by!(DirShard, shard_id: id).last_verify_status == "ok"
+    end
   end
 
   defp wait_until(fun, tries \\ 400) do
