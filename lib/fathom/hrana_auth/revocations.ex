@@ -29,9 +29,12 @@ defmodule Fathom.HranaAuth.Revocations do
       GET, ~60 s against a stalled store.
     * If it cannot be read in budget (timeout or error) the same posture applies as for a directory
       error: `:fail_closed` returns `:unavailable`; `:fail_open` serves the directory floor it
-      already holds, UNCACHED (so the backstop is retried on the next hello, never replaced by a
-      cached directory-only answer), without a second GET. On the success path the storage floor is
-      always unioned in.
+      already holds, UNCACHED (never replaced by a cached directory-only answer), without a second
+      GET. On the success path the storage floor is always unioned in.
+    * A failed read starts a per-shard cool-down (`:hrana_storage_floor_backoff_ms`, default 30 s)
+      in which that shard's cold hellos skip the read and take the same posture at once, so an
+      outage costs one budget per shard per cool-down, not one per hello. The first hello after
+      it reads storage again.
     * N concurrent hellos for one cold shard share one storage read and one directory read
       (per-shard single-flight; a crashed claimant hands over to a waiter).
 
@@ -91,6 +94,11 @@ defmodule Fathom.HranaAuth.Revocations do
   # A follower's own bound on waiting for a claimant: the directory read (Repo `timeout`, 15 s by
   # default) plus the storage budget, with slack. The claimant normally answers far sooner.
   @follow_grace_ms 20_000
+  # After a storage-floor read fails, cold hellos for that shard skip the read for this long (see
+  # `fetch/3`). Matches the entry TTL: the cost of an outage is one budget per shard per TTL, as it
+  # was before the read was bounded. Override with `:hrana_storage_floor_backoff_ms`.
+  @storage_backoff Module.concat(__MODULE__, StorageBackoff)
+  @default_storage_backoff_ms 30_000
   @bulk_marker :__bulk_ok__
   @max_entries 200_000
   @full_page 5_000
@@ -187,6 +195,7 @@ defmodule Fathom.HranaAuth.Revocations do
     # contention; `write_concurrency` because every cold miss writes.
     :ets.new(@flights, [:set, :public, :named_table, write_concurrency: true])
     :ets.new(@followers, [:bag, :public, :named_table, write_concurrency: true])
+    :ets.new(@storage_backoff, [:set, :public, :named_table, read_concurrency: true])
 
     # Verify-result cache for `HranaAuth` (expert review 2026-10-17 #17); this process owns it.
     :ets.new(Fathom.HranaAuth.verify_cache_table(), [
@@ -430,22 +439,43 @@ defmodule Fathom.HranaAuth.Revocations do
   # the worst case is max(directory, budget), not their sum.
   #
   # Never raises: every failure maps to `read_error_fallback/3` or `storage_unreadable/2`.
+  #
+  # A read that comes back `:unreadable` starts a per-shard cool-down (`:hrana_storage_floor_backoff_ms`,
+  # default 30 s). During it a cold hello for that shard does not try storage at all: it takes the
+  # unreadable posture at once (`:fail_open` serves the directory floor, uncached; `:fail_closed`
+  # answers `:unavailable`). Without it, the uncached fail-open answer sent EVERY hello for a cold
+  # shard back to storage, so an S3 outage added the full budget (3 s) to every connection open
+  # for as long as it lasted; single-flight only merged hellos that arrived together (review of
+  # 9a97ec71, 2026-10-31). The cool-down never serves a floor of its own and is not the entry
+  # cache: what is served during it is exactly what the failed read served.
   defp fetch(shard_id, now, stale) do
     budget = floor_budget_ms()
     deadline = System.monotonic_time(:millisecond) + budget
-    storage_task = if stale == :none, do: Task.async(fn -> storage_floor(shard_id, budget) end)
+    read_storage? = stale == :none and not storage_backing_off?(shard_id)
+    storage_task = if read_storage?, do: Task.async(fn -> storage_floor(shard_id, budget) end)
     dir = read_directory(shard_id)
 
     storage =
       cond do
-        is_nil(storage_task) -> :skipped
+        stale != :none -> :skipped
+        is_nil(storage_task) -> :unreadable
         # Nothing will consult the answer: a stale value is served as-is, and `:fail_closed` never
         # serves the storage floor (see `read_error_fallback/3`). Don't wait out a budget for it.
         dir == :error and fail_closed?() -> discard(storage_task)
-        true -> await_storage(storage_task, deadline)
+        true -> storage_task |> await_storage(deadline) |> note_storage(shard_id)
       end
 
     resolve(shard_id, now, stale, dir, storage)
+  end
+
+  defp note_storage(:unreadable, shard_id) do
+    back_off_storage(shard_id)
+    :unreadable
+  end
+
+  defp note_storage(ok, shard_id) do
+    clear_storage_backoff(shard_id)
+    ok
   end
 
   defp read_directory(shard_id) do
@@ -766,4 +796,34 @@ defmodule Fathom.HranaAuth.Revocations do
     do: Application.get_env(:fathom, :hrana_storage_floor_budget_ms, @default_floor_budget_ms)
 
   defp follow_timeout_ms, do: floor_budget_ms() + @follow_grace_ms
+
+  defp storage_backoff_ms,
+    do: Application.get_env(:fathom, :hrana_storage_floor_backoff_ms, @default_storage_backoff_ms)
+
+  # Per-shard cool-down after an unreadable storage floor (see `fetch/3`). Stores the instant until
+  # which the read is skipped. The table is capped like `@table`: at the cap it is simply cleared,
+  # which costs at most one more bounded read per shard.
+  defp storage_backing_off?(shard_id) do
+    case :ets.lookup(@storage_backoff, shard_id) do
+      [{^shard_id, until}] -> now_ms() < until
+      [] -> false
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  defp back_off_storage(shard_id) do
+    if :ets.info(@storage_backoff, :size) >= max_entries(),
+      do: :ets.delete_all_objects(@storage_backoff)
+
+    :ets.insert(@storage_backoff, {shard_id, now_ms() + storage_backoff_ms()})
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp clear_storage_backoff(shard_id) do
+    :ets.delete(@storage_backoff, shard_id)
+  rescue
+    ArgumentError -> :ok
+  end
 end

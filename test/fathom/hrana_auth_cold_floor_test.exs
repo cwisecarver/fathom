@@ -34,6 +34,7 @@ defmodule Fathom.HranaAuthColdFloorTest do
       :shard_storage,
       :faulty_before,
       :hrana_storage_floor_budget_ms,
+      :hrana_storage_floor_backoff_ms,
       :hrana_revocation_on_error
     ]
 
@@ -165,7 +166,9 @@ defmodule Fathom.HranaAuthColdFloorTest do
              "a directory-only answer must not be cached: it would stand in for the PITR backstop"
     end
 
-    test "fail_open then recovery: the next hello consults storage again and unions it" do
+    test "fail_open then recovery: the first hello after the cool-down consults storage again" do
+      # A zero cool-down: it has lapsed by the next hello. The cool-down itself is pinned below.
+      Application.put_env(:fathom, :hrana_storage_floor_backoff_ms, 0)
       shard = cold_shard(3)
       hook_storage(shard, fn _ -> true end)
       assert {_us, {3, nil}, _log} = timed_floor_info(shard)
@@ -202,6 +205,59 @@ defmodule Fathom.HranaAuthColdFloorTest do
 
       assert calls(counter) == 1,
              "the fail-open fallback used to repeat the whole GET (pre-fix: a second, retried read)"
+    end
+
+    # Review of 9a97ec71 (2026-10-31). Symptom: the fail-open answer is uncached, so during an S3
+    # outage EVERY later hello for a cold shard paid the whole storage budget again (3 s per
+    # connection open, for the length of the outage). After one failed read the shard now cools
+    # down: the next hellos skip storage and answer at once with the same posture. Pre-fix the
+    # second hello made a second storage read and blocked on it.
+    test "fail_open: after a failed read, the next hellos skip storage instead of paying the budget" do
+      Application.put_env(:fathom, :hrana_storage_floor_backoff_ms, 60_000)
+      shard = cold_shard(3)
+      counter = hook_storage(shard, fn _ -> true end)
+
+      assert {_us, {3, nil}, _log} = timed_floor_info(shard)
+      assert calls(counter) == 1
+
+      for _ <- 1..3 do
+        {us, info, _log} = timed_floor_info(shard)
+        assert info == {3, nil}
+        assert us < 150_000, "a cooling-down hello waited on storage: #{us} us"
+      end
+
+      assert calls(counter) == 1, "storage was read again inside the cool-down"
+
+      assert :ets.lookup(Revocations, shard) == [],
+             "the cool-down must not turn the directory-only answer into a cached one"
+    end
+
+    test "fail_closed: after a failed read, the next hellos answer :unavailable at once" do
+      Application.put_env(:fathom, :hrana_revocation_on_error, :fail_closed)
+      Application.put_env(:fathom, :hrana_storage_floor_backoff_ms, 60_000)
+      shard = cold_shard(3)
+      counter = hook_storage(shard, fn _ -> true end)
+
+      assert {_us, :unavailable, _log} = timed_floor_info(shard)
+      {us, info, _log} = timed_floor_info(shard)
+
+      assert info == :unavailable
+      assert us < 150_000
+      assert calls(counter) == 1
+    end
+
+    # The cool-down is per shard: a failure on one shard must not stop another shard's backstop.
+    # An invariant guard, not a regression test (it passes without the cool-down too): it fails if
+    # the cool-down is ever widened into a node-wide breaker.
+    test "the cool-down is per shard" do
+      Application.put_env(:fathom, :hrana_storage_floor_backoff_ms, 60_000)
+      down = cold_shard(3)
+      hook_storage(down, fn _ -> true end)
+      assert {_us, {3, nil}, _log} = timed_floor_info(down)
+
+      up = cold_shard(3)
+      :ok = Storage.put_token_floor(up, 9)
+      assert Revocations.floor_info(up) == {9, nil}
     end
   end
 

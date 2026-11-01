@@ -80,13 +80,21 @@ of ms, anything else refuses to boot). It used to wait forever on Req's default 
 minute against a stalled store. If it cannot be read inside the budget (timeout, transport error or
 error status) the `:hrana_revocation_on_error` posture decides, exactly as for a directory read
 error: `:fail_closed` returns `:unavailable` and refuses the token; `:fail_open` serves the
-directory floor it already holds, **uncached** so the backstop is consulted again on the next
-hello, with no second GET (it counts in `fathom.hrana.revocation.floor_error.count`). When the
+directory floor it already holds, **uncached** so it never stands in for the backstop, with no
+second GET (it counts in `fathom.hrana.revocation.floor_error.count`). When the
 directory also fails under `:fail_open`, the same single read's answer is used if it arrived, else
 floor `0`. N concurrent hellos for one cold shard share one storage read and one directory read; a
 claimant that dies mid-read hands over to a waiter. A fast storage *error* is treated like a
 timeout (a stalled store surfaces as either, and the caller cannot tell them apart), which is
 stricter under `:fail_closed` than the previous "storage error reads as floor 0".
+
+A failed storage read starts a **per-shard cool-down**, `:hrana_storage_floor_backoff_ms`
+(default 30 s, the entry TTL). During it, cold hellos for that shard skip the storage read and take
+the same posture at once, so an S3 outage costs one budget per shard per cool-down instead of one
+per hello (review of 9a97ec71, 2026-10-31: the uncached fail-open answer used to send every hello
+back to storage, adding 3 s to every connection open for the length of the outage). The first
+cold hello after the cool-down reads storage again. It is per shard on purpose: one shard's bad
+object must not switch off the backstop for the others.
 
 ## Token lifecycle: rotate, revoke, scope (#24)
 
