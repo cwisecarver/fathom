@@ -1015,7 +1015,7 @@ defmodule Fathom.Shard do
           lease,
           etag1,
           lineage,
-          local_writes? and verdict == :ok and not took_from_another_holder?(lease),
+          local_writes? and verdict == :ok and not took_from_another_holder?(lease, owner),
           head,
           prefetch
         )
@@ -1354,15 +1354,29 @@ defmodule Fathom.Shard do
   # promotes a replica strictly ahead of the object, so a local that equals the object loses
   # nothing, and a reclaim of this node's own lock (no `:prev_owner`) is unchanged.
   #
-  # NOT for a released marker (`Storage.released_owner/0`). A clean marker records that the
-  # visitors since wrote nothing (the touch provenance, 2026-10-12 #10), so the warm local IS the
-  # newest history, and running the decision there would refuse a safe open whenever peers are
-  # short (`RefusedOpenUnderQuorumTest` pins serving it). Known gap, not covered: a holder that
-  # wrote and then released DIRTY, over an object whose bytes still equal this node's flush.
-  defp took_from_another_holder?(%{prev_owner: prev}) when is_binary(prev),
-    do: prev != Storage.released_owner()
+  # A RELEASED MARKER counts when the holder it names (`:released_by`, carried through clean
+  # visitors by `Storage.floor_owner/1`) is another NODE (Jepsen 2026-11-01, shard 4). fathom4 kept
+  # its local copy and released; fathom5 took over, promoted those same bytes, acked writes to
+  # fathom2 and lost power before flushing; fathom1 stole fathom5's lock, refused its open under
+  # quorum and released clean, so the marker named fathom5; fathom4 took that marker, adopted the
+  # unchanged object as its own flush, opened WARM, never asked fathom2, and wrote over fathom5's
+  # acked writes. Only a marker naming this node (its own release, or clean visits since) or naming
+  # nobody keeps the warm skip: there the warm local IS the newest history, and running the decision
+  # would refuse a safe open whenever peers are short (`RefusedOpenUnderQuorumTest` pins serving it).
+  # Compared by node key, not owner string, so this node's own release from an earlier incarnation
+  # is still its own.
+  defp took_from_another_holder?(%{prev_owner: prev} = lease, owner) when is_binary(prev) do
+    if prev == Storage.released_owner(),
+      do: released_by_another_node?(Storage.floor_owner(lease), owner),
+      else: true
+  end
 
-  defp took_from_another_holder?(_lease), do: false
+  defp took_from_another_holder?(_lease, _owner), do: false
+
+  defp released_by_another_node?(by, owner) when is_binary(by),
+    do: Fathom.Rebalancer.owner_node_key(by) != Fathom.Rebalancer.owner_node_key(owner)
+
+  defp released_by_another_node?(_nobody, _owner), do: false
 
   defp revalidate_takeover(shard_id, path, lease, etag, warm?, head) do
     cond do

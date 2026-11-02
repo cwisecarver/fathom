@@ -168,6 +168,12 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     end
   end
 
+  defp stored_lock(id) do
+    body = File.read!(Path.join(Fathom.Shard.Storage.Local.dir(), "#{id}.lock"))
+    {:ok, lease} = Storage.decode_lease(body)
+    lease
+  end
+
   defp open_and_read(id) do
     {:ok, conn} = ShardExecutor.open(id)
     result = rows(conn)
@@ -836,6 +842,78 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     assert open_and_read(id) == Enum.to_list(1..10),
            "the takeover served its warm local (the object's rows) over a replica holding the " <>
              "previous holder's acked writes"
+  end
+
+  # Jepsen 2026-11-01 (shard 4, power-loss mix): the test above, but the other holder's tenure ends
+  # in a RELEASED MARKER rather than a dead lock. fathom5 acked writes it never flushed and lost
+  # power; fathom1 stole its lock, refused the open under quorum and released clean, so the marker
+  # named fathom5; fathom4 took the marker with a warm local equal to the object, skipped
+  # promotion, and wrote over fathom5's acked writes. The invariant: a marker naming another node is
+  # a takeover from another holder, exactly like that node's lock.
+  test "a marker released by another node promotes past a warm local that equals the object",
+       ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :replication_recover_from_peers, true)
+
+    {conn, coordinator} = build_shard(id, 10, 3)
+    assert {:ok, stamp} = Storage.object_position(id)
+
+    install_replica(id, %{
+      epoch: stamp.epoch,
+      wal_gen: stamp.wal_gen,
+      wal_ordinal: stamp.wal_ordinal,
+      offset: stamp.offset + 1
+    })
+
+    own_lease = :sys.get_state(coordinator).lease
+    tear_down_primary(id, conn, coordinator)
+
+    path = Fathom.Shard.db_path(id)
+    assert {:ok, etag} = Storage.pull(id, path)
+    Fathom.Shard.Provenance.write(path, etag)
+
+    # ANOTHER node held the shard and let go: the lock is now a marker naming it.
+    :ok = Storage.release_lease(id, own_lease)
+    {:ok, other} = Storage.acquire_lease(id, "other-holder#1", 60_000)
+    :ok = Storage.release_lease_fenced(id, other, nil)
+    assert %{owner: marker_owner, released_by: "other-holder#1"} = stored_lock(id)
+    assert marker_owner == Storage.released_owner(), "the fixture needs a released marker"
+
+    assert open_and_read(id) == Enum.to_list(1..10),
+           "the open served its warm local (the object's rows) over a replica holding another " <>
+             "node's acked writes, because the lease came from a marker"
+  end
+
+  # The other side of the test above: a marker naming THIS node is its own release, so the warm
+  # local is still the newest history and must not be replaced by a peer that is behind it.
+  test "a marker released by this node keeps its fresher warm local", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :replication_recover_from_peers, true)
+
+    {conn, coordinator} = build_shard(id, 7, 3)
+    assert {:ok, stamp} = Storage.object_position(id)
+
+    install_replica(id, %{
+      epoch: stamp.epoch,
+      wal_gen: stamp.wal_gen,
+      wal_ordinal: stamp.wal_ordinal,
+      offset: stamp.offset + 1
+    })
+
+    for i <- 8..10 do
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (?1)", [i]))
+    end
+
+    own_lease = :sys.get_state(coordinator).lease
+    kill_primary_keep_disk(conn, coordinator)
+    :ok = Storage.release_lease_fenced(id, own_lease, nil)
+    own = own_lease.owner
+    assert %{released_by: ^own} = stored_lock(id)
+    assert File.exists?(Fathom.Shard.db_path(id)), "this degenerated into a cold open"
+
+    assert open_and_read(id) == Enum.to_list(1..10)
   end
 
   # Jepsen 2026-10-24 (`--hard`, MinIO paused): a takeover chose a replica ahead of the stored
