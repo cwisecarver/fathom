@@ -3396,9 +3396,15 @@ cmd_deploy() {
 # survivors' warm follower + clears their cache so every re-home cold-opens (full pull); `warm=on`
 # (default) lets them 304-promote the pre-warmed copy. The floor is the lease TTL + steal margin
 # (~15s here): a silent-killed owner's shards are unstealable until its heartbeat lapses.
+#
+# It waits 8 s for "a durable flush", so it needs a fast flush like `failover` (round-8 herd run,
+# 2026-10-23: at the rig's 300 s default nothing was flushed, so it measured never-flushed shards).
+# Each request gives up at HERD_DEADLINE_S (default 120) and counts as unserved: a shard that never
+# comes back used to spin its retry loop forever and hang the run.
 cmd_failover_herd() {
-  local shards=${1:-300} warm=${2:-on} node=fathom1
+  local shards=${1:-300} warm=${2:-on} node=fathom1 deadline_ms=$(( ${HERD_DEADLINE_S:-120} * 1000 ))
   echo "failover-herd: $shards shards on $node, warm=$warm — kill it, measure time-to-served across the herd"
+  require_fast_flush failover-herd || return 1
 
   rpc "$node" 'Application.put_env(:fathom, :shard_idle_ms, 600_000); Application.put_env(:fathom, :max_open_shards, 100_000)' >/dev/null
 
@@ -3433,7 +3439,10 @@ cmd_failover_herd() {
   for i in $(seq 1 "$shards"); do
     (
       s="herd_${i}"
-      until sql "$s" "SELECT seq FROM kv LIMIT 1" >/dev/null 2>&1; do sleep 0.05; done
+      until sql "$s" "SELECT seq FROM kv LIMIT 1" >/dev/null 2>&1; do
+        [ $(($(now_ms) - t0)) -ge "$deadline_ms" ] && exit 0
+        sleep 0.05
+      done
       echo $(($(now_ms) - t0)) >"$tmp/$i"
     ) &
     # Bound the fork fan-out in waves of 150 so the driver host isn't the bottleneck.

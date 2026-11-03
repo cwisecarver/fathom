@@ -1015,7 +1015,8 @@ defmodule Fathom.Shard do
           lease,
           etag1,
           lineage,
-          local_writes? and verdict == :ok and not took_from_another_holder?(lease, owner),
+          local_writes? and verdict == :ok and
+            not PromoteOnOpen.took_from_another_holder?(lease, owner),
           head,
           prefetch
         )
@@ -1342,41 +1343,8 @@ defmodule Fathom.Shard do
   # 2026-10-17 #1): a peer that held the shard while we opened can flush and clean-release (which
   # DELETES the lock) between our speculative GET and our create, so the pull holds the pre-flush
   # object. See `cold_fresh_check/5` for what that costs and what it still leaves open.
-  # A WARM LOCAL IS NOT THE NEWEST HISTORY WHEN THE LEASE CAME FROM ANOTHER HOLDER (Jepsen
-  # 2026-10-24, `WarmTakeoverPromoteTest`). Promote-on-open skips a warm local (2026-09-18 #1) on
-  # the argument that no replica can be ahead of this node's own former-primary file. That holds only
-  # if nobody else owned the shard since. Jepsen: fathom4's flush landed and it released; fathom3
-  # took over, promoted exactly those bytes, and acked 5,044 writes it never managed to flush (MinIO
-  # paused); fathom4 stole the shard back, found its local copy byte-identical to the object (so
-  # `Fork.resolve` correctly saw no fork), opened WARM, skipped the promotion, and served without
-  # fathom3's quorum-acked writes, which its own replica table was holding. Whenever the lease was
-  # stolen from another NODE (`:prev_owner` names one), the promotion decision runs. It only
-  # promotes a replica strictly ahead of the object, so a local that equals the object loses
-  # nothing, and a reclaim of this node's own lock (no `:prev_owner`) is unchanged.
-  #
-  # A RELEASED MARKER counts when the holder it names (`:released_by`, carried through clean
-  # visitors by `Storage.floor_owner/1`) is another NODE (Jepsen 2026-11-01, shard 4). fathom4 kept
-  # its local copy and released; fathom5 took over, promoted those same bytes, acked writes to
-  # fathom2 and lost power before flushing; fathom1 stole fathom5's lock, refused its open under
-  # quorum and released clean, so the marker named fathom5; fathom4 took that marker, adopted the
-  # unchanged object as its own flush, opened WARM, never asked fathom2, and wrote over fathom5's
-  # acked writes. Only a marker naming this node (its own release, or clean visits since) or naming
-  # nobody keeps the warm skip: there the warm local IS the newest history, and running the decision
-  # would refuse a safe open whenever peers are short (`RefusedOpenUnderQuorumTest` pins serving it).
-  # Compared by node key, not owner string, so this node's own release from an earlier incarnation
-  # is still its own.
-  defp took_from_another_holder?(%{prev_owner: prev} = lease, owner) when is_binary(prev) do
-    if prev == Storage.released_owner(),
-      do: released_by_another_node?(Storage.floor_owner(lease), owner),
-      else: true
-  end
-
-  defp took_from_another_holder?(_lease, _owner), do: false
-
-  defp released_by_another_node?(by, owner) when is_binary(by),
-    do: Fathom.Rebalancer.owner_node_key(by) != Fathom.Rebalancer.owner_node_key(owner)
-
-  defp released_by_another_node?(_nobody, _owner), do: false
+  # The warm skip's override lives in `PromoteOnOpen.took_from_another_holder?/2` (Jepsen 2026-10-24
+  # and 2026-11-01), which the no-object takeover decision shares.
 
   defp revalidate_takeover(shard_id, path, lease, etag, warm?, head) do
     cond do
@@ -4910,6 +4878,8 @@ defmodule Fathom.Shard do
   # protect until something is written, and stamping at open would PUT an empty database for every
   # read-only probe of a shard id that never existed. What remains is the window between the first
   # acked write and this PUT landing (one object-store round trip) instead of a whole interval.
+  # A takeover inside that window no longer serves the shard empty: it ranks the missing object as
+  # `Recovery.absent_stamp/0` and asks the fleet (`PromoteOnOpen.decision_stamp/4`, option A).
   # A flush already in flight is not stacked (`:durability_flush` reschedules), and a failed PUT
   # leaves `etag` nil, so the next stream's first write asks again.
   defp stamp_first_write(%{etag: nil, lineage: lineage}) when is_integer(lineage) do

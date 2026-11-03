@@ -87,6 +87,15 @@ underneath, so a peer is adopted only when it is **provably ahead of that object
 uncertain answer is `false`). When no peer can prove it, the open degrades to exactly the pre-A2
 behaviour. There is no state in which this serves older bytes than leaving it off.
 
+**No object at all ranks `{0, 0, 0}` on a takeover (2026-11-02, option A).** A brand-new shard's
+owner can quorum-ack writes and die before its first object lands. A takeover then found no object,
+and `nil` ("unstamped") skipped the ask, so it served the shard empty while peers held the writes.
+Now, when the lease came from another holder and the open pulled no bytes, the decision runs
+against `Recovery.absent_stamp/0`: any replica with a stated lineage and ordinal wins, under the
+same N−Q+1 floor. Two guards: an unstamped *real* object still pulls bytes, so it stays
+unoverridable; and a durable tombstone marker (`Storage.tombstone_present?/1`) stops a deleted
+tenant's leftover replica from being promoted.
+
 Two things it costs, both deliberate, which is why it is a **separate gate** rather than part of
 `REPLICATION_PROMOTE_ON_OPEN`:
 

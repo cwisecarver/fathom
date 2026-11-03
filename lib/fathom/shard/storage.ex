@@ -576,6 +576,9 @@ defmodule Fathom.Shard.Storage do
   # delete; `tombstoned_ids/0` is the boot-time union scan that repopulates the ETS despite a rollback.
   @callback put_tombstone(shard_id :: String.t()) :: :ok | {:error, term()}
   @callback tombstoned_ids() :: {:ok, [String.t()]} | {:error, term()}
+  # One id's marker, for the open path's resurrection guard (`PromoteOnOpen`): a takeover that finds
+  # no object may promote a peer's replica, and must not do it for a tenant whose purge already ran.
+  @callback tombstone_present?(shard_id :: String.t()) :: {:ok, boolean()} | {:error, term()}
 
   # The durable token-revocation floor (expert review #6, DR backstop). Token revocation bumps a
   # per-shard `token_version` in the Postgres directory; a directory point-in-time restore rolls it
@@ -1299,6 +1302,13 @@ defmodule Fathom.Shard.Storage do
   """
   @spec tombstoned_ids() :: {:ok, [String.t()]} | {:error, term()}
   def tombstoned_ids, do: backend().tombstoned_ids()
+
+  @doc """
+  Is `shard_id`'s durable tombstone marker present? One HEAD (S3) or stat (Local), so the open path
+  can ask about one id without the boot-time LIST. See the `c:tombstone_present?/1` callback.
+  """
+  @spec tombstone_present?(String.t()) :: {:ok, boolean()} | {:error, term()}
+  def tombstone_present?(shard_id), do: backend().tombstone_present?(shard_id)
 
   @doc "Mirrors `shard_id`'s token-revocation floor to durable storage (the DR backstop, #6). Idempotent."
   @spec put_token_floor(String.t(), non_neg_integer()) :: :ok | {:error, term()}

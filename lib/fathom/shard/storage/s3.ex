@@ -2451,6 +2451,16 @@ defmodule Fathom.Shard.Storage.S3 do
   defp tombstone_key(shard_id), do: prefix() <> "tombstones/" <> shard_id
 
   @impl true
+  def tombstone_present?(shard_id) do
+    case Req.head(req(), url: url_path(tombstone_key(shard_id))) do
+      {:ok, %{status: 200}} -> {:ok, true}
+      {:ok, %{status: 404}} -> {:ok, false}
+      {:ok, %{status: status}} -> {:error, {:s3_head_status, status}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @impl true
   def put_token_floor(shard_id, version) do
     case Req.put(req(),
            url: url_path(token_floor_key(shard_id)),

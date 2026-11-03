@@ -262,7 +262,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # and fell through to the LOCAL path, which `promote_on_open_test.exs:435` immediately caught: a
   # node with a local replica and no peers still runs the fleet DECISION (`best_replica/3`
   # short-circuits on its own replica before opening a socket), and only that path performs the
-  # mid-flight `recheck_object/4`. Routing it to the local path silently dropped the re-read and
+  # mid-flight `recheck_object/5`. Routing it to the local path silently dropped the re-read and
   # promoted against a stamp that had moved.
   #
   # Do NOT skip the fleet ask for a claim-less lease (expert review 2026-10-17 #7, decided: keep it).
@@ -316,13 +316,14 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # only added a serial round trip (expert review 2026-10-01 perf #3). The RE-read below is a
   # different read on purpose and is never shared.
   defp try_promote_from_fleet(shard_id, path, lease, etag, lineage, {:ok, head} = prefetched, ask) do
-    # perf review 2026-10-14 #8(b): an object whose stamp cannot be ranked (no object, unstamped,
-    # lineage 0) can never be overridden, so `Recovery.best_replica/3` answers `:none` without a
-    # socket and nothing is "pending". Skip the marker's open + fsync + close + rm too — the
-    # marker exists to make the ASK crash-safe, and there is no ask. Only decidable when the
-    # coordinator already holds the decision head; otherwise the marker is written before the HEAD
-    # exactly as before.
-    if Recovery.rankable_stamp?(position_of(head)) do
+    # perf review 2026-10-14 #8(b): an object whose stamp cannot be ranked (unstamped, lineage 0)
+    # can never be overridden, so `Recovery.best_replica/3` answers `:none` without a socket and
+    # nothing is "pending". Skip the marker's open + fsync + close + rm too — the marker exists to
+    # make the ASK crash-safe, and there is no ask. Only decidable when the coordinator already
+    # holds the decision head; otherwise the marker is written before the HEAD exactly as before.
+    # A takeover that found NO object is the exception (`absent_takeover?/3`): it asks.
+    if Recovery.rankable_stamp?(position_of(head)) or
+         absent_takeover?(position_of(head), path, lease) do
       recover_with_marker(shard_id, path, lease, etag, lineage, prefetched, ask)
     else
       etag
@@ -360,12 +361,17 @@ defmodule Fathom.Shard.PromoteOnOpen do
     started = System.monotonic_time(:millisecond)
 
     with {:head, {:ok, head}} <- {:head, decision_head(shard_id, prefetched)},
-         {:ok, replica} <-
-           ask_answer(ask, shard_id, path, position_of(head), Storage.floor_owner(lease)),
-         true <- Promote.fresher?(replica, position_of(head)),
-         :ok <- recheck_object(shard_id, head, replica, started) do
-      promote_replica(shard_id, path, lease, etag, replica, position_of(head), lineage)
+         {:stamp, {:ok, stamp}} <- {:stamp, decision_stamp(shard_id, path, lease, head)},
+         {:ok, replica} <- ask_answer(ask, shard_id, path, stamp, Storage.floor_owner(lease)),
+         true <- Promote.fresher?(replica, stamp),
+         :ok <- recheck_object(shard_id, head, replica, stamp, started) do
+      promote_replica(shard_id, path, lease, etag, replica, stamp, lineage)
     else
+      # The resurrection guard could not be read, so whether a peer's copy may be promoted over
+      # NO object is undecided: the same window as an unreadable decision head.
+      {:stamp, {:error, reason}} ->
+        refuse_or_etag(Recovery.error_window(shard_id, {:tombstone_check, reason}), path, etag)
+
       # THE RE-READ FAILED (expert review 2026-10-13 N3). By here a peer replica was already
       # chosen as fresher, and used to be DECLINED on this error: the open then proceeded from the
       # OLDER stored object, with no floor, on exactly the S3 brownout that coincides with the
@@ -489,6 +495,90 @@ defmodule Fathom.Shard.PromoteOnOpen do
   defp decision_head(_shard_id, {:ok, _} = head), do: head
   defp decision_head(shard_id, _), do: Storage.object_head(shard_id)
 
+  # A TAKEOVER THAT FOUND NO OBJECT DECIDES AGAINST `Recovery.absent_stamp/0` (Jepsen round-8 herd
+  # run, 2026-10-23; the user chose option A). The owner of a brand-new shard can be killed after
+  # quorum-acking writes and before its first object lands (`Fathom.Shard`'s `stamp_first_write/1`
+  # shrank that window to one object-store round trip; it did not close it). The survivor then found
+  # no object, or only a steal sentinel, and an unrankable `nil` stamp skipped the fleet ask, so it
+  # served the shard EMPTY while peers held the writes. Ranking "nothing" as `{0, 0, 0}` lets any
+  # replica with a stated lineage and ordinal win, under the ordinary `N - Q + 1` floor.
+  #
+  # All three conditions are load-bearing:
+  #   * NOT RANKABLE: a stamped object is decided on its own stamp as before;
+  #   * TAKEN FROM ANOTHER HOLDER (`took_from_another_holder?/2`): only then can someone else have
+  #     acked writes this node did not see. A fresh create or a reclaim of this node's own lock
+  #     keeps today's path, so a read-only probe of a never-seen id never asks the fleet;
+  #   * NO LOCAL FILE: the open pulled no bytes. An unstamped REAL object pulls bytes, and must stay
+  #     unoverridable (`Promote.fresher?(_, nil)`), so "no bytes", not "no stamp", is the test. It
+  #     is also backend-neutral: S3 leaves a steal sentinel with no position, Local leaves nothing.
+  defp absent_takeover?(stamp, path, lease) do
+    not Recovery.rankable_stamp?(stamp) and took_from_another_holder?(lease, lease.owner) and
+      not Fathom.FS.exists?(path)
+  end
+
+  # THE RESURRECTION GUARD for `absent_takeover?/3`. A purged tenant has no object either, and a
+  # peer that missed the delete notification may still hold its replica, so promoting it would bring
+  # a deleted tenant back. The coordinator already refused ids in this node's tombstone ETS at init;
+  # this reads the DURABLE marker (`Storage.tombstone_present?/1`), which `Tenants.delete/1` writes
+  # before the purge job is enqueued and `Tenants.purge/1` writes again before its final sweep, so it
+  # covers a node whose ETS missed the notification. One HEAD, only on an absent takeover.
+  defp decision_stamp(shard_id, path, lease, head) do
+    stamp = position_of(head)
+
+    if absent_takeover?(stamp, path, lease) do
+      case Storage.tombstone_present?(shard_id) do
+        {:ok, false} -> {:ok, Recovery.absent_stamp()}
+        {:ok, true} -> {:ok, stamp}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, stamp}
+    end
+  end
+
+  @doc """
+  Did this lease come from ANOTHER holder, so that someone else may have acked writes this node never
+  saw? True when it was stolen from another owner, or taken from a released marker that names
+  another NODE.
+
+  A WARM LOCAL IS NOT THE NEWEST HISTORY WHEN THE LEASE CAME FROM ANOTHER HOLDER (Jepsen
+  2026-10-24, `WarmTakeoverPromoteTest`). Promote-on-open skips a warm local (2026-09-18 #1) on
+  the argument that no replica can be ahead of this node's own former-primary file. That holds only
+  if nobody else owned the shard since. Jepsen: fathom4's flush landed and it released; fathom3
+  took over, promoted exactly those bytes, and acked 5,044 writes it never managed to flush (MinIO
+  paused); fathom4 stole the shard back, found its local copy byte-identical to the object (so
+  `Fork.resolve` correctly saw no fork), opened WARM, skipped the promotion, and served without
+  fathom3's quorum-acked writes, which its own replica table was holding. Whenever the lease was
+  stolen from another NODE (`:prev_owner` names one), the promotion decision runs. It only
+  promotes a replica strictly ahead of the object, so a local that equals the object loses
+  nothing, and a reclaim of this node's own lock (no `:prev_owner`) is unchanged.
+
+  A RELEASED MARKER counts when the holder it names (`:released_by`, carried through clean
+  visitors by `Storage.floor_owner/1`) is another NODE (Jepsen 2026-11-01, shard 4). fathom4 kept
+  its local copy and released; fathom5 took over, promoted those same bytes, acked writes to
+  fathom2 and lost power before flushing; fathom1 stole fathom5's lock, refused its open under
+  quorum and released clean, so the marker named fathom5; fathom4 took that marker, adopted the
+  unchanged object as its own flush, opened WARM, never asked fathom2, and wrote over fathom5's
+  acked writes. Only a marker naming this node (its own release, or clean visits since) or naming
+  nobody keeps the warm skip: there the warm local IS the newest history, and running the decision
+  would refuse a safe open whenever peers are short (`RefusedOpenUnderQuorumTest` pins serving it).
+  Compared by node key, not owner string, so this node's own release from an earlier incarnation
+  is still its own. Pure.
+  """
+  @spec took_from_another_holder?(Storage.lease(), String.t()) :: boolean()
+  def took_from_another_holder?(%{prev_owner: prev} = lease, owner) when is_binary(prev) do
+    if prev == Storage.released_owner(),
+      do: released_by_another_node?(Storage.floor_owner(lease), owner),
+      else: true
+  end
+
+  def took_from_another_holder?(_lease, _owner), do: false
+
+  defp released_by_another_node?(by, owner) when is_binary(by),
+    do: Fathom.Rebalancer.owner_node_key(by) != Fathom.Rebalancer.owner_node_key(owner)
+
+  defp released_by_another_node?(_nobody, _owner), do: false
+
   defp position_of(nil), do: nil
   defp position_of(%{position: position}), do: position
 
@@ -496,10 +586,10 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # ordinary path then serves the newer object). A re-read that FAILS is `{:head_error, reason}`,
   # routed by the caller through the recovery error window — NOT treated as "moved" (expert review
   # 2026-10-13 N3: that opened from the older object after the replica was already pulled).
-  defp recheck_object(shard_id, before, replica, started) do
+  defp recheck_object(shard_id, before, replica, stamp, started) do
     case Storage.object_head(shard_id) do
       {:ok, head} ->
-        case Recovery.recheck(before, head, replica) do
+        case Recovery.recheck(before, head, replica, absent_or_nil(stamp)) do
           :ok -> :ok
           {:error, reason} -> decline_promotion(shard_id, reason, started)
         end
@@ -508,6 +598,9 @@ defmodule Fathom.Shard.PromoteOnOpen do
         {:head_error, reason}
     end
   end
+
+  defp absent_or_nil(:absent), do: :absent
+  defp absent_or_nil(_stamp), do: nil
 
   # Counted, not just logged. A promotion abandoned here means a database was transferred across
   # the network for nothing, and that is invisible in the success telemetry by construction —

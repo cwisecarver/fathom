@@ -570,6 +570,10 @@ defmodule Fathom.Shard.Storage.Local do
   end
 
   @impl true
+  def tombstone_present?(shard_id),
+    do: {:ok, File.exists?(Path.join([dir(), "tombstones", shard_id]))}
+
+  @impl true
   def put_token_floor(shard_id, version) do
     path = Path.join([dir(), "tokenfloors", shard_id])
     File.mkdir_p!(Path.dirname(path))

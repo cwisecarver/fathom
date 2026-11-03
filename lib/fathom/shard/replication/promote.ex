@@ -88,8 +88,11 @@ defmodule Fathom.Shard.Replication.Promote do
   The comparison is lexicographic on `{epoch, wal_gen, offset}` — see `t:Storage.position/0` for
   why that is a total order on how far along a copy is. `>` and not `>=`: equal positions mean the
   two hold the same history, and the stored object is then the one with provenance.
+
+  The stamp `:absent` means "a takeover found NO stored object" (see `Recovery.absent_stamp/0`):
+  every rankable replica is ahead of nothing.
   """
-  @spec fresher?(map() | nil, Storage.position() | nil) :: boolean()
+  @spec fresher?(map() | nil, Storage.position() | :absent | nil) :: boolean()
   def fresher?(nil, _stamp), do: false
   def fresher?(_replica, nil), do: false
 
@@ -131,6 +134,18 @@ defmodule Fathom.Shard.Replication.Promote do
   # feature that is off is never worse than off; one that is subtly wrong on a data-loss path is.
   # Land, roll the fleet out, then flip the gate.
   def fresher?(%{wal_ordinal: 0}, _stamp), do: false
+
+  # NO OBJECT ON A TAKEOVER RANKS {0, 0, 0} (Jepsen round-8 herd run, 2026-10-23, option A). A shard
+  # whose owner died before its first flush has nothing in the store, and `nil` above answers false
+  # for every replica, so the survivor served it EMPTY while peers held its quorum-acked writes.
+  # `PromoteOnOpen` passes `:absent` only for a takeover whose open pulled no bytes (an unstamped
+  # REAL object stays `nil`: never overridable), so here a replica with a stated lineage and ordinal
+  # is strictly ahead. The torn, lineage-0 and ordinal-0 clauses above still refuse first.
+  def fresher?(%{lineage: l, wal_ordinal: n}, :absent)
+      when is_integer(l) and l > 0 and is_integer(n) and n > 0,
+      do: true
+
+  def fresher?(_replica, :absent), do: false
 
   # LINEAGE against LINEAGE. The replica's `epoch` is the primary's LOCK epoch, which
   # `release_lease` resets to 1 on every clean idle-drop, drain and handoff; the object's position

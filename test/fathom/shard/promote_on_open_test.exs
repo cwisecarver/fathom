@@ -593,6 +593,40 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     assert open_and_read(id) == [1, 2, 3]
   end
 
+  # The same object on a TAKEOVER (option A, 2026-10-23). A takeover that finds NO object ranks it
+  # `{0, 0, 0}` so a replica can win; an unstamped REAL object must not be mistaken for that, or a
+  # replica that is behind it would be promoted over rows only the object holds. The test is "the
+  # open pulled no bytes", not "the object has no stamp".
+  test "an object with no stamp is never overridden on a takeover either", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :replication_recover_from_peers, true)
+
+    {conn, coordinator} = build_shard(id, 3, 3)
+    ordinal = assign_ordinal!(id, coordinator)
+    # A replica with a stated lineage and ordinal, holding only the first three rows.
+    install_replica(id, %{epoch: 1, wal_gen: 0, wal_ordinal: ordinal, offset: 1})
+
+    for i <- 4..6 do
+      {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (?1)", [i]))
+    end
+
+    own_lease = :sys.get_state(coordinator).lease
+    flush!(coordinator)
+    tear_down_primary(id, conn, coordinator)
+
+    scratch = Path.join(ctx.dir, "unstamped.db")
+    assert {:ok, _} = Storage.pull(id, scratch)
+    :ok = Storage.flush(id, scratch)
+    assert {:ok, nil} = Storage.object_position(id)
+
+    :ok = Storage.release_lease(id, own_lease)
+    {:ok, _} = Storage.acquire_lease(id, "other-holder#1", -60_000)
+
+    assert open_and_read(id) == Enum.to_list(1..6),
+           "a replica behind an unstamped object was promoted over it on a takeover"
+  end
+
   # The fleet path reads the object's head, then spends seconds on the network — a peer query and,
   # when a peer wins, a whole-database transfer — and only then decides to overwrite the object.
   # Anything flushed in that window makes the comparison a claim about a version that no longer
@@ -914,6 +948,58 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     assert File.exists?(Fathom.Shard.db_path(id)), "this degenerated into a cold open"
 
     assert open_and_read(id) == Enum.to_list(1..10)
+  end
+
+  # A NEVER-FLUSHED SHARD (Jepsen round-8 herd run, 2026-10-23; option A). Its owner acked writes
+  # to the replicas and died before any object landed, so a takeover found NO object, its `nil`
+  # stamp skipped the fleet ask, and it served the shard EMPTY ("no such table") while a replica
+  # held every row. The invariant: a takeover from another holder never serves "nothing" over a
+  # replica with a stated lineage and ordinal.
+  defp build_never_flushed(id) do
+    {conn, coordinator} = build_shard(id, 10, 0)
+    ordinal = assign_ordinal!(id, coordinator)
+    install_replica(id, %{epoch: 1, wal_gen: 0, wal_ordinal: ordinal, offset: 1})
+    own_lease = :sys.get_state(coordinator).lease
+    tear_down_primary(id, conn, coordinator)
+
+    assert {:ok, nil} = Storage.object_head(id),
+           "fixture: an object exists, so this is not the never-flushed case"
+
+    # ANOTHER holder took the shard and died too: its lock, long expired, is what the open steals.
+    :ok = Storage.release_lease(id, own_lease)
+    {:ok, _} = Storage.acquire_lease(id, "other-holder#1", -60_000)
+    :ok
+  end
+
+  test "a takeover that finds no stored object promotes a replica holding the acked writes",
+       ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :replication_recover_from_peers, true)
+    build_never_flushed(id)
+
+    assert open_and_read(id) == Enum.to_list(1..10),
+           "the takeover served an empty shard over a replica holding every acked write"
+  end
+
+  # The resurrection guard: a PURGED tenant also has no object, and a peer that missed the delete
+  # may still hold its replica. A durable tombstone marker means the replica is never promoted.
+  test "a takeover that finds no object never promotes a tombstoned tenant's replica", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :replication_recover_from_peers, true)
+    build_never_flushed(id)
+
+    :ok = Storage.put_tombstone(id)
+    on_exit(fn -> File.rm(Path.join([Storage.Local.dir(), "tombstones", id])) end)
+
+    refute Fathom.Tenants.tombstoned?(id),
+           "fixture: the ETS guard would refuse before the decision"
+
+    {:ok, conn} = ShardExecutor.open(id)
+    assert {:error, _} = ShardExecutor.execute(conn, stmt("SELECT a FROM t"))
+    :ok = ShardExecutor.close(conn)
+    assert {:ok, nil} = Storage.object_head(id), "a deleted tenant's replica was published"
   end
 
   # Jepsen 2026-10-24 (`--hard`, MinIO paused): a takeover chose a replica ahead of the stored

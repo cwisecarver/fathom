@@ -153,7 +153,7 @@ defmodule Fathom.Shard.Replication.Recovery do
   Ties go to the local replica (no transfer for no gain) and are then broken by `node_key`, so two
   nodes recovering the same shard make the same choice rather than each picking a different peer.
   """
-  @spec choose(position() | nil, map() | nil, [{endpoint(), position() | nil}]) ::
+  @spec choose(position() | nil, map() | :absent | nil, [{endpoint(), position() | nil}]) ::
           :none | :local | {:pull, endpoint(), position()}
   def choose(local, object_stamp, offers) do
     ahead = Enum.filter(offers, fn {_endpoint, pos} -> Promote.fresher?(pos, object_stamp) end)
@@ -227,19 +227,25 @@ defmodule Fathom.Shard.Replication.Recovery do
       carrying an advanced position keeps the etag. Etag equality alone would call that unchanged
       and promote over a newer claim.
   """
-  @spec recheck(head(), head(), position() | nil) :: :ok | {:error, term()}
-  def recheck(before, now, replica) do
+  @spec recheck(head(), head(), position() | nil, :absent | nil) :: :ok | {:error, term()}
+  def recheck(before, now, replica, decided \\ nil) do
     cond do
       etag_of(now) != etag_of(before) ->
         {:error, {:object_moved, etag_of(before), etag_of(now)}}
 
-      not Promote.fresher?(replica, position_of(now)) ->
+      not Promote.fresher?(replica, recheck_stamp(now, decided)) ->
         {:error, {:object_advanced, position_of(now)}}
 
       true ->
         :ok
     end
   end
+
+  # A decision made against NO object (`absent_stamp/0`) stays one while the etag is unchanged: the
+  # check above already proved nothing was published in between, and the head's own `nil` position
+  # would otherwise decline every such promotion.
+  defp recheck_stamp(_now, :absent), do: :absent
+  defp recheck_stamp(now, _decided), do: position_of(now)
 
   defp etag_of(nil), do: nil
   defp etag_of(%{etag: etag}), do: etag
@@ -293,7 +299,7 @@ defmodule Fathom.Shard.Replication.Recovery do
   With no peers, or with `Q >= N` (a misconfiguration the shipping side refuses at boot), the floor
   is at most 1, which this node's own answer meets, so those cases are unchanged.
   """
-  @spec best_replica(String.t(), map() | nil, keyword()) ::
+  @spec best_replica(String.t(), map() | :absent | nil, keyword()) ::
           {:ok, position()} | :none | {:refuse, UnderQuorum.t()}
   def best_replica(shard_id, object_stamp, opts \\ []) do
     follower = Keyword.get(opts, :follower, Follower)
@@ -402,7 +408,7 @@ defmodule Fathom.Shard.Replication.Recovery do
   `N - Q + 1`, or 0 when the stored object's stamp cannot be ranked (nothing could be promoted over
   it anyway). Pure, for the test.
   """
-  @spec answers_needed([endpoint()], map() | nil, keyword()) :: number()
+  @spec answers_needed([endpoint()], map() | :absent | nil, keyword()) :: number()
   def answers_needed(peers, object_stamp, opts \\ []) do
     if rankable_stamp?(object_stamp) do
       length(peers) - Keyword.get(opts, :quorum, quorum()) + 1
@@ -414,14 +420,25 @@ defmodule Fathom.Shard.Replication.Recovery do
   # Mirrors the clauses of `Promote.fresher?/2` that refuse on the STAMP side: nil, lineage 0 and an
   # unstated ordinal answer false for every replica, so no peer's answer could matter.
   @doc """
-  Could ANY replica be promoted over an object carrying this stamp? False for `nil`, lineage 0 and
-  an unstated ordinal. Pure. `PromoteOnOpen` asks it BEFORE writing the recovery marker, so an open
+  The object stamp a takeover decides against when its open found NO stored object (Jepsen round-8
+  herd run, 2026-10-23, option A): rank `{0, 0, 0}`, so any replica with a stated lineage and
+  ordinal is ahead of it (`Promote.fresher?/2`), and the ask is held to the same `N - Q + 1`
+  responder floor as a stamped object. Only `PromoteOnOpen` produces it; see `absent_takeover?` there.
+  """
+  @spec absent_stamp() :: :absent
+  def absent_stamp, do: :absent
+
+  @doc """
+  Could ANY replica be promoted over an object carrying this stamp? True for `absent_stamp/0`.
+  False for `nil`, lineage 0 and an unstated ordinal. Pure. `PromoteOnOpen` asks it BEFORE writing the recovery marker, so an open
   that can never promote pays neither the marker fsync nor the peer ask (perf review 2026-10-14 #8(b)).
   """
   @spec rankable_stamp?(term()) :: boolean()
   def rankable_stamp?(%{epoch: e, wal_ordinal: n})
       when is_integer(e) and e > 0 and is_integer(n) and n > 0,
       do: true
+
+  def rankable_stamp?(:absent), do: true
 
   def rankable_stamp?(_stamp), do: false
 
