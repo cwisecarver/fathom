@@ -120,8 +120,11 @@
    [nil "--nemesis-interval SECS" "Seconds each fault lasts, and the gap between faults"
     :default 20
     :parse-fn parse-long]
+   ;; 60, not 30: a power-loss heal that starts near the end of the faulty phase
+   ;; can take ~25 s to restart the node, which left a shard ~11 s to write again
+   ;; and failed liveness on a fault-free fleet (Tier 0 hard2, 2026-11-03).
    [nil "--quiet-period SECS" "Fault-free seconds at the end, so reads can see what survived"
-    :default 30
+    :default 60
     :parse-fn parse-long]
    [nil "--recovery-deadline SECS" "Seconds after the heal by which every shard must write again (default: by the end of the run)"
     :parse-fn parse-long]

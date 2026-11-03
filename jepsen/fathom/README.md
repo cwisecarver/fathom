@@ -25,8 +25,9 @@ By default there is one fault at a time, on one random node, lasting `--nemesis-
 (default 20, longer than the lease TTL plus the steal margin, 15 s, so a steal can really happen).
 `--hard` instead mixes faults in shifting combinations, after Jepsen's Datomic and Bufstream
 analyses: start one, maybe pile on more 0-10 s later (up to `--max-concurrent-faults`, default 2),
-hold 3-30 s, heal everything, rest 0-15 s. The last `--quiet-period` seconds (default 30) have no
-faults. Then every key each shard touched is read back.
+hold 3-30 s, heal everything, rest 0-15 s. The last `--quiet-period` seconds (default 60) have no
+faults; a power-loss heal can take ~25 s to restart the node, and 30 s left too little time
+after it for the liveness check. Then every key each shard touched is read back.
 
 | fault | what it does |
 |---|---|
