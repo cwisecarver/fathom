@@ -273,6 +273,14 @@ defmodule Fathom.HranaAuth.Revocations do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
+  @impl true
+  def handle_cast(:evict, state) do
+    # A burst of casts at the cap collapses: once a batch has brought the table under the cap the
+    # rest are no-ops.
+    if :ets.info(@table, :size) >= max_entries(), do: evict_unrevoked()
+    {:noreply, state}
+  end
+
   # An entry is fresh if its own TTL is unexpired OR the last bulk refresh is recent (expert review
   # 2026-07-24 #5). The marker extends freshness for ENTRIES THAT ALREADY EXIST — never for an
   # absent one, which still misses and takes the full `read_through/2` including the storage union.
@@ -653,22 +661,48 @@ defmodule Fathom.HranaAuth.Revocations do
   end
 
   defp insert(shard_id, version, bumped_at, now) do
-    evict_unrevoked_at_cap()
+    request_eviction_at_cap()
     :ets.insert(@table, {shard_id, version, bumped_at, now + ttl_ms()})
   rescue
     ArgumentError -> :ok
   end
 
-  # Bound the table (perf review 2026-10-14 #23): entries were never evicted, so it grew by one row
-  # per shard ever authenticated. At the cap, drop the floor-0 (never revoked) entries in one pass —
-  # a re-read costs one cold-miss read-through, exactly as for a never-seen shard. Revoked entries
-  # (floor > 0) are kept: they are the bulk-loaded set and the stale-serve source, and are bounded
-  # by revocations, not by shard count. The 2-tuple freshness marker never matches the 4-tuple
-  # pattern. Same shape as `Fathom.Shards.KnownShards`.
-  defp evict_unrevoked_at_cap do
-    if :ets.info(@table, :size) >= max_entries() do
-      :ets.match_delete(@table, {:_, 0, :_, :_})
+  # Bound the table (perf review 2026-10-14 #23; expert review 2026-11-04 #2). The caller (a hello
+  # or the GenServer itself) does only an O(1) size check and, at the cap, a cast; the eviction runs
+  # in this GenServer (`evict_unrevoked/0`). It used to be an inline `match_delete` in the caller's
+  # process that targeted floor 0 while real rows carry floor 1 (`token_version` defaults to 1), so
+  # it deleted nothing, the table grew without bound, and every insert at the cap paid a full-table
+  # scan under the write lock. Not just "change the pattern to 1": a one-shot wipe is a node-wide
+  # wave of cold storage-floor reads, hence a bounded batch.
+  defp request_eviction_at_cap do
+    if :ets.info(@table, :size) >= max_entries(), do: GenServer.cast(__MODULE__, :evict)
+  end
+
+  @doc """
+  Evicts one bounded batch (about 1% of the cap) of UNREVOKED entries (floor `<= 1`: the default
+  `token_version` is 1, and 0 is "directory has no row"), and returns how many it deleted.
+
+  Never touches a floor above 1: a revoked floor is the stale-serve source and the revocation
+  property itself. Each delete re-checks the floor atomically (`select_delete` keyed on the shard),
+  so a row raised between the select and the delete survives. The 2-tuple freshness marker never
+  matches the 4-tuple pattern. Runs in the GenServer, never in a hello.
+  """
+  @spec evict_unrevoked() :: non_neg_integer()
+  def evict_unrevoked do
+    batch = max(div(max_entries(), 100), 1)
+    spec = [{{:"$1", :"$2", :_, :_}, [{:is_binary, :"$1"}, {:"=<", :"$2", 1}], [:"$1"]}]
+
+    case :ets.select(@table, spec, batch) do
+      {keys, _continuation} ->
+        Enum.reduce(keys, 0, fn key, acc ->
+          acc + :ets.select_delete(@table, [{{key, :"$1", :_, :_}, [{:"=<", :"$1", 1}], [true]}])
+        end)
+
+      :"$end_of_table" ->
+        0
     end
+  rescue
+    ArgumentError -> 0
   end
 
   @doc false

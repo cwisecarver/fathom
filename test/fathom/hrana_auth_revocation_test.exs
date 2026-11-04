@@ -419,24 +419,85 @@ defmodule Fathom.HranaAuthRevocationTest do
            "directory + storage reads must overlap (serial would be >= 120 ms): #{us} us"
   end
 
-  # perf review 2026-10-14 #23: the cache never evicted. At the cap only never-revoked (floor 0)
-  # entries are dropped; a revoked floor must survive (it is the stale-serve source).
-  test "the table is bounded: at the cap floor-0 entries are evicted, revoked floors are kept" do
-    prev = Application.get_env(:fathom, :hrana_revocation_max_entries)
-    Application.put_env(:fathom, :hrana_revocation_max_entries, :ets.info(Revocations, :size) + 5)
+  # perf review 2026-10-14 #23 / expert review 2026-11-04 #2. The cap never evicted real rows: the
+  # old pattern targeted floor 0 while a real, never-revoked shard carries floor 1 (token_version
+  # defaults to 1), so the table grew without bound and every insert at the cap ran a full-table
+  # scan in the hello process. Eviction is now a bounded batch of floor <= 1 rows, run in the
+  # Revocations GenServer. (The old fixture used floor-0 rows, which is why it never caught this.)
+  describe "cap eviction (2026-11-04 #2)" do
+    setup do
+      prev = Application.get_env(:fathom, :hrana_revocation_max_entries)
 
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :hrana_revocation_max_entries, prev),
-        else: Application.delete_env(:fathom, :hrana_revocation_max_entries)
-    end)
+      Application.put_env(
+        :fathom,
+        :hrana_revocation_max_entries,
+        :ets.info(Revocations, :size) + 200
+      )
 
-    revoked = uniq()
-    Revocations.put(revoked, 4)
-    for _ <- 1..20, do: Revocations.put(uniq(), 0)
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:fathom, :hrana_revocation_max_entries, prev),
+          else: Application.delete_env(:fathom, :hrana_revocation_max_entries)
+      end)
 
-    assert :ets.info(Revocations, :size) <= Revocations.max_entries() + 1
-    assert [{^revoked, 4, _, _}] = :ets.lookup(Revocations, revoked)
+      :ok
+    end
+
+    defp settle, do: :sys.get_state(Revocations)
+
+    test "the table stays bounded at the cap with realistic floor-1 rows" do
+      cap = Revocations.max_entries()
+      for _ <- 1..(cap * 2), do: Revocations.put(uniq(), 1)
+      settle()
+
+      assert :ets.info(Revocations, :size) <= cap,
+             "floor-1 rows were never evicted: size #{:ets.info(Revocations, :size)} > cap #{cap}"
+    end
+
+    test "a revoked floor (> 1) survives eviction pressure" do
+      cap = Revocations.max_entries()
+      revoked = uniq()
+      Revocations.put(revoked, 2)
+      for _ <- 1..(cap * 3), do: Revocations.put(uniq(), 1)
+      settle()
+      Revocations.evict_unrevoked()
+
+      assert [{^revoked, 2, _, _}] = :ets.lookup(Revocations, revoked)
+    end
+
+    test "evict_unrevoked/0 deletes only floor <= 1 rows, a bounded batch at a time" do
+      cap = Revocations.max_entries()
+      revoked = for _ <- 1..5, do: uniq()
+      for r <- revoked, do: :ets.insert(Revocations, {r, 3, nil, 0})
+      for _ <- 1..(cap * 2), do: :ets.insert(Revocations, {uniq(), 1, nil, 0})
+
+      before = :ets.info(Revocations, :size)
+      deleted = Revocations.evict_unrevoked()
+
+      assert deleted > 0
+      assert deleted <= max(div(cap, 100), 1), "one call must be a bounded batch, not a wipe"
+      assert :ets.info(Revocations, :size) == before - deleted
+      for r <- revoked, do: assert([{^r, 3, nil, 0}] = :ets.lookup(Revocations, r))
+    end
+
+    # The caller path must do no O(n) work at the cap. With the GenServer suspended, an insert at
+    # the cap returns with the table over the cap (nothing evicted inline); the batch only runs once
+    # the GenServer is allowed to.
+    test "an insert at the cap does not evict in the caller; the GenServer does" do
+      cap = Revocations.max_entries()
+      pid = Process.whereis(Revocations)
+      :erlang.suspend_process(pid)
+
+      try do
+        for _ <- 1..(cap + 10), do: Revocations.put(uniq(), 1)
+        assert :ets.info(Revocations, :size) > cap, "the caller evicted inline"
+      after
+        :erlang.resume_process(pid)
+      end
+
+      settle()
+      assert :ets.info(Revocations, :size) <= cap
+    end
   end
 
   # Expert review 2026-07-24 #5. The per-shard TTL read-through scaled with SHARD COUNT rather than
