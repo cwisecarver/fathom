@@ -90,6 +90,8 @@ defmodule Fathom.Shard do
   # Spread each flush timer by ±25% (expert review #17) so a mass re-home's phase-aligned timers
   # drift apart instead of firing N snapshots + PUTs in lockstep every interval. 0 disables.
   @default_flush_jitter_ratio 0.25
+  @default_flush_deadline_ms 600_000
+
   # Short retry after the node-wide flush cap (Fathom.Shard.FlushGate) refused a slot (#17); the
   # shard stayed dirty, so it just re-attempts soon rather than waiting a full interval.
   @default_flush_backoff_ms 250
@@ -1172,6 +1174,10 @@ defmodule Fathom.Shard do
         # #17): true only when the node-wide concurrent-flush cap is enabled and we acquired. The
         # slot is released at every site that clears flush_task (completion, crash, terminate).
         flush_slot_held: false,
+        # Timer for the coordinator-side flush deadline (expert review 2026-11-04 #3); cancelled
+        # wherever the slot is released, so a finished flush leaves no timer behind to wake a
+        # hibernated coordinator.
+        flush_deadline_timer: nil,
         flush_pending: nil,
         flush_pending_gen: nil,
         # Callers of a synchronous force-flush (`:flush_now`, the flush-before-fork primitive):
@@ -2056,6 +2062,43 @@ defmodule Fathom.Shard do
     {:noreply, settle_flushed_and_reschedule(state)}
   end
 
+  # THE FLUSH DEADLINE (expert review 2026-11-04 #3, carried 2026-10-29 #25). A PUT whose body
+  # stalls (a peer that stops reading) parked the flush task for the kernel's ~15 min, holding a
+  # node-wide FlushGate slot and this shard's only flush; `FlushGate.sweep/0` frees only DEAD
+  # holders. Kill the task, give the slot back, and treat it as a failed flush: the shard stays
+  # dirty (never marked clean on a timed-out PUT) and retries on the failure backoff. Fence
+  # semantics are untouched: if the killed PUT did land, our cached etag is now stale, so the next
+  # flush 412s and goes through the existing reconcile path, which only accepts the object as ours
+  # on an etag match. A stale message (the task already settled) matches no `flush_task` ref.
+  def handle_info({:flush_deadline, ref}, %{flush_task: %Task{ref: ref} = task} = state) do
+    Task.shutdown(task, :brutal_kill)
+
+    Logger.warning(
+      "shard #{state.id}: durability flush exceeded #{flush_deadline_ms()} ms; killed it to free its slot"
+    )
+
+    :telemetry.execute([:fathom, :shard, :flush, :deadline], %{count: 1}, %{shard_id: state.id})
+
+    state =
+      release_flush_slot(
+        record_flush_failure(%{state | flush_task: nil}, {:flush_deadline, flush_deadline_ms()})
+      )
+
+    # A killed flush is a TRANSIENT failure: retry on the short doubling backoff, not a whole
+    # interval (the crash handler above keeps the interval; this one is a store fault by design).
+    before = state.flush_rekicks
+    settled = settle_waiters(state, :flushed)
+
+    settled =
+      if settled.flush_rekicks > before,
+        do: settled,
+        else: schedule_flush_after_failure(settled, {:flush_deadline, flush_deadline_ms()})
+
+    {:noreply, settled}
+  end
+
+  def handle_info({:flush_deadline, _ref}, state), do: {:noreply, state}
+
   # An eviction close finished (expert review 2026-10-20 #22; see start_side_close/2).
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{side_closes: sc} = state)
       when is_map_key(sc, ref),
@@ -2604,6 +2647,8 @@ defmodule Fathom.Shard do
              %{
                state
                | flush_task: task,
+                 flush_deadline_timer:
+                   Process.send_after(self(), {:flush_deadline, task.ref}, flush_deadline_ms()),
                  flush_slot_held: gate == :ok,
                  flush_pending: flushed_to,
                  flush_pending_gen: pending_gen
@@ -6259,12 +6304,29 @@ defmodule Fathom.Shard do
   # every site that clears flush_task — completion, task crash, and terminate — so the node-wide
   # counter tracks live flush tasks. A no-op when no slot was held (cap disabled, or we didn't
   # acquire), so it's safe to call unconditionally on each of those paths.
-  defp release_flush_slot(%{flush_slot_held: true} = state) do
-    FlushGate.release()
-    %{state | flush_slot_held: false}
+  defp release_flush_slot(state) do
+    state = cancel_flush_deadline(state)
+
+    if Map.get(state, :flush_slot_held) do
+      FlushGate.release()
+      %{state | flush_slot_held: false}
+    else
+      state
+    end
   end
 
-  defp release_flush_slot(state), do: state
+  defp cancel_flush_deadline(%{flush_deadline_timer: timer} = state) when timer != nil do
+    _ = Process.cancel_timer(timer)
+    %{state | flush_deadline_timer: nil}
+  end
+
+  defp cancel_flush_deadline(state), do: state
+
+  # Upper bound on one flush task (fence + VACUUM INTO + PUT). A backstop only: the S3 pool's
+  # `send_timeout` ends a stalled body in 30 s, so this has to outlast a legitimately slow
+  # multi-GiB upload and fire only on a hang the transport missed.
+  defp flush_deadline_ms,
+    do: Application.get_env(:fathom, :shard_flush_deadline_ms, @default_flush_deadline_ms)
 
   # A transactionally-consistent copy of the live shard, safe to run while writers
   # are active (unlike a raw file copy). `VACUUM INTO` requires a string literal

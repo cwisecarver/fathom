@@ -300,6 +300,16 @@ defmodule Fathom.Test.FaultyStorage do
         _ = Local.flush(shard_id, local_path, expected_etag, position, lineage, opts)
         {:error, :s3_unreachable}
 
+      # THE STALLED PUT (expert review 2026-11-04 #3): the body never finishes, so the call never
+      # returns. `:flush_lands_then_hangs` is the worse variant: the object advances server-side,
+      # then the caller waits forever for a response that never comes.
+      fault() == :flush_hangs ->
+        Process.sleep(:infinity)
+
+      fault() == :flush_lands_then_hangs ->
+        _ = Local.flush(shard_id, local_path, expected_etag, position, lineage, opts)
+        Process.sleep(:infinity)
+
       true ->
         Local.flush(shard_id, local_path, expected_etag, position, lineage, opts)
     end

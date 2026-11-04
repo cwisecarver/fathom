@@ -837,6 +837,11 @@ defmodule Fathom.Telemetry do
         description:
           "Durability-flush failures (#27) — a persistent rate means flushes aren't landing and the RPO is growing silently (S3 auth / bucket-policy / reachability). The direct flush-failure signal behind the rising oldest-unflushed-age gauge"
       ),
+      counter("fathom.shard.flush.deadline.count",
+        event_name: [:fathom, :shard, :flush, :deadline],
+        description:
+          "Durability flushes killed for outliving :shard_flush_deadline_ms (expert review 2026-11-04 #3) — a stalled S3 PUT that would otherwise hold a FlushGate slot; any sustained rate means the store is hanging requests rather than failing them"
+      ),
       # #5: the drain window each coordinator was given by drain_all/1. A distribution whose
       # minimum is 0 means shards behind a busy one were handed no window at all — hard-cutting
       # their streams instead of letting them finish, which is what the node drain exists to avoid.

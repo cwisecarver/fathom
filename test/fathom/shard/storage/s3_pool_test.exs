@@ -18,6 +18,17 @@ defmodule Fathom.Shard.Storage.S3PoolTest do
     assert opts[:pools][:default][:count] == 1
   end
 
+  # Expert review 2026-11-04 #3: a peer that stops reading mid-body parked the flush PUT until the
+  # kernel gave up (~15 min) because the socket's send_timeout defaults to :infinity. The pool's
+  # transport opts must carry a finite send_timeout that closes the socket on expiry. (A raw-socket
+  # probe of the blocking behaviour is platform-dependent: macOS loopback buffers absorb 64 MiB.)
+  test "the pool bounds a blocked send (finite send_timeout that closes the socket)" do
+    {Finch, opts} = S3.finch_child_spec()
+    topts = opts[:pools][:default][:conn_opts][:transport_opts]
+    assert is_integer(topts[:send_timeout]) and topts[:send_timeout] > 0
+    assert topts[:send_timeout_close] == true
+  end
+
   test "pool size and count are configurable via :pool_size / :pool_count" do
     prev = Application.get_env(:fathom, S3, [])
     on_exit(fn -> Application.put_env(:fathom, S3, prev) end)

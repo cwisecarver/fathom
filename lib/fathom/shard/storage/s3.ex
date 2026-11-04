@@ -62,6 +62,7 @@ defmodule Fathom.Shard.Storage.S3 do
   # (expert review 2026-07-24 #14).
   @default_conn_max_idle_time :timer.seconds(15)
   @default_connect_timeout 3_000
+  @default_send_timeout 30_000
 
   # Streaming transfer tuning (expert review #20): bodies are streamed in chunks in
   # both directions instead of materialized whole in the BEAM, and a single PUT is
@@ -148,7 +149,20 @@ defmodule Fathom.Shard.Storage.S3 do
          # the same discipline as the LB's `keepalive_timeout` vs Bandit's idle close.
          conn_max_idle_time: conn_max_idle_time(),
          # A hung connect otherwise sits for Finch's default before anything reacts.
-         conn_opts: [transport_opts: [timeout: connect_timeout()]]
+         #
+         # `send_timeout` (expert review 2026-11-04 #3): the socket default is :infinity, so a peer
+         # that stops reading mid-body parked the flush PUT until the kernel gave up (~15 min),
+         # holding a FlushGate slot. `send_timeout_close` closes the socket on expiry so the
+         # blocked send returns an error instead of leaving the connection wedged. It is a
+         # no-PROGRESS bound (per blocked send), so it never cuts a slow-but-moving large upload;
+         # the coordinator's `:shard_flush_deadline_ms` is the backstop.
+         conn_opts: [
+           transport_opts: [
+             timeout: connect_timeout(),
+             send_timeout: send_timeout(),
+             send_timeout_close: true
+           ]
+         ]
        ]
      }}
   end
@@ -157,6 +171,7 @@ defmodule Fathom.Shard.Storage.S3 do
   defp pool_count, do: config()[:pool_count] || @default_pool_count
   defp conn_max_idle_time, do: config()[:conn_max_idle_time] || @default_conn_max_idle_time
   defp connect_timeout, do: config()[:connect_timeout] || @default_connect_timeout
+  defp send_timeout, do: config()[:send_timeout] || @default_send_timeout
 
   @doc """
   Boot-time self-test that the configured store **enforces** HTTP conditional writes
