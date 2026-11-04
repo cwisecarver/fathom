@@ -79,13 +79,17 @@ defmodule Fathom.Shard.StampLaneTest do
       send(other, :done)
     end
 
-    test "is off when the main gate is unbounded, and when configured off" do
+    test "main gate unbounded: disabled; lane configured off: the MAIN gate still caps it" do
       Application.put_env(:fathom, :shard_flush_max_concurrency, 0)
       assert :disabled = FlushGate.try_acquire_stamp()
 
+      # Review of 6065bfcc: a lane configured off used to return :disabled, running stamp flushes
+      # UNCAPPED under a set main cap. It must defer to the main gate.
       Application.put_env(:fathom, :shard_flush_max_concurrency, 1)
       Application.put_env(:fathom, :shard_stamp_flush_max_concurrency, 0)
-      assert :disabled = FlushGate.try_acquire_stamp()
+      assert FlushGate.stamp_cap() == nil
+      assert :ok = FlushGate.try_acquire()
+      assert :full = FlushGate.try_acquire_stamp(), "lane off must not bypass a full main gate"
     end
 
     test "sweep reclaims a stamp slot whose holder died" do
@@ -223,6 +227,69 @@ defmodule Fathom.Shard.StampLaneTest do
         assert FlushGate.stamp_in_flight() == 0, "the stamp slot was not released"
         :ok = ShardExecutor.close(conn)
       end
+    end
+
+    # Review of 6065bfcc: the refusal retry was a fixed ~250 ms with no growth, so thousands of new
+    # shards against a small lane meant tens of thousands of wakeups/s. It now doubles (capped at
+    # 2 s). `stamp_refusals` counts the refusals one shard took: over 3 s a fixed 250 ms retry takes
+    # ~12, the doubling one (250+500+1000+2000) at most 5.
+    test "a refused first-write stamp backs off (bounded wakeups, not a fixed 250 ms)",
+         %{id: id, root: root} do
+      set_mode!(:legacy)
+      Application.put_env(:fathom, :shard_stamp_flush_max_concurrency, 1)
+      followers = replicating!(root)
+      assert :ok = FlushGate.try_acquire_stamp()
+
+      {:ok, conn} = ShardExecutor.open(id)
+      {:ok, pid} = Shards.ensure(id)
+      for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
+      {:ok, _} = run(conn, "CREATE TABLE kv (v TEXT)")
+      {:ok, _} = run(conn, "INSERT INTO kv VALUES ('acked')")
+
+      receive do
+      after
+        3_000 -> :ok
+      end
+
+      refusals = :sys.get_state(pid).stamp_refusals
+      assert refusals >= 2, "fixture: the stamp flush was never refused (#{refusals})"
+
+      assert refusals <= 6,
+             "the refused stamp flush is probing at a fixed rate (#{refusals} in 3 s)"
+
+      assert {:ok, nil} = Storage.object_head(id)
+
+      FlushGate.release_stamp()
+      :ok = ShardExecutor.close(conn)
+    end
+
+    # A flush of an EXISTING object (stamp_on_open's re-stamp, or any later periodic flush) must use
+    # the MAIN gate: it can be a multi-GiB upload and must not fill the lane that first-write
+    # stamps depend on.
+    test "a flush of an existing object takes the main gate, never the stamp lane",
+         %{id: id, root: root} do
+      set_mode!(:legacy)
+      followers = replicating!(root)
+      {:ok, conn} = ShardExecutor.open(id)
+      {:ok, pid} = Shards.ensure(id)
+      for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
+      {:ok, _} = run(conn, "CREATE TABLE kv (v TEXT)")
+      {:ok, _} = run(conn, "INSERT INTO kv VALUES ('first')")
+      assert %{} = await_object(id, 150)
+      _ = :sys.get_state(pid)
+      assert :sys.get_state(pid).etag != nil
+
+      {:ok, e0} = Storage.object_etag(id)
+      assert :ok = FlushGate.try_acquire()
+      before = FlushGate.refusals()
+      {:ok, _} = run(conn, "INSERT INTO kv VALUES ('second')")
+      send(pid, :durability_flush)
+      _ = :sys.get_state(pid)
+
+      assert FlushGate.refusals() > before, "the flush did not go through the main gate"
+      assert FlushGate.stamp_in_flight() == 0
+      assert {:ok, ^e0} = Storage.object_etag(id)
+      :ok = ShardExecutor.close(conn)
     end
   end
 end

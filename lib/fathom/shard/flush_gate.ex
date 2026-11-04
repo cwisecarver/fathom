@@ -244,8 +244,10 @@ defmodule Fathom.Shard.FlushGate do
           :full
         end
 
+      # Lane configured off: never an UNCAPPED path -- the main gate decides (and its slot is
+      # released with `release/0`; callers route on `stamp_cap/0`). Both off => :disabled.
       _ ->
-        :disabled
+        try_acquire()
     end
   rescue
     ArgumentError -> :disabled
