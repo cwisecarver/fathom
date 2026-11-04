@@ -837,6 +837,12 @@ defmodule Fathom.Telemetry do
         description:
           "Durability-flush failures (#27) — a persistent rate means flushes aren't landing and the RPO is growing silently (S3 auth / bucket-policy / reachability). The direct flush-failure signal behind the rising oldest-unflushed-age gauge"
       ),
+      counter("fathom.shards.checkout.retry.count",
+        event_name: [:fathom, :shards, :checkout, :retry],
+        tags: [:reason],
+        description:
+          "Checkouts that lost a race with the coordinator lifecycle and re-resolved (expert review 2026-11-04 #10), by reason: normal = landed while the coordinator was stopping (waited out its drop flush, then cold-reopened), unavailable = dead pid lingering in the Registry. Watch-only; decides whether an idle-stop collision fix is worth building"
+      ),
       counter("fathom.shard.flush.deadline.count",
         event_name: [:fathom, :shard, :flush, :deadline],
         description:

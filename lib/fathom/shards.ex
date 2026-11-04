@@ -190,6 +190,7 @@ defmodule Fathom.Shards do
       # (rare) race path sleeps; the happy path is untouched.
       {:error, reason} when attempts > 1 ->
         if retry_checkout?(reason) do
+          note_checkout_retry(reason)
           Process.sleep(1)
           do_checkout(shard_id, attempts - 1, held, scope)
         else
@@ -423,6 +424,19 @@ defmodule Fathom.Shards do
   #     coordinator processed the stop first and the pending `GenServer.call` exited `:normal`.
   #     Idle stops are routine at scale, so without this a steady trickle of checkouts a 1 ms
   #     retry would have fixed surfaced as spurious `{:error, :normal}` to the client.
+
+  # Watch-only counter (expert review 2026-11-04 #10): how often a checkout lost a race with the
+  # coordinator's lifecycle and had to re-resolve. `:normal` is a checkout that landed while the
+  # coordinator was stopping (idle-stop, drain), so it waited out the stop's whole drop flush and
+  # then cold-reopens; `:unavailable` is a dead pid lingering in the Registry. Read it on the
+  # `tpc-churn` arm to decide whether the idle-stop collision is worth any behaviour change. Only
+  # the (rare) retry path emits; the happy path is untouched. Bounded `reason` tag, no shard id.
+  @doc false
+  @spec note_checkout_retry(:unavailable | :normal) :: :ok
+  def note_checkout_retry(reason) do
+    :telemetry.execute([:fathom, :shards, :checkout, :retry], %{count: 1}, %{reason: reason})
+  end
+
   @doc false
   @spec retry_checkout?(term()) :: boolean()
   def retry_checkout?(reason), do: reason in [:unavailable, :normal]
