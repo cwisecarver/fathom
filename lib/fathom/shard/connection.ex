@@ -1138,6 +1138,10 @@ defmodule Fathom.Shard.Connection do
   When the statement also returns columns, `sqlite3_changes()` is not fetched (a dirty-NIF
   dispatch) and `num_changes` is reported as 0; the caller must not need the inherited count.
 
+  `tag_blobs: true` returns each BLOB cell as `{:blob, binary}` (TEXT stays a bare binary) when the
+  carried exqlite patch is present; only the tenant query path (`ShardExecutor`) opts in, so
+  migration copy, snapshots and Capture keep bare binaries.
+
   `control?: true` is the caller's promise that the statement is transaction control (BEGIN /
   COMMIT / END / ROLLBACK / SAVEPOINT / RELEASE): `num_changes` is reported as 0 and no rowid
   without fetching either (expert review 2026-10-20-2027 #1).
@@ -1156,6 +1160,8 @@ defmodule Fathom.Shard.Connection do
     read? = Keyword.get(opts, :read?, false)
     control? = Keyword.get(opts, :control?, false)
     state? = Keyword.get(opts, :conn_state?, false)
+    # Opt-in (tenant query path only): hand BLOB cells back as `{:blob, bin}`, see `multi_step/3`.
+    tag? = Keyword.get(opts, :tag_blobs, false) and tagged_reads?()
 
     # Statement deadline (expert review 2026-07-14 #26): when `:query_timeout_ms` is set, a runaway
     # query (missing-index full scan) is interrupted so it can't pin memory and keep the shard busy
@@ -1178,15 +1184,15 @@ defmodule Fathom.Shard.Connection do
     result =
       case Keyword.get(opts, :deadline, false) && timeout_ms() do
         falsy when falsy in [nil, false] ->
-          do_query(conn, sql, args, dml?, read?, control?, state?, nil)
+          do_query(conn, sql, args, dml?, read?, control?, state?, nil, tag?)
 
         ms when is_integer(ms) and ms > 0 ->
           with_deadline(conn, ms, fn deadline_at ->
-            do_query(conn, sql, args, dml?, read?, control?, state?, deadline_at)
+            do_query(conn, sql, args, dml?, read?, control?, state?, deadline_at, tag?)
           end)
 
         _ ->
-          do_query(conn, sql, args, dml?, read?, control?, state?, nil)
+          do_query(conn, sql, args, dml?, read?, control?, state?, nil, tag?)
       end
 
     # Busy-queue handoff (expert review 2026-10-20-2027 #13, see `busy_wait/6`). A read-verb
@@ -1201,7 +1207,7 @@ defmodule Fathom.Shard.Connection do
     busy_ungate()
   end
 
-  defp do_query(conn, sql, args, dml?, read?, control?, state?, deadline_at) do
+  defp do_query(conn, sql, args, dml?, read?, control?, state?, deadline_at, tag?) do
     # A 4-tuple with a plain pattern, not a 3-tuple plus a guard. A `with` whose pattern carries a
     # guard lets the unmatched value fall through as the function's return, which dialyzer caught
     # as `{:ok, _, _} | {:refresh, reference(), [any()]}` escaping `query/4`'s spec.
@@ -1225,7 +1231,7 @@ defmodule Fathom.Shard.Connection do
       try do
         with :ok <- bind_args(stmt, args),
              {:ok, rows, row_count} <-
-               reset_if_abandoned(stmt, step_all(conn, stmt, row_cap(), deadline_at)) do
+               reset_if_abandoned(stmt, step_all(conn, stmt, row_cap(), deadline_at, tag?)) do
           # Post-step column read when the schema moved under this connection (expert review
           # 2026-08-26 #7). Only on the `:refresh` path — a DDL happened somewhere since this
           # statement was cached — so the ordinary hit pays nothing. See `cached_stmt/2` for why
@@ -1365,14 +1371,14 @@ defmodule Fathom.Shard.Connection do
   # exqlite's message for a `prepare` the busy handler gave up on (SQLITE_BUSY).
   @locked "database is locked"
 
-  defp step_all(conn, stmt, cap, deadline_at) do
-    case collect(conn, stmt, cap) do
-      :busy_before_rows -> retry_busy(conn, stmt, cap, deadline_at)
+  defp step_all(conn, stmt, cap, deadline_at, tag?) do
+    case collect(conn, stmt, cap, tag?) do
+      :busy_before_rows -> retry_busy(conn, stmt, cap, deadline_at, tag?)
       other -> other
     end
   end
 
-  defp retry_busy(conn, stmt, cap, deadline_at) do
+  defp retry_busy(conn, stmt, cap, deadline_at, tag?) do
     with {:ok, budget_ms} when budget_ms > 0 <- busy_retry_budget_ms(conn) do
       # `busy_wait/6` serves both the step and the prepare retry, so dialyzer's success typing for
       # it is the union of both; the match narrows it back to what `collect/3` returns.
@@ -1380,7 +1386,7 @@ defmodule Fathom.Shard.Connection do
              conn,
              :step,
              give_up_at(budget_ms, deadline_at),
-             fn -> collect(conn, stmt, cap) end,
+             fn -> collect(conn, stmt, cap, tag?) end,
              &(&1 == :busy_before_rows),
              {:error, :busy}
            ) do
@@ -2933,14 +2939,14 @@ defmodule Fathom.Shard.Connection do
   # materialize in BEAM memory (a `SELECT *` on a large table, expert review 2026-07-14 #26),
   # erroring instead of OOMing the node. Checked on EVERY batch including the final one, so
   # enforcement is exact regardless of @multi_step_chunk.
-  defp collect(conn, stmt, cap, count \\ 0, batches \\ []) do
-    case Sqlite3.multi_step(conn, stmt, @multi_step_chunk) do
+  defp collect(conn, stmt, cap, tag?, count \\ 0, batches \\ []) do
+    case multi_step(conn, stmt, tag?) do
       {:rows, rows} ->
         count = count + length(rows)
 
         if is_integer(cap) and count > cap,
           do: {:error, {:too_many_rows, cap}},
-          else: collect(conn, stmt, cap, count, [rows | batches])
+          else: collect(conn, stmt, cap, tag?, count, [rows | batches])
 
       {:done, rows} ->
         count = count + length(rows)
@@ -2955,6 +2961,43 @@ defmodule Fathom.Shard.Connection do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  # Tenant reads tag BLOB cells as `{:blob, bin}` (expert review 2026-11-04 #1). exqlite returns a
+  # bare binary for BOTH BLOB and TEXT, so downstream (Filo) had to guess with `String.valid?`, and
+  # a BLOB holding valid UTF-8 (ASCII, JSON, empty) went out as Hrana `text`. Needs the carried
+  # exqlite patch (native/exqlite_patch/); where it is absent `tagged_reads?/0` is false and this
+  # is the plain `multi_step`, i.e. the old behaviour. Filo already encodes `{:blob, bin}`.
+  defp multi_step(conn, stmt, true) do
+    fun = :multi_step_tagged
+    apply(Sqlite3, fun, [conn, stmt, @multi_step_chunk])
+  end
+
+  defp multi_step(conn, stmt, false), do: Sqlite3.multi_step(conn, stmt, @multi_step_chunk)
+
+  @doc false
+  @spec tagged_reads?() :: boolean()
+  def tagged_reads? do
+    case :persistent_term.get({__MODULE__, :tagged_reads}, nil) do
+      nil ->
+        # The Elixir stub can exist while the NIF library is the stock precompiled one (then
+        # calling it raises :not_loaded), so probe the NIF itself with arguments it rejects.
+        fun = :multi_step_tagged
+
+        loaded? =
+          try do
+            {:error, _} = apply(Exqlite.Sqlite3NIF, fun, [nil, nil, 1])
+            true
+          rescue
+            _ -> false
+          end
+
+        :persistent_term.put({__MODULE__, :tagged_reads}, loaded?)
+        loaded?
+
+      loaded? ->
+        loaded?
     end
   end
 

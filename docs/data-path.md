@@ -78,6 +78,14 @@ toward marking dirty — an extra flush, never lost data.)
 
 ## Known limitation — a short, all-ASCII BLOB comes back typed as text
 
+> **Fixed where the carried exqlite patch is built in** (expert review 2026-11-04 #1). The patch
+> (`native/exqlite_patch/`, applied by `scripts/apply_exqlite_patch.sh`, built with
+> `FATHOM_EXQLITE_PATCHED=1`) adds `Exqlite.Sqlite3.multi_step_tagged/3`, which returns BLOB cells
+> as `{:blob, bin}`; the tenant query path (`ShardExecutor`, `Connection.query(..., tag_blobs: true)`)
+> uses it and Filo already encodes `{:blob, bin}` as a Hrana blob (JSON and protobuf). Every other
+> reader (migration copy, snapshots, Capture) keeps bare binaries. With the stock precompiled
+> exqlite NIF the limitation below still applies (`Connection.tagged_reads?/0` is false).
+
 SQLite distinguishes the storage classes `text` and `blob`. Fathom cannot always preserve that
 distinction across the wire, and the cause is below fathom: `exqlite`'s `make_cell`
 (`c_src/sqlite3_nif.c`) reads `sqlite3_column_type`, then returns a plain Elixir binary for

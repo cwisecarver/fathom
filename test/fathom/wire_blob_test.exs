@@ -74,6 +74,9 @@ defmodule Fathom.WireBlobTest do
     :ok = HranaClient.close(c)
   end
 
+  # FIXED when the carried exqlite patch is built in (see below and `native/exqlite_patch/`);
+  # the rest of this comment describes the unpatched behaviour.
+  #
   # CHARACTERIZATION, not approval. The storage class does not survive the wire, and the cause is
   # below fathom: `deps/exqlite/c_src/sqlite3_nif.c` reads `sqlite3_column_type` and then returns
   # `make_binary` for BOTH `SQLITE_BLOB` and `SQLITE_TEXT`, so the class is discarded in the NIF
@@ -108,7 +111,16 @@ defmodule Fathom.WireBlobTest do
     # gets a String where it stored bytes. The second is not valid UTF-8, so the guess lands on
     # blob and happens to be right.
     assert [[wrong], [right]] = res.rows
-    assert wrong == "text-as-blob", "blob with UTF-8 bytes is currently returned as text"
     assert right == {:blob, <<0xFF, 0xFE, 0xFD>>}
+
+    # Expert review 2026-11-04 #1: with the carried exqlite patch (tenant reads tag BLOB cells)
+    # this used to assert the OPPOSITE (`wrong == "text-as-blob"`, pinning the defect) and now
+    # asserts the fix. An unpatched exqlite keeps the characterization.
+    if Connection.tagged_reads?() do
+      assert wrong == {:blob, "text-as-blob"}, "a BLOB must go out as a Hrana blob"
+    else
+      assert wrong == "text-as-blob",
+             "unpatched exqlite: blob with UTF-8 bytes comes back as text"
+    end
   end
 end

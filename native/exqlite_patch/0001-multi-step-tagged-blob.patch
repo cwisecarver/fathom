@@ -1,0 +1,170 @@
+--- a/c_src/sqlite3_nif.c
++++ b/c_src/sqlite3_nif.c
+@@ -19,6 +19,7 @@
+ static ERL_NIF_TERM am_out_of_memory;
+ static ERL_NIF_TERM am_done;
+ static ERL_NIF_TERM am_row;
++static ERL_NIF_TERM am_blob;
+ static ERL_NIF_TERM am_rows;
+ static ERL_NIF_TERM am_invalid_filename;
+ static ERL_NIF_TERM am_invalid_flags;
+@@ -243,8 +244,12 @@
+     return enif_raise_exception(env, badarg);
+ }
+ 
++// When `tag_blobs` is set, a SQLITE_BLOB cell is returned as `{:blob, binary}`
++// instead of a bare binary, so a caller can tell BLOB from TEXT (both are
++// otherwise plain binaries, and a BLOB holding valid UTF-8 is indistinguishable
++// from TEXT).
+ static ERL_NIF_TERM
+-make_cell(ErlNifEnv* env, sqlite3_stmt* statement, unsigned int i)
++make_cell(ErlNifEnv* env, sqlite3_stmt* statement, unsigned int i, int tag_blobs)
+ {
+     switch (sqlite3_column_type(statement, i)) {
+         case SQLITE_INTEGER:
+@@ -256,11 +261,13 @@
+         case SQLITE_NULL:
+             return am_nil;
+ 
+-        case SQLITE_BLOB:
+-            return make_binary(
++        case SQLITE_BLOB: {
++            ERL_NIF_TERM blob = make_binary(
+               env,
+               sqlite3_column_blob(statement, i),
+               sqlite3_column_bytes(statement, i));
++            return tag_blobs ? enif_make_tuple2(env, am_blob, blob) : blob;
++        }
+ 
+         case SQLITE_TEXT:
+             return make_binary(
+@@ -274,7 +281,7 @@
+ }
+ 
+ static ERL_NIF_TERM
+-make_row(ErlNifEnv* env, sqlite3_stmt* statement)
++make_row(ErlNifEnv* env, sqlite3_stmt* statement, int tag_blobs)
+ {
+     assert(env);
+     assert(statement);
+@@ -289,7 +296,7 @@
+     }
+ 
+     for (unsigned int i = 0; i < count; i++) {
+-        columns[i] = make_cell(env, statement, i);
++        columns[i] = make_cell(env, statement, i, tag_blobs);
+     }
+ 
+     row = enif_make_list_from_array(env, columns, count);
+@@ -1061,8 +1068,8 @@
+ /// This is to reduce the back and forth between the BEAM and sqlite in
+ /// fetching data. Without using this, throughput can suffer.
+ ///
+-ERL_NIF_TERM
+-exqlite_multi_step(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
++static ERL_NIF_TERM
++multi_step_impl(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[], int tag_blobs)
+ {
+     assert(env);
+ 
+@@ -1126,7 +1133,7 @@
+                 return enif_make_tuple2(env, am_done, rows);
+ 
+             case SQLITE_ROW:
+-                row  = make_row(env, statement->statement);
++                row  = make_row(env, statement->statement, tag_blobs);
+                 rows = enif_make_list_cell(env, row, rows);
+                 break;
+ 
+@@ -1147,7 +1154,23 @@
+     return enif_make_tuple2(env, am_rows, rows);
+ }
+ 
++ERL_NIF_TERM
++exqlite_multi_step(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
++{
++    return multi_step_impl(env, argc, argv, 0);
++}
++
+ ///
++/// Same as multi_step, but a BLOB cell is returned as `{:blob, binary}` so the
++/// caller can tell it from TEXT.
++///
++ERL_NIF_TERM
++exqlite_multi_step_tagged(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
++{
++    return multi_step_impl(env, argc, argv, 1);
++}
++
++///
+ /// Invokes one step on the SQLite prepared statement's results. If multiple
+ /// steps are being taken, throughput may suffer, but this does allow for
+ /// better interleaved calls to a NIF and letting the VM do more bookkeeping
+@@ -1189,7 +1212,7 @@
+     int rc = sqlite3_step(statement->statement);
+     switch (rc) {
+         case SQLITE_ROW:
+-            result = enif_make_tuple2(env, am_row, make_row(env, statement->statement));
++            result = enif_make_tuple2(env, am_row, make_row(env, statement->statement, 0));
+             connection_clear_caller(conn);
+             connection_release_lock(conn);
+             return result;
+@@ -1648,6 +1671,7 @@
+     am_out_of_memory                       = enif_make_atom(env, "out_of_memory");
+     am_done                                = enif_make_atom(env, "done");
+     am_row                                 = enif_make_atom(env, "row");
++    am_blob                                = enif_make_atom(env, "blob");
+     am_rows                                = enif_make_atom(env, "rows");
+     am_invalid_filename                    = enif_make_atom(env, "invalid_filename");
+     am_invalid_flags                       = enif_make_atom(env, "invalid_flags");
+@@ -2318,6 +2342,7 @@
+   {"bind_null", 2, exqlite_bind_null},
+   {"step", 2, exqlite_step, ERL_NIF_DIRTY_JOB_IO_BOUND},
+   {"multi_step", 3, exqlite_multi_step, ERL_NIF_DIRTY_JOB_IO_BOUND},
++  {"multi_step_tagged", 3, exqlite_multi_step_tagged, ERL_NIF_DIRTY_JOB_IO_BOUND},
+   {"columns", 2, exqlite_columns, ERL_NIF_DIRTY_JOB_IO_BOUND},
+   {"last_insert_rowid", 1, exqlite_last_insert_rowid, ERL_NIF_DIRTY_JOB_IO_BOUND},
+   {"transaction_status", 1, exqlite_transaction_status, ERL_NIF_DIRTY_JOB_IO_BOUND},
+--- a/lib/exqlite/sqlite3_nif.ex
++++ b/lib/exqlite/sqlite3_nif.ex
+@@ -65,6 +65,14 @@
+           :busy | {:rows, [row()]} | {:done, [row()]} | {:error, reason()}
+   def multi_step(_conn, _statement, _chunk_size), do: :erlang.nif_error(:not_loaded)
+ 
++  @doc """
++  Like `multi_step/3`, but a BLOB cell is returned as `{:blob, binary}` while TEXT stays a bare
++  binary, so a caller can tell the two apart (both are otherwise plain binaries).
++  """
++  @spec multi_step_tagged(db(), statement(), integer()) ::
++          :busy | {:rows, [row()]} | {:done, [row()]} | {:error, reason()}
++  def multi_step_tagged(_conn, _statement, _chunk_size), do: :erlang.nif_error(:not_loaded)
++
+   @spec columns(db(), statement()) :: {:ok, list(binary())} | {:error, reason()}
+   def columns(_conn, _statement), do: :erlang.nif_error(:not_loaded)
+ 
+--- a/lib/exqlite/sqlite3.ex
++++ b/lib/exqlite/sqlite3.ex
+@@ -366,6 +366,23 @@
+       handle_nif_exception(e, __STACKTRACE__)
+   end
+ 
++  @doc """
++  Like `multi_step/3`, but a BLOB cell is returned as `{:blob, binary}`; TEXT stays a bare binary.
++  """
++  @spec multi_step_tagged(db(), statement(), integer()) ::
++          :busy | {:rows, [term()]} | {:done, [term()]} | {:error, reason()}
++  def multi_step_tagged(conn, statement, chunk_size) do
++    case Sqlite3NIF.multi_step_tagged(conn, statement, chunk_size) do
++      :busy -> :busy
++      {:error, reason} -> {:error, reason}
++      {:rows, rows} -> {:rows, Enum.reverse(rows)}
++      {:done, rows} -> {:done, Enum.reverse(rows)}
++    end
++  rescue
++    e ->
++      handle_nif_exception(e, __STACKTRACE__)
++  end
++
+   @spec last_insert_rowid(db()) :: {:ok, integer()}
+   def last_insert_rowid(conn), do: Sqlite3NIF.last_insert_rowid(conn)
+ 

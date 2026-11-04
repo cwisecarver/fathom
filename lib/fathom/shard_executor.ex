@@ -440,6 +440,7 @@ defmodule Fathom.ShardExecutor do
            read?: read?,
            control?: control?,
            deadline: true,
+           tag_blobs: true,
            conn_state?: repl_on? and (dml? or commit_boundary?(head))
          ) do
       {:ok, result} ->

@@ -13,7 +13,10 @@ defmodule Fathom.Test.NifDispatchCounter do
   are counted (that is where `Connection.query/4` and `Connection.open/2` execute).
   """
 
-  @dirty ~w(open close execute changes prepare reset step multi_step columns last_insert_rowid
+  # `multi_step_tagged` is the carried exqlite patch's variant of `multi_step` (tenant reads, see
+  # `Connection.query` `tag_blobs:`); it is the same single dispatch and is counted AS `multi_step`.
+  @dirty ~w(open close execute changes prepare reset step multi_step multi_step_tagged columns
+            last_insert_rowid
             transaction_status serialize deserialize release enable_load_extension
             set_update_hook set_authorizer set_log_hook interrupt)a
 
@@ -57,8 +60,14 @@ defmodule Fathom.Test.NifDispatchCounter do
 
   defp collect(parent, acc) do
     receive do
-      {:trace, _pid, :call, {Exqlite.Sqlite3NIF, f, _args}} -> collect(parent, [f | acc])
-      :stop -> send(parent, {:calls, Enum.reverse(acc)})
+      {:trace, _pid, :call, {Exqlite.Sqlite3NIF, :multi_step_tagged, _args}} ->
+        collect(parent, [:multi_step | acc])
+
+      {:trace, _pid, :call, {Exqlite.Sqlite3NIF, f, _args}} ->
+        collect(parent, [f | acc])
+
+      :stop ->
+        send(parent, {:calls, Enum.reverse(acc)})
     end
   end
 end

@@ -105,6 +105,13 @@ config :fathom, :replication_conn_nonce, config_env() == :prod
 # fathom serves has given up long before 30 s. Set QUERY_TIMEOUT_MS=0 to restore the unbounded park.
 config :fathom, :query_timeout_ms, if(config_env() == :prod, do: 30_000)
 
+# exqlite's NIF is a PRECOMPILED download by default. The carried blob-tagging patch
+# (native/exqlite_patch/, scripts/apply_exqlite_patch.sh; expert review 2026-11-04 #1) needs the NIF
+# built from the patched source, which needs a C toolchain: opt in with FATHOM_EXQLITE_PATCHED=1
+# at `mix deps.compile`. Unset (the public default) = the stock precompiled NIF and the old
+# bare-binary reads, which `Fathom.Shard.Connection.tagged_reads?/0` detects at runtime.
+config :exqlite, force_build: System.get_env("FATHOM_EXQLITE_PATCHED") == "1"
+
 # Soften the cap above: at capacity, evict the least-recently-used IDLE shard (flush +
 # drop + release its lease) to admit a new open, rather than refusing with a 503. An idle
 # shard is bottomless-backed, so eviction costs only a cold re-open if it's touched again;
