@@ -181,7 +181,7 @@ bin/fathom stop
 Set `:drain_lb_settle_ms` to your LB's health-probe interval so `drain_all` waits for the LB to
 notice the 503 before it drains (otherwise a request can still land mid-drain). Tune
 `:drain_all_budget_ms` (default 55s, keep under your orchestrator's SIGTERM grace),
-`:drain_all_concurrency` (default 16 — the fan-out width, so the drain doesn't fire every shard's
+`:drain_all_concurrency` (default 64 — the fan-out width, so the drain doesn't fire every shard's
 flush at once), and `:drain_all_flush_grace_ms` (default 5s — the tail a busy shard needs to finish
 its final flush before the deadline). A clean drain reports `busy: 0, timed_out: 0`; a `timed_out`
 shard is left to the supervisor shutdown (raise the budget or lower per-node density). This is the
