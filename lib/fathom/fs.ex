@@ -69,17 +69,27 @@ defmodule Fathom.FS do
   readdir hung on bad media or a stuck mount cannot block the tombstone sweeper or the temp reaper
   forever. Every caller already treats `{:error, _}` as "this pass did nothing". A readdir stuck in
   the kernel keeps its dirty-IO thread until it returns; the kill only frees the caller.
+
+  An optional `filter` (`[String.t()] -> [String.t()]`) runs INSIDE the side process, so only the
+  names the caller cares about are copied back (and retained by it): the temp reaper sweeps a
+  ~400k-entry dir every 5 minutes and wants a few dozen of them (expert review 2026-11-04 #16;
+  unfiltered, the reaper held 34 MB after each sweep).
   """
-  @spec list_dir_isolated(Path.t(), timeout()) :: {:ok, [String.t()]} | {:error, term()}
-  def list_dir_isolated(dir, timeout_ms \\ 60_000) do
+  @spec list_dir_isolated(Path.t(), timeout(), ([String.t()] -> [String.t()]) | nil) ::
+          {:ok, [String.t()]} | {:error, term()}
+  def list_dir_isolated(dir, timeout_ms \\ 60_000, filter \\ nil) do
     dir = IO.chardata_to_string(dir)
 
     {pid, ref} =
       spawn_monitor(fn ->
         result =
           case :prim_file.list_dir(dir) do
-            {:ok, entries} -> {:ok, Enum.map(entries, &IO.chardata_to_string/1)}
-            {:error, _} = err -> err
+            {:ok, entries} ->
+              names = Enum.map(entries, &IO.chardata_to_string/1)
+              {:ok, if(filter, do: filter.(names), else: names)}
+
+            {:error, _} = err ->
+              err
           end
 
         exit({:done, result})

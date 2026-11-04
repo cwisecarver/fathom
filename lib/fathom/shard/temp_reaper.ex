@@ -121,17 +121,19 @@ defmodule Fathom.Shard.TempReaper do
   @impl true
   def handle_continue(:sweep, state) do
     do_sweep()
-    {:noreply, schedule(state)}
+    {:noreply, schedule(state), :hibernate}
   end
 
   @impl true
   def handle_info(:sweep, state) do
     do_sweep()
-    {:noreply, schedule(state)}
+    {:noreply, schedule(state), :hibernate}
   end
 
+  # Hibernate after a sweep (expert review 2026-11-04 #16): the process sleeps ~5 minutes between
+  # sweeps and would otherwise sit on the garbage of the last one until its next GC.
   @impl true
-  def handle_call(:sweep, _from, state), do: {:reply, do_sweep(), state}
+  def handle_call(:sweep, _from, state), do: {:reply, do_sweep(), state, :hibernate}
 
   # One directory scan of the shard data dir for stale, uniquely-suffixed orphan temps.
   #
@@ -149,7 +151,7 @@ defmodule Fathom.Shard.TempReaper do
     # retries.
     dir = Shard.data_dir()
 
-    case Fathom.FS.list_dir_isolated(dir) do
+    case Fathom.FS.list_dir_isolated(dir, 60_000, &interesting/1) do
       {:ok, names} ->
         sweep_listing(dir, names)
 
@@ -176,6 +178,19 @@ defmodule Fathom.Shard.TempReaper do
     :exit, reason ->
       Logger.warning("shard temp reaper: sweep exited (#{inspect(reason)}); skipping this pass")
       0
+  end
+
+  # Runs inside `list_dir_isolated`'s side process (expert review 2026-11-04 #16): keep only the
+  # names the three consumers of the listing look at (orphan temps, quarantine copies, retained
+  # markers), so the reaper never copies or retains the fleet-sized name list. A SUPERSET of what
+  # each consumer re-checks; `Retained.reconcile/2` still sees every `.db.retained` name, so its
+  # forget-what-is-missing logic is unchanged.
+  @doc false
+  @spec interesting([String.t()]) :: [String.t()]
+  def interesting(names) do
+    temps = for n <- names, Storage.temp_orphan?(n), do: n
+    retained = for n <- names, String.ends_with?(n, ".db.retained"), do: n
+    Enum.uniq(temps ++ Shard.quarantine_files_in(names, "") ++ retained)
   end
 
   defp sweep_listing(dir, names) do
