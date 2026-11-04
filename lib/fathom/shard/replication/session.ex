@@ -900,8 +900,8 @@ defmodule Fathom.Shard.Replication.Session do
           |> await_stragglers_if_short(wal_path, deadline)
 
         case seed_first(state, wal_path, deadline, mode) do
-          {:seeded, seeded_state} ->
-            case await_seeds(seeded_state, deadline, wal_path, prior) do
+          {:seeded, seeded_state, target} ->
+            case await_seeds(seeded_state, deadline, wal_path, prior, target) do
               {:ok, ready_state} ->
                 retry_after_seed(ready_state, wal_path, deadline, :impossible, mode)
 
@@ -922,7 +922,7 @@ defmodule Fathom.Shard.Replication.Session do
   # request, i.e. `:unknown_shard` too. The commit then read up to 1 MiB of WAL, compressed and
   # encoded it N times, waited a full quorum round for N refusals, logged `quorum IMPOSSIBLE` at
   # warning, and only then started the seeds and re-shipped. Now it starts the seeds directly,
-  # exactly as that refusal would have (same `start_seeds/3`, same `await_seeds/4` bounded by this
+  # exactly as that refusal would have (same `start_seeds/3`, same `await_seeds/5` bounded by this
   # call's deadline, same `retry_after_seed/5`), for every CONNECTED shipper; a disconnected one
   # would have answered `:disconnected` and is left to the retry's push, as before.
   #
@@ -943,7 +943,7 @@ defmodule Fathom.Shard.Replication.Session do
       for shipper <- shippers(), shipper_connected?(shipper), do: {shipper, :unknown_shard, 0}
 
     with true <- rejects != [] and reseed_enabled?(),
-         {:ok, %{salt1: salt}} <- Wal.read(wal_path) do
+         {:ok, %{salt1: salt} = header} <- Wal.read(wal_path) do
       # THE ORDINAL BEFORE THE SEED (rig 2026-10-14 B1; caught by `replication_seed_ordinal_test`
       # on the first draft of this path). On the ship-first path the doomed push resolved
       # `{wal_salt, wal_ordinal}` (`with_ordinal/2`) before any seed started, and the seed stamps
@@ -952,7 +952,10 @@ defmodule Fathom.Shard.Replication.Session do
       # refuses to rank: the write would be lost on failover. Resolve it here, from the same header
       # read and the same coordinator call. An empty or unreadable WAL takes the old path.
       {_ordinal, state} = with_ordinal(state, salt)
-      {:seeded, start_seeds(state, wal_path, rejects)}
+      #
+      # `header` is this commit's target, so the seed wait can release as soon as a quorum of
+      # seeded followers holds it (expert review 2026-11-04 #5, `await_seeds/5`).
+      {:seeded, start_seeds(state, wal_path, rejects), header}
     else
       _ -> {:ship, state}
     end
@@ -1030,7 +1033,7 @@ defmodule Fathom.Shard.Replication.Session do
       # bounded wait is the better side of that deal — and for the small shards fathom's whole
       # thesis is about, the wait is milliseconds.
       #
-      # Still bounded, and still fails honestly: `await_seeds/4` waits only for seeds THIS
+      # Still bounded, and still fails honestly: `await_seeds/5` waits only for seeds THIS
       # commit started, only until the caller's own deadline, and a shard too large to seed
       # inside it fails exactly as it did before, having spent time it was going to spend
       # anyway. Seeding remains write-gated — nothing seeds a shard nobody writes to, which is
@@ -1044,7 +1047,9 @@ defmodule Fathom.Shard.Replication.Session do
       {:error, {:no_quorum, why}, new_state, rejects} ->
         seeded_state = start_seeds(new_state, wal_path, rejects)
 
-        case await_seeds(seeded_state, deadline, wal_path, prior) do
+        # The header the ship last planned from is the target the release tests against: this
+        # commit's extent, or a later one in the same generation (stricter, never weaker).
+        case await_seeds(seeded_state, deadline, wal_path, prior, new_state.last_header) do
           {:ok, ready_state} ->
             retry_after_seed(ready_state, wal_path, deadline, why, mode)
 
@@ -3186,7 +3191,7 @@ defmodule Fathom.Shard.Replication.Session do
   # map, and a follower whose socket has dropped does not pin this — `Shipper.drop/2` fails its
   # waiter with `:disconnected` immediately, which is an answer.
   #
-  # Same `receive`-inside-the-call shape as `await_seeds/3`, and for the same reason: nothing else
+  # Same `receive`-inside-the-call shape as `await_seeds/5`, and for the same reason: nothing else
   # is reading this mailbox during a `handle_call`, so a reply left queued would be applied only
   # after the reply had already gone out.
   defp settle_inflight(state, wal_path, deadline) do
@@ -3252,8 +3257,9 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   # Wait for the seeds THIS commit started, until `deadline`. Returns `{:ok, state}` once none are
-  # outstanding, `{:timeout, state}` otherwise — in both cases with every result that did arrive
-  # applied, so a partial wait still advances the followers it heard about.
+  # outstanding OR a write quorum already holds `target` (below), `{:timeout, state}` otherwise — in
+  # every case with each result that did arrive applied, so a partial wait still advances the
+  # followers it heard about.
   #
   # Consumed with `receive` rather than left to `handle_info/2` for the same reason
   # `drain_late_replies/2` does it: we are inside the `handle_call`, so nothing else is reading this
@@ -3264,55 +3270,105 @@ defmodule Fathom.Shard.Replication.Session do
   # mistake it for an answer to the retry.
   #
   # `prior` is the set of seed tokens already in flight when the call began (expert review
-  # 2026-10-20 #6): those were started by an earlier call and are NOT waited on. A seed this call
-  # started is skipped too when the Session's last observed seed rate says it cannot land inside
-  # the time left — the wait would only burn the deadline. Either way the result still arrives in
-  # `handle_info/2` and is applied there.
-  defp await_seeds(state, deadline, wal_path, prior) do
+  # 2026-10-20 #6): those were started by an earlier call and are NOT waited on. Their results, and
+  # those of any seed this call stops waiting for, still arrive in `handle_info/2` and are applied
+  # there.
+  #
+  # RELEASED AT THE QUORUM, NOT THE LAST SEED (expert review 2026-11-04 #5). A reopened shard's first
+  # commit seeds every follower, and the wait used to end only when the LAST of them landed, so one
+  # slow follower link turned a commit two of three followers already held into
+  # `{:no_quorum, :impossible}` at the deadline. Now the wait also ends as soon as
+  # `quorum_holds?/2` is true for `target` (the commit's header): Q followers, none of them seeding,
+  # hold every byte of it by recorded position. The release is deliberately that strict, not "Q
+  # followers are free": the retry then acks trivially, and a quorum that does NOT yet hold the
+  # bytes keeps waiting for the seeds exactly as before, rather than retrying early against a
+  # follower that just failed the round. The ACK is unchanged — still the retry's `quorum_holds?/2`
+  # plus `ack_if_owned/1` — so the release can never ack on fewer than Q durable followers; a seed
+  # still in flight keeps its `seeding` entry (excluded from that quorum) and lands later through
+  # `handle_info/2`, where its follower is recorded and the next commit carries it forward.
+  defp await_seeds(state, deadline, wal_path, prior, target) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     case own_seeds(state, prior) do
       [] ->
         {:ok, state}
 
-      _own when remaining <= 0 ->
-        {:timeout, state}
-
       own ->
-        if hopeless_seed?(state, own, remaining),
-          do: {:timeout, state},
-          else: await_seed_messages(state, deadline, wal_path, prior, remaining)
+        cond do
+          quorum_holds_target?(state, target) -> {:ok, state}
+          remaining <= 0 -> {:timeout, state}
+          hopeless_seed?(state, own, remaining, target) -> {:timeout, state}
+          true -> await_seed_messages(state, deadline, wal_path, prior, remaining, target)
+        end
     end
   end
+
+  # A header with no frames (or none read) has no extent to hold; only the all-seeds-landed exit
+  # applies then.
+  defp quorum_holds_target?(state, %{ckpt_seq: _, salt1: _, commit_extent: _} = target),
+    do: quorum_holds?(state, target)
+
+  defp quorum_holds_target?(_state, _target), do: false
 
   defp seed_tokens(state), do: MapSet.new(state.seeding, fn {_shipper, e} -> e.token end)
 
   defp own_seeds(state, prior),
     do: for({_shipper, e} <- state.seeding, not MapSet.member?(prior, e.token), do: e)
 
-  # Seeds to different followers stream concurrently, so the wait ends when the LAST one lands:
-  # hopeless when any of them, at the last observed rate, finishes past the time left. No observed
-  # rate yet (this Session's first seed) waits, as before. Underestimates the rate if anything (it
-  # is measured start-to-result, queueing included), which errs toward not waiting.
-  defp hopeless_seed?(%{seed_rate: rate}, own, remaining) when is_number(rate) and rate > 0 do
+  # The wait can succeed two ways — every seed this call started lands, or a quorum holds `target`
+  # — so it is hopeless only when NEITHER can happen inside the time left:
+  #
+  #   * some seed this call started cannot land in time, at the last observed rate (the old rule,
+  #     expert review 2026-10-20 #6: seeds stream concurrently, so "all landed" waits for the
+  #     slowest); AND
+  #   * fewer than Q followers can still hold `target`: those that already do (non-seeding, by
+  #     position) plus those whose seed — this call's or an earlier one's, whose result this loop
+  #     also applies — is predicted to land in time (2026-11-04 #5). Under the old rule alone one
+  #     slow seed made the wait hopeless for everyone although two fast seeds were a quorum.
+  #
+  # No observed rate yet (this Session's first seed) waits, as before. The rate underestimates if
+  # anything (measured start-to-result, queueing included), which errs toward not waiting.
+  defp hopeless_seed?(%{seed_rate: rate} = state, own, remaining, target)
+       when is_number(rate) and rate > 0 do
     now = System.monotonic_time(:millisecond)
+    late? = &seed_late?(&1, rate, now, remaining)
 
-    Enum.any?(own, fn
-      %{bytes: b, started_at: t} when is_integer(b) -> t + b / rate - now > remaining
-      _ -> false
+    Enum.any?(own, late?) and feasible_holders(state, target, late?) < quorum()
+  end
+
+  defp hopeless_seed?(_state, _own, _remaining, _target), do: false
+
+  defp seed_late?(%{bytes: b, started_at: t}, rate, now, remaining) when is_integer(b),
+    do: t + b / rate - now > remaining
+
+  defp seed_late?(_entry, _rate, _now, _remaining), do: false
+
+  defp feasible_holders(state, %{ckpt_seq: gen, salt1: salt, commit_extent: extent}, late?) do
+    Enum.count(shippers(), fn s ->
+      case Map.get(state.seeding, s) do
+        nil ->
+          match?(
+            %{wal_gen: ^gen, salt1: ^salt, offset: o} when is_integer(o) and o >= extent,
+            Map.get(state.followers, s)
+          )
+
+        entry ->
+          not late?.(entry)
+      end
     end)
   end
 
-  defp hopeless_seed?(_state, _own, _remaining), do: false
+  # No target to hold: only the all-seeds-landed exit is left, and some seed is late.
+  defp feasible_holders(_state, _target, _late?), do: 0
 
-  defp await_seed_messages(state, deadline, wal_path, prior, remaining) do
+  defp await_seed_messages(state, deadline, wal_path, prior, remaining, target) do
     refs = seed_refs(state)
 
     receive do
       {:seeded, shipper, token, result} ->
         state
         |> apply_seed_result(shipper, token, result)
-        |> await_seeds(deadline, wal_path, prior)
+        |> await_seeds(deadline, wal_path, prior, target)
 
       # A seed task that died WITHOUT answering (expert review 2026-10-13 #12). Only
       # `handle_info/2` used to consume its DOWN, which cannot run inside this call, so the
@@ -3320,7 +3376,7 @@ defmodule Fathom.Shard.Replication.Session do
       {:DOWN, ref, :process, _pid, reason} when is_map_key(refs, ref) ->
         state
         |> apply_seed_down(ref, reason)
-        |> await_seeds(deadline, wal_path, prior)
+        |> await_seeds(deadline, wal_path, prior, target)
 
       # `forget_inflight/2` too, as every other late-ack consumer does (expert review 2026-10-22
       # r8 #27): a mismatched ack is declined by `settle_late_ack/3`, but the follower HAS
@@ -3331,7 +3387,7 @@ defmodule Fathom.Shard.Replication.Session do
         state
         |> settle_late_ack(from, next)
         |> forget_inflight(from)
-        |> await_seeds(deadline, wal_path, prior)
+        |> await_seeds(deadline, wal_path, prior, target)
 
       # A REJECT MUST BE RECONCILED, NOT DROPPED. The first draft of this fell through to the
       # catch-all and threw rejects away, and the rig showed exactly what this module's own
@@ -3347,10 +3403,10 @@ defmodule Fathom.Shard.Replication.Session do
         state
         |> reconcile(rejects)
         |> start_seeds(wal_path, rejects)
-        |> await_seeds(deadline, wal_path, prior)
+        |> await_seeds(deadline, wal_path, prior, target)
 
       {:repl_reply, _from, _other} ->
-        await_seeds(state, deadline, wal_path, prior)
+        await_seeds(state, deadline, wal_path, prior, target)
     after
       remaining -> {:timeout, state}
     end
@@ -3429,7 +3485,7 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   # The last completed seed's throughput, bytes per ms (expert review 2026-10-20 #6), for
-  # `hopeless_seed?/3`. Wall time from start to result as this Session saw it.
+  # `hopeless_seed?/4`. Wall time from start to result as this Session saw it.
   defp note_seed_rate(state, %{bytes: b, started_at: t}, {:ok, _}) when is_integer(b) and b > 0,
     do: %{state | seed_rate: b / max(System.monotonic_time(:millisecond) - t, 1)}
 
@@ -3466,7 +3522,7 @@ defmodule Fathom.Shard.Replication.Session do
       end
 
     # What the batch is about to stream (one stat pair per batch, not per follower), recorded per
-    # entry so `hopeless_seed?/3` can price the wait (expert review 2026-10-20 #6). A seed is rare.
+    # entry so `hopeless_seed?/4` can price the wait (expert review 2026-10-20 #6). A seed is rare.
     bytes = if needs == [], do: 0, else: seed_bytes(db_path, wal_path)
 
     seeded =

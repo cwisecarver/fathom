@@ -7,14 +7,14 @@ defmodule Fathom.Shard.ReplicationSeedWaitLateAckTest do
   `{:repl_reply, _, {:ack, _, _}}` — `handle_info/2`, `drain_late_replies/2`, `settle_inflight/3` —
   runs `settle_late_ack/3` AND `forget_inflight/2`: the first declines to advance an ack for a
   position that was not recorded, the second ends the expectation either way, because the follower
-  HAS answered. `await_seed_messages/5`'s ack clause ran only the first, so an ack whose position
+  HAS answered. `await_seed_messages/6`'s ack clause ran only the first, so an ack whose position
   disagreed with the record (the real shape: a straggler's answer to a push the record has since
   moved past) was swallowed with the expectation still standing. The follower then looked
   mid-flight until its `inflight_at` aged out, and an `await_no_inflight!` in
   `replication_collapse_test` #6 timed out once under CI load (27bc300d / 299b1eba).
 
   Deterministic, not a race: the only `SeedGate` slot is held by the test, so the commit's seeds
-  block and the Session sits in `await_seed_messages/5` until the commit deadline; the test waits
+  block and the Session sits in `await_seed_messages/6` until the commit deadline; the test waits
   for exactly that frame and only then sends the ack, so it can only be consumed by that clause.
   The ack's sender is a stand-in pid with an injected expectation, because a real shipper's entry
   is consumed by `collect/4` inside the same call and cannot be set up from outside it; the clause
@@ -109,7 +109,7 @@ defmodule Fathom.Shard.ReplicationSeedWaitLateAckTest do
     [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
 
     # Hold the node's only seed slot: the seeds the next commit starts block in `SeedGate.acquire`,
-    # so the commit waits in `await_seed_messages/5` until its deadline.
+    # so the commit waits in `await_seed_messages/6` until its deadline.
     test_pid = self()
 
     holder =
@@ -142,7 +142,8 @@ defmodule Fathom.Shard.ReplicationSeedWaitLateAckTest do
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
     commit = Task.async(fn -> Session.commit(id, wal, coordinator) end)
 
-    await_frame!(session, {Session, :await_seed_messages, 5})
+    # Arity 6 since expert review 2026-11-04 #5 threaded the commit's target header through.
+    await_frame!(session, {Session, :await_seed_messages, 6})
 
     # The call is now blocked inside the seed wait, so this ack can only be consumed by that
     # clause (were it left to `handle_info/2` after the call, which forgets, the test would pass
