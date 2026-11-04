@@ -198,6 +198,80 @@ defmodule Fathom.Shard.FlushGate do
     ArgumentError -> :ok
   end
 
+  # --- The stamp lane (expert review 2026-11-04 #4) --------------------------------------------
+  #
+  # The first-write / stamp-on-open flush (068ab044) closes the "acked write, no object yet"
+  # window the Jepsen bug-1 fix is about, so it must not queue behind the periodic flush wave or
+  # back off on the herd-scaled timer: exactly when it matters most (a reopen/provisioning herd
+  # plus a node kill) the main lane is full. It gets its own small lane instead of bypassing the
+  # gate, so a herd of stamping shards stays bounded too. The work is small (a brand-new shard's
+  # snapshot and PUT, or one unstamped object's re-stamp).
+
+  @stamp_counter :stamp_in_flight
+  @default_stamp_cap 4
+
+  @doc """
+  The stamp lane's cap (`:shard_stamp_flush_max_concurrency`, default #{@default_stamp_cap}).
+  `nil` when the main gate is unbounded: the lane exists only to bypass a full main lane.
+  """
+  @spec stamp_cap() :: pos_integer() | nil
+  def stamp_cap do
+    if cap() == nil do
+      nil
+    else
+      case Application.get_env(:fathom, :shard_stamp_flush_max_concurrency, @default_stamp_cap) do
+        n when is_integer(n) and n > 0 -> n
+        _ -> nil
+      end
+    end
+  end
+
+  @doc """
+  Reserve a slot in the stamp lane. Same answers as `try_acquire/0`; the caller MUST
+  `release_stamp/0` on `:ok`. A lane configured off falls back to the main gate.
+  """
+  @spec try_acquire_stamp() :: :ok | :full | :disabled
+  def try_acquire_stamp do
+    case stamp_cap() do
+      cap when is_integer(cap) ->
+        n = :ets.update_counter(@table, @stamp_counter, {2, 1}, {@stamp_counter, 0})
+
+        if n <= cap do
+          :ets.insert(@table, {{:stamp_holder, self()}, System.monotonic_time(:millisecond)})
+          :ok
+        else
+          :ets.update_counter(@table, @stamp_counter, {2, -1, 0, 0}, {@stamp_counter, 0})
+          :full
+        end
+
+      _ ->
+        :disabled
+    end
+  rescue
+    ArgumentError -> :disabled
+  end
+
+  @doc "Release a slot reserved by `try_acquire_stamp/0`."
+  @spec release_stamp() :: :ok
+  def release_stamp do
+    :ets.delete(@table, {:stamp_holder, self()})
+    :ets.update_counter(@table, @stamp_counter, {2, -1, 0, 0}, {@stamp_counter, 0})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc "Current stamp-lane in-flight count (tests / observability)."
+  @spec stamp_in_flight() :: non_neg_integer()
+  def stamp_in_flight do
+    case :ets.lookup(@table, @stamp_counter) do
+      [{@stamp_counter, n}] -> n
+      _ -> 0
+    end
+  rescue
+    ArgumentError -> 0
+  end
+
   @doc """
   Reclaim slots held by processes that are no longer alive. Returns how many it freed.
 
@@ -217,18 +291,23 @@ defmodule Fathom.Shard.FlushGate do
   """
   @spec sweep() :: non_neg_integer()
   def sweep do
+    reclaim(:holder, @counter) + reclaim(:stamp_holder, @stamp_counter)
+  end
+
+  @spec reclaim(:holder | :stamp_holder, atom()) :: non_neg_integer()
+  defp reclaim(tag, counter) do
     @table
-    |> :ets.match({{:holder, :"$1"}, :_})
+    |> :ets.match({{tag, :"$1"}, :_})
     |> List.flatten()
     |> Enum.reject(&Process.alive?/1)
     |> Enum.reduce(0, fn dead, freed ->
       # `:ets.take/2` so two concurrent sweeps cannot both free the same slot.
-      case :ets.take(@table, {:holder, dead}) do
+      case :ets.take(@table, {tag, dead}) do
         [] ->
           freed
 
         [_ | _] ->
-          :ets.update_counter(@table, @counter, {2, -1, 0, 0}, {@counter, 0})
+          :ets.update_counter(@table, counter, {2, -1, 0, 0}, {counter, 0})
           freed + 1
       end
     end)
@@ -250,7 +329,9 @@ defmodule Fathom.Shard.FlushGate do
   @doc false
   def reset do
     :ets.match_delete(@table, {{:holder, :_}, :_})
+    :ets.match_delete(@table, {{:stamp_holder, :_}, :_})
     :ets.insert(@table, {@counter, 0})
+    :ets.insert(@table, {@stamp_counter, 0})
   end
 
   @sweep_interval_ms 30_000

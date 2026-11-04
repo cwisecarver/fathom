@@ -1178,6 +1178,10 @@ defmodule Fathom.Shard do
         # wherever the slot is released, so a finished flush leaves no timer behind to wake a
         # hibernated coordinator.
         flush_deadline_timer: nil,
+        # True from `stamp_on_open/3` until a flush lands: the stamping flush of an unstamped
+        # object rides the FlushGate stamp lane (expert review 2026-11-04 #4), like the
+        # no-object first-write flush (`etag == nil`).
+        stamp_pending: false,
         flush_pending: nil,
         flush_pending_gen: nil,
         # Callers of a synchronous force-flush (`:flush_now`, the flush-before-fork primitive):
@@ -2560,7 +2564,15 @@ defmodule Fathom.Shard do
         # backoff and stay dirty (the safe direction — the flush just waits), so a mass re-home's
         # phase-aligned timers can't fire N snapshots + PUTs in lockstep and starve cold-open pulls.
         # :disabled (no cap configured — the default) and :ok (slot reserved) both proceed to flush.
-        case FlushGate.try_acquire() do
+        stamp_lane? = stamp_flush?(state)
+
+        case if(stamp_lane?, do: FlushGate.try_acquire_stamp(), else: FlushGate.try_acquire()) do
+          # The stamp lane is small and its flushes are short, so a refused stamp flush retries on
+          # the plain short backoff, NOT the herd-scaled one (`open_shards/2000` s: ~5 s at 10k
+          # shards) that exists to damp the periodic wave's probes (expert review 2026-11-04 #4).
+          :full when stamp_lane? ->
+            {:noreply, schedule_flush_backoff(state)}
+
           :full ->
             {:noreply, gate_full(state)}
 
@@ -2635,11 +2647,11 @@ defmodule Fathom.Shard do
                 end)
               rescue
                 e ->
-                  if gate == :ok, do: FlushGate.release()
+                  if gate == :ok, do: release_lane(stamp_lane?)
                   reraise e, __STACKTRACE__
               catch
                 kind, reason ->
-                  if gate == :ok, do: FlushGate.release()
+                  if gate == :ok, do: release_lane(stamp_lane?)
                   :erlang.raise(kind, reason, __STACKTRACE__)
               end
 
@@ -2649,7 +2661,7 @@ defmodule Fathom.Shard do
                | flush_task: task,
                  flush_deadline_timer:
                    Process.send_after(self(), {:flush_deadline, task.ref}, flush_deadline_ms()),
-                 flush_slot_held: gate == :ok,
+                 flush_slot_held: gate == :ok and if(stamp_lane?, do: :stamp, else: true),
                  flush_pending: flushed_to,
                  flush_pending_gen: pending_gen
              }}
@@ -4902,7 +4914,7 @@ defmodule Fathom.Shard do
       state
     else
       send(self(), :durability_flush)
-      state = %{state | flushed_through: -1}
+      state = %{state | flushed_through: -1, stamp_pending: true}
       FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
       state
     end
@@ -6194,6 +6206,7 @@ defmodule Fathom.Shard do
       | flushed_through: state.flush_pending,
         counter_gen: state.flush_pending_gen,
         etag: new_etag,
+        stamp_pending: false,
         # The flush stamped this coordinator's lineage onto the object (expert review 2026-10-12 #3).
         lineage_stamped?: true,
         # CACHE WHAT THE BACKEND SAID IT CARRIED (expert review 2026-08-26 #33) — but never
@@ -6307,12 +6320,28 @@ defmodule Fathom.Shard do
   defp release_flush_slot(state) do
     state = cancel_flush_deadline(state)
 
-    if Map.get(state, :flush_slot_held) do
-      FlushGate.release()
-      %{state | flush_slot_held: false}
-    else
-      state
+    case Map.get(state, :flush_slot_held) do
+      false ->
+        state
+
+      nil ->
+        state
+
+      held ->
+        release_lane(held == :stamp)
+        %{state | flush_slot_held: false}
     end
+  end
+
+  defp release_lane(true), do: FlushGate.release_stamp()
+  defp release_lane(false), do: FlushGate.release()
+
+  # The flushes that close the "acked write, no rankable object" window ride the stamp lane: a
+  # replicating shard with no object yet (`stamp_first_write/1`) or an object with no rankable
+  # stamp (`stamp_on_open/3`, which sets `stamp_pending`).
+  defp stamp_flush?(state) do
+    Map.get(state, :stamp_pending, false) or
+      (state.etag == nil and is_integer(state.lineage) and Fleet.replicating?())
   end
 
   defp cancel_flush_deadline(%{flush_deadline_timer: timer} = state) when timer != nil do
