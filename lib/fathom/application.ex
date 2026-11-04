@@ -965,6 +965,7 @@ defmodule Fathom.Application do
       # ETS set of deleted (tombstoned) shard ids — the admission re-mint guard for tenant
       # deletion (expert review #15). Loaded from the directory at boot, pushed fleet-wide on
       # delete over Oban's notifier, refreshed periodically. Off the Postgres hot path.
+      Fathom.Tenants.LocalEraser,
       Fathom.Tenants.Tombstones,
       # ETS set of suspended shard ids — the admission deny gate for tenant suspension (expert
       # review #20). Same shape as Tombstones but reversible (resume clears it; the periodic

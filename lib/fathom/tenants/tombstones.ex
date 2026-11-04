@@ -212,7 +212,7 @@ defmodule Fathom.Tenants.Tombstones do
   # copies (assumed default D1): erasure outranks forensics.
   defp on_tombstoned(shard_id) do
     forget_replica(shard_id)
-    run_async(fn -> Fathom.Tenants.erase_local(shard_id) end)
+    Fathom.Tenants.LocalEraser.erase_async(shard_id)
     :ok
   end
 
@@ -235,7 +235,9 @@ defmodule Fathom.Tenants.Tombstones do
         end)
         |> Enum.uniq()
         |> Enum.filter(&tombstoned?/1)
-        |> Enum.each(&Fathom.Tenants.erase_local/1)
+        |> Fathom.Tenants.erase_local_batch()
+
+        :ok
 
       {:error, _} ->
         :ok

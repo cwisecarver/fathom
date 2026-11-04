@@ -35,7 +35,7 @@ defmodule Fathom.Tenants do
   alias Fathom.Rebalancer.Overrides
   alias Fathom.Shard.{SqliteHeader, Storage}
   alias Fathom.ShardId
-  alias Fathom.Tenants.{DeleteJob, Suspensions, Tombstones}
+  alias Fathom.Tenants.{DeleteJob, LocalEraser, Suspensions, Tombstones}
 
   # Graceful-drain budget when suspending a tenant — in-flight streams finish, then the
   # coordinator flushes + stops; a busy one keeps serving current streams (new opens are denied
@@ -856,53 +856,106 @@ defmodule Fathom.Tenants do
   re-runs every tombstoned id, and `purge/1` returns the error so its `DeleteJob` retries.
   """
   @spec erase_local(String.t()) :: :ok | {:error, term()}
-  def erase_local(shard_id) do
-    with {:ok, id} <- cast(shard_id), true <- Tombstones.tombstoned?(id) do
-      Shards.stop(id)
+  def erase_local(shard_id), do: LocalEraser.erase_now(shard_id)
 
-      with :ok <- rm_local(id) do
-        :telemetry.execute([:fathom, :tenants, :local_erased], %{count: 1}, %{shard_id: id})
+  @doc """
+  Erases the local files of every tombstoned id in `ids` with ONE data-dir listing (expert review
+  2026-11-04 #6): the per-id form listed the fleet-sized dir once per tombstone, so a delete burst
+  of 200 ids against ~100k files held +2.8 GB of listing garbage and stalled an unrelated shard's
+  queries for seconds (`test/fathom/tenants/tombstone_burst_bench_test.exs`). Called by
+  `Fathom.Tenants.LocalEraser`, which coalesces; semantics per id are exactly `erase_local/1`'s
+  (not tombstoned: `:ok` no-op; listing failure: `{:error, {:local_erase, reason}}` +
+  `:local_erase_failed`, never `:local_erased`). Returns `[{id, result}]` in input order.
+  """
+  @spec erase_local_batch([String.t()]) :: [{String.t(), :ok | {:error, term()}}]
+  def erase_local_batch(ids) do
+    checked =
+      for shard_id <- ids do
+        case cast(shard_id) do
+          {:ok, id} -> if Tombstones.tombstoned?(id), do: {shard_id, id}, else: {shard_id, nil}
+          _ -> {shard_id, nil}
+        end
       end
-    else
-      _ -> :ok
+
+    eligible = for {_, id} when id != nil <- checked, uniq: true, do: id
+
+    stopped =
+      Task.async_stream(eligible, fn id -> {id, Shards.stop(id)} end,
+        max_concurrency: 8,
+        timeout: 120_000,
+        on_timeout: :kill_task,
+        ordered: false
+      )
+      |> Enum.zip(eligible)
+      |> Map.new(fn
+        {{:ok, {id, :ok}}, _} -> {id, :ok}
+        {{:ok, {id, other}}, _} -> {id, {:error, {:local_erase, other}}}
+        {{:exit, reason}, id} -> {id, {:error, {:local_erase, {:stop, reason}}}}
+      end)
+
+    to_rm = for {id, :ok} <- stopped, do: id
+    rm_results = rm_local_many(to_rm)
+
+    for {shard_id, id} <- checked do
+      cond do
+        id == nil ->
+          {shard_id, :ok}
+
+        stopped[id] != :ok ->
+          {shard_id, stopped[id]}
+
+        true ->
+          result = Map.fetch!(rm_results, id)
+
+          if result == :ok,
+            do:
+              :telemetry.execute([:fathom, :tenants, :local_erased], %{count: 1}, %{shard_id: id})
+
+          {shard_id, result}
+      end
     end
   end
 
-  # Remove every local working file for the shard after the coordinator is stopped: the live
-  # db + its WAL/SHM AND any quarantine copies (`.fenced.<ts>` / `.forked.<ts>` / `.corrupt.<ts>`)
-  # a prior partial run or self-fence could have left — otherwise an erased tenant's data
-  # lingers on local disk. The glob is anchored at `<id>.db` so it can't match a sibling id
-  # (`<id>9.db` doesn't start with `<id>.db`).
+  # Remove every local working file for each shard in `ids` after its coordinator is stopped: the
+  # live db + its WAL/SHM AND any quarantine copies (`.fenced.<ts>` / `.forked.<ts>` /
+  # `.corrupt.<ts>`) a prior partial run or self-fence could have left; otherwise an erased tenant's
+  # data lingers on local disk. A file belongs to the id before its first ".db" (ids carry no dot,
+  # ShardId), the same extraction `Tombstones.sweep_local/0` uses, so a sibling `<id>9.db` is a
+  # different id and is never matched.
   #
   # expert review 2026-10-22 r8 #7 (Q12=A): `Path.wildcard` listed the fleet-sized data dir through
-  # `file_server_2` (69 MB pinned per 120k entries) on EVERY node for EVERY tombstone. The listing
-  # is now raw in a side process and each file is removed raw; the erase of quarantine copies stays
-  # immediate (erasure outranks forensics).
+  # `file_server_2` (69 MB pinned per 120k entries). The listing is raw in a side process and each
+  # file is removed raw; the erase of quarantine copies stays immediate (erasure outranks forensics).
   #
   # A LISTING FAILURE IS NOT AN ERASURE (rv8 F7). This used to read `{:error, _}` (and any raise)
   # as `:ok`, so `erase_local/1` emitted `:local_erased` and `purge/1` completed with every local
   # file still on disk. Now it logs, emits `[:fathom, :tenants, :local_erase_failed]`, and returns
   # the error. `:enoent` is a success: no data dir means no local files.
-  defp rm_local(id) do
+  defp rm_local(id), do: Map.fetch!(rm_local_many([id]), id)
+
+  defp rm_local_many([]), do: %{}
+
+  defp rm_local_many(ids) do
     dir = Fathom.Shard.data_dir()
-    prefix = Path.basename(Fathom.Shard.db_path(id))
+    wanted = MapSet.new(ids)
 
     case Fathom.FS.list_dir_isolated(dir) do
       {:ok, names} ->
         for name <- names,
-            String.starts_with?(name, prefix),
+            [id, _rest] <- [String.split(name, ".db", parts: 2)],
+            MapSet.member?(wanted, id),
             do: Fathom.FS.rm(Path.join(dir, name))
 
-        :ok
+        Map.new(ids, &{&1, :ok})
 
       {:error, :enoent} ->
-        :ok
+        Map.new(ids, &{&1, :ok})
 
       {:error, reason} ->
-        local_erase_failed(id, reason)
+        Map.new(ids, &{&1, local_erase_failed(&1, reason)})
     end
   rescue
-    e -> local_erase_failed(id, e)
+    e -> Map.new(ids, &{&1, local_erase_failed(&1, e)})
   end
 
   defp local_erase_failed(id, reason) do
