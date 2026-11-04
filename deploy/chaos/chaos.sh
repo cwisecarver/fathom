@@ -41,6 +41,12 @@
 #                                 poll. Prints reductions per committed replication txn per role. Run it
 #                                 with replication ON, then again on a fleet brought up with
 #                                 REPLICATION_ENABLED=false for the baseline. Never part of a gate.
+#   ./chaos.sh repl-latency <ms>|clear [node]  latency on the follower links (REPL_VIA_TOXI=1); with a node, ONE link
+#   ./chaos.sh wake-big <MB>      time the first write after a <MB> tenant idle-drops (replication ON, flush 30 s)
+#   ./chaos.sh bulk-commit <MB>   one large single transaction: wall time + replicated commit rounds
+#   TPC_NET=container TPC_DRIVER=elixir ./chaos.sh tpc-churn [tenants duration_s median_gap_s retain:idle,...]
+#                                 lognormal-gap idle->reopen churn; A/B SHARD_RETAIN_LOCAL_BYTES x SHARD_IDLE_MS
+#   ./chaos.sh msacc-poll [secs] [-- <arm args>]  :msacc poll-thread busy% on every node (review #21)
 #   ./chaos.sh seed-rate [kib...] Phase-2 A2: what one seed costs by shard size (default 64 1024
 #                                 8192 32768 KiB) — per-seed ms and the first-write latency a
 #                                 seed-on-ownership-change rule would add. Needs REPLICATION_ENABLED;
@@ -553,26 +559,54 @@ cmd_latency() {
 # see docker-compose.yml); without that, replication goes node->node directly and this is a no-op.
 # `<ms>` is added each way, so a quorum ack round-trip gains ~2x that.
 cmd_repl_latency() {
-  local p n
+  # `repl-latency <ms> [node]` / `repl-latency clear [node]`. With a node the toxic goes on THAT node's
+  # follower proxy only (expert review 2026-11-04 #8: one slow follower, the others healthy) and the
+  # arm reads the toxics back to prove it landed there and nowhere else; no node = all links, as before.
+  local p n targets=("${NODES[@]}") only="" t
+  if [ -n "${2:-}" ]; then
+    only=$2
+    case " ${NODES[*]} " in *" $only "*) ;; *) echo "repl-latency: '$only' is not a rig node (${NODES[*]})" >&2; return 64 ;; esac
+    targets=("$only")
+  fi
   if [ "${1:-}" = "clear" ]; then
-    for n in "${NODES[@]}"; do
+    for n in "${targets[@]}"; do
       p="repl-$n"
       curl -sS -X DELETE "$TOXI/proxies/$p/toxics/lat_down" >/dev/null 2>&1
       curl -sS -X DELETE "$TOXI/proxies/$p/toxics/lat_up" >/dev/null 2>&1
     done
-    echo "replication latency cleared"
+    echo "replication latency cleared${only:+ on $only}"
   else
-    local ms=${1:?usage: repl-latency <ms>|clear}
-    for n in "${NODES[@]}"; do
+    local ms=${1:?usage: repl-latency <ms> [node] | repl-latency clear [node]}
+    if [ -n "$only" ] && [ "${REPL_VIA_TOXI:-}" != "1" ]; then
+      echo "repl-latency $ms $only: REPL_VIA_TOXI=1 is not set in this shell; bring the fleet up with it (REPL_VIA_TOXI=1 ./chaos.sh up) and set it here, or this is inert." >&2
+      return 1
+    fi
+    for n in "${targets[@]}"; do
       p="repl-$n"
+      # Replace, not stack: a second POST of the same toxic name is a 409 and would leave the OLD value.
+      curl -sS -X DELETE "$TOXI/proxies/$p/toxics/lat_down" >/dev/null 2>&1
+      curl -sS -X DELETE "$TOXI/proxies/$p/toxics/lat_up" >/dev/null 2>&1
       curl -sS -X POST "$TOXI/proxies/$p/toxics" -d \
         "{\"name\":\"lat_down\",\"type\":\"latency\",\"stream\":\"downstream\",\"attributes\":{\"latency\":$ms}}" >/dev/null
       curl -sS -X POST "$TOXI/proxies/$p/toxics" -d \
         "{\"name\":\"lat_up\",\"type\":\"latency\",\"stream\":\"upstream\",\"attributes\":{\"latency\":$ms}}" >/dev/null
     done
-    echo "replication latency: ${ms}ms each way on all follower links (~$((ms * 2))ms added per quorum ack RTT)"
+    echo "replication latency: ${ms}ms each way on ${only:-all follower links} (~$((ms * 2))ms added per quorum ack RTT)"
     if [ "${REPL_VIA_TOXI:-}" != "1" ]; then
       echo "  NOTE: bring the fleet up with REPL_VIA_TOXI=1 or replication bypasses toxiproxy and this is inert."
+    fi
+    if [ -n "$only" ]; then
+      # Precondition: the toxic is on the named link, and ONLY there.
+      for n in "${NODES[@]}"; do
+        t=$(curl -sS "$TOXI/proxies/repl-$n/toxics" 2>/dev/null | jq -r '[.[]? | select(.name=="lat_down" or .name=="lat_up") | .attributes.latency] | join(",")' 2>/dev/null)
+        if [ "$n" = "$only" ]; then
+          [ "$t" = "$ms,$ms" ] || { echo "FAIL: repl-$n carries latency toxics '${t:-none}', wanted $ms,$ms" >&2; return 1; }
+        elif [ -n "$t" ]; then
+          echo "FAIL: repl-$n ALSO carries a latency toxic ($t): a previous all-links run was not cleared (./chaos.sh repl-latency clear)" >&2
+          return 1
+        fi
+      done
+      echo "  verified: only repl-$only carries the toxic"
     fi
   fi
 }
@@ -2935,6 +2969,380 @@ cmd_tpc_sparse() {
   echo "  'offered' means the fleet or the driver fell behind the schedule (p99 then includes that queueing)."
 }
 
+# -- round 9 arms (expert review 2026-11-04-003421 #7, #8, #21) -----------------------------------
+# Harness only, no lib/ change. Every arm asserts its own preconditions and FAILS LOUDLY: a replication-
+# OFF fleet, a flush interval other than 30 s, a tenant that never reached its size, a shard that never
+# idle-dropped, or a wake that never reopened would each produce a plausible-looking number that
+# measures something else.
+
+# r9_fail <msg>: message to stderr, return 1.
+r9_fail() { echo "FAIL: $*" >&2; return 1; }
+
+# r9_require_repl: replication ON on EVERY node (Fleet.replicating?()) and SHARD_FLUSH_INTERVAL_MS=30000
+# (read back with rpc, not trusted from this shell's env: it is what the node booted with).
+r9_require_repl() {
+  local n repl fi
+  for n in "${NODES[@]}"; do
+    repl=$(rpc "$n" 'IO.puts(Fathom.Shard.Replication.Fleet.replicating?())' | tr -d '\r\n ')
+    [ "$repl" = true ] || { r9_fail "replication is not on at $n (replicating?=${repl:-unreadable}): REPLICATION_ENABLED=true SHARD_FLUSH_INTERVAL_MS=30000 ./chaos.sh up"; return 1; }
+  done
+  fi=$(rpc "${NODES[0]}" 'IO.puts(Application.get_env(:fathom, :shard_flush_interval_ms))' | tr -d '\r\n ')
+  [ "$fi" = 30000 ] || { r9_fail "${NODES[0]} runs shard_flush_interval_ms=${fi:-unreadable}, not 30000: SHARD_FLUSH_INTERVAL_MS=30000 REPLICATION_ENABLED=true ./chaos.sh up"; return 1; }
+}
+
+# live_home <shard>: the node with a LIVE coordinator (Registry), "" if none. Not `owner`, which
+# reports any node holding a .db (a node that idle-dropped keeps a retained copy).
+live_home() {
+  local n
+  for n in "${NODES[@]}"; do
+    case "$(rpc "$n" 'IO.puts(Registry.lookup(Fathom.ShardRegistry, "'"$1"'") != [])')" in
+      *true*) echo "$n"; return 0 ;;
+    esac
+  done
+}
+
+# scrape_dump <file> <name-regex>: fleet-summed Prometheus series whose name matches the regex, one
+# "series value" per line (the repl_hist_dump shape, generalised). Cumulative since boot: diff two.
+scrape_dump() {
+  local out=$1 pat=$2 n tmp; tmp=$(mktemp)
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Fathom.Telemetry.scrape() |> IO.iodata_to_binary() |> String.split("\n") |> Enum.filter(&String.match?(&1, ~r/^('"$pat"')/)) |> Enum.each(&IO.puts/1)' >> "$tmp"
+  done
+  awk '
+    NF >= 2 { i = match($0, / [^ ]+$/); k = substr($0, 1, i - 1); s[k] += substr($0, i + 1) }
+    END { for (k in s) printf "%s %.10g\n", k, s[k] }
+  ' "$tmp" | sort > "$out"
+  rm -f "$tmp"
+}
+
+# prom_delta <before> <after> <name-regex> [label-regex]: sum of (after - before) over the series
+# matching both regexes. Keyed on FILENAME, not FNR == NR (an empty before-file breaks that).
+prom_delta() {
+  awk -v nre="$3" -v lre="${4:-}" '
+    function hit(k) { return k ~ nre && (lre == "" || k ~ lre) }
+    FILENAME == ARGV[1] { if (hit($1)) b += $2; next }
+    { if (hit($1)) a += $2 }
+    END { printf "%.0f", a - b }
+  ' "$1" "$2"
+}
+
+# timed_write <shard> <sql> <max_s>: one statement through the LB; prints "<yes|NO> <ms> <http> <err>".
+# yes means HTTP 200 AND an ok execute result (a 200 carrying an error-shaped body is a failure).
+timed_write() {
+  local shard=$1 stmt=$2 max=$3 body out code t ok=NO err=""
+  body=$(mktemp)
+  out=$(curl -sS --max-time "$max" -o "$body" -w '%{http_code} %{time_total}' -X POST "$LB/v2/pipeline" \
+    -H "Host: $shard.$DOMAIN" -H "Content-Type: application/json" \
+    -d "{\"requests\":[{\"type\":\"execute\",\"stmt\":{\"sql\":$(jq -Rn --arg s "$stmt" '$s')}},{\"type\":\"close\"}]}" 2>/dev/null || true)
+  read -r code t <<< "$out"
+  code=${code:-ERR}; t=${t:-0}
+  if [ "$code" = 200 ] && [ "$(jq -r 'try (.results[0].type) catch "none"' "$body" 2>/dev/null)" = ok ]; then
+    ok=yes
+  else
+    err=$(head -c 160 "$body" 2>/dev/null | tr '\n\t' '  ')
+  fi
+  rm -f "$body"
+  echo "$ok $(awk -v x="$t" 'BEGIN{printf "%.0f", x*1000}') $code ${err:--}"
+}
+
+# db_bytes <shard>: the shard's logical size through Hrana (page_count x page_size), "" on failure.
+db_bytes() { sql "$1" "SELECT page_count * page_size FROM pragma_page_count, pragma_page_size" 2>/dev/null | val; }
+
+# r9_toxics: one line listing each follower proxy's latency toxics, so a record shows which links
+# carried the injected latency when the number was taken.
+r9_toxics() {
+  local n
+  for n in "${NODES[@]}"; do
+    printf '%s=%s ' "$n" "$(curl -sS "$TOXI/proxies/repl-$n/toxics" 2>/dev/null | jq -r '[.[]? | select(.type=="latency") | "\(.name):\(.attributes.latency)"] | join("+") | if .=="" then "none" else . end' 2>/dev/null || echo '?')"
+  done
+  echo
+}
+
+# clock_lags <secs>: lines in the last <secs> of EVERY node's log that say the colima clock stepped.
+# Nonzero INVALIDATES the run (AGENTS.md "Rig runs need a clock check").
+clock_lags() { compose logs --since "${1}s" "${NODES[@]}" 2>/dev/null | grep -c "clock lags" || true; }
+
+# -- wake-big <MB> (review #8): the first write after a big shard idle-drops ---------------------
+# The cost the whole-DB re-seed (#13) is parked on: a tenant of <MB> megabytes is provisioned, flushed,
+# left to IDLE-DROP on its own timer (not forced), then the first write after the wake is timed. The
+# seed (db + wal shipped to the followers that lost their replica) is read from the node telemetry
+# ([:fathom,:replication,:seed] count/bytes) and, when the debug line is present, "replication seed ok
+# for <shard> ... bytes= ms=". Also the S3 GET bytes the wake pulled and the commit_total delta.
+# Preconditions (each fails the run): replication on everywhere, flush interval 30 s, the tenant at
+# least 95% of <MB>, a live coordinator before the drop and none anywhere after it, and a reopen seen
+# in the cold-open / reopen-gap telemetry after the write.
+# Usage: REPLICATION_ENABLED=true SHARD_FLUSH_INTERVAL_MS=30000 ./chaos.sh wake-big <MB> [wait_drop_s]
+#   cost: fill ~1 s/MB (1 MiB statements), drop wait = the 20 s rig idle + flush, then the wake itself.
+cmd_wake_big() {
+  local mb=${1:?usage: wake-big <MB> [wait_drop_s]} n
+  is_num "$mb" && [ "$mb" -ge 1 ] || { r9_fail "MB must be a positive integer, got '$mb'"; return 1; }
+  local wait_drop=${2:-$(( 120 + mb / 2 ))} wake_max=${WAKE_MAX_S:-600}
+  r9_require_repl || return 1
+  local shard="wakebig${mb}m$(date +%H%M%S)" i out bytes home
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, false)' >/dev/null
+  done
+  trap 'for n in "${NODES[@]}"; do rpc "$n" "Application.put_env(:fathom, :rebalancer_enabled, true)" >/dev/null; done; trap - RETURN' RETURN
+
+  echo "wake-big: $shard, ${mb} MB, idle-drop wait up to ${wait_drop}s, wake budget ${wake_max}s"
+  sql "$shard" "CREATE TABLE big (b BLOB)" >/dev/null || { r9_fail "create $shard"; return 1; }
+  for ((i = 0; i < mb; i++)); do
+    out=$(sql "$shard" "INSERT INTO big VALUES (randomblob(1048576))" 2>&1) || { r9_fail "fill $shard at ${i} MiB: $(echo "$out" | cut -c1-300)"; return 1; }
+  done
+  bytes=$(db_bytes "$shard")
+  is_num "$bytes" && [ "$bytes" -ge $(( mb * 1048576 * 95 / 100 )) ] || { r9_fail "$shard is ${bytes:-unreadable} bytes, wanted >= 95% of $mb MiB: the tenant never reached the size"; return 1; }
+  home=$(live_home "$shard")
+  [ -n "$home" ] || { r9_fail "no live coordinator for $shard before the drop"; return 1; }
+  out=$(rpc "$home" 'IO.inspect(Fathom.Shards.flush("'"$shard"'"))' | tr -d '\r\n ')
+  [ "$out" = ":ok" ] || { r9_fail "flush of $shard on $home answered '${out:-nothing}'"; return 1; }
+  echo "  provisioned: $bytes bytes, home $home, flushed"
+
+  # Let it idle-drop on its own timer; no request touches it from here.
+  local t0=$SECONDS dropped=0
+  while (( SECONDS - t0 < wait_drop )); do
+    [ -z "$(live_home "$shard")" ] && { dropped=1; break; }
+    sleep 2
+  done
+  [ "$dropped" = 1 ] || { r9_fail "$shard still has a live coordinator after ${wait_drop}s: it never idle-dropped (SHARD_IDLE_MS?), the wake would not be a wake"; return 1; }
+  local drop_s=$(( SECONDS - t0 )) local_db
+  local_db=$(rpc "$home" 'IO.puts(File.exists?("/data/shards/'"$shard"'.db"))' | tr -d '\r\n ')
+  echo "  idle-dropped after ~${drop_s}s (local .db kept on $home: ${local_db:-?}; true = retained/warm wake)"
+
+  local sb ha hb sa since lag_secs
+  sb=$(mktemp); hb=$(mktemp); ha=$(mktemp); sa=$(mktemp)
+  local pat='fathom_s3_op|fathom_replication_seed|fathom_shard_reopen|fathom_shard_cold_open'
+  scrape_dump "$sb" "$pat"; repl_hist_dump "$hb"
+  since=$(/usr/bin/python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
+  local t_wake=$SECONDS first second
+  first=$(timed_write "$shard" "INSERT INTO big VALUES (x'01')" "$wake_max")
+  second=$(timed_write "$shard" "INSERT INTO big VALUES (x'02')" 30)
+  sleep 5   # seeds the quorum did not wait for finish; the telemetry is read after
+  scrape_dump "$sa" "$pat"; repl_hist_dump "$ha"
+  lag_secs=$(( SECONDS - t_wake + 8 ))
+
+  local reopens seeds seedb getb getn lines clock
+  reopens=$(prom_delta "$sb" "$sa" '^fathom_shard_(reopen_gap_ms|cold_open_duration)_count')
+  seeds=$(prom_delta "$sb" "$sa" '^fathom_replication_seed_count')
+  seedb=$(prom_delta "$sb" "$sa" '^fathom_replication_seed_bytes')
+  getb=$(prom_delta "$sb" "$sa" '^fathom_s3_op_bytes' 'op="get"')
+  getn=$(prom_delta "$sb" "$sa" '^fathom_s3_op_count' 'op="get"')
+  lines=$(compose logs --since "$since" 2>/dev/null | grep "replication seed ok for $shard " | grep -Eo 'bytes=[0-9]+ ms=[0-9]+' | tr '\n' ' ' || true)
+  clock=$(clock_lags "$lag_secs")
+
+  echo ""
+  echo "  --- wake-big $mb MB result ---"
+  echo "  first write after wake : ${first%% *}, $(echo "$first" | awk '{print $2}') ms (http $(echo "$first" | awk '{print $3}')) $(echo "$first" | cut -d' ' -f4-)"
+  echo "  next write (warm)      : ${second%% *}, $(echo "$second" | awk '{print $2}') ms"
+  echo "  seeds sent             : $seeds  (declared bytes $seedb)   per-seed lines: ${lines:-none (debug log absent)}"
+  echo "  S3 GET during wake     : $getn requests, $getb bytes"
+  echo "  reopen/cold-open events: $reopens"
+  echo "  A2 commit groups (delta over the wake):"
+  repl_hist_report "$hb" "$ha" | grep -E '^  fathom_replication_commit.* n=' | sed 's/^/    /'
+  echo "  clock lags             : $clock"
+  echo "RESULT $(jq -nc --arg shard "$shard" --argjson mb "$mb" --arg first "$first" --argjson seeds "${seeds:-0}" --argjson seed_bytes "${seedb:-0}" --argjson get_bytes "${getb:-0}" --argjson drop_s "$drop_s" --arg local_db "$local_db" --argjson clock "${clock:-0}" '{arm:"wake-big",shard:$shard,mb:$mb,first_write:$first,seeds:$seeds,seed_bytes:$seed_bytes,s3_get_bytes:$get_bytes,drop_s:$drop_s,local_db_after_drop:$local_db,clock_lags:$clock}')"
+  rm -f "$sb" "$hb" "$ha" "$sa"
+  [ "${first%% *}" = yes ] || { r9_fail "the first write after the wake FAILED ($first)"; return 1; }
+  [ "${reopens:-0}" -ge 1 ] || { r9_fail "no reopen / cold-open event was recorded after the write: the wake did not happen as measured"; return 1; }
+  [ "${clock:-0}" -eq 0 ] || { r9_fail "$clock 'clock lags' lines: colima clock stepped, this run is INVALID"; return 1; }
+}
+
+# -- bulk-commit <MB> (review #8): one large single transaction ----------------------------------
+# ONE statement (a recursive-CTE INSERT of 64 KiB random blobs, <MB>*16 rows) is one SQLite transaction
+# and therefore one replicated commit window; the arm times it end to end and reads the A2 commit
+# histogram delta (n = replicated commits observed fleet-wide) to see how many commit rounds it took.
+# Run it at repl-latency 0 and at 15 ms (`./chaos.sh repl-latency 15`, fleet up with REPL_VIA_TOXI=1):
+# the toxics in force are printed in the record. Review #18 falsifier: >= 150 MB/s at 0 ms.
+# Preconditions: replication on, flush 30 s, the table holds >= <MB> afterwards, the statement answered ok.
+# Usage: REPLICATION_ENABLED=true SHARD_FLUSH_INTERVAL_MS=30000 ./chaos.sh bulk-commit <MB>
+cmd_bulk_commit() {
+  local mb=${1:?usage: bulk-commit <MB>} n
+  is_num "$mb" && [ "$mb" -ge 1 ] || { r9_fail "MB must be a positive integer, got '$mb'"; return 1; }
+  r9_require_repl || return 1
+  local shard="bulk${mb}m$(date +%H%M%S)" max=${BULK_MAX_S:-900} rows=$(( mb * 16 )) pre post bytes hb ha t0 wall_ms ms0 ms1 clock lag_secs
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, false)' >/dev/null
+  done
+  trap 'for n in "${NODES[@]}"; do rpc "$n" "Application.put_env(:fathom, :rebalancer_enabled, true)" >/dev/null; done; trap - RETURN' RETURN
+
+  echo "bulk-commit: $shard, ${mb} MB in ONE transaction ($rows rows x 64 KiB), budget ${max}s"
+  echo "  repl latency toxics: $(r9_toxics)"
+  sql "$shard" "CREATE TABLE big (b BLOB)" >/dev/null || { r9_fail "create $shard"; return 1; }
+  pre=$(timed_write "$shard" "INSERT INTO big VALUES (x'00')" 30)
+  [ "${pre%% *}" = yes ] || { r9_fail "baseline write failed: $pre"; return 1; }
+  hb=$(mktemp); ha=$(mktemp); repl_hist_dump "$hb"
+  t0=$SECONDS; ms0=$(now_ms)
+  post=$(timed_write "$shard" "WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < $rows) INSERT INTO big SELECT randomblob(65536) FROM s" "$max")
+  ms1=$(now_ms); wall_ms=$(( ms1 - ms0 ))
+  sleep 3
+  repl_hist_dump "$ha"
+  lag_secs=$(( SECONDS - t0 + 8 ))
+  clock=$(clock_lags "$lag_secs")
+  bytes=$(db_bytes "$shard")
+
+  echo ""
+  echo "  --- bulk-commit $mb MB result ---"
+  echo "  bulk statement : ${post%% *}, $(echo "$post" | awk '{print $2}') ms client wall (http $(echo "$post" | awk '{print $3}')) $(echo "$post" | cut -d' ' -f4-)"
+  echo "  throughput     : $(awk -v m="$mb" -v w="$wall_ms" 'BEGIN{printf "%.1f", (w>0)? m/(w/1000):0}') MB/s"
+  echo "  db size after  : ${bytes:-unreadable} bytes"
+  echo "  baseline small write before: $(echo "$pre" | awk '{print $2}') ms"
+  echo "  A2 commit groups (delta; n of commit_total = replicated commit rounds seen fleet-wide):"
+  repl_hist_report "$hb" "$ha" | grep -E '^  fathom_replication_commit.* n=' | sed 's/^/    /'
+  echo "  clock lags     : $clock"
+  echo "RESULT $(jq -nc --arg shard "$shard" --argjson mb "$mb" --arg post "$post" --argjson wall_ms "$wall_ms" --arg toxics "$(r9_toxics)" --argjson clock "${clock:-0}" '{arm:"bulk-commit",shard:$shard,mb:$mb,bulk:$post,wall_ms:$wall_ms,repl_toxics:$toxics,clock_lags:$clock}')"
+  rm -f "$hb" "$ha"
+  [ "${post%% *}" = yes ] || { r9_fail "the bulk statement FAILED ($post)"; return 1; }
+  is_num "$bytes" && [ "$bytes" -ge $(( mb * 1048576 * 95 / 100 )) ] || { r9_fail "table holds ${bytes:-unreadable} bytes, wanted >= 95% of $mb MiB: the transaction did not land in full"; return 1; }
+  [ "${clock:-0}" -eq 0 ] || { r9_fail "$clock 'clock lags' lines: colima clock stepped, this run is INVALID"; return 1; }
+}
+
+# -- tpc-churn (review #7): idle -> reopen economics ----------------------------------------------
+# N tenants, each ONE-SHOT writer on a LOGNORMAL gap schedule (median median_s, sigma CHURN_SIGMA=1.0; open
+# loop, so a slow reopen shows up as queueing, not as a quietly longer gap) so a real share of gaps exceed
+# the idle timeout and the next request is an idle -> reopen. One round per `retain_bytes:idle_ms` pair; each
+# round uses its own shard namespace and pins :shard_retain_local_bytes / :shard_idle_ms on every node (read
+# back to prove the pin took), restored at the end.
+# Per round: overall p50/p99, FIRST-AFTER-GAP p50/p99 (ops whose preceding gap >= the round's idle_ms), the
+# drawn-gap histogram, S3 GET requests and bytes per second, follower seed count/bytes, the reopen-gap and
+# cold-open histograms (warm=true means a local copy was kept), and the `clock lags` count that invalidates
+# the round. Replication must be ON and the flush interval 30 s.
+# Usage: TPC_NET=container TPC_DRIVER=elixir REPLICATION_ENABLED=true SHARD_FLUSH_INTERVAL_MS=30000 \
+#          ./chaos.sh tpc-churn [tenants duration_s median_gap_s rounds_csv]
+#   defaults 256 600 90 "0:60000,268435456:60000,0:300000,268435456:300000"; CHURN_ACCOUNTS (default 100000
+#   rows, ~1.5 MB/tenant) sizes each tenant, CHURN_SIGMA the lognormal shape. Runtime ~ rounds x (duration + 1 min).
+cmd_tpc_churn() {
+  local tenants=${1:-256} dur_s=${2:-600} median_s=${3:-90} rounds_csv=${4:-"0:60000,268435456:60000,0:300000,268435456:300000"}
+  local sigma=${CHURN_SIGMA:-1.0} accounts=${CHURN_ACCOUNTS:-100000} n
+  [ "$TPC_DRIVER" = elixir ] || { r9_fail "tpc-churn needs TPC_DRIVER=elixir (the python driver has no oneshot mode)"; return 1; }
+  [ "$TPC_NET" = container ] || echo "WARNING: TPC_NET=$TPC_NET; the rig numbers assume TPC_NET=container" >&2
+  r9_require_repl || return 1
+  local median_ms=$(( median_s * 1000 )) ops
+  # Mean gap of a lognormal = median x exp(sigma^2 / 2); size the op count so a tenant runs ~dur_s.
+  ops=$(awk -v d="$dur_s" -v m="$median_s" -v s="$sigma" 'BEGIN{ x = d / (m * exp(s*s/2)); printf "%d", (x < 2) ? 2 : x }')
+  echo "tpc-churn: $tenants tenants x $ops one-shot writes, lognormal gaps median ${median_s}s sigma $sigma (~${dur_s}s/round), accounts $accounts, rounds $rounds_csv"
+
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :rebalancer_enabled, false)' >/dev/null
+  done
+  tpc_prewarm
+
+  local IFS=,
+  set -f; set -- $rounds_csv; set +f
+  unset IFS
+  local round=0 spec retain idle tag json sb sa hb ha t0 secs clock getb getn seeds seedb rb ri rc=0
+  local pat='fathom_s3_op|fathom_replication_seed|fathom_shard_reopen|fathom_shard_cold_open'
+  tag=$(date +%H%M%S)
+  for spec in "$@"; do
+    round=$(( round + 1 )); retain=${spec%%:*}; idle=${spec##*:}
+    if ! { is_num "$retain" && is_num "$idle"; }; then r9_fail "round spec '$spec' is not retain_bytes:idle_ms"; rc=1; break; fi
+    for n in "${NODES[@]}"; do
+      rpc "$n" "Application.put_env(:fathom, :shard_retain_local_bytes, $retain); Application.put_env(:fathom, :shard_idle_ms, $idle)" >/dev/null
+    done
+    # Read the knobs back: a round whose pin silently did not take is not the round it is labelled.
+    rb=$(rpc "${NODES[0]}" 'IO.puts(Application.get_env(:fathom, :shard_retain_local_bytes))' | tr -d '\r\n ')
+    ri=$(rpc "${NODES[0]}" 'IO.puts(Application.get_env(:fathom, :shard_idle_ms))' | tr -d '\r\n ')
+    if ! { [ "$rb" = "$retain" ] && [ "$ri" = "$idle" ]; }; then r9_fail "round $round: read back retain=$rb idle=$ri, wanted $retain / $idle"; rc=1; break; fi
+    sb=$(mktemp); sa=$(mktemp); hb=$(mktemp); ha=$(mktemp)
+    scrape_dump "$sb" "$pat"; repl_hist_dump "$hb"
+    t0=$(date +%s)
+    json=$(tpc_run oneshot-fleet --domain "$DOMAIN" --shard "ch${tag}r$round" \
+      --worker-timeout "${TPC_WORKER_TIMEOUT:-$(( dur_s * 3000 + 180000 ))}" --accounts "$accounts" \
+      --clients "$tenants" --streams 1 --think-ms "$median_ms" --think-dist lognormal --think-sigma "$sigma" \
+      --gap-thresh-ms "$idle" --txns $(( tenants * ops )) 2>/dev/null)
+    secs=$(( $(date +%s) - t0 + 2 ))
+    scrape_dump "$sa" "$pat"; repl_hist_dump "$ha"
+    clock=$(clock_lags "$secs")
+    getb=$(prom_delta "$sb" "$sa" '^fathom_s3_op_bytes' 'op="get"')
+    getn=$(prom_delta "$sb" "$sa" '^fathom_s3_op_count' 'op="get"')
+    seeds=$(prom_delta "$sb" "$sa" '^fathom_replication_seed_count')
+    seedb=$(prom_delta "$sb" "$sa" '^fathom_replication_seed_bytes')
+    echo ""
+    echo "  === round $round: retain=${retain}B idle=${idle}ms  (${secs}s) ==="
+    if [ "$(printf '%s' "$json" | jq -r '.ops // 0' 2>/dev/null)" = 0 ]; then
+      r9_fail "round $round: the driver produced no result/ops (json: $(printf '%s' "$json" | head -c 200))"; rc=1
+    fi
+    printf "  ops %s  errors %s  shed %s  | all p50/p99 ms %s / %s\n" \
+      "$(printf '%s' "$json" | jq -r '.ops // 0')" "$(printf '%s' "$json" | jq -r '.errors // 0')" "$(printf '%s' "$json" | jq -r '.shed_tenants // 0')" \
+      "$(printf '%s' "$json" | jq -r '(.oneshot_p50_us // 0) / 1000 | . * 100 | round / 100')" \
+      "$(printf '%s' "$json" | jq -r '(.oneshot_p99_us // 0) / 1000 | . * 100 | round / 100')"
+    printf "  FIRST-AFTER-GAP (gap >= %s ms): n %s  p50 %s ms  p95 %s ms  p99 %s ms  max %s ms\n" "$idle" \
+      "$(printf '%s' "$json" | jq -r '.after_gap_ops // 0')" \
+      "$(printf '%s' "$json" | jq -r '(.after_gap_p50_us // 0) / 1000 | . * 100 | round / 100')" \
+      "$(printf '%s' "$json" | jq -r '(.after_gap_p95_us // 0) / 1000 | . * 100 | round / 100')" \
+      "$(printf '%s' "$json" | jq -r '(.after_gap_p99_us // 0) / 1000 | . * 100 | round / 100')" \
+      "$(printf '%s' "$json" | jq -r '(.after_gap_max_us // 0) / 1000 | . * 10 | round / 10')"
+    printf "  drawn gap histogram (cumulative, seconds): %s\n" "$(printf '%s' "$json" | jq -c '.gap_hist_s // {}')"
+    printf "  S3 GET: %s req (%s/s)  %s bytes (%s B/s)   seeds: %s  seed bytes: %s (%s B/s)\n" \
+      "$getn" "$(awk -v x="$getn" -v s="$secs" 'BEGIN{printf "%.1f", x/s}')" "$getb" "$(awk -v x="$getb" -v s="$secs" 'BEGIN{printf "%.0f", x/s}')" \
+      "$seeds" "$seedb" "$(awk -v x="$seedb" -v s="$secs" 'BEGIN{printf "%.0f", x/s}')"
+    printf "  err reasons: %s\n" "$(printf '%s' "$json" | jq -c '.err_reasons // {}')"
+    echo "  reopen-gap / cold-open histograms (count, mean ms, p50/p99 bucket bounds):"
+    # repl_hist_report is generic over "series value" files, so it digests the shard series too.
+    repl_hist_report "$sb" "$sa" | grep -E '^  fathom_shard_(reopen|cold_open).* n=' | sed 's/^/    /'
+    echo "  A2 commit groups:"
+    repl_hist_report "$hb" "$ha" | grep -E '^  fathom_replication_commit.* n=' | sed 's/^/    /'
+    rm -f "$sb" "$sa" "$hb" "$ha"
+    echo "  clock lags: $clock"
+    if [ "${clock:-0}" -gt 0 ]; then echo "  WARNING: $clock 'clock lags' lines in round $round -- colima clock step, the round is INVALID"; rc=1; fi
+    echo "RESULT $(printf '%s' "$json" | jq -c --argjson r "$round" --argjson retain "$retain" --argjson idle "$idle" --argjson gb "${getb:-0}" --argjson gn "${getn:-0}" --argjson seeds "${seeds:-0}" --argjson seedb "${seedb:-0}" --argjson clock "${clock:-0}" --argjson secs "$secs" '{arm:"tpc-churn",round:$r,retain_bytes:$retain,idle_ms:$idle,secs:$secs,ops,errors,after_gap_ops,after_gap_p50_us,after_gap_p99_us,s3_get_bytes:$gb,s3_get_reqs:$gn,seeds:$seeds,seed_bytes:$seedb,clock_lags:$clock}' 2>/dev/null || echo '{}')"
+  done
+
+  for n in "${NODES[@]}"; do
+    rpc "$n" 'Application.put_env(:fathom, :shard_retain_local_bytes, 0); Application.put_env(:fathom, :shard_idle_ms, 20_000); Application.put_env(:fathom, :rebalancer_enabled, true)' >/dev/null
+  done
+  echo ""
+  echo "  Read: compare FIRST-AFTER-GAP p50/p99 and S3 GET B/s across the retain=0 vs retain>0 rounds at the SAME idle_ms, and"
+  echo "  idle 60000 vs 300000 at the SAME retain (their spread vs a repeated round is the noise floor). The gap histogram"
+  echo "  must put a real share of gaps past idle_ms, or no reopen happened and the round measured nothing. Replication"
+  echo "  ON: retention does not avoid the A2 re-seed (seed bytes), see review #13."
+  return $rc
+}
+
+# -- msacc-poll [secs] [-- <chaos.sh args>] (review #21): is the poll thread busy? -------------
+# `+IOt 4 +IOp 2` shipped unmeasured. This samples :msacc on EVERY node in parallel for <secs> (default 60)
+# and prints the poll / scheduler / dirty busy% (busy excl. :other; spin counted apart). With
+# `-- tpc-fleet 1024` the named arm runs underneath the sample; with no command, start the load yourself
+# in another shell and run this beside it. Verdict (review #21): poll < 1% on every node => close with no
+# A/B; else the A/B is ERL_ZFLAGS="+IOt 1 +IOp 1" (fleet up with it) against the default, ~20 min.
+cmd_msacc_poll() {
+  local secs=60 n out sub=() script worst=0 v
+  if [ $# -gt 0 ] && [ "$1" != "--" ]; then secs=$1; shift; fi
+  if [ "${1:-}" = "--" ]; then shift; sub=("$@"); fi
+  is_num "$secs" || { r9_fail "secs must be an integer"; return 1; }
+  out=$(mktemp -d)
+  script=$(cat <<EOS
+:msacc.start($((secs * 1000)))
+d = :msacc.stats()
+for {t, l} <- Enum.group_by(d, & &1.type), t in [:scheduler, :dirty_io_scheduler, :dirty_cpu_scheduler, :poll] do
+  sum = fn k -> l |> Enum.map(fn x -> Map.get(x.counters, k, 0) end) |> Enum.sum() end
+  tot = l |> Enum.map(fn x -> x.counters |> Map.values() |> Enum.sum() end) |> Enum.sum()
+  pct = fn v -> if tot > 0, do: Float.round(v / tot * 100, 2), else: 0.0 end
+  IO.puts("MSACC\t#{t}\t#{length(l)}\t#{pct.(tot - sum.(:sleep) - sum.(:other))}\t#{pct.(sum.(:other))}")
+end
+EOS
+)
+  echo "msacc-poll: ${secs}s on ${#NODES[@]} nodes (parallel), running ${#sub[@]} sub-command words"
+  for n in "${NODES[@]}"; do
+    ( rpc "$n" "$script" > "$out/$n.txt" ) &
+  done
+  if [ ${#sub[@]} -gt 0 ]; then "$0" "${sub[@]}" > "$out/sub.txt" 2>&1 || echo "WARNING: the sub-command exited non-zero (see its output below)"; fi
+  wait
+  printf '  %-9s %-20s %5s %9s %9s\n' node type "n" "busy%" "other%"
+  for n in "${NODES[@]}"; do
+    awk -F'\t' -v node="$n" '$1 == "MSACC" { printf "  %-9s %-20s %5s %9s %9s\n", node, $2, $3, $4, $5 }' "$out/$n.txt"
+    v=$(awk -F'\t' '$1 == "MSACC" && $2 == "poll" { print $4 }' "$out/$n.txt")
+    [ -n "$v" ] || { r9_fail "no poll row from $n (rpc failed or msacc unavailable)"; rm -rf "$out"; return 1; }
+    worst=$(awk -v a="$worst" -v b="$v" 'BEGIN{print (b > a) ? b : a}')
+  done
+  if [ -f "$out/sub.txt" ]; then echo; echo "  --- sub-command output ---"; sed 's/^/  | /' "$out/sub.txt"; fi
+  echo ""
+  if awk -v w="$worst" 'BEGIN{exit !(w < 1.0)}'; then
+    echo "  worst poll busy% = $worst  (< 1%): close review #21 without the A/B."
+  else
+    echo "  worst poll busy% = $worst  (>= 1%): run the +IOt 1 +IOp 1 A/B."
+  fi
+  rm -rf "$out"
+}
+
 # disk-cap [show|probe]: check that RIG_DISK_CAP's cap is applied where it matters (expert review
 # 2026-10-29 #16). `show` (default) reads each node's cgroup `io.max` and compares the major:minor it
 # names with the major:minor of the whole-disk device in the colima VM (a cap on the wrong device, or
@@ -3758,6 +4166,10 @@ case "${1:-}" in
   owner)       shift; cmd_owner "$@" ;;
   latency)     shift; cmd_latency "$@" ;;
   repl-latency) shift; cmd_repl_latency "$@" ;;
+  wake-big)    shift; cmd_wake_big "$@" ;;
+  bulk-commit) shift; cmd_bulk_commit "$@" ;;
+  tpc-churn)   shift; cmd_tpc_churn "$@" ;;
+  msacc-poll)  shift; cmd_msacc_poll "$@" ;;
   failover)    shift; cmd_failover "$@" ;;
   pause-fence) shift; cmd_pause_fence "$@" ;;
   partition)   shift; cmd_partition "$@" ;;

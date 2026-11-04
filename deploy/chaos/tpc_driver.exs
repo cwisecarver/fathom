@@ -524,6 +524,8 @@ defmodule Tpc do
     lat = Enum.flat_map(results, & &1.lat)
     errs = Enum.sum(Enum.map(results, & &1.errors)) + crashed * k * ops
     spans = Enum.flat_map(results, & &1.spans)
+    glat = Enum.flat_map(results, &Map.get(&1, :glat, []))
+    gaps_ms = Enum.flat_map(results, &Map.get(&1, :gaps_ms, []))
 
     window_us =
       case spans do
@@ -554,6 +556,53 @@ defmodule Tpc do
       "oneshot_tps" => tps
     }
     |> Map.merge(for {key, v} <- p, into: %{}, do: {"oneshot_#{key}", v})
+    |> churn_stats(a, glat, gaps_ms)
+  end
+
+  # `--think-dist lognormal` only (tpc-churn, expert review 2026-11-04 #7): the latency of ops that
+  # FOLLOW a gap >= `--gap-thresh-ms` (the first request after an idle period, the one that pays an
+  # idle->reopen), apart from the all-ops numbers above, and the histogram of the gaps the schedule
+  # actually drew (seconds, `le` buckets) so the run can be lined up with `reopen.gap_ms`.
+  defp churn_stats(out, %{think_dist: "lognormal"} = a, glat, gaps_ms) do
+    gp = pctls(glat)
+
+    buckets = [1, 5, 15, 30, 60, 120, 300, 600, 1800]
+
+    hist =
+      for b <- buckets, into: %{} do
+        {"le_#{b}s", Enum.count(gaps_ms, &(&1 <= b * 1000))}
+      end
+
+    out
+    |> Map.put("think_dist", "lognormal")
+    |> Map.put("think_sigma", a.think_sigma)
+    |> Map.put("gap_thresh_ms", a.gap_thresh_ms)
+    |> Map.put("after_gap_ops", length(glat))
+    |> Map.put("after_gap_p50_us", gp["p50_us"])
+    |> Map.put("after_gap_p95_us", gp["p95_us"])
+    |> Map.put("after_gap_p99_us", gp["p99_us"])
+    |> Map.put("after_gap_max_us", gp["max_us"])
+    |> Map.put("gaps_drawn", length(gaps_ms))
+    |> Map.put("gap_hist_s", Map.put(hist, "le_inf", length(gaps_ms)))
+  end
+
+  defp churn_stats(out, _a, _glat, _gaps_ms), do: out
+
+  # K gap lengths in ms, lognormal with the given MEDIAN (ln-mean = ln median) and shape sigma,
+  # clamped to [1 ms, 10 x median] so one draw cannot outlive the worker's budget. The first entry
+  # is 0: op 1 has no gap before it (the phase offset places it).
+  defp lognormal_gaps(ops, median_ms, sigma) do
+    draws =
+      if ops > 1 do
+        for _ <- 2..ops//1 do
+          g = :math.exp(:math.log(median_ms) + sigma * :rand.normal())
+          trunc(min(max(g, 1.0), 10.0 * median_ms))
+        end
+      else
+        []
+      end
+
+    [0 | draws]
   end
 
   # One tenant: seed its shard on a held stream, then run K workers against it concurrently.
@@ -572,7 +621,9 @@ defmodule Tpc do
         %{
           lat: Enum.flat_map(rs, & &1.lat),
           errors: Enum.sum(Enum.map(rs, & &1.errors)),
-          spans: Enum.map(rs, & &1.span)
+          spans: Enum.map(rs, & &1.span),
+          glat: Enum.flat_map(rs, &Map.get(&1, :glat, [])),
+          gaps_ms: Enum.flat_map(rs, &Map.get(&1, :gaps_ms, []))
         }
 
       :error ->
@@ -624,11 +675,30 @@ defmodule Tpc do
     think_us = a.think_ms * 1000
     phase_us = if think_us > 0, do: trunc(:rand.uniform() * think_us), else: 0
 
+    # Lognormal think time (tpc-churn): precompute each op's offset from `phase` as the running sum
+    # of its gaps, so the schedule stays open loop. nil = the fixed `--think-ms` grid, unchanged.
+    gaps_ms =
+      if think_us > 0 and a.think_dist == "lognormal",
+        do: lognormal_gaps(a.ops, a.think_ms, a.think_sigma)
+
+    offs_us =
+      if gaps_ms,
+        do: gaps_ms |> Enum.scan(0, fn g, acc -> acc + g * 1000 end) |> List.to_tuple()
+
+    gap_thresh_us = a.gap_thresh_ms * 1000
+
     case Client.connect(a.lb, connect_opts(a, auth)) do
       {:ok, c} ->
-        {lat, e, c} =
-          Enum.reduce(1..a.ops, {[], 0, c}, fn k, {lat, e, c} ->
-            intended = if think_us > 0, do: t0 + phase_us + (k - 1) * think_us
+        {lat, e, c, glat} =
+          Enum.reduce(1..a.ops, {[], 0, c, []}, fn k, {lat, e, c, glat} ->
+            intended =
+              cond do
+                offs_us -> t0 + phase_us + elem(offs_us, k - 1)
+                think_us > 0 -> t0 + phase_us + (k - 1) * think_us
+                true -> nil
+              end
+
+            after_gap? = gaps_ms != nil and k > 1 and Enum.at(gaps_ms, k - 1) * 1000 >= gap_thresh_us
 
             if intended do
               wait = intended - System.monotonic_time(:microsecond)
@@ -639,21 +709,29 @@ defmodule Tpc do
             origin = intended || start
 
             if start > deadline do
-              {lat, e + 1, c}
+              {lat, e + 1, c, glat}
             else
               case oneshot_op(c, a.accounts) do
                 {:ok, c} ->
-                  {[System.monotonic_time(:microsecond) - origin | lat], e, c}
+                  l = System.monotonic_time(:microsecond) - origin
+                  {[l | lat], e, c, if(after_gap?, do: [l | glat], else: glat)}
 
                 {:error, reason, c} ->
                   ErrTally.note(reason)
-                  {lat, e + 1, reconnect(c)}
+                  {lat, e + 1, reconnect(c), glat}
               end
             end
           end)
 
         _ = c.transport.close(c.transport_state)
-        %{lat: lat, errors: e, span: {t0, System.monotonic_time(:microsecond)}}
+
+        %{
+          lat: lat,
+          errors: e,
+          span: {t0, System.monotonic_time(:microsecond)},
+          glat: glat,
+          gaps_ms: gaps_ms || []
+        }
 
       other ->
         ErrTally.note(other)
@@ -984,6 +1062,12 @@ defmodule Tpc do
       tenant_hist: 0,
       # oneshot-fleet think time in ms (0 = closed loop, back to back); see mode_oneshot_fleet.
       think_ms: 0,
+      # oneshot-fleet gap distribution: "" = the fixed --think-ms grid; "lognormal" = lognormal gaps
+      # with MEDIAN --think-ms and shape --think-sigma (tpc-churn). --gap-thresh-ms: gaps at least
+      # this long count as "after a gap" in the after_gap_* percentiles.
+      think_dist: "",
+      think_sigma: 1.0,
+      gap_thresh_ms: 0,
       # --tokens-file: per-tenant bearer tokens (see connect_opts); tokens is the loaded map.
       tokens_file: nil,
       tokens: nil
@@ -1019,9 +1103,10 @@ defmodule Tpc do
     :boot,
     :excl_s,
     :tenant_hist,
-    :think_ms
+    :think_ms,
+    :gap_thresh_ms
   ]
-  @floats [:scale]
+  @floats [:scale, :think_sigma]
 
   defp parse_opts([], acc), do: acc
 

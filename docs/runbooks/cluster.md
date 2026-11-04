@@ -188,3 +188,29 @@ shard is left to the supervisor shutdown (raise the budget or lower per-node den
 structural companion to the busy-terminate flush fix (audit #2): together, a clean shutdown's
 deploy-time loss window is zero. Validating it against the chaos rig's rolling-deploy scenario and
 measuring the window with `mix fathom.rpo` is a follow-up.
+
+## Round-9 measurement arms (`deploy/chaos/chaos.sh`)
+
+Harness-only arms from the 2026-11-04 perf review (#7, #8, #21). All need the fleet up with
+`REPLICATION_ENABLED=true SHARD_FLUSH_INTERVAL_MS=30000` (each asserts both via rpc and fails loudly
+otherwise), print a human table plus one greppable `RESULT {json}` line, and fail on a nonzero
+`clock lags` count (a colima clock step invalidates the run). Run them on a fresh VM, one at a time.
+
+- **`repl-latency <ms>|clear [node]`** puts the latency toxic on ONE follower link (needs
+  `REPL_VIA_TOXI=1` on `up` and in the calling shell) and reads the toxics back to prove it is there and
+  nowhere else. Without a node it is the old all-links behaviour. It replaces an existing toxic.
+- **`wake-big <MB>`** provisions a tenant of `<MB>`, flushes it, waits for its own idle-drop, then times
+  the first write after the wake. Reports seeds and declared seed bytes (`[:fathom,:replication,:seed]`),
+  S3 GET requests and bytes, the `commit_total` delta and whether the local `.db` survived the drop.
+  Fails if the tenant is under 95% of `<MB>`, never idle-drops, or no reopen is recorded. Sizes the cost
+  review #13 is parked on.
+- **`bulk-commit <MB>`** runs one single-statement transaction of `<MB>` (64 KiB random blobs) and
+  reports wall time, MB/s, the toxics in force and the A2 commit-round counts. Run it with
+  `repl-latency clear` and at `repl-latency 15` for review #18's falsifier (>= 150 MB/s at 0 ms).
+- **`tpc-churn [tenants duration_s median_gap_s rounds]`** drives one-shot writers on lognormal gaps
+  (`tpc_driver.exs oneshot-fleet --think-dist lognormal`), one round per `retain_bytes:idle_ms` pair
+  (pinned and read back on every node). Reports first-after-gap p50/p99 apart from all-ops, the drawn gap
+  histogram, S3 GET req/s and B/s, seed count/bytes and the reopen-gap and cold-open histograms.
+  Decides review #7's retention and idle defaults.
+- **`msacc-poll [secs] [-- <arm args>]`** samples `:msacc` on every node in parallel while an arm runs
+  underneath (e.g. `-- tpc-fleet 1024`); worst poll-thread busy% under 1% closes review #21 with no A/B.
