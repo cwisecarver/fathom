@@ -2075,30 +2075,20 @@ defmodule Fathom.Shard do
   # flush 412s and goes through the existing reconcile path, which only accepts the object as ours
   # on an etag match. A stale message (the task already settled) matches no `flush_task` ref.
   def handle_info({:flush_deadline, ref}, %{flush_task: %Task{ref: ref} = task} = state) do
-    Task.shutdown(task, :brutal_kill)
+    case Task.shutdown(task, :brutal_kill) do
+      # THE REPLY ARRIVED FIRST. The task finished between this message being queued and this
+      # handler running, so `shutdown/2` consumed `{ref, reply}` from the mailbox. By then the PUT
+      # landed AND `stamp_sidecar/2` already named the new etag and cleared the PUT intents:
+      # discarding the reply would leave the coordinator on the OLD etag, the next flush would 412,
+      # and `Fork.put_origin` (the object's md5 is in no recorded intent) would call our own landed
+      # PUT a fork and quarantine acked writes. Fold it exactly like the live reply (the terminate
+      # path's `settle_flush_task/1` does the same).
+      {:ok, reply} ->
+        handle_info({ref, reply}, state)
 
-    Logger.warning(
-      "shard #{state.id}: durability flush exceeded #{flush_deadline_ms()} ms; killed it to free its slot"
-    )
-
-    :telemetry.execute([:fathom, :shard, :flush, :deadline], %{count: 1}, %{shard_id: state.id})
-
-    state =
-      release_flush_slot(
-        record_flush_failure(%{state | flush_task: nil}, {:flush_deadline, flush_deadline_ms()})
-      )
-
-    # A killed flush is a TRANSIENT failure: retry on the short doubling backoff, not a whole
-    # interval (the crash handler above keeps the interval; this one is a store fault by design).
-    before = state.flush_rekicks
-    settled = settle_waiters(state, :flushed)
-
-    settled =
-      if settled.flush_rekicks > before,
-        do: settled,
-        else: schedule_flush_after_failure(settled, {:flush_deadline, flush_deadline_ms()})
-
-    {:noreply, settled}
+      _killed ->
+        flush_deadline_failure(state)
+    end
   end
 
   def handle_info({:flush_deadline, _ref}, state), do: {:noreply, state}
@@ -5301,6 +5291,33 @@ defmodule Fathom.Shard do
   # would also silently spend the WAITER budget: a shard that had been bouncing off the gate would
   # answer the next `flush_now` caller `{:error, :flush_gate_full}` immediately, with none of the
   # patience that branch exists to give. Implement the finding, not the prescription.
+  # NOTE: the 600 s default deadline exceeds the 30 s legacy lease TTL (legacy mode does not renew
+  # during a long flush). Pre-existing and out of scope here; the fence re-checks ownership.
+  defp flush_deadline_failure(state) do
+    Logger.warning(
+      "shard #{state.id}: durability flush exceeded #{flush_deadline_ms()} ms; killed it to free its slot"
+    )
+
+    :telemetry.execute([:fathom, :shard, :flush, :deadline], %{count: 1}, %{shard_id: state.id})
+
+    state =
+      release_flush_slot(
+        record_flush_failure(%{state | flush_task: nil}, {:flush_deadline, flush_deadline_ms()})
+      )
+
+    # A killed flush is a TRANSIENT failure: retry on the short doubling backoff, not a whole
+    # interval (the crash handler above keeps the interval; this one is a store fault by design).
+    before = state.flush_rekicks
+    settled = settle_waiters(state, :flushed)
+
+    settled =
+      if settled.flush_rekicks > before,
+        do: settled,
+        else: schedule_flush_after_failure(settled, {:flush_deadline, flush_deadline_ms()})
+
+    {:noreply, settled}
+  end
+
   defp gate_full(%{flush_waiters: []} = state), do: schedule_gate_backoff(state)
 
   defp gate_full(state) do
