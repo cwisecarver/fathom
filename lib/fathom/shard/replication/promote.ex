@@ -509,10 +509,15 @@ defmodule Fathom.Shard.Replication.Promote do
   # A coordinator for this shard on this node owns those files and is renewing its own lease.
   # Copying over them would be writing underneath a live writer, and the lease acquire below would
   # not even notice — it is the same owner string.
+  #
+  # A DEAD entry is no writer: the Registry drops a dead pid's entry asynchronously, so a
+  # coordinator stopped just before this still showed up and the promotion was refused
+  # (CI 2026-11-04, seed 55835). `Process.alive?/1` is a signal round trip, which is why
+  # `Fathom.Shards` keeps it off the hot path; this is an operator-invoked path.
   defp ensure_no_coordinator(shard_id) do
     case Registry.lookup(Fathom.ShardRegistry, shard_id) do
       [] -> :ok
-      [{_pid, _}] -> {:error, :coordinator_running}
+      [{pid, _}] -> if Process.alive?(pid), do: {:error, :coordinator_running}, else: :ok
     end
   rescue
     ArgumentError -> :ok

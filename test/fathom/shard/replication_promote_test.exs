@@ -282,6 +282,40 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
     assert Promote.promote(id, follower: name) == {:error, :coordinator_running}
   end
 
+  # The Registry drops a dead pid's entry asynchronously, so a coordinator stopped just before a
+  # promotion was still listed and the promotion was refused as `:coordinator_running` (CI
+  # 2026-11-04, seed 55835, the provenance-sidecar test). Suspending the Registry's partitions
+  # holds that window open: a dead entry must read as "no coordinator".
+  test "a coordinator that already exited does not block a promotion", ctx do
+    %{id: id, root: root} = ctx
+    [{name, _}] = start_followers!(root, 1)
+    parent = self()
+
+    pid =
+      spawn(fn ->
+        {:ok, _} = Registry.register(Fathom.ShardRegistry, id, nil)
+        send(parent, :registered)
+        receive do: (:never -> :ok)
+      end)
+
+    assert_receive :registered
+    partitions = for {_, p, _, _} <- Supervisor.which_children(Fathom.ShardRegistry), do: p
+    Enum.each(partitions, &:sys.suspend/1)
+
+    try do
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+
+      assert [{^pid, _}] = Registry.lookup(Fathom.ShardRegistry, id),
+             "the fixture did not hold the dead entry in the Registry"
+
+      assert Promote.promote(id, follower: name) == {:error, :no_replica}
+    after
+      Enum.each(partitions, &:sys.resume/1)
+    end
+  end
+
   test "a failed promotion does not leak the lease", ctx do
     %{id: id, root: root} = ctx
     followers = start_followers!(root, 3)
