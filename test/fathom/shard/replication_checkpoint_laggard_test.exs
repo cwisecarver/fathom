@@ -115,6 +115,16 @@ defmodule Fathom.Shard.ReplicationCheckpointLaggardTest do
     assert :ok = Session.commit(s.id, s.wal, s.coordinator)
   end
 
+  defp await_no_seeds!(id, tries \\ 500) do
+    [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+
+    cond do
+      :sys.get_state(session).seeding == %{} -> :ok
+      tries == 0 -> flunk("the initial seeds never landed")
+      true -> Process.sleep(10) && await_no_seeds!(id, tries - 1)
+    end
+  end
+
   defp extent(s) do
     {:ok, %{commit_extent: e}} = Wal.read(s.wal)
     e
@@ -138,6 +148,12 @@ defmodule Fathom.Shard.ReplicationCheckpointLaggardTest do
 
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b BLOB)", [])
     write!(s, 0)
+
+    # The first commit seeds all three followers, and since 2026-11-04 (perf round 9 #5) it returns
+    # once a QUORUM holds the data, so the third seed can land after `listen/1` below and read as a
+    # restart seed (CI OTP 29: one 16,488-byte seed, the size of this two-statement DB). Wait for
+    # every initial seed before counting.
+    await_no_seeds!(id)
 
     listen([
       [:fathom, :replication, :seed],

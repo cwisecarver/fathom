@@ -207,6 +207,13 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
     exec!(h, "INSERT INTO t VALUES (11, randomblob(2000))")
     :ok = :sys.resume(s3)
 
+    # Burst 1's seeds must have landed before counting: a commit returns at a quorum (perf round 9
+    # #5, 2026-11-04), so the third initial seed can otherwise land after `count_seeds/0`.
+    [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+
+    assert eventually(fn -> :sys.get_state(session).seeding == %{} end),
+           "burst 1's seeds never landed"
+
     count_seeds()
 
     # The burst ends: the stream checks in and the shard goes idle inside the drain grace (100 ms),

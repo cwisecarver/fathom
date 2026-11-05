@@ -432,7 +432,11 @@ defmodule Fathom.LazyMigrateTest do
         ShardExecutor.close(conn)
       end)
 
-    refute log =~ "FAILED", "a busy gate is a deferral, not a failed migration"
+    # Scoped to this shard: capture_log sees every process's lines, and CI OTP 29 (2026-11-04)
+    # caught another test's lingering coordinator logging "fence quarantine FAILED".
+    refute log =~ ~r/shard #{Regex.escape(shard)}: .*FAILED/,
+           "a busy gate is a deferral, not a failed migration"
+
     assert {:ok, %{schema_version: 1, status: "active"}} = Directory.get(shard)
     assert_enqueued(worker: ShardMigrationJob, args: %{shard_id: shard, target: 2})
   end

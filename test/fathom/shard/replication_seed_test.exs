@@ -367,6 +367,15 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
     assert :ok = Session.commit(id, wal, coordinator)
 
+    # The commit returns at a quorum (perf round 9 #5, 2026-11-04), so the third follower's seed
+    # may still be streaming, and its open read of the DB keeps SQLite from removing the WAL below
+    # (CI OTP 29: "the WAL was not recreated"). Wait until no seed is in flight.
+    [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+
+    Enum.find_value(1..500, fn _ ->
+      :sys.get_state(session).seeding == %{} || (Process.sleep(10) && nil)
+    end) || flunk("the initial seeds never landed")
+
     {:ok, before} = Wal.read(wal)
 
     # The seam: drop every connection, so SQLite removes the WAL, then open a fresh one.
