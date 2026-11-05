@@ -30,15 +30,22 @@ defmodule Fathom.Shard.IdleHibernateTest do
                Shard.hibernate_after_ms(300_000, 0.25)
     end
 
-    test "interval at or below the idle stop keeps #32's floor (the dirty-quiet tick race)" do
+    test "a floor below the idle stop is kept (#32, the dirty-quiet tick race)" do
       assert Shard.hibernate_after_ms(30_000, 0.25, 60_000) ==
                Shard.hibernate_after_ms(30_000, 0.25)
 
       assert Shard.hibernate_after_ms(30_000, 0.25, 60_000) > round(30_000 * 1.25)
       assert Shard.hibernate_after_ms(5_000, 0.25, 60_000) == 30_000
+    end
 
-      assert Shard.hibernate_after_ms(60_000, 0.25, 60_000) ==
-               Shard.hibernate_after_ms(60_000, 0.25)
+    # Prod since 2026-11-04: 300 s interval, 300 s idle stop. This asserted the equal case kept
+    # #32's floor (376 s here), which outlives the idle stop, so a clean idle coordinator never
+    # hibernated. The cap now applies whenever the floor reaches the idle stop.
+    test "a floor at or past the idle stop is capped, even when the interval is not longer" do
+      assert Shard.hibernate_after_ms(300_000, 0.25, 300_000) == 150_000
+      assert Shard.hibernate_after_ms(60_000, 0.25, 60_000) == 30_000
+      assert Shard.hibernate_after_ms(50_000, 0.25, 60_000) == 30_000
+      assert Shard.hibernate_after_ms(300_000, 0.25, 300_000) < 300_000
     end
 
     test "flush disabled or an unusable idle value falls back to the 2-arity floor" do

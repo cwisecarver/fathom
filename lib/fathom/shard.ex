@@ -75,7 +75,11 @@ defmodule Fathom.Shard do
 
   alias Fathom.Shard.Replication.Fleet
 
-  @default_idle_ms 60_000
+  # 300 s, not 60 s (perf round 9, 2026-11-04, tpc-churn on the replicating rig): a reopen re-seeds
+  # the whole DB to every follower, and at lognormal gaps (median 90 s) a 300 s stop cut re-seed
+  # bytes 1.68 GB -> 285 MB and S3 GETs 889 -> 372 per round, 0 errors, first-after-gap p99 ~40 ms
+  # either way. The cost is more resident idle coordinators (~4 KB hibernated each, LRU-capped).
+  @default_idle_ms 300_000
   # Spread each coordinator's idle-stop deadline by ±10% (expert review 2026-10-17 #28), decided once
   # at init: a mass re-home or a synchronized traffic stop otherwise idle-stops a cohort in lockstep
   # (N drop flushes + lease releases at the same instant). Not applied below the floor, so a test or
@@ -212,7 +216,7 @@ defmodule Fathom.Shard do
 
   # CAPPED AT HALF THE IDLE STOP WHEN THE INTERVAL IS LONGER (expert review 2026-10-22 r8 #12). The
   # floor above made the value 376 s at prod's 300 s interval, while a clean idle coordinator (no
-  # timer armed, #10) idle-stops at `idle_ms` (60 s prod, 20 s rig): in the shipped configuration NO
+  # timer armed, #10) idle-stops at `idle_ms` (then 60 s prod, 20 s rig): in the shipped configuration NO
   # idle coordinator ever hibernated, reversing 07-24 #9's measured -33% retained heap (p6: 5,952 B
   # idle vs 3,328 B hibernated, -2.6 KB per idle coordinator).
   #
@@ -231,9 +235,16 @@ defmodule Fathom.Shard do
   # test's tiny idle stop does not hibernate the coordinator between every message.
   @doc false
   @spec hibernate_after_ms(term(), term(), term()) :: pos_integer()
+  #
+  # The cap keys on the FLOOR reaching the idle stop, not on `interval > idle` (perf round 9,
+  # 2026-11-04): with prod's 300 s interval and the 300 s idle stop the interval is not longer, yet
+  # the 376 s floor still outlived the idle stop, so no idle coordinator hibernated — the same
+  # defect r8 #12 fixed, back the moment the two defaults met. Below the idle stop the floor stands.
   def hibernate_after_ms(interval, ratio, idle)
-      when is_integer(interval) and is_integer(idle) and idle > 0 and interval > idle,
-      do: min(hibernate_after_ms(interval, ratio), max(1_000, div(idle, 2)))
+      when is_integer(interval) and interval > 0 and is_integer(idle) and idle > 0 do
+    floor = hibernate_after_ms(interval, ratio)
+    if floor >= idle, do: max(1_000, div(idle, 2)), else: floor
+  end
 
   def hibernate_after_ms(interval, ratio, _idle), do: hibernate_after_ms(interval, ratio)
 
