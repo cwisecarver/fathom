@@ -31,10 +31,10 @@ defmodule Fathom.Shard.ReplicationWriteAfterFlushTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shards
+  import Fathom.Test.ReplicationCase
 
   @env [
     :replication_enabled,
@@ -67,29 +67,6 @@ defmodule Fathom.Shard.ReplicationWriteAfterFlushTest do
     %{id: id, root: root}
   end
 
-  defp start_followers!(root, n) do
-    for i <- 1..n do
-      name = :"wraf_f#{i}_#{System.unique_integer([:positive])}"
-      dir = Path.join(root, to_string(name))
-      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
-      {:ok, port} = Follower.port(pid)
-      {name, port}
-    end
-  end
-
-  defp enable!(followers) do
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-    )
-
-    start_supervised!(Fleet)
-  end
-
   defp open!(path) do
     {:ok, conn} = Connection.open(path)
     on_exit(fn -> Connection.close(conn) end)
@@ -100,8 +77,8 @@ defmodule Fathom.Shard.ReplicationWriteAfterFlushTest do
     id: id,
     root: root
   } do
-    followers = start_followers!(root, 3)
-    enable!(followers)
+    followers = start_followers!(root, 3, "wraf")
+    enable_replication!(followers)
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
