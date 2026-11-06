@@ -1504,6 +1504,16 @@ defmodule Fathom.Shard.Storage do
   @spec now_ms() :: integer()
   def now_ms, do: System.system_time(:millisecond)
 
+  @default_lease_ttl_ms 30_000
+
+  @doc """
+  The lease/heartbeat TTL (`config :fathom, :shard_lease_ttl_ms`, default
+  #{@default_lease_ttl_ms}ms). The one reader: the lease, steal margin, fork, restore and
+  migration leases all take it from here so the default lives in one place.
+  """
+  @spec lease_ttl_ms() :: number()
+  def lease_ttl_ms, do: Application.get_env(:fathom, :shard_lease_ttl_ms, @default_lease_ttl_ms)
+
   @default_steal_margin_ms 5_000
 
   @doc """
@@ -1657,7 +1667,7 @@ defmodule Fathom.Shard.Storage do
   # `ttl + steal_margin`: the longest the lock-TTL fallback could have made the restarted node
   # wait, i.e. everything the fast path can save. Overridable for tests.
   defp dead_mark_ttl_ms do
-    ttl = Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000)
+    ttl = lease_ttl_ms()
     Application.get_env(:fathom, :lease_dead_mark_ttl_ms, ttl + steal_margin_ms())
   end
 
@@ -1804,6 +1814,7 @@ defmodule Fathom.Shard.Storage do
     ArgumentError -> :ok
   end
 
+  # Test seam: only tests call this.
   @doc false
   @spec reset_quiescence() :: :ok
   def reset_quiescence do
@@ -1852,7 +1863,7 @@ defmodule Fathom.Shard.Storage do
         ms
 
       _ ->
-        Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000) + steal_margin_ms()
+        lease_ttl_ms() + steal_margin_ms()
     end
   end
 
@@ -1916,6 +1927,7 @@ defmodule Fathom.Shard.Storage do
     ArgumentError -> :ok
   end
 
+  # Test seam: only tests call this.
   @doc false
   @spec reset_steal_watch() :: :ok
   def reset_steal_watch do
@@ -1937,7 +1949,7 @@ defmodule Fathom.Shard.Storage do
   # field, and the only thing our clock measures is the gap between our own two reads. Adding it
   # would be cargo-culting the neighbouring code and would halve the remaining win.
   defp probe_window_ms do
-    ttl = Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000)
+    ttl = lease_ttl_ms()
     Application.get_env(:fathom, :lease_quiescence_probe_ms, max(div(ttl, 2), 1))
   end
 
@@ -1966,6 +1978,7 @@ defmodule Fathom.Shard.Storage do
   # Test-only, hence `@doc false`: production WANTS this set to persist for the life of the node —
   # it is how a fast-restarting node remembers that each of its own dead predecessors is stealable
   # without waiting out the lock TTL.
+  # Test seam: only tests call this.
   @doc false
   @spec reset_incarnation_deaths() :: :ok
   def reset_incarnation_deaths do

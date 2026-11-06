@@ -244,7 +244,7 @@ defmodule Fathom.Tenants do
   end
 
   defp fork_owner, do: "tenant-fork@#{node()}@#{System.unique_integer([:positive])}"
-  defp fork_lease_ttl, do: Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000)
+  defp fork_lease_ttl, do: Fathom.Shard.Storage.lease_ttl_ms()
 
   @doc """
   Force-flushes a tenant's live coordinator so its current state is durable in storage, without

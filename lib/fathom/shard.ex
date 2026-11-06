@@ -86,7 +86,6 @@ defmodule Fathom.Shard do
   # an operator pinning a tiny `:shard_idle_ms` keeps exact timing. 0 disables.
   @default_idle_jitter_ratio 0.1
   @idle_jitter_floor_ms 1_000
-  @default_lease_ttl_ms 30_000
   # 5s node-loss RPO for busy shards (write-gated — clean shards skip the PUT). Was 30s;
   # the fathom.rpo sweep confirmed p99 loss ≈ interval (docs/durability.md), so 5s trades
   # ~6× more PUTs on write-active shards for a ~6× tighter loss window.
@@ -6596,7 +6595,7 @@ defmodule Fathom.Shard do
   end
 
   def jitter_idle_ms(base, _ratio), do: base
-  defp lease_ttl_ms, do: Application.get_env(:fathom, :shard_lease_ttl_ms, @default_lease_ttl_ms)
+  defp lease_ttl_ms, do: Fathom.Shard.Storage.lease_ttl_ms()
 
   defp checkout_timeout,
     do: Application.get_env(:fathom, :shard_checkout_timeout_ms, @default_checkout_timeout)

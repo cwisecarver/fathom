@@ -356,7 +356,7 @@ defmodule Fathom.Snapshots do
   # Never a coordinator's owner string — see the acquire above.
   defp restore_owner, do: "snapshot-restore@#{node()}@#{System.unique_integer([:positive])}"
 
-  defp restore_lease_ttl, do: Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000)
+  defp restore_lease_ttl, do: Fathom.Shard.Storage.lease_ttl_ms()
 
   # Renew the restore lock every ttl/3 while the copy-back task streams, so a peer never sees it
   # lapse (expert review 2026-09-05 #24). Each renew_lease fences on the CURRENT lock etag, so the

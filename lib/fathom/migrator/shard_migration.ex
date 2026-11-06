@@ -1286,7 +1286,7 @@ defmodule Fathom.Migrator.ShardMigration do
   # same-owner reclaim branch (finding #9) — the loser sees a foreign owner, gets {:held}, and
   # snoozes/retries after the winner releases.
   defp owner(token), do: "migrator@#{node()}@#{token}"
-  defp ttl, do: Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000)
+  defp ttl, do: Fathom.Shard.Storage.lease_ttl_ms()
 
   # A fresh operation token when the caller has no stable id (the direct lazy-migrate path); Oban
   # workers pass `job.id` instead so a snoozed/retried job reclaims its own lock.

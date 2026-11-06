@@ -61,8 +61,6 @@ defmodule Fathom.Shard.Heartbeat do
 
   alias Fathom.Shard.Storage
 
-  @default_ttl_ms 30_000
-
   # How many renewal attempts one cycle affords, and the pause between them (expert review
   # 2026-08-26 #14). Three, because each attempt is budgeted at `renew_ms / 3`; the pause exists
   # so a fast failure (connection refused, which returns in microseconds) cannot spin the
@@ -239,7 +237,7 @@ defmodule Fathom.Shard.Heartbeat do
         margin
 
       :down ->
-        max(div(Application.get_env(:fathom, :shard_lease_ttl_ms, @default_ttl_ms), 3), 1)
+        max(div(Storage.lease_ttl_ms(), 3), 1)
     end
   end
 
@@ -331,7 +329,7 @@ defmodule Fathom.Shard.Heartbeat do
       Keyword.get(
         opts,
         :ttl_ms,
-        Application.get_env(:fathom, :shard_lease_ttl_ms, @default_ttl_ms)
+        Storage.lease_ttl_ms()
       )
 
     owner = Keyword.get(opts, :owner, owner())
