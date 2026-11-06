@@ -33,9 +33,10 @@ defmodule Fathom.Shard.ReplicationSeedQuorumReleaseTest do
   alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Session
-  alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shards
   alias Fathom.Test.PausablePeer
+  alias Fathom.Test.Await
+  import Fathom.Test.ReplicationCase
 
   setup do
     id = "repl_seedrel_#{System.unique_integer([:positive])}"
@@ -68,16 +69,6 @@ defmodule Fathom.Shard.ReplicationSeedQuorumReleaseTest do
     %{id: id, root: root}
   end
 
-  defp start_followers!(root, n) do
-    for i <- 1..n do
-      name = :"seedrel_f#{i}_#{System.unique_integer([:positive])}"
-      dir = Path.join(root, to_string(name))
-      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
-      {:ok, port} = Follower.port(pid)
-      {name, port}
-    end
-  end
-
   defp proxy!(port) do
     peer =
       start_supervised!({PausablePeer, upstream_port: port},
@@ -87,51 +78,12 @@ defmodule Fathom.Shard.ReplicationSeedQuorumReleaseTest do
     {peer, PausablePeer.port(peer)}
   end
 
-  defp enable!(ports, timeout) do
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-    Application.put_env(:fathom, :replication_timeout_ms, timeout)
-    Application.put_env(:fathom, :replication_catchup_ms, 0)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for(p <- ports, do: {~c"127.0.0.1", p})
-    )
-
-    start_supervised!(Fleet)
-
-    await!(
-      fn -> Enum.count(Fleet.shippers(), &Shipper.connected?/1) >= length(ports) end,
-      "shippers never connected"
-    )
-  end
-
-  defp await!(fun, msg, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        fun.() -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(10) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert(msg)
-  end
-
   defp open_shard!(id) do
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
     {:ok, conn} = Connection.open(path)
     on_exit(fn -> Connection.close(conn) end)
     {coordinator, conn, path}
-  end
-
-  defp session!(id) do
-    [{pid, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
-    pid
   end
 
   defp shipper_for(port) do
@@ -163,9 +115,9 @@ defmodule Fathom.Shard.ReplicationSeedQuorumReleaseTest do
   # replies are held, so its seed cannot complete inside the commit's deadline.
   test "two seeds landed, third pending: the commit acks on the two, holding every row", ctx do
     %{id: id, root: root} = ctx
-    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3)
+    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3, "seedrel")
     {peer, pcx} = proxy!(pc)
-    enable!([pa, pb, pcx], 1_500)
+    enable_replication!([pa, pb, pcx], timeout: 1_500, catchup: 0, connected: :all)
     slow = shipper_for(pcx)
 
     {coordinator, conn, path} = open_shard!(id)
@@ -199,13 +151,13 @@ defmodule Fathom.Shard.ReplicationSeedQuorumReleaseTest do
     # The third seed keeps its bookkeeping: released, it lands through `handle_info/2`, and the next
     # commit carries the follower forward with everyone else.
     {:ok, _} = PausablePeer.release(peer)
-    await!(fn -> :sys.get_state(session).seeding == %{} end, "the held seed never landed")
+    Await.until(fn -> :sys.get_state(session).seeding == %{} end, "the held seed never landed")
     assert Map.has_key?(:sys.get_state(session).followers, slow), "the late seed was not recorded"
 
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (6)", [])
     assert :ok = Session.commit(id, wal, coordinator)
 
-    await!(
+    Await.until(
       fn -> File.read(Follower.wal_path(c, id)) == File.read(wal) end,
       "the late-seeded follower never caught up with the primary's WAL"
     )
@@ -218,10 +170,10 @@ defmodule Fathom.Shard.ReplicationSeedQuorumReleaseTest do
   # fail rather than ack with one replica.
   test "one seed landed, two pending: the commit still does not ack", ctx do
     %{id: id, root: root} = ctx
-    [{_a, pa}, {_b, pb}, {_c, pc}] = start_followers!(root, 3)
+    [{_a, pa}, {_b, pb}, {_c, pc}] = start_followers!(root, 3, "seedrel")
     {peer_b, pbx} = proxy!(pb)
     {peer_c, pcx} = proxy!(pc)
-    enable!([pa, pbx, pcx], 800)
+    enable_replication!([pa, pbx, pcx], timeout: 800, catchup: 0, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
