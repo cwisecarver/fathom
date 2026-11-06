@@ -26,11 +26,11 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Shards
+  import Fathom.Test.ReplicationCase
 
   setup do
     id = "repl_unshipped_#{System.unique_integer([:positive])}"
@@ -61,29 +61,6 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
     end)
 
     %{id: id, root: root}
-  end
-
-  defp start_followers!(root, n) do
-    for i <- 1..n do
-      name = :"us_f#{i}_#{System.unique_integer([:positive])}"
-      dir = Path.join(root, to_string(name))
-      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
-      {:ok, port} = Follower.port(pid)
-      {name, port}
-    end
-  end
-
-  defp enable!(followers) do
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-    )
-
-    start_supervised!(Fleet)
   end
 
   defp open!(path) do
@@ -142,8 +119,8 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
   # replicated commit already shipped (so the Session exists and has registered the WAL).
   defp setup_shard!(ctx) do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers)
+    followers = start_followers!(root, 3, "us")
+    enable_replication!(followers)
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -419,8 +396,8 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
   # the hook then never checkpointed it again for the life of the node.
   test "a Session's registration is released even after the files are gone (symlinked dir)",
        ctx do
-    followers = start_followers!(ctx.root, 3)
-    enable!(followers)
+    followers = start_followers!(ctx.root, 3, "us")
+    enable_replication!(followers)
     {:ok, coordinator, ref, path} = Shards.checkout(ctx.id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
     conn = open!(path)
