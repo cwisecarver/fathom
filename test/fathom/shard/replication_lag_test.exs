@@ -9,6 +9,7 @@ defmodule Fathom.Shard.ReplicationLagTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Fleet, Follower, LagGauge, Session}
   alias Fathom.Shards
+  import Fathom.Test.ReplicationCase
 
   @registry Fathom.Shard.Replication.SessionRegistry
 
@@ -63,33 +64,6 @@ defmodule Fathom.Shard.ReplicationLagTest do
     %{id: id, root: root}
   end
 
-  defp start_followers!(root, n) do
-    for i <- 1..n do
-      name = :"rl_f#{i}_#{System.unique_integer([:positive])}"
-
-      pid =
-        start_supervised!({Follower, name: name, port: 0, dir: Path.join(root, to_string(name))},
-          id: name
-        )
-
-      {:ok, port} = Follower.port(pid)
-      {name, port}
-    end
-  end
-
-  defp configure!(followers, quorum) do
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, quorum)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, p} <- followers, do: {~c"127.0.0.1", p})
-    )
-
-    start_supervised!(Fleet)
-  end
-
   defp open_shard!(id) do
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -117,8 +91,8 @@ defmodule Fathom.Shard.ReplicationLagTest do
 
   test "an acked commit emits one commit event (ok, native duration) and lag_info answers", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    configure!(followers, 2)
+    followers = start_followers!(root, 3, "rl")
+    enable_replication!(followers)
     {coordinator, path} = open_shard!(id)
     for {n, _} <- followers, do: Follower.seed(n, id, 0, 0, 0, 0)
 
@@ -163,8 +137,8 @@ defmodule Fathom.Shard.ReplicationLagTest do
   test "commit_stage events are tagged reset: true for a reset round and false for an append",
        ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    configure!(followers, 2)
+    followers = start_followers!(root, 3, "rl")
+    enable_replication!(followers)
     {coordinator, path} = open_shard!(id)
     {:ok, conn} = Connection.open(path)
     on_exit(fn -> Connection.close(conn) end)
@@ -196,8 +170,8 @@ defmodule Fathom.Shard.ReplicationLagTest do
   # so the tenant-visible histogram counted cycles nobody waited on. Each cycle now carries its origin.
   test "commit and commit_stage events carry the cycle's mode; stages carry skipped", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    configure!(followers, 2)
+    followers = start_followers!(root, 3, "rl")
+    enable_replication!(followers)
     {coordinator, path} = open_shard!(id)
     for {n, _} <- followers, do: Follower.seed(n, id, 0, 0, 0, 0)
 
@@ -219,7 +193,7 @@ defmodule Fathom.Shard.ReplicationLagTest do
 
   test "a failed quorum emits outcome no_quorum", ctx do
     %{id: id, root: root} = ctx
-    [{name, port}] = start_followers!(root, 1)
+    [{name, port}] = start_followers!(root, 1, "rl")
     Application.put_env(:fathom, :replication_enabled, true)
     Application.put_env(:fathom, :replication_quorum, 2)
 
@@ -242,8 +216,8 @@ defmodule Fathom.Shard.ReplicationLagTest do
     %{id: id, root: root} = ctx
     # Long retry so the timer stays armed while we read it.
     Application.put_env(:fathom, :replication_catchup_ms, 60_000)
-    followers = start_followers!(root, 3)
-    configure!(followers, 1)
+    followers = start_followers!(root, 3, "rl")
+    enable_replication!(followers, quorum: 1)
     {coordinator, path} = open_shard!(id)
 
     {:ok, epoch} = Fathom.Shard.epoch(coordinator)
@@ -301,8 +275,8 @@ defmodule Fathom.Shard.ReplicationLagTest do
   test "a catching-up Session's flag is cleared by terminate", ctx do
     %{id: id, root: root} = ctx
     Application.put_env(:fathom, :replication_catchup_ms, 60_000)
-    followers = start_followers!(root, 3)
-    configure!(followers, 1)
+    followers = start_followers!(root, 3, "rl")
+    enable_replication!(followers, quorum: 1)
     {coordinator, path} = open_shard!(id)
     {:ok, epoch} = Fathom.Shard.epoch(coordinator)
     lineage = Fathom.Shard.lineage(coordinator)
