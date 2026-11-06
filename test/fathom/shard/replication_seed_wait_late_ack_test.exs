@@ -23,12 +23,11 @@ defmodule Fathom.Shard.ReplicationSeedWaitLateAckTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.SeedGate
   alias Fathom.Shard.Replication.Session
-  alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shards
+  import Fathom.Test.ReplicationCase
 
   setup do
     id = "repl_seedwait_ack_#{System.unique_integer([:positive])}"
@@ -64,35 +63,12 @@ defmodule Fathom.Shard.ReplicationSeedWaitLateAckTest do
 
   test "a mismatched ack consumed during a seed wait no longer leaves the follower owing a reply",
        %{id: id, root: root} do
-    followers =
-      for i <- 1..3 do
-        name = :"sw_f#{i}_#{System.unique_integer([:positive])}"
-
-        pid =
-          start_supervised!({Follower, name: name, port: 0, dir: Path.join(root, "#{name}")},
-            id: name
-          )
-
-        {:ok, port} = Follower.port(pid)
-        {name, port}
-      end
+    followers = start_followers!(root, 3, "sw")
 
     [a, b, c] = Enum.map(followers, &elem(&1, 0))
 
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-    Application.put_env(:fathom, :replication_timeout_ms, 2_000)
-    Application.put_env(:fathom, :replication_catchup_ms, 0)
-    Application.put_env(:fathom, :replication_seed_max_concurrency, 1)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_, p} <- followers, do: {~c"127.0.0.1", p})
-    )
-
-    start_supervised!(Fleet)
-    await_connected!(3)
+    Fathom.Test.Env.put!(:replication_seed_max_concurrency, 1)
+    enable_replication!(followers, timeout: 2_000, catchup: 0, connected: :all)
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -157,20 +133,6 @@ defmodule Fathom.Shard.ReplicationSeedWaitLateAckTest do
     refute Map.has_key?(inflight, straggler),
            "the follower answered (a mismatched ack, consumed inside the seed wait) but is still " <>
              "recorded as owing a reply: #{inspect(inflight)}"
-  end
-
-  defp await_connected!(n, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        Enum.count(Fleet.shippers(), &Shipper.connected?/1) >= n -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(20) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("shippers never connected")
   end
 
   # Poll the Session's current function until it is `frame` — i.e. blocked in that receive.
