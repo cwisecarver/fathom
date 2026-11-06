@@ -34,9 +34,9 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Session
-  alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Shards
+  import Fathom.Test.ReplicationCase
 
   setup do
     id = "repl_short_#{System.unique_integer([:positive])}"
@@ -80,38 +80,6 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
     {:ok, port} = Follower.port(pid)
     {name, port}
-  end
-
-  defp enable!(followers, q) do
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, q)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-    )
-
-    start_supervised!(Fleet)
-    await_connected!()
-  end
-
-  defp await_connected!(timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      if Enum.all?(Fleet.shippers(), &Shipper.connected?/1),
-        do: :connected,
-        else: Process.sleep(20)
-    end)
-    |> Enum.find(fn
-      :connected -> true
-      _ -> System.monotonic_time(:millisecond) > deadline
-    end)
-    |> case do
-      :connected -> :ok
-      _ -> flunk("shippers never connected")
-    end
   end
 
   defp open_shard!(id) do
@@ -190,7 +158,7 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     # Only the first is driven; the second exists to make the configuration legal.
     [follower | _] = followers = [start_follower!(root), start_follower!(root)]
     {name, port} = follower
-    enable!(followers, 1)
+    enable_replication!(followers, quorum: 1, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
