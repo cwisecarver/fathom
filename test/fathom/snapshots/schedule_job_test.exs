@@ -82,7 +82,8 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
   # each a HEAD + CopyObject plus two Postgres calls, so a fleet-singleton run managed roughly
   # 1/(2 RTT + copy) shards per second and an hourly cron at 1M tenants overran its own slot.
   # Expert review 2026-10-22 r8 #25c. Symptom: `snapshot_one/1` ran `Directory.last_flushed_at/1` +
-  # `record_snapshot_attempt/1` + `record_snapshot/2` per shard: 3N + 1 `shards` round trips per
+  # a per-shard attempt stamp + `record_snapshot/2` (the stamp is now the batch
+  # `Directory.record_snapshot_attempts/2`): 3N + 1 `shards` round trips per
   # run. The watermark now rides in the sampling select and the attempt stamp is one batched
   # UPDATE: N + 2. Invariant pinned: round trips per run are at most N + 2, AND the stamps still
   # land (attempt on every sampled shard, snapshot credited with the pre-copy flush watermark).
