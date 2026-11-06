@@ -41,6 +41,8 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
   alias Fathom.Shard.Replication.{Fleet, Follower, Session}
   alias Fathom.{ShardExecutor, Shards}
   alias Filo.Stmt
+  alias Fathom.Test.Await
+  import Fathom.Test.ReplicationCase
 
   @keys [
     :replication_enabled,
@@ -91,29 +93,6 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
     %{id: id, root: root}
   end
 
-  defp start_followers!(root, n) do
-    for i <- 1..n do
-      name = :"ic_f#{i}_#{System.unique_integer([:positive])}"
-      dir = Path.join(root, to_string(name))
-      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
-      {:ok, port} = Follower.port(pid)
-      {name, port}
-    end
-  end
-
-  defp enable!(followers) do
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-    )
-
-    start_supervised!(Fleet)
-  end
-
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
   defp pid_of({pid, _ref, _conn, _id, _sc, _v, _o}), do: pid
 
@@ -143,14 +122,6 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
       {:seed, m, meta} -> seeds_received([{m, meta} | acc])
     after
       0 -> acc
-    end
-  end
-
-  defp eventually(fun, tries \\ 300) do
-    cond do
-      fun.() -> true
-      tries == 0 -> false
-      true -> Process.sleep(10) && eventually(fun, tries - 1)
     end
   end
 
@@ -190,8 +161,8 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
     id: id,
     root: root
   } do
-    followers = start_followers!(root, 3)
-    enable!(followers)
+    followers = start_followers!(root, 3, "ic")
+    enable_replication!(followers)
 
     # Burst 1: every follower seeded and current.
     h = open!(id)
@@ -211,7 +182,7 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
     # #5, 2026-11-04), so the third initial seed can otherwise land after `count_seeds/0`.
     [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
 
-    assert eventually(fn -> :sys.get_state(session).seeding == %{} end),
+    assert Await.eventually?(fn -> :sys.get_state(session).seeding == %{} end),
            "burst 1's seeds never landed"
 
     count_seeds()
@@ -221,7 +192,7 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
     :ok = ShardExecutor.close(h)
 
     # The grace's close ran: the pool is empty and the close-time checkpoint unlinked the WAL.
-    assert eventually(fn ->
+    assert Await.eventually?(fn ->
              st = :sys.get_state(coordinator)
              # `closing` keeps the finished tail's pid until a flush reaps it.
              Shard.HandlePool.count(st.pool) == 0 and
@@ -257,7 +228,7 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
     # Sanity: every replica holds every acked row, including the laggard's.
     expected = [1, 2, 3, 10, 11, 20, 21, 22]
 
-    assert eventually(fn ->
+    assert Await.eventually?(fn ->
              Enum.all?(followers, fn {name, _} -> replica_rows(name, id, root) == expected end)
            end),
            "a replica is missing acked rows: " <>
@@ -277,15 +248,15 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
     id: id,
     root: root
   } do
-    followers = start_followers!(root, 3)
-    enable!(followers)
+    followers = start_followers!(root, 3, "ic")
+    enable_replication!(followers)
 
     h = open!(id)
     exec!(h, "CREATE TABLE t (a INTEGER PRIMARY KEY, b BLOB)")
     for i <- 1..3, do: exec!(h, "INSERT INTO t VALUES (#{i}, randomblob(200))")
     coordinator = pid_of(h)
 
-    assert eventually(fn ->
+    assert Await.eventually?(fn ->
              Enum.all?(followers, fn {n, _} -> replica_rows(n, id, root) == [1, 2, 3] end)
            end),
            "precondition: the followers never all held the first burst"
@@ -313,7 +284,10 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
     :ok = :sys.resume(session)
 
     # Burst 2, after the gap: one ACKED row.
-    assert eventually(fn -> not Process.alive?(coordinator) or idle_settled?(coordinator) end)
+    assert Await.eventually?(fn ->
+             not Process.alive?(coordinator) or idle_settled?(coordinator)
+           end)
+
     h2 = open!(id)
     exec!(h2, "INSERT INTO t VALUES (200, randomblob(200))")
     :ok = ShardExecutor.close(h2)
@@ -322,7 +296,7 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
 
     # Every replica that is promotable (untorn) must be the primary's state; a torn one is refused
     # by promotion and is the safe outcome.
-    assert eventually(fn ->
+    assert Await.eventually?(fn ->
              Enum.all?(followers, fn {n, _} ->
                case Follower.state_of(n, id) do
                  %{torn: true} -> true
@@ -341,8 +315,8 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
   # (and its durability flush) forever. Past `:shard_idle_close_unanswered_ms` the drain runs.
   test "an idle close still drains once a silent Session's backstop passes", %{id: id, root: root} do
     Application.put_env(:fathom, :shard_idle_close_unanswered_ms, 300)
-    followers = start_followers!(root, 3)
-    enable!(followers)
+    followers = start_followers!(root, 3, "ic")
+    enable_replication!(followers)
 
     h = open!(id)
     exec!(h, "CREATE TABLE t (a INTEGER)")
@@ -355,7 +329,7 @@ defmodule Fathom.Shard.ReplicationIdleCloseTest do
 
     :ok = ShardExecutor.close(h)
 
-    assert eventually(fn -> idle_settled?(coordinator) end, 500),
+    assert Await.eventually?(fn -> idle_settled?(coordinator) end, 5_000),
            "the idle drain never ran while the Session stayed silent"
 
     # The drain hands the pooled handles to an async closer (`state.closing`), and THAT close is the
