@@ -25,6 +25,7 @@ defmodule Fathom.Shard.ReplicationCheckpointLaggardTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Fleet, Follower, Session, Wal}
   alias Fathom.Shards
+  import Fathom.Test.ReplicationCase
 
   @frame 4096 + 24
   @keys [
@@ -65,29 +66,6 @@ defmodule Fathom.Shard.ReplicationCheckpointLaggardTest do
     %{id: id, root: root}
   end
 
-  defp start_followers!(root, n) do
-    for i <- 1..n do
-      name = :"cl_f#{i}_#{System.unique_integer([:positive])}"
-      dir = Path.join(root, to_string(name))
-      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
-      {:ok, port} = Follower.port(pid)
-      {name, port}
-    end
-  end
-
-  defp enable!(followers) do
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-    )
-
-    start_supervised!(Fleet)
-  end
-
   defp listen(events) do
     test = self()
     handler = "ckpt-lag-#{System.unique_integer([:positive])}"
@@ -115,16 +93,6 @@ defmodule Fathom.Shard.ReplicationCheckpointLaggardTest do
     assert :ok = Session.commit(s.id, s.wal, s.coordinator)
   end
 
-  defp await_no_seeds!(id, tries \\ 500) do
-    [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
-
-    cond do
-      :sys.get_state(session).seeding == %{} -> :ok
-      tries == 0 -> flunk("the initial seeds never landed")
-      true -> Process.sleep(10) && await_no_seeds!(id, tries - 1)
-    end
-  end
-
   defp extent(s) do
     {:ok, %{commit_extent: e}} = Wal.read(s.wal)
     e
@@ -137,8 +105,8 @@ defmodule Fathom.Shard.ReplicationCheckpointLaggardTest do
 
   test "a checkpoint at the threshold waits for a connected laggard; the restart then needs no seed",
        %{id: id, root: root} do
-    followers = start_followers!(root, 3)
-    enable!(followers)
+    followers = start_followers!(root, 3, "cl")
+    enable_replication!(followers)
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
