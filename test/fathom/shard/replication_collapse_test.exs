@@ -33,9 +33,9 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Session
-  alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shards
   alias Fathom.Test.PausablePeer
+  import Fathom.Test.ReplicationCase
 
   @small_cap 16_384
 
@@ -71,16 +71,6 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     %{id: id, root: root}
   end
 
-  defp start_followers!(root, n) do
-    for i <- 1..n do
-      name = :"col_f#{i}_#{System.unique_integer([:positive])}"
-      dir = Path.join(root, to_string(name))
-      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
-      {:ok, port} = Follower.port(pid)
-      {name, port}
-    end
-  end
-
   # A PausablePeer in front of follower `port`; returns `{peer, proxied_port}`.
   defp proxy!(port) do
     peer =
@@ -89,45 +79,6 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
       )
 
     {peer, PausablePeer.port(peer)}
-  end
-
-  defp enable!(ports, opts) do
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-    Application.put_env(:fathom, :replication_timeout_ms, Keyword.get(opts, :timeout, 1_000))
-
-    if cap = opts[:cap], do: Application.put_env(:fathom, :replication_max_push_bytes, cap)
-
-    if Keyword.has_key?(opts, :catchup),
-      do: Application.put_env(:fathom, :replication_catchup_ms, opts[:catchup])
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for(p <- ports, do: {~c"127.0.0.1", p})
-    )
-
-    start_supervised!(Fleet)
-    await_connected!(Keyword.get(opts, :connected, length(ports)))
-  end
-
-  # At least `n` shippers connected (a test that points one at a closed port expects fewer).
-  defp await_connected!(n, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      if Enum.count(Fleet.shippers(), &Shipper.connected?/1) >= n,
-        do: :connected,
-        else: Process.sleep(20)
-    end)
-    |> Enum.find(fn
-      :connected -> true
-      _ -> System.monotonic_time(:millisecond) > deadline
-    end)
-    |> case do
-      :connected -> :ok
-      _ -> flunk("shippers never connected")
-    end
   end
 
   defp open_shard!(id) do
@@ -148,11 +99,6 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
 
   defp holders(names, id, expected) do
     Enum.count(names, fn name -> File.read(Follower.wal_path(name, id)) == {:ok, expected} end)
-  end
-
-  defp session!(id) do
-    [{pid, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
-    pid
   end
 
   defp timed_commit(id, wal, coordinator) do
@@ -257,9 +203,15 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   # every commit waited out its deadline for a follower the quorum did not need.
   test "#3: one follower held past the per-push cap does not fail every commit", ctx do
     %{id: id, root: root} = ctx
-    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3)
+    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3, "col")
     {peer, pcx} = proxy!(pc)
-    enable!([pa, pb, pcx], cap: @small_cap, timeout: 1_000, catchup: 0)
+
+    enable_replication!([pa, pb, pcx],
+      cap: @small_cap,
+      timeout: 1_000,
+      catchup: 0,
+      connected: :all
+    )
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -298,8 +250,14 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   # plan kept `complete?/2` false — the loop then SPUN (nothing left to send) until the deadline.
   test "#3: a follower being seeded does not fail a commit the other two acked", ctx do
     %{id: id, root: root} = ctx
-    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3)
-    enable!([pa, pb, pc], cap: @small_cap, timeout: 1_000, catchup: 0)
+    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3, "col")
+
+    enable_replication!([pa, pb, pc],
+      cap: @small_cap,
+      timeout: 1_000,
+      catchup: 0,
+      connected: :all
+    )
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -329,9 +287,15 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   # ack here with one replica of the write. (Checked: `quorum() - 1` in `quorum_holds?/2` fails it.)
   test "#3: a commit is acked only once a quorum holds ALL of its bytes", ctx do
     %{id: id, root: root} = ctx
-    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3)
+    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3, "col")
     {peer_b, pbx} = proxy!(pb)
-    enable!([pa, pbx, pc], cap: @small_cap, timeout: 1_000, catchup: 0)
+
+    enable_replication!([pa, pbx, pc],
+      cap: @small_cap,
+      timeout: 1_000,
+      catchup: 0,
+      connected: :all
+    )
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -366,11 +330,16 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   # current — on a QUIET shard, with no further write. `arm_if_short/1` arms the catch-up.
   test "#3: a follower the commit did not wait for still converges with no further writes", ctx do
     %{id: id, root: root} = ctx
-    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3)
+    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3, "col")
     {peer, pcx} = proxy!(pc)
     # No catch-up while the laggard is built up, so nothing is armed by the held phase's
     # `:already_in_flight` refusals; the property is exercised by ONE clean commit afterwards.
-    enable!([pa, pb, pcx], cap: @small_cap, timeout: 1_000, catchup: 0)
+    enable_replication!([pa, pb, pcx],
+      cap: @small_cap,
+      timeout: 1_000,
+      catchup: 0,
+      connected: :all
+    )
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -429,10 +398,10 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   # so the round outlived the budget and the caller exited first.
   test "#4: a quorum that cannot form is reported inside the caller's timeout", ctx do
     %{id: id, root: root} = ctx
-    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3)
+    [{a, pa}, {b, pb}, {c, pc}] = start_followers!(root, 3, "col")
     {peer_b, pbx} = proxy!(pb)
     {peer_c, pcx} = proxy!(pc)
-    enable!([pa, pbx, pcx], timeout: 600, catchup: 0)
+    enable_replication!([pa, pbx, pcx], timeout: 600, catchup: 0, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -462,8 +431,13 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   # queue drains at one caller-timeout per entry while new entries keep arriving.
   test "#5(a): a commit whose caller already gave up is not executed", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(for({_, p} <- followers, do: p), timeout: 300, catchup: 0)
+    followers = start_followers!(root, 3, "col")
+
+    enable_replication!(for({_, p} <- followers, do: p),
+      timeout: 300,
+      catchup: 0,
+      connected: :all
+    )
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -501,9 +475,14 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   # cycle's header covers all their frames), not N cycles that each re-read the WAL to plan nothing.
   test "#5(b): queued commits for the same WAL are answered by one commit cycle", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
+    followers = start_followers!(root, 3, "col")
     names = for {n, _} <- followers, do: n
-    enable!(for({_, p} <- followers, do: p), timeout: 5_000, catchup: 0)
+
+    enable_replication!(for({_, p} <- followers, do: p),
+      timeout: 5_000,
+      catchup: 0,
+      connected: :all
+    )
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -545,9 +524,14 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   # re-seed, and the followers must end up holding every row, not just the bytes after the restart.
   test "#9: a WAL restart inside a push round re-plans instead of failing the commit", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
+    followers = start_followers!(root, 3, "col")
     names = for {n, _} <- followers, do: n
-    enable!(for({_, p} <- followers, do: p), timeout: 3_000, catchup: 0)
+
+    enable_replication!(for({_, p} <- followers, do: p),
+      timeout: 3_000,
+      catchup: 0,
+      connected: :all
+    )
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -613,9 +597,14 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   # no replica goes torn, and after the next commit a quorum holds every row of both generations.
   test "#9 (unlink+recreate): a WAL recreated inside a push round never ships a splice", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
+    followers = start_followers!(root, 3, "col")
     names = for {n, _} <- followers, do: n
-    enable!(for({_, p} <- followers, do: p), timeout: 3_000, catchup: 0)
+
+    enable_replication!(for({_, p} <- followers, do: p),
+      timeout: 3_000,
+      catchup: 0,
+      connected: :all
+    )
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -762,9 +751,9 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   # commit sat out its whole deadline behind a seed it could not use.
   test "#6: a commit that misses quorum does not wait for a seed it did not start", ctx do
     %{id: id, root: root} = ctx
-    [{a, pa}, {c, pc}] = start_followers!(root, 2)
+    [{a, pa}, {c, pc}] = start_followers!(root, 2, "col")
     # The middle follower is a closed port: every push to it is `:disconnected` at once.
-    enable!([pa, 1, pc], timeout: 1_000, catchup: 0, connected: 2)
+    enable_replication!([pa, 1, pc], timeout: 1_000, catchup: 0, connected: 2)
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -787,8 +776,8 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   # the time left — the rig's 16.5 MB seeds ran 145 s+, so the wait could only burn the deadline.
   test "#6: a seed this commit started is not awaited when it cannot land in time", ctx do
     %{id: id, root: root} = ctx
-    [{a, pa}, {_c, pc}] = start_followers!(root, 2)
-    enable!([pa, 1, pc], timeout: 1_000, catchup: 0, connected: 2)
+    [{a, pa}, {_c, pc}] = start_followers!(root, 2, "col")
+    enable_replication!([pa, 1, pc], timeout: 1_000, catchup: 0, connected: 2)
 
     # Hold the node's only seed slot, so the seed this commit starts cannot make progress.
     prev_cap = Application.get_env(:fathom, :replication_seed_max_concurrency)
