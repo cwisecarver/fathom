@@ -589,8 +589,11 @@ defmodule Fathom.Directory do
   end
 
   @doc """
-  Batch form of `record_snapshot_attempt/2`: one UPDATE for every id (expert review 2026-10-22 r8
-  #25c). Returns rows updated.
+  Stamps `last_snapshot_attempt_at` BEFORE a scheduled snapshot is tried (expert review 2026-10-10
+  #14). The rotation orders by it, so a shard whose snapshot fails every time moves to the back
+  after one attempt instead of holding a per-run slot forever (`last_snapshot_at` is stamped only
+  on success, so keying the rotation on it let poison shards starve the queue). One UPDATE for
+  every id (expert review 2026-10-22 r8 #25c). Returns rows updated.
   """
   @spec record_snapshot_attempts([String.t()], DateTime.t()) :: non_neg_integer()
   def record_snapshot_attempts(shard_ids, at \\ DateTime.utc_now())
@@ -599,22 +602,6 @@ defmodule Fathom.Directory do
   def record_snapshot_attempts(shard_ids, at) when is_list(shard_ids) do
     {count, _} =
       from(s in Shard, where: s.shard_id in ^shard_ids)
-      |> Repo.update_all(set: [last_snapshot_attempt_at: at, updated_at: DateTime.utc_now()])
-
-    count
-  end
-
-  @doc """
-  Stamps `last_snapshot_attempt_at` BEFORE a scheduled snapshot is tried (expert review 2026-10-10
-  #14). The rotation orders by it, so a shard whose snapshot fails every time moves to the back
-  after one attempt instead of holding a per-run slot forever (`last_snapshot_at` is stamped only
-  on success, so keying the rotation on it let poison shards starve the queue). Returns rows
-  updated.
-  """
-  @spec record_snapshot_attempt(String.t(), DateTime.t()) :: non_neg_integer()
-  def record_snapshot_attempt(shard_id, at \\ DateTime.utc_now()) do
-    {count, _} =
-      from(s in Shard, where: s.shard_id == ^shard_id)
       |> Repo.update_all(set: [last_snapshot_attempt_at: at, updated_at: DateTime.utc_now()])
 
     count
