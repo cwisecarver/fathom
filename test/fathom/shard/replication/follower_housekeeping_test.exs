@@ -64,6 +64,28 @@ defmodule Fathom.Shard.Replication.FollowerHousekeepingTest do
       :gen_tcp.close(client)
     end
 
+    # Tier 0 2026-11-06 (hard1, liveness RED): keepalive never fires on a connection with a push in
+    # flight, so a shipper to a follower that was partitioned or power-lost stayed stuck on the
+    # kernel's retransmit backoff ~20 s after the follower was back, refusing that shard's pushes
+    # `:already_in_flight`. The user timeout aborts such a connection; pin that it is set.
+    test "the user timeout for unacknowledged data is applied where the OS supports it", %{
+      name: name
+    } do
+      case Keepalive.user_timeout_option(:os.type()) do
+        nil ->
+          :ok
+
+        {opt, unit} ->
+          want = if unit == :ms, do: 10_000, else: 10
+          state = :sys.get_state(name)
+
+          assert {:ok, [{:raw, 6, ^opt, <<got::native-32>>}]} =
+                   :inet.getopts(state.lsock, [{:raw, 6, opt, 4}])
+
+          assert got == want, "user timeout #{got} #{unit}, expected #{want}"
+      end
+    end
+
     test "the tuned idle time is applied where the OS supports it", %{name: name} do
       case Keepalive.option_numbers(:os.type()) do
         nil ->
