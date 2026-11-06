@@ -5,6 +5,8 @@ defmodule Fathom.ShardDurabilityTest do
   # like the idle flush. Not async: shards are global.
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.FlushGateScope
+
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
@@ -1160,7 +1162,7 @@ defmodule Fathom.ShardDurabilityTest do
 
     # Occupy the node's only flush slot, as if a sibling shard were mid-flush.
     assert :ok = FlushGate.try_acquire()
-    assert FlushGate.in_flight() == 1
+    assert FlushGateScope.in_flight(shard) == 1
 
     # This coordinator's flush is now over the cap: it must back off — no flush task spawned, the
     # shard stays dirty, and it does NOT consume a slot (the counter stays at the sibling's 1).
@@ -1168,13 +1170,15 @@ defmodule Fathom.ShardDurabilityTest do
     _ = :sys.get_state(coordinator)
     assert :sys.get_state(coordinator).flush_task == nil, "a capped flush must not spawn a task"
     assert Shard.dirty?(coordinator), "a backed-off shard stays dirty (the safe direction)"
-    assert FlushGate.in_flight() == 1, "a refused flush must not consume a slot"
+    assert FlushGateScope.in_flight(shard) == 1, "a refused flush must not consume a slot"
 
     # Free the sibling's slot; the coordinator's next flush is admitted and the shard goes durable.
     FlushGate.release()
     flush_now(coordinator)
     refute Shard.dirty?(coordinator), "once a slot frees, the flush runs and the shard is clean"
-    assert FlushGate.in_flight() == 0, "the admitted flush released its slot when it settled"
+
+    assert FlushGateScope.in_flight(shard) == 0,
+           "the admitted flush released its slot when it settled"
   end
 
   # Expert review 2026-07-24 #11: the durability snapshot's temp file inherits its connection's

@@ -13,6 +13,8 @@ defmodule Fathom.Shard.StampLaneTest do
   """
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.FlushGateScope
+
   @moduletag :capture_log
 
   alias Fathom.{Shard, ShardExecutor, Shards}
@@ -68,14 +70,17 @@ defmodule Fathom.Shard.StampLaneTest do
         end)
 
       assert_receive {:stamp, :ok}
-      assert FlushGate.stamp_in_flight() == 2
+      assert FlushGateScope.stamp_in_flight() == 2
 
       assert :full = FlushGate.try_acquire_stamp()
-      assert FlushGate.stamp_in_flight() == 2, "a refused stamp acquire must not consume a slot"
-      assert FlushGate.in_flight() == 1, "the stamp lane must not touch the main counter"
+
+      assert FlushGateScope.stamp_in_flight() == 2,
+             "a refused stamp acquire must not consume a slot"
+
+      assert FlushGateScope.in_flight() == 1, "the stamp lane must not touch the main counter"
 
       FlushGate.release_stamp()
-      assert FlushGate.stamp_in_flight() == 1
+      assert FlushGateScope.stamp_in_flight() == 1
       send(other, :done)
     end
 
@@ -101,9 +106,9 @@ defmodule Fathom.Shard.StampLaneTest do
 
       ref = Process.monitor(holder)
       assert_receive {:DOWN, ^ref, :process, ^holder, _}
-      assert FlushGate.stamp_in_flight() == 1
+      assert FlushGateScope.stamp_in_flight() == 1
       assert FlushGate.sweep() == 1
-      assert FlushGate.stamp_in_flight() == 0
+      assert FlushGateScope.stamp_in_flight() == 0
     end
   end
 
@@ -224,7 +229,7 @@ defmodule Fathom.Shard.StampLaneTest do
                  "loses every acked write"
 
         assert Recovery.rankable_stamp?(head.position)
-        assert FlushGate.stamp_in_flight() == 0, "the stamp slot was not released"
+        assert FlushGateScope.stamp_in_flight(id) == 0, "the stamp slot was not released"
         :ok = ShardExecutor.close(conn)
       end
     end
@@ -287,7 +292,7 @@ defmodule Fathom.Shard.StampLaneTest do
       _ = :sys.get_state(pid)
 
       assert FlushGate.refusals() > before, "the flush did not go through the main gate"
-      assert FlushGate.stamp_in_flight() == 0
+      assert FlushGateScope.stamp_in_flight(id) == 0
       assert {:ok, ^e0} = Storage.object_etag(id)
       :ok = ShardExecutor.close(conn)
     end

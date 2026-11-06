@@ -5,6 +5,8 @@ defmodule Fathom.Shard.FlushGateTest do
   # back-off-when-full behavior is in shard_durability_test.exs. Not async: the counter is global.
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.FlushGateScope
+
   alias Fathom.Shard.FlushGate
 
   setup do
@@ -31,7 +33,7 @@ defmodule Fathom.Shard.FlushGateTest do
 
     assert is_integer(FlushGate.cap()) and FlushGate.cap() > 0
     assert FlushGate.try_acquire() == :ok
-    assert FlushGate.in_flight() == 1
+    assert FlushGateScope.in_flight() == 1
     FlushGate.release()
   end
 
@@ -42,7 +44,9 @@ defmodule Fathom.Shard.FlushGateTest do
     assert FlushGate.cap() == nil
     assert FlushGate.try_acquire() == :disabled
     assert FlushGate.try_acquire() == :disabled
-    assert FlushGate.in_flight() == 0, "with no cap the counter is never touched (zero-cost off)"
+
+    assert FlushGateScope.in_flight() == 0,
+           "with no cap the counter is never touched (zero-cost off)"
   end
 
   test "caps concurrent slots and frees them on release" do
@@ -50,15 +54,15 @@ defmodule Fathom.Shard.FlushGateTest do
 
     assert FlushGate.try_acquire() == :ok
     assert FlushGate.try_acquire() == :ok
-    assert FlushGate.in_flight() == 2
+    assert FlushGateScope.in_flight() == 2
 
     assert FlushGate.try_acquire() == :full, "a third slot over the cap of 2 is refused"
-    assert FlushGate.in_flight() == 2, "a refused acquire rolls back its own increment"
+    assert FlushGateScope.in_flight() == 2, "a refused acquire rolls back its own increment"
 
     FlushGate.release()
-    assert FlushGate.in_flight() == 1
+    assert FlushGateScope.in_flight() == 1
     assert FlushGate.try_acquire() == :ok, "a freed slot admits the next flush"
-    assert FlushGate.in_flight() == 2
+    assert FlushGateScope.in_flight() == 2
   end
 
   test "release clamps at zero so a stray release can't underflow the counter" do
@@ -66,10 +70,10 @@ defmodule Fathom.Shard.FlushGateTest do
 
     FlushGate.release()
     FlushGate.release()
-    assert FlushGate.in_flight() == 0
+    assert FlushGateScope.in_flight() == 0
 
     assert FlushGate.try_acquire() == :ok, "an underflowed counter must not wedge admission"
-    assert FlushGate.in_flight() == 1
+    assert FlushGateScope.in_flight() == 1
   end
 
   # THE LEAK (expert review 2026-08-20 #15). The counter is node-global and outlives any
@@ -117,7 +121,7 @@ defmodule Fathom.Shard.FlushGateTest do
         end
 
       for pid <- holders, do: assert_receive({:acquired, ^pid}, 2_000)
-      assert FlushGate.in_flight() == 2
+      assert FlushGateScope.in_flight() == 2
       assert FlushGate.try_acquire() == :full, "the fixture did not actually fill the gate"
 
       for pid <- holders do
@@ -130,9 +134,9 @@ defmodule Fathom.Shard.FlushGateTest do
       # slot held by a process that no longer exists.
       assert FlushGate.sweep() == 2,
              "the gate did not reclaim slots from dead holders; in_flight is stuck at " <>
-               "#{FlushGate.in_flight()} and no shard on this node can flush again"
+               "#{FlushGateScope.in_flight()} and no shard on this node can flush again"
 
-      assert FlushGate.in_flight() == 0
+      assert FlushGateScope.in_flight() == 0
       assert FlushGate.try_acquire() == :ok, "the gate never reopened"
       FlushGate.release()
     end
@@ -148,13 +152,13 @@ defmodule Fathom.Shard.FlushGateTest do
         end)
 
       assert_receive :acquired, 2_000
-      assert FlushGate.in_flight() == 1
+      assert FlushGateScope.in_flight() == 1
 
       assert FlushGate.sweep() == 0,
              "the sweep reclaimed a slot from a process that is still flushing — the cap is now " <>
                "over-subscribed and the storm it exists to prevent is back"
 
-      assert FlushGate.in_flight() == 1
+      assert FlushGateScope.in_flight() == 1
       Process.exit(live, :kill)
     end
   end

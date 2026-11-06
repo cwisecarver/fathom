@@ -37,6 +37,8 @@ defmodule Fathom.ShardKillCleanupTest do
   """
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.FlushGateScope
+
   alias Fathom.Shard.FlushGate
   alias Fathom.Shard.WriteFence
   alias Fathom.Shards
@@ -179,11 +181,11 @@ defmodule Fathom.ShardKillCleanupTest do
     Process.exit(holder, :kill)
     assert_receive {:DOWN, ^mon, :process, ^holder, :killed}, 2_000
 
-    assert FlushGate.in_flight() >= 1, "the fixture did not leave a slot held"
+    assert FlushGateScope.in_flight() >= 1, "the fixture did not leave a slot held"
 
     FlushGate.sweep()
 
-    assert FlushGate.in_flight() == 0,
+    assert FlushGateScope.in_flight() == 0,
            "a flush slot held by a dead process was never reclaimed. The cap is single digits, " <>
              "so a handful of these answers :full forever and every dirty shard on the node " <>
              "stops flushing — a node-wide, permanent, silent durability stall."
