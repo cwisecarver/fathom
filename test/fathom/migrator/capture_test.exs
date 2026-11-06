@@ -514,7 +514,8 @@ defmodule Fathom.Migrator.CaptureTest do
           _ = :sys.get_state(Capture)
         end)
 
-      refute log =~ "AWAITING"
+      # Scoped to this conn: Capture is a global GenServer and capture_log sees every caller.
+      refute log =~ ~r/on conn #{Regex.escape(inspect(conn))} superseded.*AWAITING/s
       refute_receive {:dropped, _}, 50
     end
 

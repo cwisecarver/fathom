@@ -532,7 +532,9 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
                    )
         end)
 
-      refute log =~ "STALLED", "an ordinary short deferral must not cry wolf"
+      # Scoped to this shard: capture_log sees every process's lines (expert review 2026-11-06 #6).
+      refute log =~ ~r/shard #{Regex.escape(shard)}: .*STALLED/,
+             "an ordinary short deferral must not cry wolf"
     end
 
     test "past the threshold it escalates to [warning] and emits telemetry", %{shard: shard} do
@@ -630,7 +632,7 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
 
       assert later > first, "a revert deferred again and again kept snoozing #{first}s"
       assert far <= 60
-      refute quiet =~ "STALLED"
+      refute quiet =~ ~r/shard #{Regex.escape(shard)}: .*STALLED/
       assert loud =~ "STALLED", "a revert deferring for 30 minutes must be alertable"
       assert_receive {:stalled, %{attempt: 50}, %{shard_id: ^shard, kind: :revert}}, 2_000
     end

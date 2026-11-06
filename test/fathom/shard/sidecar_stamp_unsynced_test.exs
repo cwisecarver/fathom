@@ -263,7 +263,8 @@ defmodule Fathom.Shard.SidecarStampUnsyncedTest do
 
     {log, _rows} = crash_and_reopen!(shard, ctx, stale)
 
-    refute log =~ "adopted"
+    # Scoped to this shard: capture_log sees every process (expert review 2026-11-06 #6).
+    refute log =~ ~r/shard #{Regex.escape(shard)}: .*adopted/
     assert Path.wildcard(db(shard) <> ".forked.*") != [], "the stale image was not a fork"
   end
 end

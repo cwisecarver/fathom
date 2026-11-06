@@ -183,7 +183,11 @@ defmodule Fathom.Shard.RefusedOpenUnderQuorumTest do
         assert log =~ "open REFUSED after the lease was acquired",
                "an UnderQuorum refusal must take the demoted warning path"
 
-        refute log =~ "open FAILED", "a routine floor refusal must not log at error"
+        # Scoped to this shard: capture_log sees every process, so a lingering coordinator from
+        # another test logging "open FAILED" must not fail this one (expert review 2026-11-06 #6).
+        refute log =~ ~r/shard #{Regex.escape(shard)}: open FAILED/,
+               "a routine floor refusal must not log at error"
+
         refute log =~ "(fathom ", "no stacktrace for a routine floor refusal"
 
         e1 = S3EtagStore.etag_of(store, "#{shard}.db")
