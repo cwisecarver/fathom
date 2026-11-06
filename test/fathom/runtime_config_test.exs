@@ -233,17 +233,19 @@ defmodule Fathom.RuntimeConfigTest do
     # sample and must stay opt-in.
     refute Keyword.has_key?(fathom_config(%{}), :restore_drill_sample)
 
-    # `env_int` rejects zero and garbage rather than writing them: `0` would be a sample size that
-    # runs the cron to do nothing, which looks configured and is not.
+    # `env_int` rejects zero rather than writing it: `0` would be a sample size that runs the cron
+    # to do nothing, which looks configured and is not.
     refute Keyword.has_key?(
              fathom_config(%{"RESTORE_DRILL_SAMPLE" => "0"}),
              :restore_drill_sample
            )
 
-    refute Keyword.has_key?(
-             fathom_config(%{"RESTORE_DRILL_SAMPLE" => "lots"}),
-             :restore_drill_sample
-           )
+    # Garbage used to be silently ignored (and "12abc" truncated to 12). This test previously
+    # asserted the silent drop; since expert review 2026-11-06 #8 a malformed integer fails the
+    # boot, naming the variable.
+    assert_raise RuntimeError, ~r/RESTORE_DRILL_SAMPLE must be an integer, got: "lots"/, fn ->
+      fathom_config(%{"RESTORE_DRILL_SAMPLE" => "lots"})
+    end
   end
 
   # The three A2 gates that default ON (2026-08-25). They read through `env_bool`, which is

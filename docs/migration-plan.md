@@ -1,5 +1,10 @@
 # Fathom — Shard Schema Migration Plan
 
+> **Status banner (expert review 2026-11-06 #16): every module this plan lists as "to build" is built; the
+> names `Fathom.ShardExec` and `Fathom.Retirement` below are historical and do not exist
+> (`Fathom.Migrator.Copy` and `Fathom.Migrator.RetirementJob` are the built forms). The shipped
+> design is [`migration.md`](migration.md); do not build from this file.**
+>
 > Status: **SUPERSEDED DRAFT — history, not a work list.** This was the design for
 > evolving the schema across millions of per-shard libSQL shards. **The engine it
 > describes is built**: read [`migration.md`](migration.md) for what actually ships,
@@ -216,8 +221,9 @@ no longer possible — by design.
   applies if remote shards are adopted (see Reality check).
 - `Fathom.Directory` — `schema_version`, `live_namespace`, `retired_namespace`,
   `retain_until`, `migration_status`; atomic cutover + cache invalidation.
-- `Fathom.Retirement` (Oban cron) — drop/let-expire `retired` shards past
-  `retain_until` (if not using S3 lifecycle).
+- ~~`Fathom.Retirement` (Oban cron)~~ **done as `Fathom.Migrator.RetirementJob`** — drops/lets-expire
+  `retired` shards past `retain_until` (if not using S3 lifecycle). The module name
+  `Fathom.Retirement` never existed.
 - Postgres: `schema_migrations(version, up, transform, checksum, inserted_at)`;
   directory columns above.
 </content>

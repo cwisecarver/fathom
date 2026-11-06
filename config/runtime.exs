@@ -1,5 +1,18 @@
 import Config
 
+# The ONE strict integer parser for env values (expert review 2026-11-06 #8): the whole string
+# must be an integer (`{n, ""}`, surrounding whitespace trimmed), otherwise the boot fails NAMING
+# the variable. A bare `String.to_integer/1` raised an unnamed ArgumentError, and a lenient
+# `Integer.parse` `{n, _}` silently truncated "12abc" to 12. It takes the variable name and the
+# raw value, and does not read the environment itself, so `Fathom.ConfigurationDocTest`'s scan
+# sees the knob on the line that reads it.
+parse_int! = fn name, raw ->
+  case Integer.parse(String.trim(raw)) do
+    {n, ""} -> n
+    _ -> raise "#{name} must be an integer, got: #{inspect(raw)}"
+  end
+end
+
 # config/runtime.exs is executed for all environments, including
 # during releases. It is executed after compilation and before the
 # system starts, so it is typically used to load production configuration
@@ -21,7 +34,7 @@ if System.get_env("PHX_SERVER") do
 end
 
 config :fathom, FathomWeb.Endpoint,
-  http: [port: String.to_integer(System.get_env("PORT", "4000"))]
+  http: [port: parse_int!.("PORT", System.get_env("PORT", "4000"))]
 
 # Optional web-endpoint bind IP (any env) — WEB_BIND_IP=0.0.0.0 to reach the dashboard from the LAN.
 # Unset ⇒ the per-env default (dev binds loopback). NB: on 0.0.0.0 the /admin dashboard is reachable
@@ -71,8 +84,9 @@ end
 # deploy/chaos rig). Unset ⇒ the compile-time defaults (Local storage under System.tmp_dir!),
 # so dev/test are unaffected.
 
-# An optional integer env var: unset (or unparseable) ⇒ nil, so the reading module falls back to
-# its own default rather than to 0.
+# An optional integer env var: unset, empty, or non-positive ⇒ nil, so the reading module falls
+# back to its own default rather than to 0. A malformed value (not a whole integer) fails the boot,
+# naming the variable (see `parse_int!` above).
 env_int = fn name ->
   case System.get_env(name) do
     nil ->
@@ -82,8 +96,8 @@ env_int = fn name ->
       nil
 
     v ->
-      case Integer.parse(v) do
-        {n, _} when n > 0 -> n
+      case parse_int!.(name, v) do
+        n when n > 0 -> n
         _ -> nil
       end
   end
@@ -101,8 +115,8 @@ env_nonneg_int = fn name ->
       nil
 
     v ->
-      case Integer.parse(v) do
-        {n, _} when n >= 0 -> n
+      case parse_int!.(name, v) do
+        n when n >= 0 -> n
         _ -> nil
       end
   end
@@ -111,11 +125,12 @@ end
 # A TRI-STATE boolean env var: "true"/"1" ⇒ true, "false"/"0" ⇒ false, unset or anything else ⇒
 # nil, meaning "say nothing" so the compiled default survives.
 #
-# Every other flag here uses the two-state `if System.get_env("X") in ~w(true 1)` form, which can
-# only turn something ON. That was correct while every gate defaulted OFF. It is wrong the moment
-# one defaults ON: an operator would have no way to turn it off short of editing config and
-# rebuilding, which is not a flag, it is a hardcode with extra steps. The three A2 gates below are
-# the first to need it.
+# A flag that defaults OFF reads it as `if env_bool.("X") == true` (only "true"/"1" turn it on;
+# this replaced the older two-state `System.get_env("X") in ~w(true 1)` form, same results on every
+# input, expert review 2026-11-06 #8). A flag that defaults ON branches on all three states
+# (`case`), because an operator needs a way to turn it off short of editing config and rebuilding,
+# which is not a flag, it is a hardcode with extra steps. The A2 gates below were the first to
+# need that.
 #
 # NB: `Fathom.ConfigurationDocTest` scans this file for env-var names by matching the helper forms
 # by NAME. Adding a helper without adding it to that regex makes every knob read through it
@@ -147,7 +162,7 @@ case System.get_env("SHARD_STORAGE") do
       # Optional override for S3-compatible stores (MinIO, R2, Tigris). Unset ⇒ AWS.
       endpoint: System.get_env("S3_ENDPOINT"),
       # MinIO and R2 need path-style addressing (endpoint/bucket/key).
-      path_style: System.get_env("S3_PATH_STYLE") in ~w(true 1),
+      path_style: env_bool.("S3_PATH_STYLE") == true,
       prefix: System.get_env("S3_PREFIX", ""),
       access_key_id: System.get_env("AWS_ACCESS_KEY_ID"),
       secret_access_key: System.get_env("AWS_SECRET_ACCESS_KEY"),
@@ -299,9 +314,9 @@ end
 # Scheduled point-in-time snapshots (expert review 2026-08-01 #18). Both jobs are fleet singletons
 # on the Oban crontab and INERT until sized here.
 #
-# The live durable object is overwritten every :shard_flush_interval_ms (default 5 s), so without
-# these the last-good state for a LOGICAL corruption — the more common incident — is gone within
-# seconds. Snapshots are the only answer to "restore tenant acme to 09:00".
+# The live durable object is overwritten every :shard_flush_interval_ms (library default 5 s; prod
+# default 300 s, set below), so without these the last-good state for a LOGICAL corruption — the
+# more common incident — is gone within seconds (5 s) to minutes (300 s). Snapshots are the only answer to "restore tenant acme to 09:00".
 if n = env_int.("SNAPSHOT_SCHEDULE_SAMPLE") do
   config :fathom, :snapshot_schedule_sample, n
 end
@@ -431,10 +446,11 @@ end
 # Node heartbeat / lease TTL (ms). Bounds how long a dead node's shards stay unstealable —
 # the failover-stall ceiling. Default 30_000.
 if ttl = System.get_env("SHARD_LEASE_TTL_MS") do
-  config :fathom, :shard_lease_ttl_ms, String.to_integer(ttl)
+  config :fathom, :shard_lease_ttl_ms, parse_int!.("SHARD_LEASE_TTL_MS", ttl)
 end
 
-# Periodic durability-flush cadence and idle (flush+drop+stop) threshold, ms.
+# Periodic durability-flush cadence, ms (SHARD_FLUSH_INTERVAL_MS). The idle (flush+drop+stop)
+# threshold, SHARD_IDLE_MS, is read separately further down and keeps its own default.
 #
 # The DEPLOYMENT default is 300 s, deliberately 60× looser than the library default
 # (`Fathom.Shard.@default_flush_interval_ms`, 5 s). Cost analysis 2026-08-07: PUT count is
@@ -455,10 +471,13 @@ end
 if config_env() == :prod do
   config :fathom,
          :shard_flush_interval_ms,
-         String.to_integer(System.get_env("SHARD_FLUSH_INTERVAL_MS") || "300000")
+         parse_int!.(
+           "SHARD_FLUSH_INTERVAL_MS",
+           System.get_env("SHARD_FLUSH_INTERVAL_MS") || "300000"
+         )
 else
   if ms = System.get_env("SHARD_FLUSH_INTERVAL_MS") do
-    config :fathom, :shard_flush_interval_ms, String.to_integer(ms)
+    config :fathom, :shard_flush_interval_ms, parse_int!.("SHARD_FLUSH_INTERVAL_MS", ms)
   end
 end
 
@@ -514,14 +533,14 @@ if bytes = System.get_env("JOURNAL_SIZE_LIMIT") do
 end
 
 if ms = System.get_env("SHARD_IDLE_MS") do
-  config :fathom, :shard_idle_ms, String.to_integer(ms)
+  config :fathom, :shard_idle_ms, parse_int!.("SHARD_IDLE_MS", ms)
 end
 
 # Expert review 2026-10-20-2027 #22: the node disk budget (bytes) for keeping a shard's local `.db`
 # after a clean durable drop, so the next open here is warm instead of a full pull. Default 0 = OFF
 # until the rig measures it (`Fathom.Shard.Retained`).
 if bytes = System.get_env("SHARD_RETAIN_LOCAL_BYTES") do
-  config :fathom, :shard_retain_local_bytes, String.to_integer(bytes)
+  config :fathom, :shard_retain_local_bytes, parse_int!.("SHARD_RETAIN_LOCAL_BYTES", bytes)
 end
 
 # Expert review 2026-10-22 r8 #26: the smallest `.db` worth retaining. Unset = 0 with replication on,
@@ -567,24 +586,24 @@ end
 # Perf review 2026-10-14 #16: node-wide cap on idle pooled handles (default 8192). Over it a checkin
 # is closed instead of pooled; a checkout is never refused.
 if n = System.get_env("POOL_IDLE_BUDGET") do
-  config :fathom, :connection_pool_idle_budget, String.to_integer(n)
+  config :fathom, :connection_pool_idle_budget, parse_int!.("POOL_IDLE_BUDGET", n)
 end
 
 # Rollout sweep per-run cap (#19): how many laggards the hourly ReconcileJob enqueues per run.
 # Default 100; raise it (RECONCILE_BATCH_SIZE) to converge a large cold tail faster.
 if n = System.get_env("RECONCILE_BATCH_SIZE") do
-  config :fathom, :reconcile_batch_size, String.to_integer(n)
+  config :fathom, :reconcile_batch_size, parse_int!.("RECONCILE_BATCH_SIZE", n)
 end
 
 # Perf review 2026-10-14 #14: the run keeps enqueuing RECONCILE_BATCH_SIZE chunks while the live
 # migration-job backlog is below RECONCILE_WATERMARK (default 1000), within RECONCILE_ROLLOUT_BUDGET_MS
 # (default 10 min). Set the watermark <= the batch size for the old one-chunk-per-hour behaviour.
 if n = System.get_env("RECONCILE_WATERMARK") do
-  config :fathom, :reconcile_watermark, String.to_integer(n)
+  config :fathom, :reconcile_watermark, parse_int!.("RECONCILE_WATERMARK", n)
 end
 
 if n = System.get_env("RECONCILE_ROLLOUT_BUDGET_MS") do
-  config :fathom, :reconcile_rollout_budget_ms, String.to_integer(n)
+  config :fathom, :reconcile_rollout_budget_ms, parse_int!.("RECONCILE_ROLLOUT_BUDGET_MS", n)
 end
 
 # THE PER-SHARD SIZE CAP, and the reason it is a knob at all: past S3's 5 GiB single-PUT ceiling a
@@ -633,7 +652,7 @@ end
 # Separate from RESTORE_DRILL_SAMPLE and much smaller: a fork is a full object copy, so this costs
 # real storage I/O per sample where the read-only drill costs a GET. Unset ⇒ off.
 if n = System.get_env("RESTORE_DRILL_FULL_SAMPLE") do
-  config :fathom, :restore_drill_full_sample, String.to_integer(n)
+  config :fathom, :restore_drill_full_sample, parse_int!.("RESTORE_DRILL_FULL_SAMPLE", n)
 end
 
 # The WARM_* warm-cache config (WARM_DISK_FREE_FLOOR_BYTES, WARM_CACHE_MAX_BYTES, and the
@@ -647,7 +666,7 @@ end
 # Past this window it logs at [warning], emits [:fathom, :migrator, :migration_stalled], and
 # counts in `Migrator.status/0`'s `stalled`. Default 10 minutes.
 if ms = System.get_env("MIGRATION_STALL_AFTER_MS") do
-  config :fathom, :migration_stall_after_ms, String.to_integer(ms)
+  config :fathom, :migration_stall_after_ms, parse_int!.("MIGRATION_STALL_AFTER_MS", ms)
 end
 
 # Per-shard load counters (`Fathom.ShardLoad`) — the Phase-2 rebalancing input. ON by default
@@ -775,12 +794,12 @@ if spec = System.get_env("LB_BACKENDS") do
 end
 
 # Publish this node's hot shards to Postgres (needs SHARD_LOAD too).
-if System.get_env("LOAD_REPORTER") in ~w(true 1) do
+if env_bool.("LOAD_REPORTER") == true do
   config :fathom, :load_reporter, true
 end
 
 # Act on handoff warm/drain commands addressed to this node.
-if System.get_env("COMMAND_POLLER") in ~w(true 1) do
+if env_bool.("COMMAND_POLLER") == true do
   config :fathom, :command_poller, true
 end
 
@@ -794,7 +813,7 @@ end
 # induce a handoff (a brief drain blip on the victim). The move is bounded by confirm_windows,
 # cooldown_ms, max_moves (1/tick), and the improvement guard, but the boundary is the
 # defense — do not enable REBALANCER_ENABLED on a data path open to untrusted callers.
-if System.get_env("REBALANCER_ENABLED") in ~w(true 1) do
+if env_bool.("REBALANCER_ENABLED") == true do
   config :fathom, :rebalancer_enabled, true
 end
 
@@ -820,11 +839,11 @@ end
 # command is killed at the deadline so it can't hold the fleet advisory lock / a pooled
 # connection. Defaults 10s each.
 if ms = System.get_env("LB_TEST_TIMEOUT_MS") do
-  config :fathom, :lb_test_timeout_ms, String.to_integer(ms)
+  config :fathom, :lb_test_timeout_ms, parse_int!.("LB_TEST_TIMEOUT_MS", ms)
 end
 
 if ms = System.get_env("LB_RELOAD_TIMEOUT_MS") do
-  config :fathom, :lb_reload_timeout_ms, String.to_integer(ms)
+  config :fathom, :lb_reload_timeout_ms, parse_int!.("LB_RELOAD_TIMEOUT_MS", ms)
 end
 
 # The hot-detection floor (absolute q/s). Unset ⇒ the p99-relative rule. Accepts an integer
@@ -836,20 +855,20 @@ end
 
 # Rebalancer cadence/policy tunables (all have code defaults).
 if ms = System.get_env("LOAD_REPORT_INTERVAL_MS") do
-  config :fathom, :load_report_interval_ms, String.to_integer(ms)
+  config :fathom, :load_report_interval_ms, parse_int!.("LOAD_REPORT_INTERVAL_MS", ms)
 end
 
 if n = System.get_env("REBALANCE_CONFIRM_WINDOWS") do
-  config :fathom, :rebalance_confirm_windows, String.to_integer(n)
+  config :fathom, :rebalance_confirm_windows, parse_int!.("REBALANCE_CONFIRM_WINDOWS", n)
 end
 
 if ms = System.get_env("REBALANCE_COOLDOWN_MS") do
-  config :fathom, :rebalance_cooldown_ms, String.to_integer(ms)
+  config :fathom, :rebalance_cooldown_ms, parse_int!.("REBALANCE_COOLDOWN_MS", ms)
 end
 
 # Opt out of the boot-time conditional-write probe (expert review #16) ONLY for rigs where
 # storage isn't reachable at boot and the store is known-good. Never in prod.
-if System.get_env("VERIFY_STORAGE_FENCE") in ~w(false 0) do
+if env_bool.("VERIFY_STORAGE_FENCE") == false do
   config :fathom, :verify_storage_fence, false
 end
 
@@ -935,7 +954,7 @@ end
 # floor, i.e. ~2.4× fathom's whole current request round trip. Off is never WORSE than today
 # either — if every replica holding an un-synced frame dies at once, the shard falls back to its
 # S3 object, which is exactly the pre-A2 behaviour.
-if System.get_env("REPLICATION_FSYNC") in ~w(true 1) do
+if env_bool.("REPLICATION_FSYNC") == true do
   config :fathom, :replication_fsync, true
 end
 
@@ -1402,7 +1421,7 @@ admin_pass = if admin_blank?.(admin_pass), do: nil, else: admin_pass
 # Opt-out for the prod boot guard that refuses a weak dashboard password (under 16 bytes, or equal
 # to the username). Blank and half-configured credentials are never opted out of. See
 # docs/runbooks/admin-dashboard.md.
-if System.get_env("ADMIN_WEAK_CREDENTIALS_OK") in ~w(true 1) do
+if env_bool.("ADMIN_WEAK_CREDENTIALS_OK") == true do
   config :fathom, :admin_weak_credentials_ok, true
 end
 
@@ -1428,7 +1447,7 @@ if config_env() == :prod do
       For example: ecto://USER:PASS@HOST/DATABASE
       """
 
-  maybe_ipv6 = if System.get_env("ECTO_IPV6") in ~w(true 1), do: [:inet6], else: []
+  maybe_ipv6 = if env_bool.("ECTO_IPV6") == true, do: [:inet6], else: []
 
   # The Oban demand floor: the sum of every queue's concurrency in config.exs (25 today: migrations
   # 10, retirement 5, rebalance 3, tenants 3, tokens 3, erasure 1). Read from the merged config,
@@ -1464,14 +1483,16 @@ if config_env() == :prod do
     # `queues:` instead of drifting under it: the fixed 25 equalled the queue sum (25) once `tokens`
     # and `erasure` were added. A POOL_SIZE at or under the queue sum refuses to boot
     # (`Fathom.Application.check_repo_pool_headroom!/0`); one with less than 10 spare warns.
-    pool_size: String.to_integer(System.get_env("POOL_SIZE") || "#{oban_queue_sum + 10}"),
+    pool_size: parse_int!.("POOL_SIZE", System.get_env("POOL_SIZE") || "#{oban_queue_sum + 10}"),
     # DBConnection's defaults (50/1000) were already in force implicitly; they are stated here
     # because they are load-bearing. Past `queue_interval` of saturation, checkouts are DROPPED
     # rather than queued — and the module that most needs them, HranaAuth.Revocations, sits on the
     # stream-open path, where a queued caller pins its Hrana stream. That is the pressure #5 removed
     # from the common case; this bounds what happens when the pool saturates anyway.
-    queue_target: String.to_integer(System.get_env("POOL_QUEUE_TARGET_MS") || "50"),
-    queue_interval: String.to_integer(System.get_env("POOL_QUEUE_INTERVAL_MS") || "1000"),
+    queue_target:
+      parse_int!.("POOL_QUEUE_TARGET_MS", System.get_env("POOL_QUEUE_TARGET_MS") || "50"),
+    queue_interval:
+      parse_int!.("POOL_QUEUE_INTERVAL_MS", System.get_env("POOL_QUEUE_INTERVAL_MS") || "1000"),
     # For machines with several cores, consider starting multiple pools of `pool_size`
     # pool_count: 4,
     socket_options: maybe_ipv6
@@ -1514,7 +1535,7 @@ if config_env() == :prod do
   # SHARD_BASE_DOMAIN). Without the zone anchor, shard_from_host promotes any attacker-controlled
   # Host first-label to a shard id, so Fathom.Application.check_shard_base_domain! refuses to boot
   # an exposed data plane with the zone unset (expert review 2026-07-14 #6) — set this to override.
-  if System.get_env("ALLOW_UNANCHORED_ROUTING") in ~w(true 1) do
+  if env_bool.("ALLOW_UNANCHORED_ROUTING") == true do
     config :fathom, :allow_unanchored_routing, true
   end
 
@@ -1559,7 +1580,7 @@ if config_env() == :prod do
   # Optional token expiry in seconds (unset ⇒ tokens don't expire; revoke by rotating
   # SECRET_KEY_BASE).
   if max_age = System.get_env("HRANA_TOKEN_MAX_AGE") do
-    config :fathom, :hrana_token_max_age, String.to_integer(max_age)
+    config :fathom, :hrana_token_max_age, parse_int!.("HRANA_TOKEN_MAX_AGE", max_age)
   end
 
   # Revocation-floor posture when the directory is unreadable and this node has no cached floor
@@ -1598,7 +1619,7 @@ if config_env() == :prod do
   # Per-node open-shard cap (finding #14). config.exs sets a conservative finite default; operators
   # tune it to their node's measured fd/RSS density (mix fathom.scale --ramp) here.
   if cap = System.get_env("MAX_OPEN_SHARDS") do
-    config :fathom, :max_open_shards, String.to_integer(cap)
+    config :fathom, :max_open_shards, parse_int!.("MAX_OPEN_SHARDS", cap)
   end
 
   # Background pre-eviction headroom below that cap (perf review 2026-10-21 #14). Unset = auto (1% of
@@ -1618,18 +1639,18 @@ if config_env() == :prod do
   # RPO went unbounded with no operator remedy. A write-time cap cannot lose data (SQLITE_FULL is
   # never acked); a flush-time one already has. Set `SHARD_MAX_PAGE_COUNT=0` to opt out.
   if pages = System.get_env("SHARD_MAX_PAGE_COUNT") do
-    config :fathom, :shard_max_page_count, String.to_integer(pages)
+    config :fathom, :shard_max_page_count, parse_int!.("SHARD_MAX_PAGE_COUNT", pages)
   end
 
   # Novel-shard creation rate limit (finding #14's churn half; see Fathom.Shards.NovelLimiter).
   # Grants/sec for brand-new shard ids only; unset = off. Size to tenant-signup rate with
   # headroom — legitimate novel creation is rare, so single digits/sec is generous.
   if rate = System.get_env("NOVEL_SHARD_RATE") do
-    config :fathom, :novel_shard_rate, String.to_integer(rate)
+    config :fathom, :novel_shard_rate, parse_int!.("NOVEL_SHARD_RATE", rate)
   end
 
   if burst = System.get_env("NOVEL_SHARD_BURST") do
-    config :fathom, :novel_shard_burst, String.to_integer(burst)
+    config :fathom, :novel_shard_burst, parse_int!.("NOVEL_SHARD_BURST", burst)
   end
 
   # Control-plane abuse throttles (#34; see Fathom.RateLimiter). ON by default in prod with
@@ -1638,19 +1659,21 @@ if config_env() == :prod do
   # one shared admin password (#8) and the expensive /api ops (list/export/fork).
   #
   # Admin BasicAuth: lock out a source IP after this many failed attempts within the window.
-  admin_fail_max = String.to_integer(System.get_env("ADMIN_AUTH_MAX_FAILURES", "20"))
+  admin_fail_max =
+    parse_int!.("ADMIN_AUTH_MAX_FAILURES", System.get_env("ADMIN_AUTH_MAX_FAILURES", "20"))
+
   if admin_fail_max > 0, do: config(:fathom, :admin_auth_max_failures, admin_fail_max)
 
   if window = System.get_env("ADMIN_AUTH_WINDOW_MS") do
-    config :fathom, :admin_auth_window_ms, String.to_integer(window)
+    config :fathom, :admin_auth_window_ms, parse_int!.("ADMIN_AUTH_WINDOW_MS", window)
   end
 
   # /api per-IP request rate: this many requests per window before 429.
-  api_rate = String.to_integer(System.get_env("API_RATE_LIMIT", "120"))
+  api_rate = parse_int!.("API_RATE_LIMIT", System.get_env("API_RATE_LIMIT", "120"))
   if api_rate > 0, do: config(:fathom, :api_rate_limit, api_rate)
 
   if window = System.get_env("API_RATE_WINDOW_MS") do
-    config :fathom, :api_rate_window_ms, String.to_integer(window)
+    config :fathom, :api_rate_window_ms, parse_int!.("API_RATE_WINDOW_MS", window)
   end
 
   # Which peers may speak for a client via `X-Forwarded-For` (expert review 2026-08-01 #35).
@@ -1676,7 +1699,7 @@ if config_env() == :prod do
   # The opt-out for the prod boot guard that refuses throttles on with no trusted proxy (expert
   # review 2026-10-12 #12). Only for a deployment with NOTHING in front of :4000, where remote_ip
   # is already the client. Setting it behind a proxy reinstates the one-flood lockout.
-  if System.get_env("ADMIN_THROTTLE_SHARED_BUCKET_OK") in ~w(true 1) do
+  if env_bool.("ADMIN_THROTTLE_SHARED_BUCKET_OK") == true do
     config :fathom, :admin_throttle_shared_bucket_ok, true
   end
 
@@ -1684,7 +1707,7 @@ if config_env() == :prod do
   # cert, which CANNOT serve an id that isn't a DNS-safe label (an underscore id — RFC 6125). With
   # this on, `Tenants.provision`/`fork` REFUSE such an id (422) instead of handing back an un-servable
   # `libsql://<id>.<zone>` URL; off (default) they provision but return a `warnings` entry.
-  if System.get_env("WILDCARD_TLS_SERVING") in ~w(true 1) do
+  if env_bool.("WILDCARD_TLS_SERVING") == true do
     config :fathom, :wildcard_tls_serving, true
   end
 
@@ -1692,7 +1715,7 @@ if config_env() == :prod do
   # the retained template@HEAD snapshot (mix fathom.snapshot template-head). Off by
   # default; enable only with a template + snapshot in place. Fork failures fall back to
   # born-empty. See config/config.exs and Fathom.Migrator.fork_from_template/1.
-  if System.get_env("FORK_FROM_TEMPLATE") in ~w(true 1) do
+  if env_bool.("FORK_FROM_TEMPLATE") == true do
     config :fathom, :fork_from_template, true
   end
 
