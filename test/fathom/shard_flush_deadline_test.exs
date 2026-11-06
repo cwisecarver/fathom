@@ -73,6 +73,12 @@ defmodule Fathom.ShardFlushDeadlineTest do
     %{shard: shard}
   end
 
+  # Whether `coordinator` holds a main-lane FlushGate slot. Not `FlushGate.in_flight/0`: that
+  # counter is node-global, and a lingering coordinator from an earlier test flushing at the same
+  # moment moved it (CI OTP 28, 2026-11-06: "the killed flush leaked its FlushGate slot" with no
+  # leak). The gate records each holder by pid, so ask about this coordinator only.
+  defp holds_slot?(coordinator), do: :ets.member(FlushGate, {:holder, coordinator})
+
   defp seed!(shard, v) do
     {:ok, conn} = ShardExecutor.open(shard)
 
@@ -129,7 +135,6 @@ defmodule Fathom.ShardFlushDeadlineTest do
         assert_mode!(coordinator, unquote(mode))
         assert Shard.dirty?(coordinator)
 
-        base = FlushGate.in_flight()
         Application.put_env(:fathom, :storage_fault, unquote(fault))
 
         capture_log(fn ->
@@ -137,7 +142,7 @@ defmodule Fathom.ShardFlushDeadlineTest do
           await(coordinator, fn -> :sys.get_state(coordinator).flush_task != nil end)
 
           # The stalled PUT holds exactly one gate slot (the premise of the finding).
-          assert FlushGate.in_flight() == base + 1
+          assert holds_slot?(coordinator)
 
           assert_receive {:deadline, ^shard}, 5_000, "the stalled flush was never cut off"
         end)
@@ -146,7 +151,7 @@ defmodule Fathom.ShardFlushDeadlineTest do
         assert state.flush_task == nil
         refute state.flush_slot_held
         assert state.flush_deadline_timer == nil
-        assert FlushGate.in_flight() == base, "the killed flush leaked its FlushGate slot"
+        refute holds_slot?(coordinator), "the killed flush leaked its FlushGate slot"
         assert Shard.dirty?(coordinator), "a timed-out PUT must never mark the shard clean"
         assert state.flush_failures >= 1
 
@@ -164,7 +169,7 @@ defmodule Fathom.ShardFlushDeadlineTest do
           clean?
         end)
 
-        assert FlushGate.in_flight() == base
+        refute holds_slot?(coordinator)
       end
     end
   end
