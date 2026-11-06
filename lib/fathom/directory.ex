@@ -2096,9 +2096,8 @@ defmodule Fathom.Directory do
     n
   end
 
-  # active_recent/1 (the fleet-wide hot set the WarmFollower read cache pre-pulled) was removed
-  # 2026-09-14 with the WarmFollower retirement — it had no other caller. Its partial index
-  # (shards_active_last_active_at_index) had NO reader after that (`laggards` uses the composite
+  # The partial index (shards_active_last_active_at_index) had NO reader once active_recent/1 went
+  # (`laggards` uses the composite
   # shards_active_schema_version_last_active_at_index; `flush_lag_report`'s `status != 'deleted'`
   # does not imply the partial predicate) and was dropped by perf review 2026-10-14 #5: every
   # touch/flush write is non-HOT, so an unread index is pure per-write WAL.

@@ -184,8 +184,6 @@ defmodule Mix.Tasks.Fathom.Scale do
 
   defp prometheus_row(_), do: "off (no telemetry handler attached)"
 
-  # print_warm_density/1 (and --warm-density) removed 2026-09-14 with the WarmFollower retirement.
-
   defp print_ramp(r) do
     rows = [
       {"ceiling", "#{r.ceiling_shards} open shards"},

@@ -390,8 +390,6 @@ defmodule Mix.Tasks.Fathom.Bench do
     Mix.shell().error("")
   end
 
-  # rto_speedup/1 (warm-vs-cold RTO) removed 2026-09-14 with the WarmFollower retirement.
-
   defp format_value(nil), do: String.pad_leading("skipped", 12)
 
   defp format_value(v),

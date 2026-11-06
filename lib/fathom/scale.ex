@@ -342,8 +342,6 @@ defmodule Fathom.Scale do
     |> Stream.run()
   end
 
-  # warm_density/1 (warm-standby cache density) was removed 2026-09-14 with the WarmFollower retirement.
-
   # --- hot-spot evidence (Phase-2 §B rebalancing prerequisite) -------------
 
   @doc """

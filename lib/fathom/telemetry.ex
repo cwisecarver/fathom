@@ -436,9 +436,8 @@ defmodule Fathom.Telemetry do
         description:
           "How long a held checkout slept before retrying, split by whether the wait was AIMED at a known steal instant (#23) or a blind backoff step. aimed=false dominating a crash failover means the backend stopped supplying the instant and the takeover is back to polling — ~8 retries and ~17 S3 requests per shard instead of one or two"
       ),
-      # fathom.shard.warm.{promoted,pulled,evicted,refresh} removed 2026-09-14 with the WarmFollower
-      # retirement (no emitter). The cold-open `warm` TAG (warm restart = local file present) and
-      # the rebalancer affinity hit-rate are unrelated and stay.
+      # The cold-open `warm` TAG (warm restart = local file present) and the rebalancer affinity
+      # hit-rate are unrelated to the retired warm cache and stay.
       distribution("fathom.shards.checkout.stop.duration",
         event_name: [:fathom, :shards, :checkout, :stop],
         measurement: :duration,
@@ -583,8 +582,6 @@ defmodule Fathom.Telemetry do
         measurement: :port_used_ratio,
         description: "Open ports as a fraction of +Q (1.0 ⇒ the listener stops accepting)"
       ),
-      # The warm_follower.disk_pressure metrics were removed 2026-09-14 with the WarmFollower
-      # retirement. The replication.disk_pressure metrics below are UNRELATED (A2) and stay.
       # The flush gate had no observability at all (expert review 2026-08-20 #15). A leaked slot is
       # permanent without the sweep, the cap is single digits, and a node whose gate is full simply
       # stops flushing — quietly, because the failure counter only moves for flushes that RAN.
@@ -1134,9 +1131,6 @@ defmodule Fathom.Telemetry do
           "Purges that deleted a live object while a REMOTE node still held the lease — correct by design (that node self-fences on its next fenced flush rather than resurrecting the object), but it makes a cross-node erase observable instead of silent. Untagged: the owner is another node's key, and the shard_id stays in the log"
       ),
 
-      # Warm-standby cache throughput metrics (warm.pulled{.count,.bytes}, warm.evicted) removed
-      # 2026-09-14 with the WarmFollower retirement — no emitter.
-
       # Rebalancer — a fail-safe deferral, so silence here can mean 'working' or 'wedged'.
       counter("fathom.rebalancer.reconcile.skipped.count",
         event_name: [:fathom, :rebalancer, :reconcile, :skipped],
@@ -1324,9 +1318,6 @@ defmodule Fathom.Telemetry do
         description:
           "Lease releases that hit a 412 and re-read to find the lock STILL OURS at a rotated etag, then finished the delete (the 2026-08-04 stuck-lease fix). Every one of these would previously have leaked a lock that no live node could ever steal — a tenant that serves normally but can NEVER migrate, snoozing forever with failed: 0"
       ),
-
-      # Warm-standby revalidation metrics (warm.refresh.{cached,body_bytes}) removed 2026-09-14 with
-      # the WarmFollower retirement — no emitter.
 
       # Snapshots — the scheduler half (the retention/deletion half is above).
       sum("fathom.snapshots.scheduled.ok",

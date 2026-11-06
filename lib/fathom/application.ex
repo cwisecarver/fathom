@@ -1213,8 +1213,6 @@ defmodule Fathom.Application do
       else: []
   end
 
-  # The warm-standby follower (Phase 2 A1) was removed 2026-09-14, superseded by A2 replication.
-
   @doc """
   Whether this node serves the Hrana data plane.
 
