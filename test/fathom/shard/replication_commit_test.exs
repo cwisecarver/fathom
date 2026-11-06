@@ -17,6 +17,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shards
+  import Fathom.Test.ReplicationCase
 
   setup do
     id = "repl_commit_#{System.unique_integer([:positive])}"
@@ -47,19 +48,6 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     end)
 
     %{id: id, root: root}
-  end
-
-  # THREE followers with a quorum of two. Not two-and-two: `Q < N` is enforced at construction (and
-  # now at boot), because Q=N tolerates zero failures — the first version of this test configured
-  # 2-of-2 and every commit raised, which is the guard working exactly as intended.
-  defp start_followers!(root, n) do
-    for i <- 1..n do
-      name = :"rc_f#{i}_#{System.unique_integer([:positive])}"
-      dir = Path.join(root, to_string(name))
-      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
-      {:ok, port} = Follower.port(pid)
-      {name, port}
-    end
   end
 
   # Pre-seed a follower as the CURRENT owner would have: at its real lock epoch and lineage.
@@ -111,18 +99,9 @@ defmodule Fathom.Shard.ReplicationCommitTest do
   test "a committed write reaches a follower quorum, byte-identical", ctx do
     %{id: id, root: root} = ctx
 
-    followers = start_followers!(root, 3)
+    followers = start_followers!(root, 3, "rc")
 
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-    )
-
-    start_supervised!(Fleet)
+    enable_replication!(followers)
 
     # A real shard with a real coordinator, so the epoch shipped is a real lease epoch.
     {:ok, coordinator, ref, path} = Shards.checkout(id)
@@ -176,18 +155,9 @@ defmodule Fathom.Shard.ReplicationCommitTest do
   describe "the commit ack is gated on confirmed ownership (#5)" do
     test "heartbeat mode refuses the ack when liveness is unconfirmed; legacy is ungated", ctx do
       %{id: id, root: root} = ctx
-      followers = start_followers!(root, 3)
+      followers = start_followers!(root, 3, "rc")
 
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_quorum, 2)
-
-      Application.put_env(
-        :fathom,
-        :replication_followers,
-        for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-      )
-
-      start_supervised!(Fleet)
+      enable_replication!(followers)
 
       # Heartbeat FIRST, so `Shards.checkout` opens the coordinator in HEARTBEAT mode.
       owner = "n_#{System.unique_integer([:positive])}@test"
@@ -238,18 +208,9 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     # it cannot silently change; gating it on an inline S3 check_lease is a deliberate deferral.
     test "legacy mode (no heartbeat started) leaves the ack ungated", ctx do
       %{id: id, root: root} = ctx
-      followers = start_followers!(root, 3)
+      followers = start_followers!(root, 3, "rc")
 
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_quorum, 2)
-
-      Application.put_env(
-        :fathom,
-        :replication_followers,
-        for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-      )
-
-      start_supervised!(Fleet)
+      enable_replication!(followers)
 
       # No Heartbeat → legacy mode (acquire_gen nil), so the gate is a no-op and commits still ack.
       {:ok, coordinator, ref, path} = Shards.checkout(id)
@@ -274,18 +235,9 @@ defmodule Fathom.Shard.ReplicationCommitTest do
   defp heartbeat_session!(ctx, opts \\ []) do
     %{id: id, root: root} = ctx
     unseeded? = Keyword.get(opts, :unseeded, false)
-    followers = start_followers!(root, 3)
+    followers = start_followers!(root, 3, "rc")
 
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-    )
-
-    start_supervised!(Fleet)
+    enable_replication!(followers)
 
     owner = "n_#{System.unique_integer([:positive])}@test"
     # :temporary so the #23 tests can kill it and have it STAY down.
@@ -422,17 +374,8 @@ defmodule Fathom.Shard.ReplicationCommitTest do
 
     test "legacy mode: the ack stays ungated (deliberate deferral) through a re-seed", ctx do
       %{id: id, root: root} = ctx
-      followers = start_followers!(root, 3)
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_quorum, 2)
-
-      Application.put_env(
-        :fathom,
-        :replication_followers,
-        for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-      )
-
-      start_supervised!(Fleet)
+      followers = start_followers!(root, 3, "rc")
+      enable_replication!(followers)
 
       {:ok, coordinator, ref, path} = Shards.checkout(id)
       on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -569,18 +512,9 @@ defmodule Fathom.Shard.ReplicationCommitTest do
   describe "a heartbeat lapse must not permanently 503 the session (#4)" do
     test "the session recovers its ack after the coordinator revalidates the generation", ctx do
       %{id: id, root: root} = ctx
-      followers = start_followers!(root, 3)
+      followers = start_followers!(root, 3, "rc")
 
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_quorum, 2)
-
-      Application.put_env(
-        :fathom,
-        :replication_followers,
-        for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-      )
-
-      start_supervised!(Fleet)
+      enable_replication!(followers)
 
       # Heartbeat FIRST, so the coordinator opens in HEARTBEAT mode.
       owner = "n_#{System.unique_integer([:positive])}@test"
@@ -636,18 +570,9 @@ defmodule Fathom.Shard.ReplicationCommitTest do
 
   test "committing with nothing new ships nothing and still succeeds", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
+    followers = start_followers!(root, 3, "rc")
 
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-    )
-
-    start_supervised!(Fleet)
+    enable_replication!(followers)
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -665,7 +590,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
 
   test "an unreachable quorum fails the commit rather than reporting success", ctx do
     %{id: id, root: root} = ctx
-    [{name, port} | _] = start_followers!(root, 1)
+    [{name, port} | _] = start_followers!(root, 1, "rc")
 
     Application.put_env(:fathom, :replication_enabled, true)
     Application.put_env(:fathom, :replication_quorum, 2)
@@ -704,7 +629,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
   # follower that is in fact free — silently under-replicating it.
   test "a follower that rejects is no longer recorded as owing a reply", ctx do
     %{id: id, root: root} = ctx
-    [{name, port} | _] = start_followers!(root, 1)
+    [{name, port} | _] = start_followers!(root, 1, "rc")
 
     Application.put_env(:fathom, :replication_enabled, true)
     Application.put_env(:fathom, :replication_quorum, 2)
@@ -798,7 +723,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
 
   test "a WAL far larger than the per-push cap still converges byte-identically", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
+    followers = start_followers!(root, 3, "rc")
 
     prev_cap = Application.get_env(:fathom, :replication_max_push_bytes)
     Application.put_env(:fathom, :replication_max_push_bytes, @small_cap)
@@ -809,16 +734,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
         else: Application.delete_env(:fathom, :replication_max_push_bytes)
     end)
 
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-    )
-
-    start_supervised!(Fleet)
+    enable_replication!(followers)
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -1105,18 +1021,9 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       # the sibling arms describe: `{:ok, _, rejects}`, tenant sees `:ok`, one follower silently
       # behind. A commit whose quorum FAILS seeds and retries synchronously instead, so it never
       # reaches the deferred retry at all.
-      followers = start_followers!(root, 3)
+      followers = start_followers!(root, 3, "rc")
 
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_quorum, 1)
-
-      Application.put_env(
-        :fathom,
-        :replication_followers,
-        for({_n, p} <- followers, do: {~c"127.0.0.1", p})
-      )
-
-      start_supervised!(Fleet)
+      enable_replication!(followers, quorum: 1)
 
       {:ok, coordinator, ref, path} = Shards.checkout(id)
       on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -1202,7 +1109,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     test "a killed seed task is forgotten, and the next request seeds again", ctx do
       %{id: id, root: root} = ctx
 
-      live = start_followers!(root, 2)
+      live = start_followers!(root, 2, "rc")
       bh_port = seed_black_hole!()
 
       Application.put_env(:fathom, :replication_enabled, true)
@@ -1287,7 +1194,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
           else: Application.put_env(:fathom, :replication_seed_expiry_ms, prev)
       end)
 
-      live = start_followers!(root, 2)
+      live = start_followers!(root, 2, "rc")
       bh_port = seed_black_hole!()
 
       Application.put_env(:fathom, :replication_enabled, true)
@@ -1363,7 +1270,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
          ctx do
       %{id: id, root: root} = ctx
 
-      live = start_followers!(root, 2)
+      live = start_followers!(root, 2, "rc")
       bh_port = seed_black_hole!()
 
       Application.put_env(:fathom, :replication_enabled, true)
@@ -1430,18 +1337,9 @@ defmodule Fathom.Shard.ReplicationCommitTest do
             do: Application.delete_env(:fathom, k)
       end)
 
-      followers = start_followers!(root, 3)
+      followers = start_followers!(root, 3, "rc")
 
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_quorum, 2)
-
-      Application.put_env(
-        :fathom,
-        :replication_followers,
-        for({_n, p} <- followers, do: {~c"127.0.0.1", p})
-      )
-
-      start_supervised!(Fleet)
+      enable_replication!(followers)
 
       {:ok, coordinator, ref, path} = Shards.checkout(id)
       on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -1478,18 +1376,9 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       Application.put_env(:fathom, :replication_timeout_ms, 4_000)
       on_exit(fn -> Application.delete_env(:fathom, :replication_timeout_ms) end)
 
-      followers = start_followers!(root, 3)
+      followers = start_followers!(root, 3, "rc")
 
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_quorum, 2)
-
-      Application.put_env(
-        :fathom,
-        :replication_followers,
-        for({_n, p} <- followers, do: {~c"127.0.0.1", p})
-      )
-
-      start_supervised!(Fleet)
+      enable_replication!(followers)
 
       {:ok, coordinator, ref, path} = Shards.checkout(id)
       on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -1533,7 +1422,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     test "a stopped session does not leave a seed streaming for a shard it no longer owns", ctx do
       %{id: id, root: root} = ctx
 
-      live = start_followers!(root, 2)
+      live = start_followers!(root, 2, "rc")
       bh_port = seed_black_hole!()
 
       Application.put_env(:fathom, :replication_enabled, true)
@@ -1582,7 +1471,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
          ctx do
       %{id: id, root: root} = ctx
 
-      live = start_followers!(root, 2)
+      live = start_followers!(root, 2, "rc")
       bh_port = seed_black_hole!()
 
       Application.put_env(:fathom, :replication_enabled, true)
@@ -1637,17 +1526,8 @@ defmodule Fathom.Shard.ReplicationCommitTest do
        ctx do
     %{id: id, root: root} = ctx
 
-    live = start_followers!(root, 2)
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 1)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, p} <- live, do: {~c"127.0.0.1", p})
-    )
-
-    start_supervised!(Fleet)
+    live = start_followers!(root, 2, "rc")
+    enable_replication!(live, quorum: 1)
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
