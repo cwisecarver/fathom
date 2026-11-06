@@ -25,9 +25,9 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Session
-  alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Shards
+  import Fathom.Test.ReplicationCase
 
   setup do
     id = "repl_seed_#{System.unique_integer([:positive])}"
@@ -60,52 +60,6 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     end)
 
     %{id: id, root: root}
-  end
-
-  defp start_followers!(root, n) do
-    for i <- 1..n do
-      name = :"seed_f#{i}_#{System.unique_integer([:positive])}"
-      dir = Path.join(root, to_string(name))
-      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
-      {:ok, port} = Follower.port(pid)
-      {name, port}
-    end
-  end
-
-  defp enable!(followers, q) do
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, q)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-    )
-
-    start_supervised!(Fleet)
-    await_connected!()
-  end
-
-  # Shippers connect in `handle_continue`, so without this the FIRST commit races the connect and
-  # every follower answers `:disconnected` — not `:unknown_shard`, so no seed is triggered and the
-  # test looks like seeding is broken. Production self-heals (the next commit finds them connected
-  # and seeds), but a test that depends on that race is a flake.
-  defp await_connected!(timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      if Enum.all?(Fleet.shippers(), &Shipper.connected?/1),
-        do: :connected,
-        else: Process.sleep(20)
-    end)
-    |> Enum.find(fn
-      :connected -> true
-      _ -> System.monotonic_time(:millisecond) > deadline
-    end)
-    |> case do
-      :connected -> :ok
-      _ -> flunk("shippers never connected")
-    end
   end
 
   defp open_shard!(id) do
@@ -173,8 +127,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # crash in the application, once per tenant, forever.
   test "the FIRST commit to a shard succeeds, rather than failing while the seed runs", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "seed")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b TEXT)", [])
@@ -227,8 +181,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # closes that gap for good, so the class stays visible without a Docker rig.
   test "commits keep replicating ACROSS a WAL checkpoint, not just within one generation", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "seed")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -290,8 +244,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
   test "a follower ABSORBS its WAL at a reset, so the replica is still a database", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "seed")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -357,8 +311,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # `ckpt_seq` too, so both sides agree a generation boundary happened.
   test "replication survives the WAL being RECREATED when all connections close", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "seed")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -408,10 +362,10 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # restarted lost an acked write on the chaos rig.
   test "a follower that restarts recovers its position from the files, without a re-seed", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 2)
+    followers = start_followers!(root, 2, "seed")
     [{name, _port} | _] = followers
     dir = Path.join(root, to_string(name))
-    enable!(followers, 1)
+    enable_replication!(followers, quorum: 1, connected: :all)
 
     # Drive one real seed + commit so the follower holds genuine bytes.
     {coordinator, conn, path} = open_shard!(id)
@@ -454,10 +408,10 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # object — with its guard silently removed by an unrelated fix.
   test "a torn replica is STILL torn after the follower restarts", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 2)
+    followers = start_followers!(root, 2, "seed")
     [{name, _port} | _] = followers
     dir = Path.join(root, to_string(name))
-    enable!(followers, 1)
+    enable_replication!(followers, quorum: 1, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
@@ -508,9 +462,9 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # the half that rested on a filter the pull path never ran.
   test "a torn replica answers unknown_shard to a replica_request", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 2)
+    followers = start_followers!(root, 2, "seed")
     [{name, port} | _] = followers
-    enable!(followers, 1)
+    enable_replication!(followers, quorum: 1, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
@@ -548,8 +502,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   test "a torn replica is re-seeded while commits keep flowing, without already_in_flight",
        ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "seed")
+    enable_replication!(followers, quorum: 2, connected: :all)
     # Small chunks stretch the seed across many frames, so it is still streaming when the next
     # commits arrive — the window the race needs.
     Application.put_env(:fathom, :replication_seed_chunk_bytes, 4 * 1024)
@@ -626,8 +580,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # with pushes in flight on both, and they are resumed only AFTER the second commit has started.
   test "a commit waits for in-flight stragglers instead of failing on already_in_flight", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "seed")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -688,10 +642,10 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # full re-seed of every shard the node follows.
   test "a healthy replica is still promotable after the follower restarts", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 2)
+    followers = start_followers!(root, 2, "seed")
     [{name, _port} | _] = followers
     dir = Path.join(root, to_string(name))
-    enable!(followers, 1)
+    enable_replication!(followers, quorum: 1, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
@@ -714,8 +668,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
   test "an unseeded follower is seeded automatically, then replicates", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "seed")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b TEXT)", [])
@@ -775,8 +729,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
   test "a follower that joins late is seeded mid-stream and converges", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "seed")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
@@ -820,8 +774,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # hand and its size is known, so the delta the primary must compute is a specific one.
   test "a follower that falls behind is caught up from ITS OWN offset", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "seed")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
@@ -877,8 +831,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # laggard set by receiving bytes, so skipping it would strand it there for good.
   test "a quiet shard catches a laggard up without waiting on it", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "seed")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
@@ -941,11 +895,15 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   test "a laggard refused by our own shipper is caught up without waiting for the next write",
        ctx do
     %{id: id, root: root} = ctx
-    [{a, pa}, {b, pb}, {laggard, plag}] = start_followers!(root, 3)
+    [{a, pa}, {b, pb}, {laggard, plag}] = start_followers!(root, 3, "seed")
 
     # Only the laggard is proxied; a and b answer directly, exactly as in the flaky test.
     peer = start_supervised!({Fathom.Test.PausablePeer, upstream_port: plag, notify: self()})
-    enable!([{a, pa}, {b, pb}, {laggard, Fathom.Test.PausablePeer.port(peer)}], 2)
+
+    enable_replication!([{a, pa}, {b, pb}, {laggard, Fathom.Test.PausablePeer.port(peer)}],
+      quorum: 2,
+      connected: :all
+    )
 
     {coordinator, conn, path} = open_shard!(id)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
@@ -1047,7 +1005,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # that the ACK ITSELF is enough, with no extra round trip.
   test "a held ack still advances the follower after our own shipper refused a later push", ctx do
     %{id: id, root: root} = ctx
-    [{a, pa}, {b, pb}, {laggard, plag}] = start_followers!(root, 3)
+    [{a, pa}, {b, pb}, {laggard, plag}] = start_followers!(root, 3, "seed")
 
     prev_catchup = Application.get_env(:fathom, :replication_catchup_ms)
     Application.put_env(:fathom, :replication_catchup_ms, 0)
@@ -1059,7 +1017,11 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     end)
 
     peer = start_supervised!({Fathom.Test.PausablePeer, upstream_port: plag, notify: self()})
-    enable!([{a, pa}, {b, pb}, {laggard, Fathom.Test.PausablePeer.port(peer)}], 2)
+
+    enable_replication!([{a, pa}, {b, pb}, {laggard, Fathom.Test.PausablePeer.port(peer)}],
+      quorum: 2,
+      connected: :all
+    )
 
     {coordinator, conn, path} = open_shard!(id)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
@@ -1145,9 +1107,13 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
     test "quorum still reachable without it: the commit acks and no push is refused", ctx do
       %{id: id, root: root} = ctx
-      [{a, pa}, {b, pb}, {laggard, plag}] = start_followers!(root, 3)
+      [{a, pa}, {b, pb}, {laggard, plag}] = start_followers!(root, 3, "seed")
       peer = start_supervised!({Fathom.Test.PausablePeer, upstream_port: plag, notify: self()})
-      enable!([{a, pa}, {b, pb}, {laggard, Fathom.Test.PausablePeer.port(peer)}], 2)
+
+      enable_replication!([{a, pa}, {b, pb}, {laggard, Fathom.Test.PausablePeer.port(peer)}],
+        quorum: 2,
+        connected: :all
+      )
 
       {coordinator, conn, path} = open_shard!(id)
       {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
@@ -1180,7 +1146,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
     test "quorum NOT reachable without them: resolves to no_quorum, still no push", ctx do
       %{id: id, root: root} = ctx
-      [{a, pa}, {b, pb}, {c, pc}, {d, pd}] = start_followers!(root, 4)
+      [{a, pa}, {b, pb}, {c, pc}, {d, pd}] = start_followers!(root, 4, "seed")
 
       peer_b =
         start_supervised!({Fathom.Test.PausablePeer, upstream_port: pb, notify: self()}, id: :pb)
@@ -1188,14 +1154,15 @@ defmodule Fathom.Shard.ReplicationSeedTest do
       peer_c =
         start_supervised!({Fathom.Test.PausablePeer, upstream_port: pc, notify: self()}, id: :pc)
 
-      enable!(
+      enable_replication!(
         [
           {a, pa},
           {b, Fathom.Test.PausablePeer.port(peer_b)},
           {c, Fathom.Test.PausablePeer.port(peer_c)},
           {d, pd}
         ],
-        2
+        quorum: 2,
+        connected: :all
       )
 
       {coordinator, conn, path} = open_shard!(id)
@@ -1318,9 +1285,9 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # first iteration.
   test "a real shard seeds across many chunks and lands byte-identical", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
+    followers = start_followers!(root, 3, "seed")
     Application.put_env(:fathom, :replication_seed_chunk_bytes, 4_096)
-    enable!(followers, 2)
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)", [])
@@ -1380,8 +1347,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
   test "seeds from LIVE bytes, not a VACUUM INTO snapshot", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "seed")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)", [])
@@ -1438,8 +1405,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   test "a seed taken over a REUSED WAL lets the next commits replicate, and the replica holds them",
        ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "seed")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -1528,8 +1495,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   test "commits after a checkpoint keep their followers' advance (no offset_mismatch rounds)",
        ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "seed")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
