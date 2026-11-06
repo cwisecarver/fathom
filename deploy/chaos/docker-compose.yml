@@ -71,11 +71,6 @@ x-fathom-env: &fathom-env
   # Per-shard load counters on, so `chaos.sh hotspots` can read Fathom.ShardLoad.top
   # per node — the real-traffic hot-spot measurement (Phase-2 §B).
   SHARD_LOAD: "true"
-  # Every node is also a warm-standby follower, so kill-failover exercises the
-  # warm-promotion (304) path when the survivor has the shard cached.
-  WARM_FOLLOWER: "true"
-  WARM_CACHE_DIR: /data/warm
-  WARM_POLL_MS: "2000"
   # Phase-2 A2 quorum replication. LISTENING IS ON EVERYWHERE, SHIPPING IS NOT — that is the
   # documented rollout order (docs/configuration.md), and the rig should demonstrate the order it
   # tells operators to use. A shipper whose followers are not listening 503s every tenant write.

@@ -13,8 +13,8 @@
 #   ./chaos.sh repl-latency <ms>|clear  inject latency on the REPLICATION (follower) links to model a
 #                                 cross-AZ/region replica set. Needs `REPL_VIA_TOXI=1 ./chaos.sh up`.
 #   ./chaos.sh failover <shard>   silent-kill the owner; time LB reroute + survivor steal
-#   ./chaos.sh failover-herd [shards warm]  kill a node holding N shards; measure time-to-served
-#                                 across ALL its tenants (p50/p90/p99/max) — the herd, warm=on|off
+#   ./chaos.sh failover-herd [shards]  kill a node holding N shards; measure time-to-served
+#                                 across ALL its tenants (p50/p90/p99/max) — the herd
 #   ./chaos.sh deploy [shards node]  clean-shutdown (rolling-deploy) proof: hold N open+dirty shards
 #                                 on a node, SIGTERM it, verify the graceful terminate flushed EVERY
 #                                 shard (zero loss) — the herd analog of failover for a node upgrade
@@ -22,8 +22,6 @@
 #                                   unpause the zombie and prove it self-fences
 #   ./chaos.sh partition <node> [secs]  cut one node off S3; observe lapse + recovery
 #   ./chaos.sh soak <secs>        sustained load + node churn; end-to-end integrity check
-#   ./chaos.sh warm-home <shard>  a shard's home node must NOT warm its own shard
-#                                 (survivors do) — while served AND after idle-drop
 #   ./chaos.sh hotspots [shards secs zipf workers]  drive Zipf-skewed REAL Hrana
 #                                 traffic through the LB, then read Fathom.ShardLoad.top
 #                                 per node — the non-synthetic Phase-2 §B hot-spot run
@@ -371,7 +369,7 @@ await_steal() {
 # same way, reporting rows=2, then 3, then 5 across successive runs.
 #
 # Truncating here rather than in each command means every caller (smoke, failover, pause-fence,
-# soak, warm-home, rebalance) gets a clean baseline by construction, and a command added later
+# soak, rebalance) gets a clean baseline by construction, and a command added later
 # cannot forget to. Every current caller seeds once at setup, never between steps, so this
 # cannot clear data a run is still relying on.
 seed() {
@@ -704,9 +702,9 @@ cmd_failover() {
   revive "$owner"
 }
 
-grep_promote() { # did the survivor open warm (304-promote) or cold?
+grep_promote() { # did the survivor promote a replica on open?
   compose logs --since 2m "$1" 2>/dev/null |
-    grep -Ei "warm|promote" | tail -3 | sed 's/^/  log: /'
+    grep -Ei "promote" | tail -3 | sed 's/^/  log: /'
 }
 
 cmd_pause_fence() {
@@ -930,44 +928,6 @@ cmd_soak() {
     echo "  unmatched ack(s) are unverified, not counted as destroyed. Re-run, or raise SOAK_SETTLE_S."
   fi
   [ $leaks -eq 0 ] && [ $destroyed -eq 0 ] && [ "$unreadable" -eq 0 ]
-}
-
-# A shard's HOME node (the LB-hash target that serves it) must NOT warm its own
-# shard — only the survivors warm it, so a failover away from the home lands warm
-# while the home never wastes cache budget on a shard that routes back to it. The
-# regression is a home node re-warming a shard it just idle-dropped (lease released,
-# no live "home" signal); the fix remembers recently-owned shards for
-# :warm_home_retention_ms. This checks BOTH while-served and after-idle-drop.
-check_warm_placement() {
-  local shard=$1 home=$2 rc=0 n present
-  for n in "${NODES[@]}"; do
-    if compose exec -T "$n" test -f "/data/warm/$shard.db" 2>/dev/null; then present=yes; else present=no; fi
-    if [ "$n" = "$home" ]; then
-      printf "  %-8s warm=%-3s (home — MUST be no)\n" "$n" "$present"
-      [ "$present" = "no" ] || rc=1
-    else
-      printf "  %-8s warm=%-3s (survivor — should be yes)\n" "$n" "$present"
-    fi
-  done
-  [ $rc -eq 0 ] && echo "  PASS: home node does not warm its own shard" \
-    || echo "  *** FAIL: home node warmed its own shard"
-  return $rc
-}
-
-cmd_warm_home() {
-  local shard=${1:?usage: warm-home <shard>}
-  seed "$shard"
-  local home; home=$(cmd_owner "$shard") || { echo "no home found"; return 1; }
-  echo "home=$home — waiting ~8s for warm propagation (shard still served, < idle)"
-  sleep 8
-  echo "--- while served (live coordinator on home) ---"
-  check_warm_placement "$shard" "$home" || true
-  # Past SHARD_IDLE_MS (rig 20s) so home flushes+drops+releases, but within the
-  # home-retention window (default 60s) — the regression window.
-  echo "waiting past idle-drop, staying within the home-retention window..."
-  sleep 18
-  echo "--- after idle-drop, within home-retention (the fix's window) ---"
-  check_warm_placement "$shard" "$home"
 }
 
 # -- replication: A2 quorum replication, multi-node for the first time ---------
@@ -3800,9 +3760,7 @@ cmd_deploy() {
 # cmd_failover_herd — the failover HERD at density (expert review #39). `failover` measures ONE
 # shard's re-home time; a real node death re-homes ALL its tenants onto survivors at once. This seeds
 # N shards on a node, kills it, then fires all N requests through the LB CONCURRENTLY and reports the
-# time-to-served distribution (p50/p90/p99/max + served/N) — the herd. `warm=off` disables the
-# survivors' warm follower + clears their cache so every re-home cold-opens (full pull); `warm=on`
-# (default) lets them 304-promote the pre-warmed copy. The floor is the lease TTL + steal margin
+# time-to-served distribution (p50/p90/p99/max + served/N) — the herd. The floor is the lease TTL + steal margin
 # (~15s here): a silent-killed owner's shards are unstealable until its heartbeat lapses.
 #
 # It waits 8 s for "a durable flush", so it needs a fast flush like `failover` (round-8 herd run,
@@ -3810,8 +3768,8 @@ cmd_deploy() {
 # Each request gives up at HERD_DEADLINE_S (default 120) and counts as unserved: a shard that never
 # comes back used to spin its retry loop forever and hang the run.
 cmd_failover_herd() {
-  local shards=${1:-300} warm=${2:-on} node=fathom1 deadline_ms=$(( ${HERD_DEADLINE_S:-120} * 1000 ))
-  echo "failover-herd: $shards shards on $node, warm=$warm — kill it, measure time-to-served across the herd"
+  local shards=${1:-300} node=fathom1 deadline_ms=$(( ${HERD_DEADLINE_S:-120} * 1000 ))
+  echo "failover-herd: $shards shards on $node — kill it, measure time-to-served across the herd"
   require_fast_flush failover-herd || return 1
 
   rpc "$node" 'Application.put_env(:fathom, :shard_idle_ms, 600_000); Application.put_env(:fathom, :max_open_shards, 100_000)' >/dev/null
@@ -3825,19 +3783,6 @@ cmd_failover_herd() {
   done
   echo "waiting for a durable flush (a kill must lose nothing) ..."
   sleep 8
-
-  local sv
-  if [ "$warm" = "on" ]; then
-    echo "warm=on: waiting so survivors pre-warm $node's shards (2 poll cycles) ..."
-    sleep 6
-  else
-    echo "warm=off: disabling the follower + clearing warm caches on survivors (force cold-open) ..."
-    for sv in "${NODES[@]}"; do
-      [ "$sv" = "$node" ] && continue
-      rpc "$sv" 'Application.put_env(:fathom, :warm_follower, false)' >/dev/null
-      compose exec -T "$sv" sh -c 'rm -rf /data/warm/* 2>/dev/null' || true
-    done
-  fi
 
   local tmp; tmp=$(mktemp -d)
   echo "killing $node; firing $shards concurrent requests through the LB ..."
@@ -4174,6 +4119,5 @@ case "${1:-}" in
   pause-fence) shift; cmd_pause_fence "$@" ;;
   partition)   shift; cmd_partition "$@" ;;
   soak)        shift; cmd_soak "$@" ;;
-  warm-home)   shift; cmd_warm_home "$@" ;;
-  *) sed -n '2,20p' "$0"; exit 64 ;;
+  *) awk 'NR==1{next} /^#/{print;next} {exit}' "$(basename "$0")"; exit 64 ;;
 esac
