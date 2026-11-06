@@ -510,7 +510,9 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
                    )
         end)
 
-      refute log =~ "recovery chose"
+      # Scoped to this test's shard: the capture is node-global, so a takeover another test's
+      # shard logs while this runs must not fail the refute.
+      refute log =~ ~r/shard #{Regex.escape(id)}: .*recovery chose/
     end
 
     test "decision_line names a pull, the floor and silent peers" do
