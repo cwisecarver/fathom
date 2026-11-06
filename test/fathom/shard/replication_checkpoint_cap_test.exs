@@ -13,8 +13,9 @@ defmodule Fathom.Shard.ReplicationCheckpointCapTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Replication.{Fleet, Follower, Session}
+  alias Fathom.Shard.Replication.Session
   alias Fathom.Shards
+  import Fathom.Test.ReplicationCase
 
   @frame 4096 + 24
   @keys [
@@ -50,31 +51,12 @@ defmodule Fathom.Shard.ReplicationCheckpointCapTest do
     %{id: id, root: root}
   end
 
-  defp start_followers!(root, n) do
-    for i <- 1..n do
-      name = :"cc_f#{i}_#{System.unique_integer([:positive])}"
-      dir = Path.join(root, to_string(name))
-      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
-      {:ok, port} = Follower.port(pid)
-      {name, port}
-    end
-  end
-
   test "a tenant at its stream cap still gets a covered checkpoint at the threshold", %{
     id: id,
     root: root
   } do
-    followers = start_followers!(root, 3)
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-    )
-
-    start_supervised!(Fleet)
+    followers = start_followers!(root, 3, "cc")
+    enable_replication!(followers)
 
     # The tenant holds its whole cap: two streams.
     Application.put_env(:fathom, :max_checkouts_per_shard, 2)
