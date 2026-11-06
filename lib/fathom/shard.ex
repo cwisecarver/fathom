@@ -731,7 +731,7 @@ defmodule Fathom.Shard do
     # alongside the fork verdict wait and the pull instead of after them (perf review 2026-10-14
     # #3). The lease is held, so "we hold the lock, nobody flushed since" (`open_lineage/2`) is the
     # same invariant it was when the HEAD followed the pull. A HEAD issued BEFORE the lease would
-    # not be (parked: perf #3(b)). `nil` unless replicating and not a takeover claim.
+    # not be (parked: perf review 2026-10-14 #3(b)). `nil` unless replicating and not a takeover claim.
     head_task = start_open_head(shard_id, lease, path, not file?)
 
     # Consume the overlapped fork-check verdict here — the same pre-serving point the
@@ -922,7 +922,7 @@ defmodule Fathom.Shard do
   # Anything other than a clean, timely verdict is `:unreachable` — resolve_fork/4's fail-safe.
   #
   # A TIMEOUT (not an in-task error) is retried ONCE and is observable (expert review 2026-10-10
-  # #29 shrank the wait to 5 s; fix-review R1-5): `:unreachable` means warm-serve, fenced only by
+  # #29 shrank the wait to 5 s; fix-review 2026-10-10 R1-5): `:unreachable` means warm-serve, fenced only by
   # the provenance etag, so one slow HEAD should not quietly decide a possibly-forked copy serves.
   # Each timeout emits `[:fathom, :shard, :fork_evidence, :timeout]` (tag `attempt`: 1 | 2 — a
   # bounded set; never the shard id). Worst case is two bounded waits, still far under the checkout
@@ -1618,7 +1618,7 @@ defmodule Fathom.Shard do
   # flush-time fence remains the hard guard — but it is now visible.
   #
   # `Registry.lookup/2` RAISES ArgumentError while the partition's ETS table is being rebuilt after a
-  # partition restart (fix-review R1-2) — exactly the window this check exists for. `:unknown` lets
+  # partition restart (fix-review 2026-10-10 R1-2) — exactly the window this check exists for. `:unknown` lets
   # the caller re-arm once instead of crashing the coordinator (a crash with a non-`{:shutdown, _}`
   # reason would run the drop path against a file that may belong to the replacement).
   defp registered?(shard_id) do
@@ -1628,7 +1628,7 @@ defmodule Fathom.Shard do
   end
 
   # `first?` re-arms ONE more check when the lookup itself was unavailable; a second `:unknown` is
-  # treated as unregistered (fix-review R1-2).
+  # treated as unregistered (fix-review 2026-10-10 R1-2).
   defp verify_registration(state, first?) do
     case registered?(state.id) do
       true ->
@@ -2676,7 +2676,7 @@ defmodule Fathom.Shard do
   # coordinator may already own this shard's `.db`/`-wal`/`-shm`/`.etag`, its lease, and every
   # shard-id-keyed ETS row (write fence, watermark, load, LRU). All of that is the replacement's
   # now — flushing, dropping, releasing the lease or `forget`-ing any of it would destroy the live
-  # coordinator's state (fix-review R1-1). Close only what is ours alone: the handle pool, and
+  # coordinator's state (fix-review 2026-10-10 R1-1). Close only what is ours alone: the handle pool, and
   # answer any pending flush waiters. Open stream connections end with their streams.
   #
   # ITS OWN IN-FLIGHT WORK IS ALSO OURS ALONE (expert review 2026-10-12 #27): shut the flush, renew
@@ -3202,7 +3202,7 @@ defmodule Fathom.Shard do
 
     # Update the busy count and re-stamp recency (#14): a just-released shard was recently used, so it
     # should not read as the LRU-coldest, and its lowered count lets the eviction probe consider it.
-    # The count only on the 1 -> 0 EDGE, the one change `Lru.busy?/1` can observe (perf #34).
+    # The count only on the 1 -> 0 EDGE, the one change `Lru.busy?/1` can observe (perf review 2026-10-01 #34).
     #
     # No `Lru.touch/1` after it any more (expert review 2026-10-19 #5): on the edge,
     # `record_conns(_, 0)` has just stamped the shard, so the touch was a redundant lookup; on a
