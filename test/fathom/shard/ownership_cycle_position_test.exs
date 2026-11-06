@@ -38,12 +38,12 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
 
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Heartbeat
-  alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Promote
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Storage
   alias Fathom.Shards
+  import Fathom.Test.ReplicationCase
 
   setup do
     root = Path.join(System.tmp_dir!(), "owncycle_#{System.unique_integer([:positive])}")
@@ -96,28 +96,6 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
            "expected legacy mode (nil acquire_gen) — something started the heartbeat"
   end
 
-  # Shippers connect in `handle_continue`, so without this the first commit RACES the connect and
-  # every follower answers `:disconnected` — nothing ships, the follower records offset 0, and the
-  # comparison below has no replica to make. Wins the race when this file runs alone and loses it
-  # under a full-suite load, which is how it reached CI green locally and red there.
-  defp await_connected!(timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      if Enum.all?(Fleet.shippers(), &Fathom.Shard.Replication.Shipper.connected?/1),
-        do: :connected,
-        else: Process.sleep(20)
-    end)
-    |> Enum.find(fn
-      :connected -> true
-      _ -> System.monotonic_time(:millisecond) > deadline
-    end)
-    |> case do
-      :connected -> :ok
-      _ -> flunk("shippers never connected")
-    end
-  end
-
   # The first follower with a real recorded position, or fail loudly. Any of them proves the
   # point: the comparison below is "did a follower that watched this shard end up outranking the
   # object", and which follower answered first is not part of it.
@@ -145,16 +123,6 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
     end
   end
 
-  defp start_followers!(root, n) do
-    for i <- 1..n do
-      name = :"oc_f#{i}_#{System.unique_integer([:positive])}"
-      dir = Path.join(root, to_string(name))
-      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
-      {:ok, port} = Follower.port(pid)
-      {name, port}
-    end
-  end
-
   for mode <- [:legacy, :heartbeat] do
     @mode mode
 
@@ -171,19 +139,9 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
         set_mode!(@mode)
 
         id = "occ_#{System.unique_integer([:positive])}"
-        followers = start_followers!(root, 2)
+        followers = start_followers!(root, 2, "oc")
 
-        Application.put_env(:fathom, :replication_enabled, true)
-        Application.put_env(:fathom, :replication_quorum, 1)
-
-        Application.put_env(
-          :fathom,
-          :replication_followers,
-          for({_n, p} <- followers, do: {~c"127.0.0.1", p})
-        )
-
-        start_supervised!(Fleet)
-        await_connected!()
+        enable_replication!(followers, quorum: 1, connected: :all)
 
         {:ok, coordinator, ref, path} = Shards.checkout(id)
         assert_mode!(coordinator, @mode)
@@ -303,16 +261,9 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
 
     # TWO followers with quorum 1: `Fleet` refuses Q == N outright ("tolerates zero follower
     # failures and inherits the slowest replica"), so a single follower cannot be configured here.
-    followers = start_followers!(root, 2)
+    followers = start_followers!(root, 2, "oc")
 
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, p} <- followers, do: {~c"127.0.0.1", p})
-    )
-
-    start_supervised!(Fleet)
-    await_connected!()
+    enable_replication!(followers, quorum: 1, connected: :all)
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     assert_mode!(coordinator, :heartbeat)
