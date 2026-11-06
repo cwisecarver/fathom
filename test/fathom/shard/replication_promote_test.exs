@@ -15,13 +15,12 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Promote
   alias Fathom.Shard.Replication.Session
-  alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shard.Storage
   alias Fathom.Shards
+  import Fathom.Test.ReplicationCase
 
   setup do
     id = "repl_promote_#{System.unique_integer([:positive])}"
@@ -52,48 +51,6 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
     end)
 
     %{id: id, root: root}
-  end
-
-  defp start_followers!(root, n) do
-    for i <- 1..n do
-      name = :"promote_f#{i}_#{System.unique_integer([:positive])}"
-      dir = Path.join(root, to_string(name))
-      pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
-      {:ok, port} = Follower.port(pid)
-      {name, port}
-    end
-  end
-
-  defp enable!(followers, q) do
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, q)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_n, port} <- followers, do: {~c"127.0.0.1", port})
-    )
-
-    start_supervised!(Fleet)
-    await_connected!()
-  end
-
-  defp await_connected!(timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      if Enum.all?(Fleet.shippers(), &Shipper.connected?/1),
-        do: :connected,
-        else: Process.sleep(20)
-    end)
-    |> Enum.find(fn
-      :connected -> true
-      _ -> System.monotonic_time(:millisecond) > deadline
-    end)
-    |> case do
-      :connected -> :ok
-      _ -> flunk("shippers never connected")
-    end
   end
 
   defp await_seeded(name, id, commit, timeout \\ 5_000) do
@@ -162,8 +119,8 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
 
   test "promotes writes that never reached storage", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "promote")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     :ok = replicate_then_abandon_primary(id, followers, 12)
     [{name, _} | _] = followers
@@ -198,8 +155,8 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
 
   test "the promoted shard has no WAL left and passes quick_check", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "promote")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     :ok = replicate_then_abandon_primary(id, followers, 4)
     [{name, _} | _] = followers
@@ -217,8 +174,8 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
 
   test "the replica is released, not kept, so the shard can be opened normally afterwards", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "promote")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     :ok = replicate_then_abandon_primary(id, followers, 3)
     [{name, _} | _] = followers
@@ -240,8 +197,8 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
 
   test "refuses to promote a shard a live node still owns", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "promote")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     :ok = replicate_then_abandon_primary(id, followers, 2)
     [{name, _} | _] = followers
@@ -259,7 +216,7 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
 
   test "refuses when there is no replica to promote", ctx do
     %{id: id, root: root} = ctx
-    [{name, _} | _] = start_followers!(root, 1)
+    [{name, _} | _] = start_followers!(root, 1, "promote")
 
     # Distinct from a failure: a caller sweeping shards needs "not here" to differ from "broken".
     assert Promote.promote(id, follower: name) == {:error, :no_replica}
@@ -267,8 +224,8 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
 
   test "refuses while this node is still serving the shard", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "promote")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     :ok = replicate_then_abandon_primary(id, followers, 2)
     [{name, _} | _] = followers
@@ -288,7 +245,7 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
   # holds that window open: a dead entry must read as "no coordinator".
   test "a coordinator that already exited does not block a promotion", ctx do
     %{id: id, root: root} = ctx
-    [{name, _}] = start_followers!(root, 1)
+    [{name, _}] = start_followers!(root, 1, "promote")
     parent = self()
 
     pid =
@@ -318,8 +275,8 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
 
   test "a failed promotion does not leak the lease", ctx do
     %{id: id, root: root} = ctx
-    followers = start_followers!(root, 3)
-    enable!(followers, 2)
+    followers = start_followers!(root, 3, "promote")
+    enable_replication!(followers, quorum: 2, connected: :all)
 
     :ok = replicate_then_abandon_primary(id, followers, 2)
     [{name, _} | _] = followers
@@ -352,8 +309,8 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
   describe "the replayed frame count is verified (2026-10-15 #15)" do
     test "a flipped byte inside a committed frame declines the promotion", ctx do
       %{id: id, root: root} = ctx
-      followers = start_followers!(root, 3)
-      enable!(followers, 2)
+      followers = start_followers!(root, 3, "promote")
+      enable_replication!(followers, quorum: 2, connected: :all)
 
       :ok = replicate_then_abandon_primary(id, followers, 12)
       [{name, _} | _] = followers
@@ -409,8 +366,8 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
   describe "operator promote vs leftovers at the live path (#28)" do
     test "refuses to replace an existing local .db, leaving it and the lease untouched", ctx do
       %{id: id, root: root} = ctx
-      followers = start_followers!(root, 3)
-      enable!(followers, 2)
+      followers = start_followers!(root, 3, "promote")
+      enable_replication!(followers, quorum: 2, connected: :all)
       :ok = replicate_then_abandon_primary(id, followers, 3)
       [{name, _} | _] = followers
 
@@ -427,8 +384,8 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
 
     test "removes a stale -wal/-shm left beside an absent .db before publishing", ctx do
       %{id: id, root: root} = ctx
-      followers = start_followers!(root, 3)
-      enable!(followers, 2)
+      followers = start_followers!(root, 3, "promote")
+      enable_replication!(followers, quorum: 2, connected: :all)
       :ok = replicate_then_abandon_primary(id, followers, 3)
       [{name, _} | _] = followers
 
@@ -452,8 +409,8 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
   describe "publishing a promotion safely (#17)" do
     test "(a) the promoted file carries a provenance sidecar", ctx do
       %{id: id, root: root} = ctx
-      followers = start_followers!(root, 3)
-      enable!(followers, 2)
+      followers = start_followers!(root, 3, "promote")
+      enable_replication!(followers, quorum: 2, connected: :all)
       :ok = replicate_then_abandon_primary(id, followers, 5)
       [{name, _} | _] = followers
 
@@ -475,8 +432,8 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
 
     test "(b) the publish is FENCED — an object that moved under it refuses the promotion", ctx do
       %{id: id, root: root} = ctx
-      followers = start_followers!(root, 3)
-      enable!(followers, 2)
+      followers = start_followers!(root, 3, "promote")
+      enable_replication!(followers, quorum: 2, connected: :all)
       :ok = replicate_then_abandon_primary(id, followers, 5)
       [{name, _} | _] = followers
 
@@ -517,8 +474,8 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
     test "(c) the lease is taken under a DISTINCT owner, so a coordinator is fenced not reclaimed",
          ctx do
       %{id: id, root: root} = ctx
-      followers = start_followers!(root, 3)
-      enable!(followers, 2)
+      followers = start_followers!(root, 3, "promote")
+      enable_replication!(followers, quorum: 2, connected: :all)
       :ok = replicate_then_abandon_primary(id, followers, 5)
       [{name, _} | _] = followers
 
