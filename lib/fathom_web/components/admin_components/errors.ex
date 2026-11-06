@@ -28,10 +28,6 @@ defmodule FathomWeb.AdminComponents.Errors do
     heartbeat_lapsed: "heartbeat.lapsed"
   ]
 
-  @doc "Event keys in display order (the collector's `events_5m` keys)."
-  @spec event_keys() :: [atom()]
-  def event_keys, do: Keyword.keys(@event_labels)
-
   @doc """
   Errors panel state: `:error` when a timeout or a no-quorum refusal happened in the window (or is
   happening now), `:warn` for any other error, `:ok` when clean, `:idle` before the first tick.

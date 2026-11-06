@@ -86,10 +86,6 @@ defmodule Fathom.Bench.DjangoSchema do
 
   @wide_cols 29
 
-  @doc "The 29-column table added by `build!(path, wide: true)` (the Django request arm)."
-  @spec wide_table() :: String.t()
-  def wide_table, do: "app_wide"
-
   @doc """
   A Django-shaped point SELECT over `app_wide`: every one of its #{@wide_cols} columns, each as a
   qualified `"app_wide"."col"`, one `?` for the id, `LIMIT 21` (what `.get()` emits).
