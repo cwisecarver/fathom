@@ -22,7 +22,7 @@ defmodule Fathom.Tenants.Tombstones do
       still converges. The set is append-only in memory — a tombstone is permanent, so a
       refresh never removes an id (an operator who wants an id reusable hard-deletes the
       directory row, deletes the storage tombstone, and restarts);
-    * **unioned at boot from durable storage** (`Fathom.Shard.Storage.tombstoned_ids/0`, #6):
+    * **unioned at boot from durable storage** (`Fathom.Shard.Storage.tombstoned_ids/0`, expert review 2026-07-19 #6):
       a Postgres point-in-time restore rolls the directory back and can un-tombstone a deleted
       tenant, but storage is *not* rolled back, so a `tombstones/<id>` marker written on delete
       keeps the guard complete across a directory restore. Boot-only (the set is append-only, so
@@ -124,7 +124,7 @@ defmodule Fathom.Tenants.Tombstones do
   def handle_continue(:load, state), do: {:noreply, attempt_load(state)}
 
   # One attempt at every load that has not yet succeeded. Each load is independent: the storage union
-  # (#6) and the directory full load both run, and a success is never repeated. The directory's
+  # (expert review 2026-07-19 #6) and the directory full load both run, and a success is never repeated. The directory's
   # success seeds the incremental cursor and starts the periodic refresh, exactly once.
   #
   # Expert review #33: a FAILED load must not wait the full refresh interval — that leaves the
@@ -385,7 +385,7 @@ defmodule Fathom.Tenants.Tombstones do
       {:error, reason}
   end
 
-  # Additive union from durable storage (#6) — the DR backstop that survives a directory restore.
+  # Additive union from durable storage (expert review 2026-07-19 #6) — the DR backstop that survives a directory restore.
   # Best-effort: a storage blip at boot just means the directory-derived set stands until the storage
   # is reachable (a restore is a rare, operator-driven event).
   # Returns `{:error, reason}` on failure so `attempt_load/1` retries it (expert review 2026-10-13 #20).

@@ -80,7 +80,7 @@ defmodule Fathom.Admin.FlushWatermark do
 
   @doc """
   How many watermark rows are published, without copying the table (expert review 2026-10-01
-  perf #33: the durability poller used `length(snapshot())`, a full `tab2list` of every open shard
+  perf review 2026-10-01 #33: the durability poller used `length(snapshot())`, a full `tab2list` of every open shard
   just to count it).
   """
   @spec size() :: non_neg_integer()
