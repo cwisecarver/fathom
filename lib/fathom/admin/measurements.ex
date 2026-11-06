@@ -734,7 +734,8 @@ defmodule Fathom.Admin.Measurements do
     :ok
   end
 
-  @doc "Forgets the cached free-space reading (a test's cleanup)."
+  @doc false
+  # Test seam: only tests call this.
   @spec clear_data_free_bytes() :: :ok
   def clear_data_free_bytes do
     case :persistent_term.get(@free_key, nil) do

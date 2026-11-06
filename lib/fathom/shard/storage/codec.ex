@@ -89,11 +89,9 @@ defmodule Fathom.Shard.Storage.Codec do
   def decoder(@zstd_marker), do: {:ok, :zstd}
   def decoder(other), do: {:error, {:unknown_object_encoding, other}}
 
-  @doc """
-  Compresses `path` with `encoding` (`:zlib` or `:zstd`) to a sibling temp file, returning
-  `{:ok, tmp_path}`. See `compress_to_temp_hashed/2` for the single-pass variant that also
-  returns the digests and size.
-  """
+  @doc false
+  # Codec bench baseline: the single-pass compress_to_temp_hashed/3 replaced it on the upload path.
+  # Test seam: only tests and the codec bench call this.
   @spec compress_to_temp(Path.t(), :zlib | :zstd) :: {:ok, Path.t()} | {:error, term()}
   def compress_to_temp(path, encoding) do
     with {:ok, tmp, _size, _body_md5, _plain_hex} <- compress_to_temp_hashed(path, encoding),
@@ -222,15 +220,8 @@ defmodule Fathom.Shard.Storage.Codec do
     end
   end
 
-  @doc """
-  Decodes the compressed file at `path` as `encoding` and checks its plaintext MD5 is `expected_hex`.
-
-  `:ok`, or `{:error, {:compressed_body_mismatch, actual_hex}}` / `{:error, {:zstd | :zlib, _}}`.
-  The upload path no longer runs this: `compress_to_temp_hashed/2` proves the same property inline,
-  over the pieces as they are produced, so the file is not read a second time (expert review
-  2026-10-17 #20). It stays as the file-level oracle the codec tests check against. Streamed, in
-  bounded pieces, like the download path.
-  """
+  @doc false
+  # Test seam: only tests call this.
   @spec verify_decodes_to(Path.t(), :zlib | :zstd, String.t()) :: :ok | {:error, term()}
   def verify_decodes_to(path, encoding, expected_hex),
     do: verify_chunks(File.stream!(path, @chunk), encoding, expected_hex)

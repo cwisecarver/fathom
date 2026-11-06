@@ -160,13 +160,8 @@ defmodule Fathom.Shard.Replication.Wal do
     end
   end
 
-  @doc """
-  Read `len` bytes starting at `offset` — the frame delta itself.
-
-  `pread` rather than `File.read!` + `binary_part`: a WAL under a busy tenant can be tens of
-  megabytes, and reading all of it to slice off the tail would allocate the whole file on every
-  commit.
-  """
+  @doc false
+  # Test seam: only tests call this.
   @spec read_delta(Path.t(), non_neg_integer(), non_neg_integer()) ::
           {:ok, binary()} | {:error, term()}
   def read_delta(_path, _offset, 0), do: {:ok, <<>>}

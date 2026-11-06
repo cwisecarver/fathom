@@ -44,11 +44,8 @@ defmodule Fathom.HealthPlug do
   @spec draining?() :: boolean()
   def draining?, do: :persistent_term.get(@draining_key, false)
 
-  @doc """
-  Probe counters for the admin UI: total `/health` probes served, how many were non-200, and the
-  wall-clock time of the last non-200 (`nil` if none). Held in an `:atomics` ref in `persistent_term`
-  (created lazily; a racing first create at worst loses a count) so the probe path stays lock-free.
-  """
+  @doc false
+  # Test seam: only tests call this.
   @spec probe_stats() :: %{
           probes: non_neg_integer(),
           non_200: non_neg_integer(),

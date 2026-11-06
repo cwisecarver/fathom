@@ -94,7 +94,8 @@ defmodule Fathom.Admin.Durability do
     {:ok, %{}}
   end
 
-  @doc "The alarm definitions as `{key, label}`, in display order."
+  @doc false
+  # Test seam: only tests call this.
   @spec alarm_keys() :: [{atom(), String.t()}]
   def alarm_keys, do: Enum.map(@alarms, fn {k, label, _} -> {k, label} end)
 

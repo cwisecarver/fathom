@@ -1217,9 +1217,9 @@ defmodule Fathom.Shard.Replication.Recovery do
   # rule by giving each connection to one slot process that dials it and runs every frame on it
   # (`QueryPool`).
   @doc false
-  # Dial + handshake, with the fixed connect bound. Public for the benchmark probe and tests that
-  # exercise the fresh path directly; `QueryPool`'s slots call `dial_peer/3` and the handshake
-  # themselves, because they must tell a dial timeout from a handshake timeout (see `Slot`).
+  # Dial + handshake, with the fixed connect bound. Test seam: only tests call this, to exercise
+  # the fresh path directly; `QueryPool`'s slots call `dial_peer/3` and the handshake themselves,
+  # because they must tell a dial timeout from a handshake timeout (see `Slot`).
   @spec connect_peer(String.t() | charlist(), :inet.port_number()) ::
           {:ok, :gen_tcp.socket()} | {:error, term()}
   def connect_peer(host, port), do: connect(host, port)

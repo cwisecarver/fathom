@@ -357,13 +357,8 @@ defmodule Fathom.Keystone do
   defp family_cols(:reals), do: Enum.filter(@scalar_cols, &real_col?/1)
   defp family_cols(:numeric_text), do: Enum.filter(@scalar_cols, &numeric_col?/1)
 
-  @doc """
-  The `ks_scalars` columns belonging to each affinity family, and the pinned edge values the
-  generator guarantees are present in each.
-
-  Exposed so the fidelity test can assert coverage against the generator's own definition rather
-  than restating a column list that would drift.
-  """
+  @doc false
+  # Test seam: only tests call this.
   @spec edge_values() :: [{atom(), [String.t()], list()}]
   def edge_values do
     for {kind, values} <- @edge_rows, kind != :all_null, do: {kind, family_cols(kind), values}

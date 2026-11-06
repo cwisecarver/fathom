@@ -247,7 +247,8 @@ defmodule Fathom.Shard.Provenance do
     end
   end
 
-  @doc "The CURRENT recorded PUT intent (plaintext md5, hex), or `nil` — none recorded or a legacy sidecar."
+  @doc false
+  # Test seam: only tests call this.
   @spec read_intent(String.t()) :: String.t() | nil
   def read_intent(path), do: path |> read_intents() |> List.first()
 
