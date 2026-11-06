@@ -2,7 +2,7 @@ defmodule Fathom.Shard.Replication.FollowerAbsorbLeanTest do
   @moduledoc """
   Perf review 2026-10-14 #13: the follower's absorb-before-reset uses a LEAN handle.
 
-  `checkpoint_into_db/1` ran `Connection.open/1` (extension load+disable, pragma guard, page_size,
+  `absorb_into_db/1` ran `Connection.open/1` (extension load+disable, pragma guard, page_size,
   WAL enable, five pragmas) just to TRUNCATE-checkpoint: ~450 us p50 inline on the reset push's ack
   path, 361 us of it the open. It now opens raw with the busy timeout and `synchronous=FULL` only.
 
@@ -49,7 +49,7 @@ defmodule Fathom.Shard.Replication.FollowerAbsorbLeanTest do
 
   test "the absorb moves the WAL's frames into the .db and empties the WAL", %{db: db} do
     replica_with_wal!(db)
-    assert :ok = Follower.checkpoint_into_db(db)
+    assert {:ok, _extent} = Follower.absorb_into_db(db)
     refute File.exists?(db <> "-shm")
     assert not File.exists?(db <> "-wal") or File.stat!(db <> "-wal").size == 0
 
@@ -80,7 +80,7 @@ defmodule Fathom.Shard.Replication.FollowerAbsorbLeanTest do
       end
     end
 
-    new = fn -> :ok = Follower.checkpoint_into_db(db) end
+    new = fn -> {:ok, _} = Follower.absorb_into_db(db) end
 
     time = fn f ->
       replica_with_wal!(db)

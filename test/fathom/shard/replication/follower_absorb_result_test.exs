@@ -37,7 +37,7 @@ defmodule Fathom.Shard.Replication.FollowerAbsorbResultTest do
     :ok = Connection.exec(w, "INSERT INTO t VALUES (randomblob(10000))")
 
     try do
-      assert {:error, {:absorb_incomplete, [_busy, log, ckpt]}} = Follower.checkpoint_into_db(db),
+      assert {:error, {:absorb_incomplete, [_busy, log, ckpt]}} = Follower.absorb_into_db(db),
              "the absorb reported success with frames still only in the WAL"
 
       assert ckpt < log
@@ -50,6 +50,6 @@ defmodule Fathom.Shard.Replication.FollowerAbsorbResultTest do
 
   test "with no reader in the way the absorb succeeds", %{db: db, writer: w} do
     Connection.close(w)
-    assert :ok = Follower.checkpoint_into_db(db)
+    assert {:ok, _extent} = Follower.absorb_into_db(db)
   end
 end

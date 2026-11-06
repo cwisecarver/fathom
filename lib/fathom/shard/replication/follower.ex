@@ -898,7 +898,7 @@ defmodule Fathom.Shard.Replication.Follower do
   # This was one serial loop per primary connection: recv -> decide -> write -> ack, strictly in
   # order, for EVERY shard that primary replicates here. So one shard's slow step held every other
   # shard on the link — and the slow steps are routine, not exotic: every primary WAL reset absorbs
-  # the old WAL (`checkpoint_into_db/1`: a SQLite open, a TRUNCATE checkpoint, fsyncs), which happens
+  # the old WAL (`absorb_into_db/1`: a SQLite open, a TRUNCATE checkpoint, fsyncs), which happens
   # on every flush; seed chunks and installs ran in the same loop too. The rig (2026-10-03, 1024
   # tenants) measured this socket's Recv-Q at a 2-3 MB median and ~6 MB (the buffer max) at p90 on
   # every node, before and after the #17/#6 changes: the follower was not reading fast enough, and
@@ -1208,7 +1208,7 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
-  # SCOPE (fix-review R1-3): the refusal lasts only as long as the coordinator is registered. After
+  # SCOPE (fix-review 2026-10-10 R1-3): the refusal lasts only as long as the coordinator is registered. After
   # an idle-drop a still-alive DEPOSED owner can re-seed this node again; that is bounded by its own
   # self-fence (it cannot keep a quorum or flush under a stale epoch). A durable lineage floor that
   # outlives the coordinator was the rejected alternative (user decision 2026-10-10).
@@ -3322,8 +3322,6 @@ defmodule Fathom.Shard.Replication.Follower do
   # that never reached the `.db` — a replica marked whole and promotable, silently missing pages.
   # `busy = 1` with every frame backfilled is fine (the reset rewrites the WAL itself), so the test
   # is `log == checkpointed`. Same defect class as `Migrator.Copy`'s fold (review #25, 73d95f6).
-  @doc false
-  @spec checkpoint_into_db(Path.t()) :: :ok | {:error, term()}
   #
   # A LEAN HANDLE (perf review 2026-10-14 #13). This used `Connection.open/1` — extension load and
   # disable, the pragma guard, page_size/max_page_count, WAL enable, five pragmas: 361 us of a 450 us
@@ -3338,13 +3336,7 @@ defmodule Fathom.Shard.Replication.Follower do
   # SQLite opens a database in WAL mode whenever one is present (`pagerOpenWalIfPresent`), whatever
   # the header says. The only file a raw handle could see as non-WAL is one with no WAL at all,
   # which the caller never absorbs.
-  def checkpoint_into_db(db) do
-    case absorb_into_db(db) do
-      {:ok, _extent} -> :ok
-      {:error, _} = err -> err
-    end
-  end
-
+  #
   # THE EXTENT THE `.db` NOW HOLDS comes from SQLite, not from the WAL's own claim (expert review
   # 2026-10-15 #4 follow-up). `absorb_before_reset/5` records it as the `.db`'s position, and
   # `Wal.read/1`'s commit extent is found by salts and commit markers WITHOUT checksums — a frame
