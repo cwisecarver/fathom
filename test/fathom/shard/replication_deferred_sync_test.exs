@@ -23,6 +23,7 @@ defmodule Fathom.Shard.ReplicationDeferredSyncTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Fleet, Follower, Session, WalSync}
   alias Filo.Stmt
+  import Fathom.Test.ReplicationCase, only: [session!: 1]
 
   @keys [
     :replication_enabled,
@@ -350,11 +351,6 @@ defmodule Fathom.Shard.ReplicationDeferredSyncTest do
   # lost on power loss. macOS cannot reproduce errseq, so these pin the MECHANISM: one long-lived fd
   # per WAL inode, retired with a last sync, and checkpoint IOERRs feeding the poison.
   describe "the long-lived sync fd (rv6 F1)" do
-    defp session!(id) do
-      [{pid, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
-      pid
-    end
-
     # A stand-in io-server fd whose fdatasync fails with EIO (the `:file` request protocol).
     defp failing_fd do
       spawn(fn ->
