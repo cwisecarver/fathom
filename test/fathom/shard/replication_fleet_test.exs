@@ -133,22 +133,11 @@ defmodule Fathom.Shard.ReplicationFleetTest do
 
     # The live follower's shipper connects in handle_continue; without waiting, "connected?" is a
     # race rather than a measurement.
-    defp await_connected!(timeout \\ 5_000) do
-      deadline = System.monotonic_time(:millisecond) + timeout
-
-      Stream.repeatedly(fn ->
-        if Enum.any?(Fleet.connection_status(), fn {_k, up?} -> up? end),
-          do: :up,
-          else: Process.sleep(20)
-      end)
-      |> Enum.find(fn
-        :up -> true
-        _ -> System.monotonic_time(:millisecond) > deadline
-      end)
-      |> case do
-        :up -> :ok
-        _ -> flunk("the live follower's shipper never connected")
-      end
+    defp await_connected! do
+      Fathom.Test.Await.until(
+        fn -> Enum.any?(Fleet.connection_status(), fn {_k, up?} -> up? end) end,
+        "the live follower's shipper never connected"
+      )
     end
 
     test "connection_status reports the live follower up and the closed port down" do
