@@ -96,7 +96,12 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
       handler,
       [:fathom, :s3, :op],
       fn _event, _measurements, meta, _config ->
-        send(test_pid, {:s3_op, meta.op, meta.status_class})
+        # Telemetry is global, and the stub is this test's `:shard_storage`, so a lingering
+        # coordinator from an EARLIER test also lands here (CI OTP 29, 2026-11-06: a GET of
+        # `drainwstx_*.lock` made a cold open count `get: 2`). Drop ops whose emitter (or the
+        # process it runs for) is registered to a different shard; keep unattributed ones.
+        unless other_shard?(shard),
+          do: send(test_pid, {:s3_op, meta.op, meta.status_class})
       end,
       nil
     )
@@ -161,6 +166,14 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
     after
       0 -> Enum.reverse(acc)
     end
+  end
+
+  # True when the calling process, or one it works for (`$callers`), is a coordinator registered
+  # to a shard other than `shard`. Runs inside the telemetry handler, i.e. in the emitter.
+  defp other_shard?(shard) do
+    [self() | Process.get(:"$callers", [])]
+    |> Enum.flat_map(&Registry.keys(Fathom.ShardRegistry, &1))
+    |> Enum.any?(&(&1 != shard))
   end
 
   # `[{method, status_class}]` -> `%{method => count}`, the shape the assertions pin.

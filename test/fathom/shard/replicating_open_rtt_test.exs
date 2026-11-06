@@ -195,7 +195,7 @@ defmodule Fathom.Shard.ReplicatingOpenRttTest do
       test "warm: one head serves the authority check and the lineage", %{shard: shard} do
         etag = seed_object!(shard)
         place_warm!(shard, etag)
-        {elapsed, pid, calls} = timed_open!(shard)
+        {_elapsed, pid, calls} = timed_open!(shard)
 
         assert :sys.get_state(pid).acquire_gen != nil == (unquote(mode) == :heartbeat)
         refute call!(calls, :pull), "a matching warm copy must not pull"
@@ -206,9 +206,14 @@ defmodule Fathom.Shard.ReplicatingOpenRttTest do
 
         {_, _, lease_done} = call!(calls, :acquire_lease)
         {_, head_start, _} = call!(calls, :object_head)
+        {_, etag_start, _} = call!(calls, :object_etag)
         assert head_start >= lease_done
 
-        assert elapsed < 2 * @d + div(@d, 2) + 1, "warm open took #{elapsed} ms (3D = #{3 * @d})"
+        # The critical path is acquire D + head D = 2D, not 3D, because the fork-evidence HEAD
+        # overlaps the acquire. Pinned by ORDER, as the cold test above is: the wall-clock bound
+        # that sat here (elapsed < 2.5D) failed at 268 ms on a loaded CI runner (OTP 28,
+        # 2026-11-06) with every call in the right place.
+        assert etag_start < lease_done, "the fork-evidence HEAD no longer overlaps the acquire"
       end
 
       test "warm: a moved object is still quarantined and re-pulled from the shared head",
