@@ -1612,11 +1612,20 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       %{pid: task} = Map.fetch!(seeding, bh)
       task_ref = Process.monitor(task)
 
+      refute_received {:DOWN, ^task_ref, :process, ^task, _},
+                      "precondition: the seed task ended before the Session was killed"
+
       Process.exit(session, :kill)
 
-      assert_receive {:DOWN, ^task_ref, :process, ^task, :killed},
+      # CI OTP 29 (2026-11-06, run after 9bdcb563) failed the pinned `:killed` match with no
+      # record of what arrived instead. Match any DOWN and name the reason, so the next failure
+      # says whether the task was never killed (timeout) or ended on its own (another reason).
+      assert_receive {:DOWN, ^task_ref, :process, ^task, reason},
                      3_000,
                      "the Session was killed and left its seed task streaming"
+
+      assert reason == :killed,
+             "the seed task ended with #{inspect(reason)}, not the watcher's kill"
     end
   end
 
