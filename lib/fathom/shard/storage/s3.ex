@@ -328,6 +328,7 @@ defmodule Fathom.Shard.Storage.S3 do
   @spec body_hash_kind() :: :md5 | :crc32
   def body_hash_kind, do: :persistent_term.get(@body_hash_key, :md5)
 
+  # Test seam: only tests call this.
   @doc false
   @spec reset_body_hash_kind() :: :ok
   def reset_body_hash_kind do
@@ -441,10 +442,23 @@ defmodule Fathom.Shard.Storage.S3 do
   defp head_etag(key) do
     case Req.head(req(), url: url_path(key)) do
       {:ok, %{status: 200, headers: h}} -> {:ok, etag(h)}
-      {:ok, %{status: s}} -> {:error, {:s3_head_status, s}}
-      {:error, reason} -> {:error, reason}
+      other -> head_failure(other)
     end
   end
+
+  # The non-success tail every plain HEAD shares: a non-2xx status is `{:s3_head_status, status}`,
+  # a transport error passes through. The caller matches its own 200 (and 404) first.
+  defp head_failure({:ok, %{status: status}}), do: {:error, {:s3_head_status, status}}
+  defp head_failure({:error, reason}), do: {:error, reason}
+
+  # The plain DELETE mapping: any 2xx or a 404 (already gone) is `:ok`; any other status is
+  # `{:s3_delete_status, status}`; a transport error passes through. NOT for the fenced If-Match
+  # lock deletes, each of which carries its own fence verdict.
+  defp delete_ok_or_absent({:ok, %{status: status}}) when status in 200..299 or status == 404,
+    do: :ok
+
+  defp delete_ok_or_absent({:ok, %{status: status}}), do: {:error, {:s3_delete_status, status}}
+  defp delete_ok_or_absent({:error, reason}), do: {:error, reason}
 
   defp probe_status!(key, headers, expected, label) do
     case Req.put(req(), url: url_path(key), body: "fathom-fence-probe", headers: headers) do
@@ -885,11 +899,8 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, %{status: 404}} ->
         {:ok, nil, false, [], nil}
 
-      {:ok, %{status: s}} ->
-        {:error, {:s3_head_status, s}}
-
-      {:error, reason} ->
-        {:error, reason}
+      other ->
+        head_failure(other)
     end
   end
 
@@ -1884,8 +1895,7 @@ defmodule Fathom.Shard.Storage.S3 do
     case Req.head(req(), url: object_path(shard_id)) do
       {:ok, %{status: 200, headers: h}} -> {:ok, etag(h)}
       {:ok, %{status: 404}} -> {:ok, nil}
-      {:ok, %{status: status}} -> {:error, {:s3_head_status, status}}
-      {:error, reason} -> {:error, reason}
+      other -> head_failure(other)
     end
   end
 
@@ -1900,11 +1910,8 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, %{status: 404}} ->
         {:ok, nil}
 
-      {:ok, %{status: status}} ->
-        {:error, {:s3_head_status, status}}
-
-      {:error, reason} ->
-        {:error, reason}
+      other ->
+        head_failure(other)
     end
   end
 
@@ -1920,11 +1927,8 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, %{status: 404}} ->
         {:ok, nil}
 
-      {:ok, %{status: status}} ->
-        {:error, {:s3_head_status, status}}
-
-      {:error, reason} ->
-        {:error, reason}
+      other ->
+        head_failure(other)
     end
   end
 
@@ -2102,8 +2106,7 @@ defmodule Fathom.Shard.Storage.S3 do
     case Req.head(req(), url: url_path(version_key(shard_id, version))) do
       {:ok, %{status: 200}} -> :present
       {:ok, %{status: 404}} -> :absent
-      {:ok, %{status: status}} -> {:error, {:s3_head_status, status}}
-      {:error, reason} -> {:error, reason}
+      other -> head_failure(other)
     end
   end
 
@@ -2149,11 +2152,7 @@ defmodule Fathom.Shard.Storage.S3 do
 
   @impl true
   def drop_version(shard_id, version) do
-    case Req.delete(req(), url: url_path(version_key(shard_id, version))) do
-      {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
-      {:ok, %{status: status}} -> {:error, {:s3_delete_status, status}}
-      {:error, reason} -> {:error, reason}
-    end
+    Req.delete(req(), url: url_path(version_key(shard_id, version))) |> delete_ok_or_absent()
   end
 
   @impl true
@@ -2170,11 +2169,7 @@ defmodule Fathom.Shard.Storage.S3 do
 
   @impl true
   def drop_live(shard_id) do
-    case Req.delete(req(), url: object_path(shard_id)) do
-      {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
-      {:ok, %{status: status}} -> {:error, {:s3_delete_status, status}}
-      {:error, reason} -> {:error, reason}
-    end
+    Req.delete(req(), url: object_path(shard_id)) |> delete_ok_or_absent()
   end
 
   @impl true
@@ -2273,11 +2268,7 @@ defmodule Fathom.Shard.Storage.S3 do
 
   @impl true
   def drop_snapshot(shard_id, snapshot_id) do
-    case Req.delete(req(), url: url_path(snapshot_key(shard_id, snapshot_id))) do
-      {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
-      {:ok, %{status: status}} -> {:error, {:s3_delete_status, status}}
-      {:error, reason} -> {:error, reason}
-    end
+    Req.delete(req(), url: url_path(snapshot_key(shard_id, snapshot_id))) |> delete_ok_or_absent()
   end
 
   @impl true
@@ -2414,10 +2405,9 @@ defmodule Fathom.Shard.Storage.S3 do
 
   defp delete_keys(keys) do
     Enum.reduce_while(keys, :ok, fn key, :ok ->
-      case Req.delete(req(), url: url_path(key)) do
-        {:ok, %{status: status}} when status in 200..299 or status == 404 -> {:cont, :ok}
-        {:ok, %{status: status}} -> {:halt, {:error, {:s3_delete_status, status}}}
-        {:error, reason} -> {:halt, {:error, reason}}
+      case Req.delete(req(), url: url_path(key)) |> delete_ok_or_absent() do
+        :ok -> {:cont, :ok}
+        {:error, _} = error -> {:halt, error}
       end
     end)
   end
@@ -2470,8 +2460,7 @@ defmodule Fathom.Shard.Storage.S3 do
     case Req.head(req(), url: url_path(tombstone_key(shard_id))) do
       {:ok, %{status: 200}} -> {:ok, true}
       {:ok, %{status: 404}} -> {:ok, false}
-      {:ok, %{status: status}} -> {:error, {:s3_head_status, status}}
-      {:error, reason} -> {:error, reason}
+      other -> head_failure(other)
     end
   end
 
