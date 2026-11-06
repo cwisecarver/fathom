@@ -216,7 +216,7 @@ defmodule Fathom.Shard do
 
   # CAPPED AT HALF THE IDLE STOP WHEN THE INTERVAL IS LONGER (expert review 2026-10-22 r8 #12). The
   # floor above made the value 376 s at prod's 300 s interval, while a clean idle coordinator (no
-  # timer armed, #10) idle-stops at `idle_ms` (then 60 s prod, 20 s rig): in the shipped configuration NO
+  # timer armed, #10) idle-stops at `idle_ms` (then 60 s prod, 20 s rig; prod default is 300 s since 2026-11-04): in the shipped configuration NO
   # idle coordinator ever hibernated, reversing 07-24 #9's measured -33% retained heap (p6: 5,952 B
   # idle vs 3,328 B hibernated, -2.6 KB per idle coordinator).
   #
@@ -226,7 +226,7 @@ defmodule Fathom.Shard do
   # after `idle_ms / 2` and is woken by its tick at most once per interval, i.e. after sleeping at
   # least half of it — not the hibernate-then-immediately-wake pair #32 removed, which needed the
   # two values to be nearly equal. Below that regime (`interval <= idle_ms`, e.g. the 5 s library
-  # default or a 30 s interval with the 60 s idle stop) the floor is untouched.
+  # default or a 30 s interval with the 300 s idle stop) the floor is untouched.
   #
   # The simpler of the review's two options, chosen deliberately: a state-driven `{:noreply, state,
   # timeout}` would have to be returned from every handle_* clause that can leave the coordinator idle
@@ -1839,7 +1839,7 @@ defmodule Fathom.Shard do
   # than `:shard_flush_interval_ms` (5 s) restarted the countdown before it could ever fire. The
   # periodic durability flush — the thing that bounds the loss window to the interval — therefore
   # never ran on the hottest, most write-active shards, the ones it exists for. Those flushed only
-  # at idle-drop (60 s of ZERO streams), at drain, or at a clean terminate, so on node death the
+  # at idle-drop (300 s of ZERO streams, 60 s before 2026-11-04), at drain, or at a clean terminate, so on node death the
   # RPO for a continuously busy tenant was the whole session.
   #
   # The checkout path already knew this hazard: it re-arms only `if state.flush_timer == nil`,

@@ -8,9 +8,9 @@ defmodule Fathom.Shard.ReplicationHeldFdReleaseTest do
   `Session` keeps a held, inode-revalidated read fd on `<db>-wal` plus one on `<db>-shm`
   (`Wal.read_held/2`). When the shard goes idle its last SQLite connection closes — the pool drain
   grace here — and SQLite checkpoints and unlinks both files. The Session lives as long as the
-  coordinator (60 s idle stop in prod) and closed the fds only in `terminate/2`, so for that whole
-  minute the node held 2 fds per recently-written shard on deleted inodes: invisible to `du`,
-  pinning the WAL's disk, and at ~1k distinct shards/s past a 65,536 nofile limit (`emfile`).
+  coordinator (300 s idle stop in prod since 2026-11-04, 60 s before) and closed the fds only in
+  `terminate/2`, so for that whole window the node held 2 fds per recently-written shard on
+  deleted inodes: invisible to `du`, pinning the WAL's disk, and at ~1k distinct shards/s past a 65,536 nofile limit (`emfile`).
 
   ## The invariant pinned
 
@@ -139,7 +139,7 @@ defmodule Fathom.Shard.ReplicationHeldFdReleaseTest do
     assert Process.alive?(coordinator),
            "precondition: the coordinator (and Session) survive the gap"
 
-    # Pre-fix: 2 (the deleted -wal and -shm), held until the coordinator's 60 s idle stop.
+    # Pre-fix: 2 (the deleted -wal and -shm), held until the coordinator's idle stop (300 s default).
     assert eventually(fn -> deleted_fds(id) == [] end, 100),
            "fds still held on deleted inodes: #{inspect(deleted_fds(id))}"
 

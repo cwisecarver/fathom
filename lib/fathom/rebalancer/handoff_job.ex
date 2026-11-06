@@ -112,7 +112,8 @@ defmodule Fathom.Rebalancer.HandoffJob do
   # `handoff_pin_here?/1` is now false (the override carries `failed_at`) and the crash-failover
   # hold is false because the target's heartbeat keeps advancing. So `do_checkout/3` returns
   # `{:error, {:shard_held, target}}` immediately and the tenant 503s on EVERY request until the
-  # target's coordinator idles out — `:shard_idle_ms`, 60 s at the default — on the shard that, by
+  # target's coordinator idles out — `:shard_idle_ms`, 300 s at the default (60 s before 2026-11-04, so
+  # this 503 window is now up to 5x longer) — on the shard that, by
   # construction, is the least likely in the fleet to go idle. The revert exists so that "a stuck
   # shard is restored, not left pinned-and-unavailable" (docs/rebalancing.md §3); on this path it
   # produced exactly the unavailability it was written to prevent.

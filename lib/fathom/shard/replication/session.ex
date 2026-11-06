@@ -1158,10 +1158,11 @@ defmodule Fathom.Shard.Replication.Session do
   #
   # `wal_fd` pins the `-wal` inode and its `-shm` wal-index. When the shard's last SQLite connection
   # closes (the pool drain grace, or a stream's own close with pooling off), SQLite checkpoints and
-  # UNLINKS both files, but this Session lives as long as the coordinator (60 s idle) and kept both
-  # fds open on the deleted inodes until then: 2 fds per shard touched in the last minute, invisible
-  # to `du`, holding up to the WAL's size of disk each. 1k distinct shards/s is ~120k fds — past a
-  # 65,536 nofile, i.e. `emfile` for every open on the node.
+  # UNLINKS both files, but this Session lives as long as the coordinator (300 s idle default since 2026-11-04;
+  # it was 60 s) and kept both fds open on the deleted inodes until then: 2 fds per shard touched in
+  # the last 5 minutes, invisible to `du`, holding up to the WAL's size of disk each. 1k distinct
+  # shards/s is ~600k fds (was ~120k at 60 s) — far past a 65,536 nofile, i.e. `emfile` for every
+  # open on the node, so the release timer matters 5x more now, not less.
   #
   # So: if no commit (tenant or catch-up) has run for a whole `fd_release_ms/0`, close them. A timer
   # rather than a coordinator notification because the last close happens on several paths
@@ -1336,7 +1337,7 @@ defmodule Fathom.Shard.Replication.Session do
 
   @doc false
   # How long a Session keeps its WAL/-shm fds with no commit (#2). Long enough that a steadily
-  # writing shard never reopens; short against the coordinator's 60 s idle stop.
+  # writing shard never reopens; short against the coordinator's idle stop (300 s default).
   def fd_release_ms, do: Application.get_env(:fathom, :replication_fd_release_ms, 1_000)
 
   # A reply cannot exist before the commit that provoked it, so `wal_path` is always set by the time

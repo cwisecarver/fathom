@@ -7,7 +7,7 @@ defmodule Fathom.Shard.ReopenGap do
 
   Every idle drop costs a reopen later: lock DELETE + PUT, a full GET + fsync, the open HEADs and,
   with replication on, a full seed to every follower. An open idle coordinator costs ~4–6 KiB. So
-  whether `:shard_idle_ms` (60 s) is too short depends on one number nobody had: how soon a dropped
+  whether `:shard_idle_ms` (300 s default since 2026-11-04; 60 s before) is too short depends on one number nobody had: how soon a dropped
   shard comes back. A shard that is reopened 70 s after an idle drop paid the whole churn cycle to
   save a minute of a few KiB; one reopened a day later did not. This records that gap.
 
