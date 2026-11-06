@@ -13,7 +13,7 @@ ARG RUNNER_IMAGE=debian:bookworm-slim
 FROM ${BUILDER_IMAGE} AS builder
 
 # build-essential: exqlite compiles its SQLite NIF via elixir_make.
-RUN apt-get update -y && apt-get install -y build-essential git curl \
+RUN apt-get update -y && apt-get install -y build-essential git curl patch \
   && apt-get clean && rm -f /var/lib/apt/lists/*_*
 
 # Rust, for native/fathom_udf — the loadable SQLite extension supplying Django's UDFs
@@ -38,6 +38,17 @@ COPY filo/ /src/filo/
 WORKDIR /src/fathom
 COPY fathom/mix.exs fathom/mix.lock ./
 RUN mix deps.get --only prod
+
+# The carried exqlite patch (expert review 2026-11-04 #1): the NIF returns BLOB cells tagged
+# {:blob, bin}, so a BLOB whose bytes happen to be valid UTF-8 goes out over Hrana as a blob, not
+# as text. FATHOM_EXQLITE_PATCHED=1 makes config.exs set exqlite's force_build, so deps.compile
+# builds the NIF from the patched source (build-essential above) instead of downloading the stock
+# precompiled one. Without it the image still works, with tagged reads silently off
+# (Fathom.Shard.Connection.tagged_reads?/0 is false) — check that on a booted node, not here.
+COPY fathom/native/exqlite_patch native/exqlite_patch
+RUN cd deps/exqlite && patch -p1 < /src/fathom/native/exqlite_patch/0001-multi-step-tagged-blob.patch \
+  && grep -q multi_step_tagged c_src/sqlite3_nif.c
+ENV FATHOM_EXQLITE_PATCHED=1
 
 # Compile-time config first so dep compilation caches independently of app code.
 COPY fathom/config/config.exs fathom/config/prod.exs config/

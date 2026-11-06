@@ -84,7 +84,9 @@ toward marking dirty — an extra flush, never lost data.)
 > as `{:blob, bin}`; the tenant query path (`ShardExecutor`, `Connection.query(..., tag_blobs: true)`)
 > uses it and Filo already encodes `{:blob, bin}` as a Hrana blob (JSON and protobuf). Every other
 > reader (migration copy, snapshots, Capture) keeps bare binaries. With the stock precompiled
-> exqlite NIF the limitation below still applies (`Connection.tagged_reads?/0` is false).
+> exqlite NIF the limitation below still applies (`Connection.tagged_reads?/0` is false). Both
+> release images (`deploy/compose`, `deploy/chaos`) build the patched NIF since 2026-11-05; dev and
+> test use the stock one unless you run the script.
 
 SQLite distinguishes the storage classes `text` and `blob`. Fathom cannot always preserve that
 distinction across the wire, and the cause is below fathom: `exqlite`'s `make_cell`
