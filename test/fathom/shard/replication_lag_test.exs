@@ -38,7 +38,11 @@ defmodule Fathom.Shard.ReplicationLagTest do
         [:fathom, :replication, :catchup],
         [:fathom, :replication, :lag]
       ],
-      fn ev, m, meta, _ -> send(test_pid, {:tel, ev, m, meta}) end,
+      # Bounded-tag events carry no shard id: drop the ones a lingering Session or coordinator from
+      # another test emits (expert review 2026-11-06 #6).
+      fn ev, m, meta, _ ->
+        unless Fathom.Test.TelemetryScope.foreign?(id), do: send(test_pid, {:tel, ev, m, meta})
+      end,
       nil
     )
 

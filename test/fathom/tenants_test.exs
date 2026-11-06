@@ -79,7 +79,7 @@ defmodule Fathom.TenantsTest do
       # An invalid id makes purge/1 return {:error, _} without touching storage.
       job = %Oban.Job{args: %{"shard_id" => "Not Valid!"}, attempt: 1, max_attempts: 20}
       assert {:error, _} = DeleteJob.perform(job)
-      refute_received {:discarded, _, _}
+      refute_received {:discarded, _, %{shard_id: "Not Valid!"}}
 
       assert {:error, _} = DeleteJob.perform(%{job | attempt: 20})
       assert_received {:discarded, %{count: 1}, %{shard_id: "Not Valid!"}}

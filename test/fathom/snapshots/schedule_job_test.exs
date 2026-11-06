@@ -105,6 +105,7 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
       flushed = Map.new(ids, &{&1, row(&1).last_flushed_at})
 
       counter = :counters.new(1, [])
+      test_pid = self()
       handler = "snapsched-queries-#{System.unique_integer([:positive])}"
 
       # Task.async_stream workers run the per-shard stamps in OTHER processes, so count by source
@@ -114,7 +115,11 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
           handler,
           [:fathom, :repo, :query],
           fn _e, _m, meta, _c ->
-            if meta[:source] == "shards", do: :counters.add(counter, 1, 1)
+            # Only queries this test drives: the test process, or a Task it started (`$callers`).
+            # A lingering Recorder/job from another test also queries `shards` and, counted here,
+            # tipped the `<= n + 2` bound (expert review 2026-11-06 #6).
+            mine? = self() == test_pid or test_pid in Process.get(:"$callers", [])
+            if mine? and meta[:source] == "shards", do: :counters.add(counter, 1, 1)
           end,
           nil
         )

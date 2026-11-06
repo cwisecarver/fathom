@@ -413,7 +413,9 @@ defmodule Fathom.ShardLeaseReleaseTest do
         :telemetry.attach(
           handler,
           [:fathom, :shard, :flush, :failed],
-          fn _e, _m, meta, _ -> send(test_pid, {:flush_failed, meta}) end,
+          fn _e, _m, meta, _ ->
+            if meta.shard_id == shard, do: send(test_pid, {:flush_failed, meta})
+          end,
           nil
         )
 

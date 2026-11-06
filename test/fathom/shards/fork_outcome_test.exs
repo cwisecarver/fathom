@@ -54,7 +54,7 @@ defmodule Fathom.Shards.ForkOutcomeTest do
 
     assert_receive {:fork_event, [:fathom, :migrator, :fork_retry], %{shard_id: ^id}}
 
-    refute_received {:fork_event, [:fathom, :migrator, :fork_fallback], _},
+    refute_received {:fork_event, [:fathom, :migrator, :fork_fallback], %{shard_id: ^id}},
                     "the fork_fallback alert pages on ANY occurrence, deliberately — routing a " <>
                       "concurrent-forker race there makes it page on ordinary signups"
   end
@@ -72,7 +72,7 @@ defmodule Fathom.Shards.ForkOutcomeTest do
   test "the two benign refusals stay silent", %{shard: id} do
     for outcome <- [{:ok, :forked}, {:error, :template_shard}, {:error, :dst_exists}] do
       assert capture_log(fn -> assert :ok = Shards.report_fork(outcome, id) end) == ""
-      refute_received {:fork_event, _, _}
+      refute_received {:fork_event, _, %{shard_id: ^id}}
     end
   end
 

@@ -62,7 +62,11 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
           if meta.shard_id == id, do: send(test_pid, {:route, meta.route})
 
         [:fathom, :shard, :flush_checkpoint], _, meta, _ ->
-          send(test_pid, {:flush_checkpoint, meta})
+          # The event carries no shard id (bounded tags), so attribute it by emitter: drop a
+          # lingering coordinator's/Session's checkpoint from another test (expert review
+          # 2026-11-06 #6).
+          unless Fathom.Test.TelemetryScope.foreign?(id),
+            do: send(test_pid, {:flush_checkpoint, meta})
       end,
       nil
     )

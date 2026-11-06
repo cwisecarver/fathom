@@ -382,7 +382,10 @@ defmodule Fathom.ShardCoordinatorOpenTest do
         :telemetry.attach(
           id,
           [:fathom, :shard, :fork_evidence, :timeout],
-          fn _e, _m, meta, _ -> send(test_pid, {:fe_timeout, meta.attempt}) end,
+          # Node-global event: keep only this shard's (expert review 2026-11-06 #6).
+          fn _e, _m, meta, _ ->
+            if meta.shard_id == shard, do: send(test_pid, {:fe_timeout, meta.attempt})
+          end,
           nil
         )
 

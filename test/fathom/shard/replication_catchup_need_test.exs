@@ -47,7 +47,10 @@ defmodule Fathom.Shard.ReplicationCatchupNeedTest do
     :telemetry.attach(
       hid,
       [:fathom, :replication, :commit],
-      fn _, _, md, _ -> send(me, {:cycle, md.mode}) end,
+      # No shard id on the event: drop other tests' lingering Sessions (expert review 2026-11-06 #6).
+      fn _, _, md, _ ->
+        unless Fathom.Test.TelemetryScope.foreign?(id), do: send(me, {:cycle, md.mode})
+      end,
       nil
     )
 

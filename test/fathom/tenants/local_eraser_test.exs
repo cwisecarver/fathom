@@ -137,7 +137,8 @@ defmodule Fathom.Tenants.LocalEraserTest do
 
     for {_id, r} <- results, do: assert({:error, {:local_erase, _}} = r)
     for id <- ids, do: assert_received({:ev, :local_erase_failed, ^id})
-    refute_received {:ev, :local_erased, _}
+    # Scoped to this test's ids: the handler is node-global.
+    for id <- ids, do: refute_received({:ev, :local_erased, ^id})
     _ = Shard
   end
 end

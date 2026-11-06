@@ -24,6 +24,7 @@ defmodule Fathom.Shards.PreEvictTest do
   alias Fathom.Shard.Heartbeat
   alias Fathom.Shards.Lru
   alias Filo.Stmt
+  import Fathom.Test.TelemetryScope, only: [received_for: 2]
 
   @moduletag :capture_log
   @modes [:legacy, :heartbeat]
@@ -175,7 +176,11 @@ defmodule Fathom.Shards.PreEvictTest do
         evicted = Enum.reject(ids, &open?/1)
         assert evicted != [], "fixture: no idle shard was evicted"
         assert_received {[:fathom, :shards, :pre_evicted], _}
-        refute_received {[:fathom, :shards, :evicted], _}, "an admission evicted inline"
+        # Scoped to this test's ids: a lingering shard from an earlier test may be evicted too.
+        mine = [held_id | ids]
+
+        assert [] == received_for([:fathom, :shards, :evicted], mine),
+               "an admission evicted inline"
 
         refute_received {:DOWN, ^held_ref, :process, ^held, _},
                         "a shard holding a connection was pre-evicted"
@@ -205,7 +210,7 @@ defmodule Fathom.Shards.PreEvictTest do
     await_pre_evictor()
 
     assert Enum.all?(ids, &open?/1), "a shard used a moment ago was pre-evicted"
-    refute_received {[:fathom, :shards, :pre_evicted], _}
+    assert [] == received_for([:fathom, :shards, :pre_evicted], ids)
     cleanup(ids)
   end
 
@@ -274,7 +279,7 @@ defmodule Fathom.Shards.PreEvictTest do
       ids = for _ <- 1..30, do: open_dirty(uniq())
       await_pre_evictor()
       assert Enum.all?(ids, &open?/1), "pre-eviction ran with the headroom set to 0"
-      refute_received {[:fathom, :shards, :pre_evicted], _}
+      assert [] == received_for([:fathom, :shards, :pre_evicted], ids)
       cleanup(ids)
     end
   end

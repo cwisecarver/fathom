@@ -28,6 +28,7 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
   alias Fathom.Shard.Heartbeat
   alias Fathom.Shards.Lru
   alias Fathom.Test.FaultyStorage
+  import Fathom.Test.TelemetryScope, only: [received_for: 2]
 
   @moduletag :capture_log
   @modes [:legacy, :heartbeat]
@@ -193,14 +194,20 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
         match?([{_, _, ref}] when is_reference(ref), :ets.lookup(Lru.Offered, victim))
       end)
 
-      refute_received {[:fathom, :shards, :evicted], _}
+      # Scoped to this test's tenants: the handler is node-global, and an earlier test's lingering
+      # shard evicted at the cap would otherwise fail the refute (expert review 2026-11-06 #6).
+      mine = [new | filled]
+      assert [] == received_for([:fathom, :shards, :evicted], mine)
 
       send(evictor, :drop)
       assert {:ok, pid, ref, _} = Task.await(admission, 10_000)
       Fathom.Shard.checkin(pid, ref)
 
       refute open?(victim)
-      refute_received {[:fathom, :shards, :evicted], _}, "the admission evicted a second tenant"
+
+      assert [] == received_for([:fathom, :shards, :evicted], mine),
+             "the admission evicted a second tenant"
+
       assert Enum.all?(tl(filled), &open?/1)
       assert_mode!(new, mode)
     end
