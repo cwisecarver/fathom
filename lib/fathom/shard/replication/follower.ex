@@ -2841,7 +2841,7 @@ defmodule Fathom.Shard.Replication.Follower do
   # 103 B for its touch row now), ~80 MB per node at a million fleet shards over three nodes,
   # ~800 MB at ten million, nearly all for replicas nobody pushes to.
   # A row untouched (no `put_state/3`) for `:replication_row_idle_ms` (default 10 x
-  # `:shard_idle_ms`) is dropped, and `state_of/2` re-derives it from the files on the next use,
+  # `Fathom.Shard.idle_ms/0`, i.e. 10 x 300 s = 3000 s unless `:shard_idle_ms` is set) is dropped, and `state_of/2` re-derives it from the files on the next use,
   # through the same `derive_state/3` a restarted follower uses on first use.
   #
   # WHY DROPPING IT LOSES NOTHING. Every field of the row is either durable beside the replica or
@@ -2925,9 +2925,11 @@ defmodule Fathom.Shard.Replication.Follower do
       (derived.torn or not row.torn)
   end
 
-  defp row_idle_ms do
+  # Public only so the test can pin the derivation (10 x the Shard idle default).
+  @doc false
+  def row_idle_ms do
     Application.get_env(:fathom, :replication_row_idle_ms) ||
-      10 * Application.get_env(:fathom, :shard_idle_ms, 60_000)
+      10 * Fathom.Shard.idle_ms()
   end
 
   defp touch(name, shard_id),

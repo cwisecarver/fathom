@@ -6573,7 +6573,13 @@ defmodule Fathom.Shard do
 
   defp lapse_jitter_ms, do: lapse_spread_ms(Fathom.Shards.open_count())
 
-  defp idle_ms, do: Application.get_env(:fathom, :shard_idle_ms, @default_idle_ms)
+  @doc """
+  The effective coordinator idle-stop in ms: `:shard_idle_ms`, else the 300 s default. The one
+  public source for it — the A2 follower's replica row sweep derives from this rather than
+  restating the default (expert review 2026-11-06 #1).
+  """
+  @spec idle_ms() :: non_neg_integer()
+  def idle_ms, do: Application.get_env(:fathom, :shard_idle_ms, @default_idle_ms)
 
   defp idle_jitter_ratio,
     do: Application.get_env(:fathom, :shard_idle_jitter_ratio, @default_idle_jitter_ratio)
