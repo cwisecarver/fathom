@@ -544,11 +544,12 @@ defmodule Fathom.BenchTest do
     assert r.ets_b > 500 and r.ets_b < 100_000
     assert r.hibernated >= 0.0 and r.hibernated <= 1.0
 
-    # The arm runs PROD's timers (300 s flush, 60 s idle stop), the regime r8 #12 targets. It used
+    # The arm runs prod's 300 s flush and a 60 s idle stop - a faster PROXY for prod's 300 s idle
+    # (since 2026-11-04), in the regime r8 #12 targets (interval > idle). It used
     # to pin a 600 s idle stop - not prod's, and the one regime where #12 does not apply - so its
     # coordinators got the 376 s floor and idle_hibernated_frac read 0.0 on every round-8 run.
     assert r.hibernate_after_ms == 30_000,
-           "idle arm is not on prod's timers: hibernate_after #{r.hibernate_after_ms} ms"
+           "idle arm is not on its proxy timers: hibernate_after #{r.hibernate_after_ms} ms"
 
     assert r.hibernate_after_ms < Fathom.Bench.idle_wait_ms(),
            "the arm's wait ends before its coordinators can hibernate"

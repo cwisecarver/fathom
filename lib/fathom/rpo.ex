@@ -304,8 +304,8 @@ defmodule Fathom.Rpo do
   # reason the interval is contentious.
   #
   # Default stays Local, so the harness remains S3-free and offline-runnable unless an endpoint is
-  # explicitly set — the same opt-in rule `Fathom.Bench.s3_opt_in?/0` uses, and the config is read
-  # the same way so the two harnesses cannot drift apart.
+  # explicitly set — the same opt-in rule the bench uses, and the config is read
+  # the same way (both go through `Fathom.Bench.S3Env`) so the two harnesses cannot drift apart.
   defp configure_storage(store) do
     if s3_opt_in?() do
       {:ok, _} = Application.ensure_all_started(:req)
@@ -320,19 +320,9 @@ defmodule Fathom.Rpo do
     end
   end
 
-  defp s3_opt_in?, do: System.get_env("FATHOM_S3_TEST_ENDPOINT") != nil
+  defp s3_opt_in?, do: Fathom.Bench.S3Env.opt_in?()
 
-  defp s3_config_from_env do
-    [
-      bucket: System.get_env("FATHOM_S3_TEST_BUCKET", "fathom-shards-test"),
-      region: System.get_env("FATHOM_S3_TEST_REGION", "us-east-1"),
-      endpoint: System.get_env("FATHOM_S3_TEST_ENDPOINT", "http://localhost:9100"),
-      path_style: true,
-      prefix: "rpo/",
-      access_key_id: System.get_env("FATHOM_S3_TEST_ACCESS_KEY", "fathomtest"),
-      secret_access_key: System.get_env("FATHOM_S3_TEST_SECRET_KEY", "fathomtest123")
-    ]
-  end
+  defp s3_config_from_env, do: Fathom.Bench.S3Env.config("rpo/")
 
   @doc """
   Which storage backend a run will use, for the harness to print. Reported rather than assumed:

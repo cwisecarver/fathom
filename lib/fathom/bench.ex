@@ -90,6 +90,7 @@ defmodule Fathom.Bench do
   # count is the in-harness guard that the promotion actually fired.
   @promote_rows 20
   @promote_flush_after 10
+  # `warm_s3` = the S3 cold-pull failover path (concurrent cold pulls), NOT the removed warm standby.
   # How many shards `warm_s3_throughput/1` pulls concurrently. The name is legacy (the metric was
   # `warm_s3` when it shared harness bits with the retired WarmFollower); the measurement is and
   # always was concurrent S3-pull throughput, kept under its original series name for continuity.
@@ -203,6 +204,7 @@ defmodule Fathom.Bench do
       cold_open_p99_us: cold && cold.p99_us,
       # The cold-S3 path — nil unless an S3 endpoint is configured (opt-in).
       cold_open_s3_p50_us: run_if(only, :cold_open_s3, fn -> cold_open_s3(opts) end),
+      # `warm_s3` = the S3 cold-pull failover path, not the removed warm standby.
       # Concurrent S3-pull throughput (N shards pulled at once ÷ wall) — the node-startup / mass
       # failover number. Named `warm_s3` for series continuity; it never depended on WarmFollower.
       warm_s3_shards_per_s: run_if(only, :warm_s3, fn -> warm_s3_throughput(opts) end),
@@ -502,7 +504,7 @@ defmodule Fathom.Bench do
 
   # Opt-in only when an endpoint is explicitly set — keeps `mix fathom.bench` and
   # the commit gate S3-free by default.
-  defp s3_opt_in?, do: System.get_env("FATHOM_S3_TEST_ENDPOINT") != nil
+  defp s3_opt_in?, do: Fathom.Bench.S3Env.opt_in?()
 
   # Seed a shard's object into S3 (create local, flush = PUT, drop local) so the
   # next checkout is a genuine cold pull from S3. Fresh ids ⇒ no stale lease.
@@ -526,6 +528,8 @@ defmodule Fathom.Bench do
   `N ÷ wall` (shards/s). The node-startup / mass-failover number — `cold_open_s3` covers the
   single-pull LATENCY, this covers the aggregate THROUGHPUT of many pulls contending on the
   dedicated S3 Finch pool. `nil` without an S3 endpoint (opt-in, like `cold_open_s3/1`).
+
+  `warm_s3` = the S3 cold-pull failover path, not the removed warm standby.
 
   The `warm_s3` name is legacy: it shared harness setup with the retired WarmFollower and was
   labeled "warm", but the measurement never touched that cache — it is plain concurrent
@@ -3816,9 +3820,11 @@ defmodule Fathom.Bench do
   end
 
   @idle_n 200
-  # Prod's flush interval and idle stop (see `idle_stats/1`). With them `hibernate_after` is
-  # 30 s (r8 #12: min(376 s floor, idle / 2)); the wait covers that plus the open loop and must stay
-  # under the 60 s idle stop, or coordinators would drop before they are counted.
+  # Prod's flush interval (300 s) but a FASTER PROXY for its idle stop (see `idle_stats/1`). Prod's
+  # idle stop is 300 s (since 2026-11-04), giving a 150 s `hibernate_after`; this arm keeps the
+  # series' 60 s stop (`hibernate_after` 30 s: r8 #12, min(376 s floor, idle / 2)) so a run waits
+  # 45 s, not 150 s+. The wait covers the 30 s plus the open loop and must stay under the 60 s idle
+  # stop, or coordinators would drop before they are counted.
   @idle_flush_interval_ms 300_000
   @idle_stop_ms 60_000
   @idle_wait_ms 45_000
@@ -3837,8 +3843,8 @@ defmodule Fathom.Bench do
   Own scoped setup (the shared `setup/1` is untouched): `:shard_load` and `:metrics_collector` on,
   ShardLoad/ShardLatency/Lru/WriteCounter/FlushWatermark running, heartbeat mode (a `Heartbeat` is
   started and every coordinator's `acquire_gen` is asserted non-nil), prod-shaped timers (flush
-  interval 300 s, idle stop 60 s - prod's, so `hibernate_after` is whatever `Fathom.Shard` derives
-  for prod: 30 s with r8 #12). N shards are written through `ShardExecutor` and checked in, then the arm waits
+  interval 300 s = prod's; idle stop 60 s = a faster proxy, NOT prod's 300 s, so `hibernate_after`
+  is 30 s here where prod's is 150 s). N shards are written through `ShardExecutor` and checked in, then the arm waits
   up to #{@idle_wait_ms} ms for the coordinators to hibernate.
 
     * `idle_kb_per_shard` - `Process.info(:memory)` + refc binaries over the coordinators, per shard.
@@ -3850,9 +3856,10 @@ defmodule Fathom.Bench do
       0.88-0.92 vs 0.00 with #12 backed out, idle_kb 4.2 vs 9.0). Not 1.0, and correctly so: r8
       #11 draws each coordinator's FIRST flush tick uniform over (0, 300 s], so ~10% of these
       dirty shards take that tick inside the wait and restart their 30 s hibernate countdown -
-      prod's behaviour too. 0.0 without #12 (`hibernate_after` 376 s, past the idle stop). REPORTED, not asserted: a regression shows
-      as a drop to 0.0 here and a ~2.6 KB rise in `idle_kb_per_shard`. In prod an idle coordinator
-      lives 60 s and is hibernated for its second 30 s, so this is the hibernated half's footprint.
+      prod's behaviour too (at the proxy's timers). 0.0 without #12 (`hibernate_after` 376 s, past the idle stop). REPORTED, not asserted: a regression shows
+      as a drop to 0.0 here and a ~2.6 KB rise in `idle_kb_per_shard`. Here an idle coordinator
+      lives 60 s and is hibernated for its second 30 s, so this is the hibernated half's footprint;
+      in prod (300 s idle, hibernate at 150 s) the hibernated half is also the second 150 s.
 
   Preconditions (raises otherwise): every coordinator is in heartbeat mode, and the ShardLoad,
   ShardLatency, WriteCounter and FlushWatermark tables each hold at least N rows. WATCH-ONLY.
@@ -3872,13 +3879,14 @@ defmodule Fathom.Bench do
     restores = [
       put_env_scoped(:shard_load, true),
       put_env_scoped(:metrics_collector, true),
-      # PROD'S TIMERS, BOTH OF THEM: config/runtime.exs sets a 300 s flush interval in prod and
-      # leaves `:shard_idle_ms` at `Fathom.Shard`'s 60 s default (no deploy sets SHARD_IDLE_MS;
-      # only the rig's 20 s and sweep-only 900 s overrides exist). This arm used to pin a 600 s
-      # idle stop, which is not prod's shape AND is the one regime where r8 #12 does not apply
-      # (#12 caps `hibernate_after` only when interval > idle), so it reported 0.0 hibernated on
-      # code where every prod idle coordinator hibernates at 30 s. 60 s also outlasts the wait
-      # below, so no coordinator idle-stops mid-measurement.
+      # PROD'S FLUSH INTERVAL, A FASTER PROXY FOR ITS IDLE STOP: prod is 300 s flush and 300 s
+      # idle (the `Fathom.Shard` default since 2026-11-04; it was 60 s when this arm was written, and
+      # this arm still pins 60 s on purpose - expert review 2026-11-06 #4, no new series). This arm
+      # used to pin a 600 s idle stop, the one regime where r8 #12 does not apply (#12 caps
+      # `hibernate_after` only when interval > idle), so it reported 0.0 hibernated. 60 s keeps
+      # interval > idle, so #12 applies and `hibernate_after` is 30 s, and outlasts the 45 s wait
+      # below, so no coordinator idle-stops mid-measurement. Tracking prod's 300 s would need a
+      # wait above 150 s per run and a new `idle_*` series.
       put_env_scoped(:shard_flush_interval_ms, @idle_flush_interval_ms),
       put_env_scoped(:shard_idle_ms, @idle_stop_ms),
       # Prod config turns replication on, but the bench starts no replication supervisor, so a
@@ -3988,7 +3996,7 @@ defmodule Fathom.Bench do
         ets_b: (ets_bytes + max(counter_delta, 0)) / n,
         hibernated: hibernated / n,
         # The `hibernate_after` these coordinators were started with under the arm's timers - the
-        # arm's own shape check: 30 s under prod's timers with r8 #12, 376 s under the old 600 s
+        # arm's own shape check: 30 s under the arm's 60 s idle proxy with r8 #12, 376 s under the old 600 s
         # idle stop that hid #12 (test/fathom/bench_test.exs pins it).
         hibernate_after_ms:
           Fathom.Shard.hibernate_after_ms(
@@ -4608,15 +4616,7 @@ defmodule Fathom.Bench do
   # earlier entries incomparable. Scoping it to the flush metric keeps the fanout series intact.
 
   defp s3_config_from_env do
-    base = [
-      bucket: System.get_env("FATHOM_S3_TEST_BUCKET", "fathom-shards-test"),
-      region: System.get_env("FATHOM_S3_TEST_REGION", "us-east-1"),
-      endpoint: System.get_env("FATHOM_S3_TEST_ENDPOINT", "http://localhost:9100"),
-      path_style: true,
-      prefix: "bench/",
-      access_key_id: System.get_env("FATHOM_S3_TEST_ACCESS_KEY", "fathomtest"),
-      secret_access_key: System.get_env("FATHOM_S3_TEST_SECRET_KEY", "fathomtest123")
-    ]
+    base = Fathom.Bench.S3Env.config("bench/")
 
     # Unset → the storage module's defaults; set → sweep override. pool_size is
     # connections per pool, pool_count is the number of pools.

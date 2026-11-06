@@ -18,6 +18,7 @@ defmodule Fathom.Bench.Gate do
   @metrics [
     {:cold_open_p50_us, :higher_worse},
     {:cold_open_s3_p50_us, :higher_worse},
+    # `warm_s3` = the S3 cold-pull failover path, not the removed warm standby.
     # Concurrent S3-pull throughput (node-startup / mass failover). Kept through the WarmFollower
     # retirement (2026-09-14): the metric was named `warm_s3` but never touched that cache — it is
     # plain concurrent `Shards.checkout/1`, so it stays a real measurement. Opt-in (nil ⇒ skipped).
