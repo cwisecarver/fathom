@@ -18,7 +18,9 @@ defmodule Fathom.Rebalancer.PolicyTest do
   end
 
   defp propose(samples, overrides \\ [], opts) do
-    Policy.propose(samples, overrides, @backends, Keyword.put(opts, :now, @now))
+    samples
+    |> Policy.propose_traced(overrides, @backends, Keyword.put(opts, :now, @now))
+    |> elem(0)
   end
 
   test "moves a confirmed hot shard to the least-loaded node" do

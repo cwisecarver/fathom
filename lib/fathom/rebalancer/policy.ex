@@ -93,21 +93,12 @@ defmodule Fathom.Rebalancer.Policy do
   @doc """
   Proposes moves from `samples` (a short recent history), the current `overrides` (for
   cooldown), and the `backends` set (`%{node_key => address}`, the candidate targets).
-  Returns `[]` when nothing is safely worth moving.
+  Returns `{moves, declined}`: the moves (`[]` when nothing is safely worth moving), plus the hot
+  candidates that were NOT moved, each tagged with the first guard that declined it. Only
+  candidates that cleared the hot bar are reported (a cold shard is not a "decline"). Pure.
 
-  Exactly the moves of `propose_traced/4` — that function IS the implementation, so recording
-  declines cannot change a decision.
-  """
-  @spec propose([map()], [map()], %{optional(String.t()) => String.t()}, keyword()) :: [move()]
-  def propose(samples, overrides, backends, opts \\ []) do
-    {moves, _declined} = propose_traced(samples, overrides, backends, opts)
-    moves
-  end
-
-  @doc """
-  `propose/4` plus the hot candidates that were NOT moved, each tagged with the first guard that
-  declined it. Only candidates that cleared the hot bar are reported (a cold shard is not a
-  "decline"). Pure.
+  The caller that only wants the moves takes `elem(0)`; recording the declines cannot change a
+  decision because this one function is the whole policy.
   """
   @spec propose_traced([map()], [map()], %{optional(String.t()) => String.t()}, keyword()) ::
           {[move()], [decline()]}
@@ -310,7 +301,7 @@ defmodule Fathom.Rebalancer.Policy do
   # same shard_id is reported by both the old and new serving node) from double-counting one
   # hot window across nodes to reach `confirm`; de-duping by `sampled_at` counts windows, not
   # rows. (Recency is already bounded by the caller's read horizon; the latest-rate filter in
-  # propose/4 ensures the shard is still hot right now.)
+  # propose_traced/4 ensures the shard is still hot right now.)
   defp confirmed_hot?(candidate, samples, threshold, confirm) do
     samples
     |> Enum.filter(fn s ->

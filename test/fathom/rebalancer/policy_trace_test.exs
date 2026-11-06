@@ -1,9 +1,8 @@
 defmodule Fathom.Rebalancer.PolicyTraceTest do
   @moduledoc """
   `Policy.propose_traced/4` — recording declined candidates for /admin/rebalancer must not change a
-  decision (expert review 2026-10-15 #13). `propose/4` is implemented ON the traced path, so the
-  identity test below pins that the moves are the same whatever the declines look like, and the
-  guard tests pin which guard gets blamed. Pure, no DB.
+  decision (expert review 2026-10-15 #13). The guard tests pin which guard gets blamed, and the
+  moves are the only output a caller acts on. Pure, no DB.
   """
   use ExUnit.Case, async: true
 
@@ -38,21 +37,6 @@ defmodule Fathom.Rebalancer.PolicyTraceTest do
   end
 
   defp guards(declined), do: Map.new(declined, &{&1.shard_id, &1.guard})
-
-  test "propose/4 returns exactly the moves of propose_traced/4 across configurations" do
-    overrides = [pin("hot_2", "n2", 60)]
-
-    for extra <- [
-          [],
-          [max_moves: 2],
-          [max_moves: 0],
-          [ineligible: MapSet.new(["hot_1"])],
-          [floor: 100.0, confirm_windows: 1, max_moves: 5]
-        ] do
-      {moves, _declined} = Policy.propose_traced(samples(), overrides, @backends, opts(extra))
-      assert moves == Policy.propose(samples(), overrides, @backends, opts(extra))
-    end
-  end
 
   test "an unconfirmed spike and a cooling shard are blamed on their guards" do
     overrides = [pin("hot_2", "n2", 60)]

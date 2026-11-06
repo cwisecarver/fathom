@@ -105,8 +105,8 @@ rpc 'samples = Fathom.Rebalancer.LoadSamples.since(120_000) |> Enum.map(&Map.fro
      overrides = Fathom.Rebalancer.Overrides.all()
      backends = Fathom.Rebalancer.lb_backends()
      fleet_p99 = Fathom.Rebalancer.Nodes.fleet_p99(60_000, 50)
-     Fathom.Rebalancer.Policy.propose(samples, overrides, backends, fleet_p99: fleet_p99)
-     |> inspect() |> IO.puts()'
+     {moves, _declined} = Fathom.Rebalancer.Policy.propose_traced(samples, overrides, backends, fleet_p99: fleet_p99)
+     moves |> inspect() |> IO.puts()'
 ```
 
 Sit here until the proposed moves match your intuition about which shards are genuinely hot.
