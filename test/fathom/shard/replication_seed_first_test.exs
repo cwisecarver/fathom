@@ -14,11 +14,10 @@ defmodule Fathom.Shard.ReplicationSeedFirstTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Session
-  alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shards
+  import Fathom.Test.ReplicationCase
 
   setup do
     id = "repl_seedfirst_#{System.unique_integer([:positive])}"
@@ -47,26 +46,8 @@ defmodule Fathom.Shard.ReplicationSeedFirstTest do
       for s <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(id) <> s)
     end)
 
-    followers =
-      for i <- 1..3 do
-        name = :"sf_f#{i}_#{System.unique_integer([:positive])}"
-        dir = Path.join(root, to_string(name))
-        pid = start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
-        {:ok, port} = Follower.port(pid)
-        {name, port}
-      end
-
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for({_, p} <- followers, do: {~c"127.0.0.1", p})
-    )
-
-    start_supervised!(Fleet)
-    await_connected!(3)
+    followers = start_followers!(root, 3, "sf")
+    enable_replication!(followers, connected: :all)
 
     handler = "seedfirst-#{System.unique_integer([:positive])}"
     test_pid = self()
@@ -81,25 +62,6 @@ defmodule Fathom.Shard.ReplicationSeedFirstTest do
     on_exit(fn -> :telemetry.detach(handler) end)
 
     %{id: id, followers: Enum.map(followers, &elem(&1, 0))}
-  end
-
-  defp await_connected!(n, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        Enum.count(Fleet.shippers(), &Shipper.connected?/1) >= n -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(20) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("shippers never connected")
-  end
-
-  defp session!(id) do
-    [{pid, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
-    pid
   end
 
   defp collects(session) do
