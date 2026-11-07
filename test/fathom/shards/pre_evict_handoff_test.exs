@@ -284,6 +284,13 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
 
   describe "pre-eviction parallelism" do
     # Peak concurrent victim drops, observed in the lock release each drop ends with.
+    #
+    # Only releases of THIS module's shards (`uniq/0`'s `pehand_` ids) are counted. `:faulty_before`
+    # is global and hands the hook the shard id: coordinators left running by other tests release
+    # their leases through the same backend, and every one of them that overlapped the pass's 50 ms
+    # window counted as an extra "victim" (the `<= 8` assertion once read 9 in a full gate, seed
+    # 21493 - NOT reproduced in isolation, 0 of 80 passes; this rests on the hook's contract, see
+    # `FaultyStorage.run_before/2`).
     defp measure_peak_release(fun) do
       inflight = :atomics.new(2, [])
 
@@ -291,12 +298,16 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
         :fathom,
         :faulty_before,
         {:release,
-         fn _ ->
-           now = :atomics.add_get(inflight, 1, 1)
-           peak = :atomics.get(inflight, 2)
-           if now > peak, do: :atomics.compare_exchange(inflight, 2, peak, now)
-           Process.sleep(50)
-           :atomics.sub(inflight, 1, 1)
+         fn
+           "pehand_" <> _ ->
+             now = :atomics.add_get(inflight, 1, 1)
+             peak = :atomics.get(inflight, 2)
+             if now > peak, do: :atomics.compare_exchange(inflight, 2, peak, now)
+             Process.sleep(50)
+             :atomics.sub(inflight, 1, 1)
+
+           _other ->
+             :ok
          end}
       )
 
