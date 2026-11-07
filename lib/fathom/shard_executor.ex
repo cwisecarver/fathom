@@ -1989,6 +1989,45 @@ defmodule Fathom.ShardExecutor do
   # review 2026-11-07 #59). It clears when the Heartbeat is back, so it is a retry.
   def open_error({:heartbeat_unavailable, _} = reason), do: retryable_open_error(reason)
 
+  # THE TYPED OPEN REFUSALS (follow-up to the 2026-11-07 batch D). These fell to the catch-all, so a
+  # client got a 500 `FILO_OPEN_FAILED` for refusals that clear on a retry, and an SDK treats a 500 as
+  # permanent. The open path stops with these reasons (`Shard.handle_continue(:open)`):
+  #
+  #   * `{:local_stat_failed, _}` — the warm-vs-cold stat failed (EIO, ESTALE, EACCES); the open
+  #     refused before the lease or any pull so nothing was touched (expert review 2026-11-07 #21).
+  #   * `{:retained_claim_failed | :retained_claim_unavailable, _}` — claiming a clean retained copy
+  #     failed (a rename error, or the Retained server not answering).
+  #   * `{:pull_failed, reason}` — the pull / promotion / sidecar step could not make the file
+  #     available (`Shard.open_failure_reason/1`). `reason` is `:pull_temp_missing` (reaped temp: the
+  #     retry re-pulls), a pull timeout/crash/exit/exception, `{:pull_temp_unreadable, _}`,
+  #     `{:sidecar_write_failed, _}`, `{:etag_unavailable, _}`, or a raw storage error: all retryable.
+  #     The recovery refusal window and a failed peer pull arrive as `{:open_failed, %UnderQuorum{}}`
+  #     (`FILO_RECOVERING`, below), not here.
+  #
+  # EXCEPT the two that need an operator: `:sidecar_corrupt` and `:no_provenance` are a warm file whose
+  # provenance cannot be trusted and could not be quarantined (`Materializer.await_pull/3` refuses
+  # rather than adopt an unknown lineage). A retry reads the same file, so they get a stable
+  # NON-retryable code, distinct from the unclassified `FILO_OPEN_FAILED`, so an SDK and an alert can
+  # tell "will not heal" from "unknown". The reason is logged, never sent.
+  def open_error({:local_stat_failed, _} = reason), do: retryable_open_error(reason)
+  def open_error({:retained_claim_failed, _} = reason), do: retryable_open_error(reason)
+  def open_error({:retained_claim_unavailable, _} = reason), do: retryable_open_error(reason)
+
+  def open_error({:pull_failed, reason} = refusal)
+      when reason in [:sidecar_corrupt, :no_provenance] do
+    Logger.error(
+      "cannot open shard (needs an operator, a retry will not help): #{inspect(refusal)}"
+    )
+
+    %Error{
+      message: "shard needs operator repair; retrying will not help",
+      code: "FILO_SHARD_UNRECOVERABLE",
+      status: 500
+    }
+  end
+
+  def open_error({:pull_failed, _} = reason), do: retryable_open_error(reason)
+
   # Peer recovery heard too few definite answers to rule out a fresher replica (expert review
   # 2026-10-12 #5). Deliberate and bounded (`:replication_recovery_underquorum_window_ms`): the
   # client retries while the partition heals. Its own code so a rig run or an SDK log can tell it
