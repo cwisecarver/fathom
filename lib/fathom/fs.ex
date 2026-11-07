@@ -71,14 +71,141 @@ defmodule Fathom.FS do
   def rm(path), do: :file.delete(IO.chardata_to_string(path), [:raw])
 
   @spec rename(Path.t(), Path.t()) :: :ok | {:error, File.posix()}
-  def rename(src, dst),
-    do: :prim_file.rename(IO.chardata_to_string(src), IO.chardata_to_string(dst))
+  def rename(src, dst) do
+    src = IO.chardata_to_string(src)
+    dst = IO.chardata_to_string(dst)
+
+    case fs_hook() do
+      nil -> :prim_file.rename(src, dst)
+      hook -> hooked(hook, {:rename, src, dst}, fn -> :prim_file.rename(src, dst) end)
+    end
+  end
 
   @spec read(Path.t()) :: {:ok, binary()} | {:error, File.posix()}
   def read(path), do: :file.read_file(IO.chardata_to_string(path), [:raw])
 
   @spec write(Path.t(), iodata()) :: :ok | {:error, File.posix()}
-  def write(path, data), do: :file.write_file(IO.chardata_to_string(path), data, [:raw])
+  def write(path, data) do
+    path = IO.chardata_to_string(path)
+
+    case :file.write_file(path, data, [:raw]) do
+      :ok ->
+        note_written(path)
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc """
+  Hard-link `existing` as `new`: atomic and exclusive (`{:error, :eexist}` when `new` exists), which
+  is what makes it the create primitive for a file that must appear WITH its content
+  (`Fathom.Shard.Storage.atomic_create/2`).
+  """
+  @spec link(Path.t(), Path.t()) :: :ok | {:error, File.posix()}
+  def link(existing, new) do
+    existing = IO.chardata_to_string(existing)
+    new = IO.chardata_to_string(new)
+
+    case fs_hook() do
+      nil -> :prim_file.make_link(existing, new)
+      hook -> hooked(hook, {:link, existing, new}, fn -> :prim_file.make_link(existing, new) end)
+    end
+  end
+
+  @doc """
+  `fsync` the file at `path` (open, `:file.sync/1`, close): its DATA is durable when this returns
+  `:ok`. A rename of it is only durable after `sync_dir/1` on the parent.
+  """
+  @spec sync_file(Path.t()) :: :ok | {:error, term()}
+  def sync_file(path) do
+    path = IO.chardata_to_string(path)
+
+    case fs_hook() do
+      nil -> do_sync_file(path)
+      hook -> hooked(hook, {:sync_file, path}, fn -> do_sync_file(path) end)
+    end
+  end
+
+  @doc """
+  `fsync` the DIRECTORY `dir`, making the renames / links / creates already done in it durable.
+
+  Without it, an OS crash or power loss can revert a `rename`: the name keeps pointing at the
+  previous inode even though the new file's data was fsynced first (expert review 2026-11-07 #27).
+  The earlier belief that the BEAM cannot do this ("`:file.open` on a dir is `eisdir`") was only
+  half true: a plain open of a directory IS `eisdir`, but the `:directory` open mode (documented in
+  `kernel`'s `file:open/2`, present since OTP 26; fathom's floor is 28) opens it, and `:file.sync/1`
+  on that fd is `fsync(2)` on the directory. `test/fathom/fs_sync_dir_test.exs` pins the probe so
+  the false premise cannot return.
+  """
+  @spec sync_dir(Path.t()) :: :ok | {:error, term()}
+  def sync_dir(dir) do
+    dir = IO.chardata_to_string(dir)
+
+    case fs_hook() do
+      nil -> do_sync_dir(dir)
+      hook -> hooked(hook, {:sync_dir, dir}, fn -> do_sync_dir(dir) end)
+    end
+  end
+
+  @doc """
+  Tell the fault hook that `path` now holds data nobody has fsynced. Done automatically by
+  `write/2`; callers that fill a file another way (`File.cp/2`, a streamed download) call it
+  themselves. A no-op without a hook.
+  """
+  @spec note_written(Path.t()) :: :ok
+  def note_written(path) do
+    case fs_hook() do
+      nil ->
+        :ok
+
+      hook ->
+        _ = hook.({:wrote, IO.chardata_to_string(path)})
+        :ok
+    end
+  end
+
+  defp do_sync_file(path) do
+    case :file.open(path, [:read, :write, :raw, :binary]) do
+      {:ok, fd} ->
+        result = :file.sync(fd)
+        :ok = :file.close(fd)
+        result
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp do_sync_dir(dir) do
+    case :file.open(dir, [:read, :raw, :directory]) do
+      {:ok, fd} ->
+        result = :file.sync(fd)
+        :ok = :file.close(fd)
+        result
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  # THE CRASH-INJECTION SEAM (expert review 2026-11-07 #85). `config :fathom, :fs_hook` is unset in
+  # dev and prod; `Fathom.Test.CrashFS` installs it in the test suite. The hook is called BEFORE
+  # the operation with `{:rename, src, dst}`, `{:link, existing, new}`, `{:sync_file, path}` or
+  # `{:sync_dir, dir}`, and answers `:ok` (do it), `:skip` (do not do it, report `:ok` — a stubbed
+  # fsync) or `{:error, reason}` (fail it); `{:wrote, path}` is a notification after a write and its
+  # answer is ignored. UNSET COST: one `Application.get_env/2`, ~0.1-0.25 us, against a rename's
+  # ~10 us and an fsync's 30 us - 1 ms. `Application.get_env` rather than `:persistent_term`: the
+  # two measured the same, and the app env is where every other `*_hook` lives.
+  defp fs_hook, do: Application.get_env(:fathom, :fs_hook)
+
+  defp hooked(hook, op, run) do
+    case hook.(op) do
+      :ok -> run.()
+      :skip -> :ok
+      {:error, _} = err -> err
+    end
+  end
 
   @doc """
   Lists `dir` with the raw `:prim_file.list_dir/1` in a short-lived monitored side process

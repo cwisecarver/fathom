@@ -16,6 +16,11 @@
 # CI does exactly that (.github/workflows/ci.yml), so these do not rot. See
 # test/fathom/shard/wal_hook_test.exs.
 
+# The filesystem fault seam (`Fathom.FS`'s `:fs_hook`, expert review 2026-11-07 #85). Installed for
+# the whole run, but a `Fathom.Test.CrashFS` instance only sees operations under ITS directory;
+# everything else is answered `:ok`, so async tests are unaffected.
+Fathom.Test.CrashFS.install!()
+
 # Clear stale storage DR artifacts from prior runs (#6). Deleted-tenant tests write durable
 # `tombstones/<id>` (and token tests `tokenfloors/<id>`) markers that are, by design, never swept —
 # so they accumulate across runs. `System.unique_integer` resets per BEAM run, so a leftover

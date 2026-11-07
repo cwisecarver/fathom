@@ -402,8 +402,12 @@ overlapped with the push. No write is acked until both the quorum and that fdata
 
 **The flag requires ext4 or xfs** for the shard data directory (expert review 2026-10-21 rv6 F7).
 Under FULL, SQLite fsyncs the directory on a new `-wal`'s first sync, so the file's NAME is durable
-with its first commit. Under NORMAL that directory sync waits for the first checkpoint, and Erlang
-cannot fsync a directory (`:file.open/2` on one is `eisdir`). On ext4 and xfs, an `fdatasync` that
+with its first commit. Under NORMAL that directory sync waits for the first checkpoint, and the
+replication Session does not fsync the directory itself. (Until 2026-11-07 this said "Erlang cannot
+fsync a directory"; that was wrong — `Fathom.FS.sync_dir/1` does it with the `:directory` open mode,
+expert review 2026-11-07 #27. Having the Session call it once per new WAL is now possible and was
+not built: a decision for the maintainers, see `docs/component-notes.md` § Shard storage.) On ext4
+and xfs, an `fdatasync` that
 grows a newly created file forces the journal commit that also carries its directory entry, so the
 round's sync covers the name in practice. That is filesystem behaviour, not POSIX; on another
 filesystem a power loss can lose a new WAL's directory entry together with acked commits. The

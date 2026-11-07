@@ -144,6 +144,27 @@ turn a silent RPO blow-out into a page. Smaller `:shard_flush_interval_ms` means
 and more PUTs — the tuning dial (it's currently a fleet-global knob; a per-shard override was scoped
 out as a tenant-tiering feature).
 
+## Power loss and the Local backend's renames (expert review 2026-11-07 #27, #83)
+
+Every object the Local backend publishes (`flush`, version/snapshot copies, position and lineage
+sidecars, tombstones, token floors, locks and heartbeats rewritten in place) is written
+temp → `fsync` → `rename` → **`fsync` of the directory**. Without the last step a power cut can revert
+the rename, and on the drop path (flush, delete the local copy, release the lease) that loses
+everything since the previous flush while the system had reported it durable. The earlier belief
+that the BEAM cannot fsync a directory was wrong: `Fathom.FS.sync_dir/1` opens it with `:file.open/2`'s
+`:directory` mode. Measured cost on APFS: about the same as the file fsync (~0.55 ms), i.e. `flush_p50_us`
++7 % on the Local double.
+
+Deliberately **not** done: the directory fsync on an *install* (pulling an object into the local
+working path: `Local.pull`, the S3 `promote_temp`). The source object stays in the store, and SQLite
+itself fsyncs the directory when the first write creates the `-wal`, before any commit can be acked, so
+a lost install is a re-pull; with it the gated `cold_open_p50_us` read +40 %. Also not done: fsyncing
+the lock file's *data* when `Local` creates a lock — a power cut between the create and the next
+writeback can leave a zero-length lock (`:corrupt_lock`, fails closed; `mix fathom.lock.repair`). The
+process-crash version of that window is closed (the lock is `link(2)`ed into place already written).
+Both are recorded with their numbers in `docs/component-notes.md`. The crash tests are
+`test/fathom/shard/crash_durability_test.exs`, on the `Fathom.Test.CrashFS` fault double.
+
 ## Durability never buys split-brain
 
 Every flush **re-checks the lease first** and **self-fences** on a lost lease — a shard that was

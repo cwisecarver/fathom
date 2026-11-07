@@ -25,7 +25,11 @@ defmodule Fathom.Shard.Storage.Local do
       {:ok, etag} ->
         # Atomic (temp + rename) so a concurrent reader never sees a half-copied file (#24).
         # Return the content-hash etag so the coordinator can fence its first flush (#15).
-        case Storage.atomic_copy(remote_path(shard_id), local_path) do
+        #
+        # An INSTALL into the working path (`dir_sync: false`, see `Storage.atomic_copy/3`): the
+        # object stays in the store and SQLite fsyncs the directory when the first write creates the
+        # `-wal`, so a lost rename costs a re-pull, and a directory fsync costs ~550 us per open.
+        case Storage.atomic_copy(remote_path(shard_id), local_path, dir_sync: false) do
           :ok -> {:ok, etag}
           err -> err
         end
@@ -465,7 +469,10 @@ defmodule Fathom.Shard.Storage.Local do
     # to ~35 serial full-shard binaries per shard per run.
     case file_etag(snapshot_path(shard_id, snapshot_id)) do
       {:ok, etag} ->
-        case Storage.atomic_copy(snapshot_path(shard_id, snapshot_id), local_path) do
+        # An install into the working path, like `pull/2`: no directory fsync.
+        case Storage.atomic_copy(snapshot_path(shard_id, snapshot_id), local_path,
+               dir_sync: false
+             ) do
           :ok -> {:ok, etag}
           err -> err
         end
@@ -1065,33 +1072,23 @@ defmodule Fathom.Shard.Storage.Local do
 
   defp create_lock(shard_id, lease) do
     path = lock_path(shard_id)
-    Storage.ensure_dir(Path.dirname(path))
 
-    case File.open(path, [:write, :exclusive]) do
-      {:ok, io} ->
-        # CHECK BOTH RESULTS (expert review 2026-08-20 #31). `IO.binwrite/2` returns
-        # `{:error, :enospc}` / `{:error, :eio}`, and `File.close/1` is where a BUFFERED write's
-        # error actually surfaces. Both were dropped and `{:ok, lease}` returned unconditionally,
-        # so on a full or failing disk the caller believed it held a lease over a ZERO-LENGTH lock
-        # file — which then reads as `:corrupt_lock` for the rest of that tenant's life.
-        #
-        # `write_lock/2` immediately below already carries the comment naming this exact hazard and
-        # routes through `Storage.atomic_write/2`; `create_lock/2` was never given the same
-        # treatment. It cannot simply reuse it: the `:exclusive` open IS the create race (this
-        # backend's equivalent of S3's `PUT If-None-Match: *`), and a temp+rename would clobber a
-        # winner instead of losing to it.
-        #
-        # The partial file is removed on failure so the next acquire takes the clean `:enoent`
-        # path rather than the repair path below.
-        with :ok <- IO.binwrite(io, Storage.encode_lease(lease)),
-             :ok <- File.close(io) do
-          {:ok, lease}
-        else
-          {:error, reason} ->
-            _ = File.close(io)
-            _ = File.rm(path)
-            {:error, reason}
-        end
+    # EXCLUSIVE and never visible empty to a PROCESS crash (expert review 2026-11-07 #83; before
+    # that, 2026-08-20 #31). This was `File.open(path, [:write, :exclusive])` then `binwrite`/`close`:
+    # exclusive, but the name appeared FIRST, so a BEAM kill before the write landed left a
+    # zero-length lock that reads as `:corrupt_lock` and fails the tenant closed until
+    # `mix fathom.lock.repair`. `Storage.atomic_write/2` cannot be used here either: its temp +
+    # rename would CLOBBER a concurrent winner instead of losing to it, and the create race is this
+    # backend's equivalent of S3's `PUT If-None-Match: *`. `Storage.atomic_create/2` writes a temp
+    # and `link(2)`s it to the lock name (`EEXIST` = lost race, as with `O_EXCL`), checking every
+    # step (a full disk fails the create cleanly and leaves no lock behind).
+    #
+    # PARKED: the POWER-LOSS half (fsync the temp before the link) is not done — it costs the Local
+    # double's `cold_open_p50_us` over the 20 % bench gate; see `Storage.atomic_create/2` and
+    # docs/component-notes.md.
+    case Storage.atomic_create(path, Storage.encode_lease(lease)) do
+      :ok ->
+        {:ok, lease}
 
       # Lost the create race — whoever won holds it.
       {:error, :eexist} ->

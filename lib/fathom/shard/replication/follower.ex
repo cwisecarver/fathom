@@ -4420,10 +4420,12 @@ defmodule Fathom.Shard.Replication.Follower do
   # written fsync-then-rename. Off (the default) is unchanged: RAM-ack, durability from replica
   # count.
   #
-  # NOT DONE: an fsync of the DIRECTORY after the rename. The BEAM cannot open a directory for
-  # fsync portably (`:file.open` on a dir is `eisdir`; see `Storage.with_atomic_temp/2`). Losing a
-  # rename to an OS crash leaves the PREVIOUS file (or none), which recovery treats as an older
-  # replica or no replica — never as torn bytes under a whole-looking name.
+  # NOT DONE: an fsync of the DIRECTORY after the seed's `.db`/`-wal` renames. (The earlier reason
+  # given here, that the BEAM cannot open a directory for fsync, was wrong: `Fathom.FS.sync_dir/1`
+  # does it, expert review 2026-11-07 #27, and `Storage.atomic_write/2` now uses it for the state
+  # files below.) Left undone for the seed itself because losing its renames to an OS crash leaves
+  # the PREVIOUS file (or none), which recovery treats as an older replica or no replica — never as
+  # torn bytes under a whole-looking name.
   defp sync_seed_temps(state) do
     if fsync?() do
       with :ok <- :file.datasync(state.db_fd),

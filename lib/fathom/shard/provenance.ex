@@ -29,7 +29,8 @@ defmodule Fathom.Shard.Provenance do
   ## The fixed-width record and the PUT intent (expert review 2026-10-10 #6)
 
   The durable flush used to stamp the sidecar with temp+rename, and a rename is not durable until
-  its directory is fsynced (the BEAM cannot portably do that). A lost rename reverts the sidecar to
+  its directory is fsynced (`Fathom.FS.sync_dir/1` now does that, expert review 2026-11-07 #27;
+  this was written when the BEAM was believed unable to). A lost rename reverts the sidecar to
   the PREVIOUS etag while the object (already PUT) and the local `.db` hold newer, acked writes —
   `Fork` then read `{:diverged, old, new}` and quarantined a good copy. So the flush stamp is now a
   FIXED-WIDTH record overwritten IN PLACE (`pwrite` at offset 0 + `fsync`): no rename, nothing for a

@@ -327,11 +327,17 @@ defmodule Fathom.Shard.Fork do
     dest =
       path <> ".forked.#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
 
-    # The main-file rename is load-bearing; the WAL/SHM companions are best-effort
-    # (promote_pull removes stale ones before landing the pulled object).
-    case Fathom.FS.rename(path, dest) do
+    # THE `-wal`/`-shm` MOVE FIRST, THEN THE `.db`, every result checked (expert review 2026-11-07
+    # #83). The `.db` used to go first with the companions best-effort afterwards: a failed `-wal`
+    # rename (or a crash between the two) left the acked frames beside nothing at the live path,
+    # where the next open's fresh `.db` would see and REPLAY them, or `promote_pull` would drop them
+    # as stale. Companions first means every failure window leaves the `.db` at `path` (the copy is
+    # still served warm, fenced by the provenance etag) and, at worst, an orphan `-wal` NEXT TO the
+    # quarantine name, where it is inert: SQLite never needs a `-wal` without its `.db`. The obvious
+    # alternative, "rename the `.db` first and fall back to removing the companions", destroys
+    # exactly the frames the quarantine exists to preserve.
+    case move_aside(path, dest) do
       :ok ->
-        Enum.each(["-wal", "-shm"], &Fathom.FS.rename(path <> &1, dest <> &1))
         Fathom.FS.rm(Provenance.sidecar_path(path))
 
         cause =
@@ -370,5 +376,55 @@ defmodule Fathom.Shard.Fork do
 
         error
     end
+  end
+
+  # Companions first (see `quarantine_copy!/3`), then the `.db`; on ANY failure everything already
+  # moved goes back, so the result is all-moved or nothing-moved. A companion that does not exist
+  # (`:enoent`: no `-shm` is normal, and a cleanly closed WAL has no `-wal`) is simply absent.
+  @spec move_aside(Path.t(), Path.t()) :: :ok | {:error, term()}
+  defp move_aside(path, dest) do
+    with {:ok, moved} <- move_companions(path, dest, ["-wal", "-shm"], []) do
+      case Fathom.FS.rename(path, dest) do
+        :ok ->
+          :ok
+
+        {:error, _} = error ->
+          roll_back(path, dest, moved)
+          error
+      end
+    end
+  end
+
+  defp move_companions(_path, _dest, [], moved), do: {:ok, moved}
+
+  defp move_companions(path, dest, [suffix | rest], moved) do
+    case Fathom.FS.rename(path <> suffix, dest <> suffix) do
+      :ok ->
+        move_companions(path, dest, rest, [suffix | moved])
+
+      {:error, :enoent} ->
+        move_companions(path, dest, rest, moved)
+
+      {:error, _} = error ->
+        roll_back(path, dest, moved)
+        error
+    end
+  end
+
+  defp roll_back(path, dest, moved) do
+    for suffix <- moved do
+      case Fathom.FS.rename(dest <> suffix, path <> suffix) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.error(
+            "fork quarantine rollback: could not move #{dest <> suffix} back to " <>
+              "#{path <> suffix} (#{inspect(reason)}); the file is preserved at the former name"
+          )
+      end
+    end
+
+    :ok
   end
 end

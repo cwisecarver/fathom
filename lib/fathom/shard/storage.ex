@@ -1669,18 +1669,68 @@ defmodule Fathom.Shard.Storage do
     do: Application.get_env(:fathom, :steal_margin_ms, @default_steal_margin_ms)
 
   @doc """
-  Write `body` to `path` atomically: write a sibling temp file, then `File.rename/2` it into
-  place (atomic on POSIX within a filesystem — the temp sits in `path`'s dir). A crash or a
-  concurrent reader (a warm-cache promotion mid-rewrite) therefore sees either the whole old
-  file or the whole new one, never a torn/half-written object (findings #24/#28). The temp is
-  cleaned up on a write or rename error.
+  Write `body` to `path` atomically AND durably: write a sibling temp file, `fsync` it, `rename` it
+  into place (atomic on POSIX within a filesystem — the temp sits in `path`'s dir), then `fsync` the
+  directory. A crash or a concurrent reader (a warm-cache promotion mid-rewrite) therefore sees
+  either the whole old file or the whole new one, never a torn/half-written object (findings
+  #24/#28), and once this returns `:ok` the new name survives power loss. The temp is cleaned up on
+  a write, fsync or rename error.
   """
   @spec atomic_write(Path.t(), iodata()) :: :ok | {:error, term()}
   def atomic_write(path, body), do: with_atomic_temp(path, &Fathom.FS.write(&1, body))
 
-  @doc "Like `atomic_write/2` but copies `src`'s bytes into `dst` (temp + rename)."
-  @spec atomic_copy(Path.t(), Path.t()) :: :ok | {:error, term()}
-  def atomic_copy(src, dst), do: with_atomic_temp(dst, &File.cp(src, &1))
+  @doc """
+  Like `atomic_write/2` but copies `src`'s bytes into `dst` (temp + rename).
+
+  `dir_sync: false` skips the final directory fsync, for an INSTALL of a copy into a local working
+  path whose source object stays in the store (`Local.pull`, `pull_snapshot`): losing that rename to
+  a power cut costs a re-pull, never data, and SQLite itself fsyncs the directory when the first
+  write creates the `-wal` (os_unix.c: `UNIXFILE_DIRSYNC` on a newly created WAL, so it precedes the
+  first acked commit). Every PUBLISH (the default) keeps it — see `with_atomic_temp/3`.
+  """
+  @spec atomic_copy(Path.t(), Path.t(), keyword()) :: :ok | {:error, term()}
+  def atomic_copy(src, dst, opts \\ []) do
+    with_atomic_temp(
+      dst,
+      fn tmp -> with :ok <- File.cp(src, tmp), do: Fathom.FS.note_written(tmp) end,
+      Keyword.get(opts, :dir_sync, true)
+    )
+  end
+
+  @doc """
+  Create `path` holding `body`, or fail with `{:error, :eexist}` when it already exists — the
+  EXCLUSIVE twin of `atomic_write/2`, for a file whose creation IS the race (`Storage.Local`'s lock:
+  the equivalent of S3's `PUT If-None-Match: *`) and which must never be visible empty.
+
+  The obvious `File.open(path, [:write, :exclusive])` + write is exclusive but publishes the NAME
+  first: a BEAM kill between the open and the write leaves a zero-length file, which the lock reader
+  calls `:corrupt_lock` and the tenant then fails closed until an operator repairs it (expert review
+  2026-11-07 #83). And `atomic_write/2`'s temp + `rename` is atomic but not exclusive: it would
+  clobber a concurrent winner instead of losing to it. So: write a temp, then `link(2)` it to the
+  final name (`EEXIST` is the lost race, exactly as with `O_EXCL`) and drop the temp name. The name
+  therefore only ever appears together with all of its bytes. Needs a filesystem with hard links
+  (every one the Local backend is documented for); a link failure other than `:eexist` is returned
+  as an error, never swallowed.
+
+  NO FSYNC, deliberately, so this closes the PROCESS-crash window only. The power-loss half of #83
+  (fsync the temp before the link, so a lost data write cannot leave the new name over zero bytes)
+  was built and measured: on APFS it takes `create` from ~75 us to ~560 us (+ ~1 ms with the
+  directory fsync), and the Local-double `cold_open_p50_us` is +39 % on it (1239 -> 1729 us, one
+  run), over the bench gate. It is parked with those numbers in `docs/component-notes.md`.
+  """
+  @spec atomic_create(Path.t(), iodata()) :: :ok | {:error, :eexist | term()}
+  def atomic_create(path, body) do
+    ensure_dir(Path.dirname(path))
+    tmp = "#{path}.tmp.#{System.unique_integer([:positive])}"
+
+    result =
+      with :ok <- Fathom.FS.write(tmp, body), do: Fathom.FS.link(tmp, path)
+
+    # Success or not, the temp name has served its purpose. A failed rm leaves a stale `.tmp.`
+    # sibling the temp reaper takes, never a wrong lock.
+    _ = Fathom.FS.rm(tmp)
+    result
+  end
 
   # Materialize into a sibling temp, then atomically rename into `dst`; drop the temp on error.
   #
@@ -1690,16 +1740,35 @@ defmodule Fathom.Shard.Storage do
   # local file would then be adopted as authoritative on reboot (`warm?` ⇒ dirty) and
   # flushed over the good stored object with a valid If-Match — the corruption becomes
   # the durable truth. With the data fsynced first, a power cut yields whole-old (rename
-  # not yet persisted) or whole-new, never torn. Persisting the rename itself would need
-  # a directory fsync, which the BEAM can't do portably (`:file.open` on a dir is
-  # eisdir); losing the rename only re-exposes the old object, which is safe.
-  defp with_atomic_temp(dst, produce) do
-    ensure_dir(Path.dirname(dst))
+  # not yet persisted) or whole-new, never torn.
+  #
+  # The DIRECTORY is fsynced AFTER the rename when `dir_sync?` (expert review 2026-11-07 #27). This
+  # comment used to say a directory fsync was impossible on the BEAM (`:file.open` on a dir is
+  # eisdir) and that "losing the rename only re-exposes the old object, which is safe". Both
+  # halves were wrong: `Fathom.FS.sync_dir/1` opens a directory with the `:directory` mode, and a
+  # lost rename is NOT safe on a PUBLISH — `Local.flush` returns `:ok` after this, the coordinator
+  # then unlinks the only other copy and releases the lease, and a power cut inside the
+  # journal-commit window reverts the rename: the previous object returns, the local copy is gone,
+  # and everything since the previous flush was reported durable and is lost. Fault-injected by
+  # `Fathom.Test.CrashFS`.
+  #
+  # It is NOT done for an INSTALL (`dir_sync?` false: `Local.pull`, see `atomic_copy/3`, and
+  # `promote_temp/2`). The review asked for it there too; that was measured and is not needed. Cost:
+  # +550 us per atomic write on APFS (a dir fsync after a rename costs about as much as the file
+  # fsync before it) and the gated `cold_open_p50_us` +40 % (1239 -> 1729 us) with it on the pull
+  # and the lock create. Need: none for acked data — the installed file only matters once a write
+  # is acked, SQLite fsyncs the directory when that first write creates the `-wal`, and the source
+  # object is untouched, so a lost install is a re-pull. The obvious-looking "fsync the directory
+  # everywhere" is therefore wrong on the cold-open path; do not re-add it there without a bench.
+  defp with_atomic_temp(dst, produce, dir_sync? \\ true) do
+    dir = Path.dirname(dst)
+    ensure_dir(dir)
     tmp = "#{dst}.tmp.#{System.unique_integer([:positive])}"
 
     with :ok <- produce.(tmp),
-         :ok <- sync_file(tmp),
-         :ok <- Fathom.FS.rename(tmp, dst) do
+         :ok <- Fathom.FS.sync_file(tmp),
+         :ok <- Fathom.FS.rename(tmp, dst),
+         :ok <- if(dir_sync?, do: Fathom.FS.sync_dir(dir), else: :ok) do
       :ok
     else
       {:error, _} = err ->
@@ -1718,8 +1787,25 @@ defmodule Fathom.Shard.Storage do
   """
   @spec ensure_dir(Path.t()) :: :ok
   def ensure_dir(dir) do
-    unless Fathom.FS.dir?(dir), do: File.mkdir_p!(dir)
+    unless Fathom.FS.dir?(dir) do
+      created = missing_levels(dir, [])
+      File.mkdir_p!(dir)
+
+      # A directory's own entry is a journaled change in ITS parent: without this, a file fsynced
+      # (and dir-fsynced) inside a freshly created `tombstones/` can vanish with the directory
+      # (expert review 2026-11-07 #27). Only on the creation path, so the steady state stays the one
+      # `dir?` stat. Best-effort: a failure here resurfaces as the failed `sync_dir/1` of the write
+      # that follows, which is on the same filesystem.
+      for d <- created, do: Fathom.FS.sync_dir(Path.dirname(d))
+    end
+
     :ok
+  end
+
+  # The directories `mkdir_p` is about to create, outermost first.
+  defp missing_levels(dir, acc) do
+    parent = Path.dirname(dir)
+    if parent == dir or Fathom.FS.dir?(dir), do: acc, else: missing_levels(parent, [dir | acc])
   end
 
   @doc """
@@ -1734,12 +1820,18 @@ defmodule Fathom.Shard.Storage do
   Linux in the colima VM 0.42 / 1.28 ms — about 1–5% of a 26–133 ms S3 cold open, under the
   finding's 10% bar, so it was left in place. Unmeasured: a throughput-capped network volume
   (EBS gp3), where a large pull's fsync scales with the bytes still unwritten.
+
+  NO DIRECTORY FSYNC here (expert review 2026-11-07 #27 recommended one): this is an install, the
+  pulled object stays in the store, and SQLite fsyncs the directory when the first write creates the
+  `-wal`, before any commit can be acked. Rationale and numbers in `with_atomic_temp/3`.
   """
   @spec promote_temp(Path.t(), Path.t()) :: :ok | {:error, term()}
   def promote_temp(tmp, dst) do
     ensure_dir(Path.dirname(dst))
+    # The caller streamed these bytes in without fsync; tell the fault hook (a no-op in prod).
+    Fathom.FS.note_written(tmp)
 
-    with :ok <- sync_file(tmp),
+    with :ok <- Fathom.FS.sync_file(tmp),
          :ok <- Fathom.FS.rename(tmp, dst) do
       :ok
     else
@@ -2252,18 +2344,6 @@ defmodule Fathom.Shard.Storage do
     case Fathom.FS.stat(path, time: :posix) do
       {:ok, %File.Stat{mtime: mtime}} -> mtime < cutoff
       _ -> false
-    end
-  end
-
-  defp sync_file(path) do
-    case :file.open(path, [:read, :write, :raw, :binary]) do
-      {:ok, fd} ->
-        result = :file.sync(fd)
-        :ok = :file.close(fd)
-        result
-
-      {:error, _} = err ->
-        err
     end
   end
 
