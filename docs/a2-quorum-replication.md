@@ -360,6 +360,17 @@ supply `quorum+1`. Liveness still never filters the push set — the staleness w
 A membership change is not free: a newly added follower holds no base copy, so its first push
 rejects and triggers a seed **per shard**, over the one socket that also carries every other shard.
 
+A tenant commit is acked only on bytes it knows were read and shipped (expert review 2026-11-07
+#10, #17). Two states used to read as "nothing left to ship" and so acked `:ok`: a **blind
+wal-index** (the `-shm` unreadable for the round, so `Wal.read_held/2` could only repeat the
+cursor's old extent) and an **empty published follower set** (`Fleet.shippers/0 == []` during a
+Fleet restart or orderly stop). A tenant round now re-reads a blind header a few times and then
+fails `{:error, :wal_index_unreadable}` (retryable 503, `QuorumFence` marked); a blind header is
+never "covered" for a checkpoint or an idle close; and a tenant commit is refused
+`{:no_quorum, :impossible}` unless more than `Q` followers are published. Zero followers is not a
+valid single-node configuration with replication on (`Fleet.validate_quorum!/0` refuses the boot).
+Catch-up and idle-close rounds, which ack nobody, keep the old hold.
+
 ## The gap this closes
 
 A **process** crash (BEAM death, OOM kill, redeploy) loses nothing, and that does not depend on

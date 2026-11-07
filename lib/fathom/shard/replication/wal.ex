@@ -40,11 +40,17 @@ defmodule Fathom.Shard.Replication.Wal do
   # Both byte-order variants of the WAL magic. Anything else is not a WAL header we understand.
   @magics [0x377F0682, 0x377F0683]
 
+  # `blind` is present only on a `read_held/2` header read while the wal-index was unusable: how many
+  # CONSECUTIVE rounds, so `commit_extent` is the cursor's OLD extent, a deliberate under-claim (see
+  # `walk_or_hold/6`). Absent means `commit_extent` was read from the index (or walked). A header
+  # with `blind` says nothing about frames committed since the cursor was taken, so it is not a
+  # proof that anything is covered (expert review 2026-11-07 #10; `Session.read_commit_header/3`).
   @type header :: %{
-          ckpt_seq: non_neg_integer(),
-          salt1: non_neg_integer(),
-          size: non_neg_integer(),
-          commit_extent: non_neg_integer()
+          required(:ckpt_seq) => non_neg_integer(),
+          required(:salt1) => non_neg_integer(),
+          required(:size) => non_neg_integer(),
+          required(:commit_extent) => non_neg_integer(),
+          optional(:blind) => non_neg_integer()
         }
 
   @doc """
@@ -662,8 +668,12 @@ defmodule Fathom.Shard.Replication.Wal do
 
     # `size` is the stat taken before the index read; a commit published in between can put the
     # extent past it. Its frames are on disk (published ⇒ written), so report the larger.
-    {:ok, %{ckpt_seq: seq, salt1: salt1, size: max(size, extent), commit_extent: extent},
-     %{handle | cursor: cursor}}
+    header = %{ckpt_seq: seq, salt1: salt1, size: max(size, extent), commit_extent: extent}
+
+    # The key exists ONLY on a blind read, so the readable-index path returns exactly the map
+    # `read/2` does (pinned by `wal_held_fd_test`'s "read shapes still match") and pays nothing.
+    header = if blind > 0, do: Map.put(header, :blind, blind), else: header
+    {:ok, header, %{handle | cursor: cursor}}
   end
 
   # The index extent for a WAL header just read, or nil to fall back to the walk. `index` was read

@@ -882,6 +882,24 @@ defmodule Fathom.Shard.Replication.Session do
   defp do_commit(wal_path, state, deadline, mode) do
     state = %{state | commits: state.commits + 1}
 
+    # A TENANT COMMIT NEEDS MORE THAN Q PUBLISHED FOLLOWERS TO BE ACKED (expert review 2026-11-07
+    # #17). `ship_planned/5` reads "no plans" for BOTH "every follower already holds the extent" and
+    # "there are no followers", and answers the first with an ack, so an empty published set
+    # (`Fleet.init/1`'s `publish([])` before `Membership` publishes, `Membership.terminate/2`'s
+    # retraction while the Session tree is still up) acked a write held on this node's disk alone.
+    # The policy is not in doubt: with replication on, `Fleet.validate_quorum!/0` refuses a boot with
+    # no followers and `Membership` refuses any set of `q` or fewer, so a set this small is only ever
+    # a transient window, never a configuration — and a tenant write in it is refused, not acked.
+    # (`Quorum.new/2` would also have RAISED inside the commit for `0 < n <= q`; this answers it
+    # the same way.) Catch-up / idle-close cycles ack nobody and keep their old behaviour.
+    if mode == :checkpoint and length(shippers()) <= quorum() do
+      {:reply, {:error, {:no_quorum, :impossible}}, state}
+    else
+      do_commit_round(wal_path, state, deadline, mode)
+    end
+  end
+
+  defp do_commit_round(wal_path, state, deadline, mode) do
     case with_epoch(state) do
       {:error, reason} ->
         {:reply, {:error, reason}, state}
@@ -1604,7 +1622,7 @@ defmodule Fathom.Shard.Replication.Session do
     do: ship(state, wal_path, epoch, deadline, mode, %{}, nil)
 
   defp ship(state, wal_path, epoch, deadline, mode, seen, target) do
-    case Wal.read_held(state.wal_fd, wal_path) do
+    case read_commit_header(state.wal_fd, wal_path, mode) do
       {:ok, header, fd} ->
         state = %{state | wal_fd: fd} |> note_header(header)
 
@@ -1678,6 +1696,45 @@ defmodule Fathom.Shard.Replication.Session do
 
       {:error, reason, fd} ->
         read_failed(%{state | wal_fd: fd}, reason)
+    end
+  end
+
+  # THE HEADER A TENANT COMMIT ACKS AGAINST MUST BE THE INDEX'S (expert review 2026-11-07 #10).
+  # `Wal.read_held/2` answers an unusable wal-index with the cursor's OLD extent (`blind > 0`, see
+  # `Wal.walk_or_hold/6`) — a safe under-claim for "what to ship next", and for the catch-up and
+  # idle-close cycles, which ack nobody. For a tenant commit it is the opposite of safe: frames
+  # `(E_old, E_new]` that this caller's COMMIT just wrote are neither read nor shipped, every
+  # follower already sits at `E_old`, so `Primary.plan/3` plans `:nothing` and `ack_if_owned/1`
+  # replies `:ok` — "quorum-durable" for bytes no replica has; and the pinned checkpoint's header
+  # (`covered?/2`) then backfills them too. So a tenant round re-reads a few times (the torn window
+  # of the index is sub-microsecond) and otherwise FAILS the commit — retryable 503 plus a
+  # `QuorumFence` mark in the executor, the commit being locally durable — rather than acking it.
+  #
+  # WHAT ELSE WAS CONSIDERED AND IS WRONG: walking the WAL for the extent here. The walk trusts a
+  # frame HEADER and over-counts a torn frame (`Wal.walk_or_hold/6`, round-4 durability review F2),
+  # the very hazard the hold exists to avoid; and dropping the hold would make every transient
+  # index tear a torn-frame ship. Each re-read also spends one of `Wal`'s `@max_blind` rounds, so a
+  # PERMANENTLY unusable index still degrades to the walk after a few failed commits — the existing
+  # "never expected" fallback — instead of failing every write forever.
+  @blind_retries 3
+
+  defp read_commit_header(fd, wal_path, :checkpoint),
+    do: read_unblinded(fd, wal_path, @blind_retries)
+
+  defp read_commit_header(fd, wal_path, _mode), do: Wal.read_held(fd, wal_path)
+
+  defp read_unblinded(fd, wal_path, retries) do
+    case Wal.read_held(fd, wal_path) do
+      {:ok, %{blind: blind}, fd} when blind > 0 ->
+        if retries > 0 do
+          :erlang.yield()
+          read_unblinded(fd, wal_path, retries - 1)
+        else
+          {:error, :wal_index_unreadable, fd}
+        end
+
+      other ->
+        other
     end
   end
 
@@ -2807,6 +2864,12 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
+  # A BLIND HEADER IS NOT A MEASUREMENT OF THE WAL (expert review 2026-11-07 #10): its extent is the
+  # cursor's old one, so "a quorum holds it" says nothing about the frames committed since. A
+  # checkpoint decided on it would backfill frames no replica holds. Only the catch-up and
+  # idle-close cycles can leave one here (a tenant round refuses it, `read_commit_header/3`).
+  defp checkpoint_verdict(%{last_header: %{blind: blind}}) when blind > 0, do: :skip
+
   defp checkpoint_verdict(%{last_header: %{commit_extent: e} = header} = state) do
     cond do
       covered?(state, header) ->
@@ -2942,6 +3005,7 @@ defmodule Fathom.Shard.Replication.Session do
   # Does a write quorum of followers hold everything up to `header`'s commit extent, in its
   # generation? Read from the per-follower ack positions, so it means exactly "acked".
   defp covered?(_state, :empty), do: true
+  defp covered?(_state, %{blind: blind}) when blind > 0, do: false
 
   defp covered?(state, %{ckpt_seq: gen, salt1: salt, commit_extent: extent}) do
     held =

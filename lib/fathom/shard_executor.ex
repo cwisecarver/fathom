@@ -1123,7 +1123,11 @@ defmodule Fathom.ShardExecutor do
   end
 
   defp no_quorum_reason({:no_quorum, why}), do: no_quorum_reason(why)
-  defp no_quorum_reason(why) when why in [:impossible, :catching_up, :timeout], do: why
+
+  defp no_quorum_reason(why)
+       when why in [:impossible, :catching_up, :timeout, :wal_index_unreadable],
+       do: why
+
   defp no_quorum_reason({:session_down, :timeout}), do: :timeout
   defp no_quorum_reason(_), do: :other
 
