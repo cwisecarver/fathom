@@ -211,4 +211,59 @@ defmodule Fathom.ShardExecutorHostRoutingTest do
       assert resolve("acme.one.example", "one.example") == "acme"
     end
   end
+
+  # Expert review 2026-11-07 #40. The zone match used Unicode `String.downcase/1`, which folds the
+  # KELVIN SIGN (U+212A) to `k`: `acme.fathom.networ<U+212A>` resolved to shard `acme` here, while
+  # the LB — nginx's `$host` lowercases ASCII only, Bandit rejects only CR/LF/NUL — hashed that Host
+  # to a DIFFERENT backend (and missed any LB pin entry for `acme`). A routing differential between
+  # LB and node, so it is gated like any routing change: shard A must never resolve through a Host
+  # the LB does not consider to be A's. (This table's oracle above keeps the old Unicode fold; none
+  # of ITS hosts contain a character whose Unicode and ASCII folds differ, so the two still agree
+  # there, and the cases below are the deliberate divergence.)
+  describe "Host identity is ASCII-only (expert review 2026-11-07 #40)" do
+    @network "fathom.network"
+
+    test "the Kelvin sign in the ZONE does not fold to k: the Host resolves to NO shard" do
+      kelvin = "fathom.networ\u212A"
+
+      # Precondition: the premise of the finding — Unicode folding DOES equal the zone.
+      assert String.downcase(kelvin) == @network
+      refute String.downcase(kelvin, :ascii) == @network
+
+      assert resolve("acme." <> kelvin, @network) == nil
+      assert resolve("ACME." <> kelvin, @network) == nil
+      # The byte-exact ASCII Host still resolves.
+      assert resolve("acme.fathom.network", @network) == "acme"
+    end
+
+    test "a configured zone containing the Kelvin sign is not folded either" do
+      assert resolve("acme.fathom.networ\u212A", "fathom.networ\u212A") == "acme"
+      assert resolve("acme.fathom.network", "fathom.networ\u212A") == nil
+    end
+
+    test "cross-shard/zone isolation: every shard resolves only through its own byte-exact Host" do
+      hosts = %{
+        "a.fathom.network" => "a",
+        "b.fathom.network" => "b",
+        "A.Fathom.Network" => "a",
+        "b.fathom.networ\u212A" => nil,
+        "a.fathom.networ\u212A" => nil,
+        "a.FATHOM.NETWOR\u212A" => nil,
+        # A Cyrillic е in the sub-label is not the shard `acme`, and not any shard.
+        "acm\u0435.fathom.network" => nil,
+        "a.other.network" => nil
+      }
+
+      for {host, expected} <- hosts do
+        assert resolve(host, @network) == expected, inspect(host)
+      end
+
+      # And no host in the table maps `a` to `b` or vice versa.
+      resolved = for {host, _} <- hosts, id = resolve(host, @network), do: {host, id}
+
+      assert Enum.all?(resolved, fn {host, id} ->
+               String.downcase(hd(String.split(host, ".")), :ascii) == id
+             end)
+    end
+  end
 end

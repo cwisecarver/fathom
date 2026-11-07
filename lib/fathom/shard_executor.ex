@@ -2141,7 +2141,16 @@ defmodule Fathom.ShardExecutor do
   # has no empty label before it is compared). `{:zone, z}` is the lowercased, dot-trimmed zone.
   defp zone_matches?(rest, :any), do: rest != "" and not empty_label?(rest)
   defp zone_matches?(_rest, :none), do: false
-  defp zone_matches?(rest, {:zone, zone}), do: String.downcase(rest) == zone
+
+  # ASCII-only, byte-exact after lowercasing A-Z (expert review 2026-11-07 #40). `String.downcase/1`
+  # is Unicode: `String.downcase("fathom.networ\u212A") == "fathom.network"` (KELVIN SIGN folds to
+  # `k`), so `Host: acme.fathom.networ<U+212A>` resolved to shard `acme` HERE while the LB — nginx's
+  # `$host` lowercases ASCII only, and Bandit rejects only CR/LF/NUL in a header — hashed that Host
+  # to a DIFFERENT backend and missed any LB pin entry for `acme`. No data is read across tenants
+  # (the lease and the epoch fence still hold), but the node then served a shard it was not routed
+  # (extra lease contention, a rebalancer-pin bypass). The two sides must agree on Host identity, and
+  # the LB's is ASCII.
+  defp zone_matches?(rest, {:zone, zone}), do: String.downcase(rest, :ascii) == zone
 
   # The previous implementation required EVERY label of the host non-empty; for the unanchored
   # (`:any`) case that still means no ".." and no leading dot in `rest`.
@@ -2184,7 +2193,7 @@ defmodule Fathom.ShardExecutor do
       normalized ->
         if "" in String.split(normalized, "."),
           do: :none,
-          else: {:zone, String.downcase(normalized)}
+          else: {:zone, String.downcase(normalized, :ascii)}
     end
   end
 
