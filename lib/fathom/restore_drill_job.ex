@@ -175,6 +175,7 @@ defmodule Fathom.RestoreDrillJob do
 
   defp drill_one(%{shard_id: id, schema_version: schema_version} = shard) do
     status = id |> verify(schema_version) |> classify_absent(Map.get(shard, :last_flushed_at))
+    note_absent_active(status, shard)
 
     # Snapshot verdicts reach the DURABLE column too (expert review 2026-08-26 #37).
     #
@@ -217,6 +218,36 @@ defmodule Fathom.RestoreDrillJob do
   # can only yield a false negative (stays :absent), never a false :lost (D5).
   defp classify_absent(:absent, %DateTime{}), do: :lost
   defp classify_absent(status, _), do: status
+
+  # An ABSENT object with a NULL `last_flushed_at` is `:absent`, not `:lost` — deliberately (D5): a
+  # shard whose flush stamp was dropped (the Recorder's buffer is best-effort) and whose object then
+  # vanished is indistinguishable from a brand-new tenant that never flushed, and a false `:lost`
+  # trains operators to ignore the alarm. But "never flushed" has a bound: a tenant that stayed active
+  # for longer than a flush interval after it was created HAS flushed, so an absent object there is
+  # suspicious. Reported as a metric and a log line, never as a failure (expert review 2026-11-07
+  # #67): `[:fathom, :restore_drill, :absent_active]`.
+  defp note_absent_active(:absent, %{
+         shard_id: id,
+         last_flushed_at: nil,
+         last_active_at: %DateTime{} = active,
+         inserted_at: %DateTime{} = born
+       }) do
+    window_ms = Application.get_env(:fathom, :shard_flush_interval_ms, 5_000)
+
+    if DateTime.diff(active, born, :millisecond) > window_ms do
+      Logger.warning(
+        "restore drill: #{id} has NO stored object and no flush stamp, but was active " <>
+          "#{DateTime.diff(active, born, :second)}s after it was created — a lost object whose " <>
+          "flush stamp was dropped looks exactly like this"
+      )
+
+      :telemetry.execute([:fathom, :restore_drill, :absent_active], %{count: 1}, %{})
+    end
+
+    :ok
+  end
+
+  defp note_absent_active(_status, _row), do: :ok
 
   defp worst_status(:ok, :ok), do: :ok
   defp worst_status(:ok, other), do: other
@@ -563,7 +594,10 @@ defmodule Fathom.RestoreDrillJob do
     # ledgers had drifted. `drill_one/1` already stamps `last_verify_status`; the full drill must too,
     # or the loudest DR gate is blind to the failure this leg exists to find. Mirrors `drill_one`:
     # records whatever it found (point-in-time, same shared column semantics).
-    Directory.record_verification(id, Atom.to_string(status))
+    # `keep_failure: true`: this verdict is the WEAKER one (see `Directory.record_verification/3`), so
+    # it must never overwrite a failure the read drill — or a snapshot verdict only it computes —
+    # stored for the same shard (expert review 2026-11-07 #67). A failure it finds itself still lands.
+    Directory.record_verification(id, Atom.to_string(status), keep_failure: true)
 
     :telemetry.execute(
       [:fathom, :restore_drill, :full_result],

@@ -367,6 +367,125 @@ defmodule Fathom.RestoreDrillJobTest do
     assert fetch(id).last_verify_status == "lost"
   end
 
+  # Expert review 2026-11-07 #67(b) (tenant-lifecycle#7). `absent` with a NULL `last_flushed_at` is the
+  # benign "brand-new tenant" by design (D5: the Recorder's flush stamp is best-effort, and a false
+  # `:lost` trains operators to ignore the alarm), so it stays `:absent` and a non-failure. But a row
+  # that stayed ACTIVE for longer than a flush interval after it was created has flushed, so its
+  # missing object is suspicious: surfaced as `[:fathom, :restore_drill, :absent_active]`.
+  describe "an absent object on a row that was active long after creation (expert review 2026-11-07 #67)" do
+    defp attach_absent_active do
+      ref = make_ref()
+      test = self()
+
+      :telemetry.attach(
+        {__MODULE__, :absent_active, ref},
+        [:fathom, :restore_drill, :absent_active],
+        fn _e, m, _meta, _ -> send(test, {:absent_active, ref, m}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach({__MODULE__, :absent_active, ref}) end)
+      ref
+    end
+
+    defp set_times!(id, inserted_at, last_active_at) do
+      {1, _} =
+        Fathom.Repo.update_all(from(s in DirShard, where: s.shard_id == ^id),
+          set: [inserted_at: inserted_at, last_active_at: last_active_at]
+        )
+    end
+
+    test "is reported as :absent_active but stays :absent (not a failure)", %{id: id} do
+      {:ok, _} = Directory.resolve(id)
+      born = DateTime.add(DateTime.utc_now(), -3600, :second)
+      set_times!(id, born, DateTime.add(born, 1800, :second))
+      row = fetch(id)
+      assert row.last_flushed_at == nil, "fixture: the flush stamp was lost"
+      assert {:ok, nil} = Storage.object_etag(id), "fixture: the object must be absent"
+
+      ref = attach_absent_active()
+      assert {:ok, %{absent: 1}} = RestoreDrillJob.run_drill(10)
+
+      assert_received {:absent_active, ^ref, %{count: 1}}
+      assert fetch(id).last_verify_status == "absent"
+    end
+
+    test "a genuinely brand-new row (active only within a flush interval) is silent", %{id: id} do
+      {:ok, _} = Directory.resolve(id)
+      born = DateTime.add(DateTime.utc_now(), -3600, :second)
+      set_times!(id, born, DateTime.add(born, 1, :second))
+
+      ref = attach_absent_active()
+      assert {:ok, %{absent: 1}} = RestoreDrillJob.run_drill(10)
+
+      refute_received {:absent_active, ^ref, _}
+    end
+  end
+
+  # Expert review 2026-11-07 #67(a). `perform/1` runs the read drill and then the full drill, and for
+  # a shard in BOTH samples the full drill's `restore_one` recorded its own verdict over the read
+  # drill's. The full drill's `ok` is the weaker one ("the fork copied and `count(*)` per table
+  # matched" — answerable from the smallest index b-tree without reading a table data page), so a
+  # corrupt tenant read `ok` in the durable column the DR audit query reads.
+  #
+  # The fixture is the repo's own "index/table divergence" object: `integrity_check` fails while
+  # `quick_check` — and `count(*)` — pass (asserted below, per AGENTS.md's fixture rule).
+  test "the full drill never overwrites a stored failure with its weaker ok", %{id: id} do
+    seed(id, [
+      "CREATE TABLE t (a INTEGER, b INTEGER)",
+      "CREATE INDEX i ON t (a)",
+      "INSERT INTO t VALUES (1, 2)",
+      "INSERT INTO t VALUES (3, 4)"
+    ])
+
+    path = Path.join(remote_dir(), "#{id}.db")
+    {:ok, conn} = Fathom.Shard.Connection.open(path)
+    :ok = Fathom.Shard.Connection.exec(conn, "PRAGMA writable_schema=ON")
+
+    {:ok, _} =
+      Fathom.Shard.Connection.query(
+        conn,
+        "UPDATE sqlite_master SET sql='CREATE INDEX i ON t (b)' WHERE name='i'",
+        []
+      )
+
+    :ok = Fathom.Shard.Connection.exec(conn, "PRAGMA writable_schema=OFF")
+    Fathom.Shard.Connection.close(conn)
+
+    assert {:ok, [["ok"]]} == quick_check(path), "fixture: quick_check must be blind to it"
+
+    # Fixture: the FULL drill, on its own, cannot see it — it reports ok. This is what makes the
+    # overwrite below a defect rather than a correct re-verification.
+    assert {:ok, %{ok: 1}} = RestoreDrillJob.run_full_drill(10)
+    assert fetch(id).last_verify_status == "ok"
+
+    # The read drill finds it...
+    assert {:ok, %{corrupt: 1}} = RestoreDrillJob.run_drill(10)
+    assert fetch(id).last_verify_status == "corrupt"
+
+    # ...and the full drill, running right after it in the same `perform/1`, must not undo that.
+    assert {:ok, %{ok: 1}} = RestoreDrillJob.run_full_drill(10)
+
+    assert fetch(id).last_verify_status == "corrupt",
+           "the full drill's weaker ok replaced the read drill's corrupt verdict"
+  end
+
+  test "the full drill still records its OWN failures over an ok", %{id: id} do
+    seed(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
+    assert {:ok, %{ok: 1}} = RestoreDrillJob.run_drill(10)
+    assert fetch(id).last_verify_status == "ok"
+
+    # `keep_failure` only protects an existing failure from an ok; a failure always lands.
+    assert 1 == Directory.record_verification(id, "restored_mismatch", keep_failure: true)
+    assert fetch(id).last_verify_status == "restored_mismatch"
+
+    # And a fresh (never verified) row takes the full drill's ok.
+    other = id <> "b"
+    {:ok, _} = Directory.resolve(other)
+    assert 1 == Directory.record_verification(other, "ok", keep_failure: true)
+    assert fetch(other).last_verify_status == "ok"
+  end
+
   test "the full-drill scratch id is digits-only (reserved shape) and not unique_integer-based" do
     a = RestoreDrillJob.scratch_id()
     assert Directory.scratch_id?(a)

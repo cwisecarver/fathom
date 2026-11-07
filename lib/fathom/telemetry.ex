@@ -924,6 +924,11 @@ defmodule Fathom.Telemetry do
         description:
           "Automated restore-drill outcomes by status (#24): ok / corrupt / schema_mismatch / sentinel / absent / error. A durable object is fathom's only copy of a cold-tail tenant — corrupt/schema_mismatch/error means it's bad or unreachable and would surface only when the tenant returns; alert on those"
       ),
+      counter("fathom.restore_drill.absent_active.count",
+        event_name: [:fathom, :restore_drill, :absent_active],
+        description:
+          "Shards the drill found with NO stored object and NO `last_flushed_at`, but that stayed active for longer than a flush interval after they were created (expert review 2026-11-07 #67). Such a row reads as the benign `absent` (a brand-new tenant) by design, because a dropped flush stamp must not raise a false `lost`; but a tenant that was active that long HAS flushed, so this is the candidate for a lost object whose stamp was lost with it. A metric, not a failure — investigate any sustained non-zero rate"
+      ),
 
       # Birth failure — the tenant that exists but has NO SCHEMA.
       #

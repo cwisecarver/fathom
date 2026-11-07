@@ -519,7 +519,9 @@ defmodule Fathom.Directory do
           %{
             shard_id: String.t(),
             schema_version: non_neg_integer(),
-            last_flushed_at: DateTime.t() | nil
+            last_flushed_at: DateTime.t() | nil,
+            last_active_at: DateTime.t() | nil,
+            inserted_at: DateTime.t()
           }
         ]
   def sample_for_drill(n) when is_integer(n) and n > 0 do
@@ -532,7 +534,11 @@ defmodule Fathom.Directory do
       select: %{
         shard_id: s.shard_id,
         schema_version: s.schema_version,
-        last_flushed_at: s.last_flushed_at
+        last_flushed_at: s.last_flushed_at,
+        # With `inserted_at`, the drill's `:absent_active` signal (expert review 2026-11-07 #67): an
+        # absent object on a row that was active long after it was born.
+        last_active_at: s.last_active_at,
+        inserted_at: s.inserted_at
       }
     )
     # Never sample a scratch fork (#27): drilling a throwaway is wasted, and a LEAKED one
@@ -858,13 +864,25 @@ defmodule Fathom.Directory do
   sampling weight) and `last_verify_status` (queryable durably). Returns how many rows were updated
   (0 if the shard is gone). Best-effort — never raises the caller.
   """
-  @spec record_verification(String.t(), String.t()) :: non_neg_integer()
-  def record_verification(shard_id, status) when is_binary(status) do
+  @spec record_verification(String.t(), String.t(), keyword()) :: non_neg_integer()
+  def record_verification(shard_id, status, opts \\ []) when is_binary(status) do
     now = DateTime.utc_now()
+    query = from(s in Shard, where: s.shard_id == ^shard_id)
+
+    # `keep_failure: true` (the FULL drill, expert review 2026-11-07 #67): an `"ok"` never replaces a
+    # stored failure. The full drill's `ok` only says "the fork copied, `count(*)` per table matched
+    # and the ledger is consistent" — `count(*)` can be answered from the smallest index b-tree
+    # without reading a table data page, so it proves nothing the read drill's `integrity_check`
+    # (and its snapshot verdicts, which the full drill never looks at) did not already disprove. It
+    # used to overwrite the read drill's `corrupt` a minute later, and the DR audit query that reads
+    # this column then saw `ok` for a corrupt tenant. A non-ok status still always lands.
+    query =
+      if status == "ok" and Keyword.get(opts, :keep_failure, false),
+        do: from(s in query, where: is_nil(s.last_verify_status) or s.last_verify_status == "ok"),
+        else: query
 
     {count, _} =
-      from(s in Shard, where: s.shard_id == ^shard_id)
-      |> Repo.update_all(
+      Repo.update_all(query,
         set: [last_verified_at: now, last_verify_status: status, updated_at: now]
       )
 
