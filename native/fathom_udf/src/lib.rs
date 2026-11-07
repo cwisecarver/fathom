@@ -36,10 +36,23 @@
 //!
 //! Extension loading is a privileged capability on a multi-tenant engine, so `Fathom.Shard
 //! .Connection` enables it, loads exactly this file, and **disables it again before any tenant SQL
-//! runs**. A tenant calling `load_extension(...)` afterwards gets `not authorized`. Every function
-//! here is pure: no filesystem, no network, no process state. They are registered
-//! `SQLITE_INNOCUOUS` because that is true, which also lets them appear in views and expression
-//! indexes the way Django expects.
+//! runs**. A tenant calling `load_extension(...)` afterwards gets `not authorized`.
+//!
+//! **What the functions are** (expert review 2026-11-07 #89; the complete table with every flag is in
+//! `docs/component-notes.md`). The Django set — `django_*`, `LPAD`/`RPAD`/`REPEAT`/`REVERSE`, the
+//! hashes, `regexp`, `BITXOR`, `COT` and the aggregates — is pure: no filesystem, no network, no
+//! node state a statement can observe (`regexp` keeps a bounded compiled-pattern cache that changes
+//! cost, never the answer). Those are registered `SQLITE_INNOCUOUS`, which also lets them appear in
+//! views and expression indexes the way Django expects. The rest of the extension is NOT pure and
+//! is not claimed to be: `UUIDV4`/`UUIDV7`/`RAND` read the OS RNG and clock (not deterministic);
+//! the `fathom_*` readers report, and `fathom_fk_on` changes, the CALLING connection's own state
+//! (flagged `INNOCUOUS` because a tenant already reaches the same facts through `PRAGMA`s it is
+//! allowed — SQLite's definition of the flag also says "no side effects", which `fathom_fk_on` does
+//! not strictly meet); the replicated-file registry, the pragma-guard policy table, the
+//! auto-extension registration and the commit/trace/busy/progress/authorizer handlers are
+//! node-global or connection mutable state, and every function that installs or changes them is
+//! `SQLITE_DIRECTONLY` (the node-global setters are further registered only on the control
+//! connection that never runs tenant SQL). `wal::canonical` also calls `std::fs::canonicalize`.
 
 use std::os::raw::{c_char, c_int};
 
@@ -109,7 +122,10 @@ fn register_common(db: &Connection) -> Result<backstop::State> {
     let det = FunctionFlags::SQLITE_UTF8
         | FunctionFlags::SQLITE_DETERMINISTIC
         | FunctionFlags::SQLITE_INNOCUOUS;
-    // Pure but NOT deterministic — SQLite will refuse to index these, which is correct.
+    // NOT deterministic — SQLite will refuse to index these, which is correct. Only `UUIDV4`,
+    // `UUIDV7` and `RAND` (OS RNG / clock) are pure otherwise; the `fathom_*` entries registered
+    // with these flags read (and for `fathom_fk_on` change) the calling connection's own state —
+    // see the module doc's "What the functions are".
     let nondet = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS;
 
     register_datetime(db, det)?;
@@ -191,17 +207,40 @@ unsafe extern "C" fn conn_init(
 // argument decoding
 // ---------------------------------------------------------------------------------------------
 
-/// Read argument `i` as text, mapping SQL NULL to `None`.
+/// Read argument `i` as text, mapping SQL NULL **and every non-text value** to `None`.
 ///
-/// Accepts an integer or real by rendering it, because SQLite is dynamically typed and a column
-/// declared `date` can hold whatever was inserted; Django's Python functions would see whatever
-/// `sqlite3` handed them and `typecast_timestamp` would raise → `None`. Returning `None` for a
-/// non-text value keeps that NULL-on-garbage behaviour without erroring.
+/// SQLite is dynamically typed, so a column declared `date` can hold an integer; Django's Python
+/// functions would see that integer and `typecast_timestamp` would raise → fathom returns NULL
+/// instead of erroring. This does NOT render an integer or real as text (an earlier comment here
+/// said it did; it never did, expert review 2026-11-07 #25). The one UDF whose Python body
+/// coerces with `str()` is `regexp`, which has its own decoder, [`regexp_subject`].
 fn opt_text<'a>(ctx: &'a Context<'a>, i: usize) -> Result<Option<&'a str>> {
     match ctx.get_raw(i) {
         ValueRef::Null => Ok(None),
         ValueRef::Text(_) => ctx.get_raw(i).as_str().map(Some).map_err(Error::from),
         _ => Ok(None),
+    }
+}
+
+/// The subject of `regexp`, coerced the way Django's `_sqlite_regexp` coerces it
+/// (`if not isinstance(string, str): string = str(string)`), so `WHERE qty REGEXP '^1'` over an
+/// INTEGER column matches `10` and `.exclude(qty__regex=…)` — which compiles to
+/// `NOT (qty REGEXP %s AND qty IS NOT NULL)` — no longer collapses to `NOT (NULL AND 1)` = NULL and
+/// drops every row (expert review 2026-11-07 #25).
+///
+/// INTEGER is `str(int)`, REAL is `str(float)` ([`pytypes::py_float_str`]). **BLOB stays NULL**, a
+/// deliberate divergence: Python's `str(bytes)` is the `b'…'` debugging repr, not the data (a
+/// `__regex` over a BinaryField matches the repr's quotes and escapes, which no app means), and
+/// mirroring it would allocate up to 4× the blob (a 64 MiB blob ⇒ 256 MiB) inside one uninterruptible
+/// call. `opt_text` is NOT widened for every UDF: the other functions' Python bodies raise on a
+/// non-str, and the oracle pins fathom's NULL for those.
+fn regexp_subject<'a>(ctx: &'a Context<'a>, i: usize) -> Result<Option<std::borrow::Cow<'a, str>>> {
+    use std::borrow::Cow;
+    match ctx.get_raw(i) {
+        ValueRef::Text(_) => ctx.get_raw(i).as_str().map(|s| Some(Cow::Borrowed(s))).map_err(Error::from),
+        ValueRef::Integer(n) => Ok(Some(Cow::Owned(n.to_string()))),
+        ValueRef::Real(f) => Ok(Some(Cow::Owned(pytypes::py_float_str(f)))),
+        ValueRef::Null | ValueRef::Blob(_) => Ok(None),
     }
 }
 
@@ -462,11 +501,11 @@ fn register_misc(db: &Connection, det: FunctionFlags, nondet: FunctionFlags) -> 
     // covers a CONSTANT argument, and a Django queryset binds the pattern as a PARAMETER
     // (`WHERE col REGEXP ?`), which would otherwise recompile per row.
     db.create_scalar_function("regexp", 2, det, |ctx| {
-        let (Some(pattern), Some(text)) = (opt_text(ctx, 0)?, opt_text(ctx, 1)?) else {
+        let (Some(pattern), Some(text)) = (opt_text(ctx, 0)?, regexp_subject(ctx, 1)?) else {
             return Ok(None);
         };
 
-        pyre::search(pattern, text)
+        pyre::search(pattern, &text)
             .map(Some)
             .map_err(|e| Error::UserFunctionError(Box::new(e)))
     })?;

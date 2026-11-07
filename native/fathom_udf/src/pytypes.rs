@@ -94,6 +94,67 @@ pub fn format_time(t: NaiveTime) -> String {
     }
 }
 
+/// Python's `str(float)` (== `repr(float)` since Python 3): the shortest digit string that
+/// round-trips, in fixed notation for decimal exponents -4..=15 and `d[.ddd]e±XX` (at least two
+/// exponent digits, an explicit sign) outside it, with `.0` on an integral fixed value and
+/// `inf` / `-inf` / `nan` spelled lower-case.
+///
+/// Rust's `{}` never uses an exponent (`1e20` prints as a 21-digit integer) and `{:?}` spells it
+/// `1e20`, not `1e+20`, so neither is `str(float)`; `{:e}` gives the right DIGITS (shortest
+/// round-trip, the same set CPython's David Gay `repr` mode picks) and this lays them out the way
+/// `float_repr_style == "short"` does. Used by `regexp` to reproduce Django's `str(string)`
+/// coercion of a REAL subject (expert review 2026-11-07 #25).
+pub fn py_float_str(f: f64) -> String {
+    if f.is_nan() {
+        return "nan".to_owned();
+    }
+    if f.is_infinite() {
+        return if f < 0.0 { "-inf" } else { "inf" }.to_owned();
+    }
+    let neg = f.is_sign_negative();
+    if f == 0.0 {
+        return if neg { "-0.0" } else { "0.0" }.to_owned();
+    }
+    // `{:e}` of a finite non-zero f64: `[-]d[.ddd]e[-]X`.
+    let sci = format!("{:e}", f.abs());
+    let (mantissa, exp) = sci.split_once('e').expect("LowerExp always has an exponent");
+    let exp: i32 = exp.parse().expect("LowerExp exponent is an integer");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+
+    let mut out = String::with_capacity(digits.len() + 8);
+    if neg {
+        out.push('-');
+    }
+    if (-4..16).contains(&exp) {
+        if exp >= 0 {
+            let int_len = exp as usize + 1;
+            if digits.len() <= int_len {
+                out.push_str(&digits);
+                out.extend(std::iter::repeat_n('0', int_len - digits.len()));
+                out.push_str(".0");
+            } else {
+                out.push_str(&digits[..int_len]);
+                out.push('.');
+                out.push_str(&digits[int_len..]);
+            }
+        } else {
+            out.push_str("0.");
+            out.extend(std::iter::repeat_n('0', (-exp - 1) as usize));
+            out.push_str(&digits);
+        }
+    } else {
+        out.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        out.push(if exp < 0 { '-' } else { '+' });
+        out.push_str(&format!("{:02}", exp.unsigned_abs()));
+    }
+    out
+}
+
 /// Python's `str(timedelta)`.
 ///
 /// CPython normalizes a `timedelta` so that `0 <= microseconds < 1_000_000`,
@@ -526,5 +587,46 @@ mod tests {
         let d = NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
         assert_eq!(iso_year(d), 2026);
         assert_eq!(iso_week(d), 53);
+    }
+}
+
+#[cfg(test)]
+mod py_float_str_tests {
+    use super::py_float_str;
+
+    /// `repr(float)` as CPython 3.12 printed it (the edge cases, then a seeded random sample of bit
+    /// patterns and short decimals), so the table can only agree with `py_float_str` if the digit
+    /// selection AND the fixed/exponent layout match. Rust's own `{}` / `{:?}` fail the exponent
+    /// rows (`1e+16`, `1e-05`, `1e+100`).
+    const CPYTHON_REPR: &[&str] = &[
+        "0.0", "-0.0", "1.0", "-1.0", "1.5", "0.1", "0.5", "2.25", "9.99", "100.0",
+        "123456789.0", "1000000000000000.0", "9999999999999998.0", "1e+16", "1.5e+16", "1e+17",
+        "1e+20", "1e+22", "1.7976931348623157e+308", "5e-324", "2.2250738585072014e-308",
+        "0.0001", "0.00012345", "1e-05", "1.5e-07", "1e-10", "123456.789", "0.30000000000000004",
+        "0.3333333333333333", "0.6666666666666666", "1e+100", "inf", "-inf", "4.35", "1e+23",
+        "8.41e+21", "5e-05", "1.2345678901234567e+19", "-2.5e-09", "-2.5544366377813396e-110",
+        "2.949134996452891e+236", "1.9120767564443592e-266", "-5.767510509558544e-23",
+        "1.527803266855153e+77", "-2.408935498377368e+292", "-7.974113368794131e-77",
+        "-2.05790020383236e+292", "1.1463514653956155e+76", "3.5855004792389e-123",
+        "1.0621012978810707e+186", "6.492585380170163e+40", "-2.0312526894157676e+46",
+        "3.0313714196943832e+100", "-2.2369147458725448e-246", "-6.700001508444422e+221",
+        "-1.0906543924865614e-79", "1.4217453579137024e-93", "-6.8803811422488385e+93",
+        "-2.5061699879010424e-117", "-1.1868555085867567e+58", "-1.9733286692134775e-183",
+        "5.8275775360402346e-276", "-7.2625975995115e+97", "-3.18545773744437e-291", "252.9",
+        "-525.0", "248.3497", "-903.9219", "-694.42517", "-728.4358", "-854.571", "304.75364",
+        "851.1738", "56.513475",
+    ];
+
+    #[test]
+    fn matches_cpython_repr() {
+        for want in CPYTHON_REPR {
+            let f: f64 = want.parse().unwrap_or_else(|_| panic!("{want} does not parse"));
+            assert_eq!(&py_float_str(f), want, "f64 {f:e}");
+        }
+    }
+
+    #[test]
+    fn nan_is_lowercase() {
+        assert_eq!(py_float_str(f64::NAN), "nan");
     }
 }

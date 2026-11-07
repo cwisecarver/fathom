@@ -162,7 +162,11 @@ again** before the connection is used, on every handle including read-only ones.
 re-disable fails the open rather than degrading. `test/fathom/shard/extension_test.exs` asserts the
 tenant-side outcome (`not authorized`) rather than trusting the sequence.
 
-Every function in the extension is pure: no filesystem, no network, no process state.
+The Django functions (`django_*`, `LPAD`…`REVERSE`, the hashes, `regexp`, `BITXOR`, `COT`, the
+aggregates) are pure: no filesystem, no network, no node state a statement can observe. The extension
+also carries non-pure `fathom_*` functions (connection-state readers and the engine's own handlers and
+registries) — each is `DIRECTONLY` or reports only the calling connection's state; the full table with
+every flag is in [component-notes](component-notes.md) ("Django UDF compatibility").
 
 #### Configuration
 
@@ -192,7 +196,7 @@ running the reference implementation rather than by hand-writing what it is beli
 |---|---|---|
 | `native/fathom_udf/tests/oracle.rs` | each `_sqlite_*` function's return value | 12,501 |
 | `native/fathom_udf/tests/re_oracle.rs` | `regexp` against CPython's `re.search` | 3,444 |
-| `test/fathom/django_sql_parity_test.exs` | **whole queries** against Django's backend | 42 |
+| `test/fathom/django_sql_parity_test.exs` | **whole queries** against Django's backend | 119 |
 
 The third is the strongest: it opens a real Python `sqlite3` connection, registers Django's UDFs on
 it exactly as `django/db/backends/sqlite3/base.py` does, runs whole queries, and requires fathom to

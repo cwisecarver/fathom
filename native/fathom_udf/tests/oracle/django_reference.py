@@ -22,6 +22,7 @@ Run ``python3 generate_cases.py`` to regenerate ``cases.json``; ``tests/oracle.r
 import datetime
 import hashlib
 import re
+from re import search as re_search
 import zoneinfo
 from datetime import timedelta
 from math import ceil
@@ -391,3 +392,14 @@ def _sqlite_bitxor(x, y):
     if x is None or y is None:
         return None
     return x ^ y
+
+
+def _sqlite_regexp(pattern, string):
+    # Vendored from django/db/backends/sqlite3/_functions.py (expert review 2026-11-07 #25). The
+    # `str(string)` coercion is the point: an INTEGER / REAL column handed to `__regex` is matched
+    # against its `str()`, not skipped.
+    if pattern is None or string is None:
+        return None
+    if not isinstance(string, str):
+        string = str(string)
+    return bool(re_search(pattern, string))

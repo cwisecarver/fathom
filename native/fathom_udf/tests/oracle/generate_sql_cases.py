@@ -28,6 +28,7 @@ asserts the *intended* difference instead of silently tolerating any difference.
 
 import json
 import platform
+import re
 import sqlite3
 import sys
 
@@ -49,7 +50,9 @@ def register(conn):
     d("django_time_diff", 2, dj._sqlite_time_diff)
     d("django_timestamp_diff", 2, dj._sqlite_timestamp_diff)
     d("django_format_dtdelta", 3, dj._sqlite_format_dtdelta)
-    d("regexp", 2, lambda p, s: bool(__import__("re").search(p, s)) if p is not None and s is not None else None)
+    # Django's own `_sqlite_regexp`, vendored: it `str()`s a non-text subject, which the previous
+    # `re.search`-only lambda here would have raised TypeError on (expert review 2026-11-07 #25).
+    d("regexp", 2, dj._sqlite_regexp)
     d("BITXOR", 2, dj._sqlite_bitxor)
     d("LPAD", 3, dj._sqlite_lpad)
     d("MD5", 1, dj._sqlite_md5)
@@ -61,6 +64,42 @@ def register(conn):
     d("SHA256", 1, dj._sqlite_sha256)
     d("SHA384", 1, dj._sqlite_sha384)
     d("SHA512", 1, dj._sqlite_sha512)
+
+
+# `str(int)` / `str(float)` round-trip: for each stored value the pattern is built from the very
+# string Python's `str()` produced, so Python answers 1 by construction and fathom answers 1 only
+# if it renders the value byte-for-byte the same way (digits AND the fixed/exponent layout:
+# `1e+16`, `1e-05`, `1.5e+16`, `inf`). The literals are `repr()`s, which round-trip exactly.
+def _regexp_str_queries():
+    import random
+    import struct
+
+    ints = [0, -1, 7, 10, 123, 2**31, 2**53 + 1, 2**63 - 1, -(2**63) + 1]
+    floats = [
+        1.0, -1.0, 1.5, 0.1, 2.25, 100.0, 123456789.0, 1e15, 9999999999999998.0, 1e16, 1.5e16,
+        1e20, 1e22, 1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 0.0001, 0.00012345,
+        1e-05, 1.5e-07, 1e-10, 123456.789, 0.30000000000000004, 1 / 3, 4.35, 1e23,
+        float("inf"), float("-inf"),
+    ]
+    rng = random.Random(20261107)
+    while len(floats) < 60:
+        f = struct.unpack("<d", struct.pack("<Q", rng.getrandbits(64)))[0]
+        if f == f and abs(f) != float("inf"):
+            floats.append(f)
+
+    def sql_literal(v):
+        if isinstance(v, float) and v in (float("inf"), float("-inf")):
+            return "9e999" if v > 0 else "-9e999"
+        return repr(v)
+
+    out = []
+    for v in ints + floats:
+        lit = sql_literal(v)
+        out.append(f"SELECT {lit} REGEXP '^{re.escape(str(v))}$', typeof({lit})")
+    return out
+
+
+REGEXP_STR_QUERIES = _regexp_str_queries()
 
 
 SCHEMA = [
@@ -133,6 +172,19 @@ QUERIES = [
     "SELECT id FROM app_order WHERE note REGEXP '(.)\\1' ORDER BY id",
     "SELECT id FROM app_order WHERE note REGEXP '^(?=.*a).*$' ORDER BY id",
     "SELECT id, note REGEXP 'a', typeof(note REGEXP 'a') FROM app_order ORDER BY id",
+    # --- regexp over a NON-text column: Django `str()`s the subject (expert review 2026-11-07 #25).
+    # `qty` is INTEGER, `price` REAL, `id` the rowid; a row-level NULL subject stays NULL, which is
+    # what makes the `.exclude(...)` form below keep or drop each row.
+    "SELECT id FROM app_order WHERE qty REGEXP '^[37]$' ORDER BY id",
+    "SELECT id FROM app_order WHERE price REGEXP '^1\\.5$' ORDER BY id",
+    "SELECT id FROM app_order WHERE price REGEXP '\\.0$' ORDER BY id",
+    "SELECT id FROM app_order WHERE id REGEXP '^[1-3]$' ORDER BY id",
+    "SELECT id, qty REGEXP '^3', typeof(qty REGEXP '^3') FROM app_order ORDER BY id",
+    # `.exclude(qty__regex=...)`: Django compiles `NOT (col REGEXP %s AND col IS NOT NULL)`.
+    "SELECT id FROM app_order WHERE NOT (qty REGEXP '^3' AND qty IS NOT NULL) ORDER BY id",
+    "SELECT id FROM app_order WHERE NOT (price REGEXP '^1' AND price IS NOT NULL) ORDER BY id",
+    "SELECT id FROM app_order WHERE qty REGEXP '(?i)^3$' ORDER BY id",
+    *REGEXP_STR_QUERIES,
     # --- text functions -------------------------------------------------------------------------
     "SELECT id, LPAD(note, 8, '.'), RPAD(note, 8, '.') FROM app_order ORDER BY id",
     "SELECT id, REVERSE(note), REPEAT(note, 2) FROM app_order ORDER BY id",

@@ -1,4 +1,4 @@
-{"_meta":true,"generated_by":"native/fathom_udf/tests/oracle/generate_sql_cases.py","source":"python sqlite3 with Django's UDFs registered","python":"3.9.6","sqlite":"3.54.0","count":42,"divergences":[{"sql":"SELECT STDDEV_POP(qty) FROM app_order","why":"Django's ListAggregate appends None and statistics.pstdev raises TypeError; fathom skips NULLs","fathom_expects":"a number","django_outcome":"OperationalError"},{"sql":"SELECT VAR_SAMP(qty) FROM app_order WHERE id = 1","why":"statistics.variance raises StatisticsError on one value; fathom returns NULL (as PostgreSQL does)","fathom_expects":"NULL","django_outcome":"OperationalError"}]}
+{"_meta":true,"generated_by":"native/fathom_udf/tests/oracle/generate_sql_cases.py","source":"python sqlite3 with Django's UDFs registered","python":"3.9.6","sqlite":"3.54.0","count":119,"divergences":[{"sql":"SELECT STDDEV_POP(qty) FROM app_order","why":"Django's ListAggregate appends None and statistics.pstdev raises TypeError; fathom skips NULLs","fathom_expects":"a number","django_outcome":"OperationalError"},{"sql":"SELECT VAR_SAMP(qty) FROM app_order WHERE id = 1","why":"statistics.variance raises StatisticsError on one value; fathom returns NULL (as PostgreSQL does)","fathom_expects":"NULL","django_outcome":"OperationalError"}]}
 {"sql":"SELECT id, django_date_extract('year', due), typeof(django_date_extract('year', due)) FROM app_order ORDER BY id","result":{"rows":[[{"int":1},{"int":2026},{"text":"integer"}],[{"int":2},{"int":2026},{"text":"integer"}],[{"int":3},{"int":2027},{"text":"integer"}],[{"int":4},{"int":2024},{"text":"integer"}],[{"int":5},{"null":true},{"text":"null"}],[{"int":6},{"int":2026},{"text":"integer"}]]}}
 {"sql":"SELECT id, django_datetime_extract('hour', created, NULL, NULL) FROM app_order ORDER BY id","result":{"rows":[[{"int":1},{"int":13}],[{"int":2},{"int":3}],[{"int":3},{"int":2}],[{"int":4},{"int":12}],[{"int":5},{"null":true}],[{"int":6},{"int":23}]]}}
 {"sql":"SELECT id, django_datetime_extract('week_day', created, NULL, NULL) FROM app_order ORDER BY id","result":{"rows":[[{"int":1},{"int":4}],[{"int":2},{"int":4}],[{"int":3},{"int":6}],[{"int":4},{"int":5}],[{"int":5},{"null":true}],[{"int":6},{"int":5}]]}}
@@ -36,6 +36,83 @@
 {"sql":"SELECT id FROM app_order WHERE note REGEXP '(.)\\1' ORDER BY id","result":{"rows":[[{"int":3}]]}}
 {"sql":"SELECT id FROM app_order WHERE note REGEXP '^(?=.*a).*$' ORDER BY id","result":{"rows":[[{"int":1}],[{"int":2}],[{"int":3}],[{"int":4}],[{"int":6}]]}}
 {"sql":"SELECT id, note REGEXP 'a', typeof(note REGEXP 'a') FROM app_order ORDER BY id","result":{"rows":[[{"int":1},{"int":1},{"text":"integer"}],[{"int":2},{"int":1},{"text":"integer"}],[{"int":3},{"int":1},{"text":"integer"}],[{"int":4},{"int":1},{"text":"integer"}],[{"int":5},{"null":true},{"text":"null"}],[{"int":6},{"int":1},{"text":"integer"}]]}}
+{"sql":"SELECT id FROM app_order WHERE qty REGEXP '^[37]$' ORDER BY id","result":{"rows":[[{"int":1}],[{"int":3}]]}}
+{"sql":"SELECT id FROM app_order WHERE price REGEXP '^1\\.5$' ORDER BY id","result":{"rows":[[{"int":1}]]}}
+{"sql":"SELECT id FROM app_order WHERE price REGEXP '\\.0$' ORDER BY id","result":{"rows":[[{"int":2}],[{"int":6}]]}}
+{"sql":"SELECT id FROM app_order WHERE id REGEXP '^[1-3]$' ORDER BY id","result":{"rows":[[{"int":1}],[{"int":2}],[{"int":3}]]}}
+{"sql":"SELECT id, qty REGEXP '^3', typeof(qty REGEXP '^3') FROM app_order ORDER BY id","result":{"rows":[[{"int":1},{"int":1},{"text":"integer"}],[{"int":2},{"int":0},{"text":"integer"}],[{"int":3},{"int":0},{"text":"integer"}],[{"int":4},{"int":0},{"text":"integer"}],[{"int":5},{"null":true},{"text":"null"}],[{"int":6},{"int":0},{"text":"integer"}]]}}
+{"sql":"SELECT id FROM app_order WHERE NOT (qty REGEXP '^3' AND qty IS NOT NULL) ORDER BY id","result":{"rows":[[{"int":2}],[{"int":3}],[{"int":4}],[{"int":5}],[{"int":6}]]}}
+{"sql":"SELECT id FROM app_order WHERE NOT (price REGEXP '^1' AND price IS NOT NULL) ORDER BY id","result":{"rows":[[{"int":2}],[{"int":3}],[{"int":4}],[{"int":5}],[{"int":6}]]}}
+{"sql":"SELECT id FROM app_order WHERE qty REGEXP '(?i)^3$' ORDER BY id","result":{"rows":[[{"int":1}]]}}
+{"sql":"SELECT 0 REGEXP '^0$', typeof(0)","result":{"rows":[[{"int":1},{"text":"integer"}]]}}
+{"sql":"SELECT -1 REGEXP '^\\-1$', typeof(-1)","result":{"rows":[[{"int":1},{"text":"integer"}]]}}
+{"sql":"SELECT 7 REGEXP '^7$', typeof(7)","result":{"rows":[[{"int":1},{"text":"integer"}]]}}
+{"sql":"SELECT 10 REGEXP '^10$', typeof(10)","result":{"rows":[[{"int":1},{"text":"integer"}]]}}
+{"sql":"SELECT 123 REGEXP '^123$', typeof(123)","result":{"rows":[[{"int":1},{"text":"integer"}]]}}
+{"sql":"SELECT 2147483648 REGEXP '^2147483648$', typeof(2147483648)","result":{"rows":[[{"int":1},{"text":"integer"}]]}}
+{"sql":"SELECT 9007199254740993 REGEXP '^9007199254740993$', typeof(9007199254740993)","result":{"rows":[[{"int":1},{"text":"integer"}]]}}
+{"sql":"SELECT 9223372036854775807 REGEXP '^9223372036854775807$', typeof(9223372036854775807)","result":{"rows":[[{"int":1},{"text":"integer"}]]}}
+{"sql":"SELECT -9223372036854775807 REGEXP '^\\-9223372036854775807$', typeof(-9223372036854775807)","result":{"rows":[[{"int":1},{"text":"integer"}]]}}
+{"sql":"SELECT 1.0 REGEXP '^1\\.0$', typeof(1.0)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -1.0 REGEXP '^\\-1\\.0$', typeof(-1.0)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1.5 REGEXP '^1\\.5$', typeof(1.5)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 0.1 REGEXP '^0\\.1$', typeof(0.1)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 2.25 REGEXP '^2\\.25$', typeof(2.25)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 100.0 REGEXP '^100\\.0$', typeof(100.0)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 123456789.0 REGEXP '^123456789\\.0$', typeof(123456789.0)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1000000000000000.0 REGEXP '^1000000000000000\\.0$', typeof(1000000000000000.0)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 9999999999999998.0 REGEXP '^9999999999999998\\.0$', typeof(9999999999999998.0)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1e+16 REGEXP '^1e\\+16$', typeof(1e+16)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1.5e+16 REGEXP '^1\\.5e\\+16$', typeof(1.5e+16)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1e+20 REGEXP '^1e\\+20$', typeof(1e+20)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1e+22 REGEXP '^1e\\+22$', typeof(1e+22)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1.7976931348623157e+308 REGEXP '^1\\.7976931348623157e\\+308$', typeof(1.7976931348623157e+308)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 5e-324 REGEXP '^5e\\-324$', typeof(5e-324)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 2.2250738585072014e-308 REGEXP '^2\\.2250738585072014e\\-308$', typeof(2.2250738585072014e-308)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 0.0001 REGEXP '^0\\.0001$', typeof(0.0001)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 0.00012345 REGEXP '^0\\.00012345$', typeof(0.00012345)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1e-05 REGEXP '^1e\\-05$', typeof(1e-05)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1.5e-07 REGEXP '^1\\.5e\\-07$', typeof(1.5e-07)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1e-10 REGEXP '^1e\\-10$', typeof(1e-10)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 123456.789 REGEXP '^123456\\.789$', typeof(123456.789)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 0.30000000000000004 REGEXP '^0\\.30000000000000004$', typeof(0.30000000000000004)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 0.3333333333333333 REGEXP '^0\\.3333333333333333$', typeof(0.3333333333333333)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 4.35 REGEXP '^4\\.35$', typeof(4.35)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1e+23 REGEXP '^1e\\+23$', typeof(1e+23)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 9e999 REGEXP '^inf$', typeof(9e999)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -9e999 REGEXP '^\\-inf$', typeof(-9e999)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -2.5544366377813396e-110 REGEXP '^\\-2\\.5544366377813396e\\-110$', typeof(-2.5544366377813396e-110)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 2.949134996452891e+236 REGEXP '^2\\.949134996452891e\\+236$', typeof(2.949134996452891e+236)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1.9120767564443592e-266 REGEXP '^1\\.9120767564443592e\\-266$', typeof(1.9120767564443592e-266)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -5.767510509558544e-23 REGEXP '^\\-5\\.767510509558544e\\-23$', typeof(-5.767510509558544e-23)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1.527803266855153e+77 REGEXP '^1\\.527803266855153e\\+77$', typeof(1.527803266855153e+77)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -2.408935498377368e+292 REGEXP '^\\-2\\.408935498377368e\\+292$', typeof(-2.408935498377368e+292)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -7.974113368794131e-77 REGEXP '^\\-7\\.974113368794131e\\-77$', typeof(-7.974113368794131e-77)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -2.05790020383236e+292 REGEXP '^\\-2\\.05790020383236e\\+292$', typeof(-2.05790020383236e+292)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1.1463514653956155e+76 REGEXP '^1\\.1463514653956155e\\+76$', typeof(1.1463514653956155e+76)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 3.5855004792389e-123 REGEXP '^3\\.5855004792389e\\-123$', typeof(3.5855004792389e-123)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1.0621012978810707e+186 REGEXP '^1\\.0621012978810707e\\+186$', typeof(1.0621012978810707e+186)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 6.492585380170163e+40 REGEXP '^6\\.492585380170163e\\+40$', typeof(6.492585380170163e+40)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -2.0312526894157676e+46 REGEXP '^\\-2\\.0312526894157676e\\+46$', typeof(-2.0312526894157676e+46)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 3.0313714196943832e+100 REGEXP '^3\\.0313714196943832e\\+100$', typeof(3.0313714196943832e+100)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -2.2369147458725448e-246 REGEXP '^\\-2\\.2369147458725448e\\-246$', typeof(-2.2369147458725448e-246)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -6.700001508444422e+221 REGEXP '^\\-6\\.700001508444422e\\+221$', typeof(-6.700001508444422e+221)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -1.0906543924865614e-79 REGEXP '^\\-1\\.0906543924865614e\\-79$', typeof(-1.0906543924865614e-79)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1.4217453579137024e-93 REGEXP '^1\\.4217453579137024e\\-93$', typeof(1.4217453579137024e-93)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -6.8803811422488385e+93 REGEXP '^\\-6\\.8803811422488385e\\+93$', typeof(-6.8803811422488385e+93)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -2.5061699879010424e-117 REGEXP '^\\-2\\.5061699879010424e\\-117$', typeof(-2.5061699879010424e-117)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -1.1868555085867567e+58 REGEXP '^\\-1\\.1868555085867567e\\+58$', typeof(-1.1868555085867567e+58)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -1.9733286692134775e-183 REGEXP '^\\-1\\.9733286692134775e\\-183$', typeof(-1.9733286692134775e-183)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 5.8275775360402346e-276 REGEXP '^5\\.8275775360402346e\\-276$', typeof(5.8275775360402346e-276)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -7.2625975995115e+97 REGEXP '^\\-7\\.2625975995115e\\+97$', typeof(-7.2625975995115e+97)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -3.18545773744437e-291 REGEXP '^\\-3\\.18545773744437e\\-291$', typeof(-3.18545773744437e-291)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -3.7581877016508725e-286 REGEXP '^\\-3\\.7581877016508725e\\-286$', typeof(-3.7581877016508725e-286)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 4.047877772835552e-16 REGEXP '^4\\.047877772835552e\\-16$', typeof(4.047877772835552e-16)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -4.900545041058929e+264 REGEXP '^\\-4\\.900545041058929e\\+264$', typeof(-4.900545041058929e+264)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -1.5104295301178809e-155 REGEXP '^\\-1\\.5104295301178809e\\-155$', typeof(-1.5104295301178809e-155)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -1.7086244625867715e+279 REGEXP '^\\-1\\.7086244625867715e\\+279$', typeof(-1.7086244625867715e+279)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT 1.9755640234523907e-249 REGEXP '^1\\.9755640234523907e\\-249$', typeof(1.9755640234523907e-249)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
+{"sql":"SELECT -3.198899226233984e-288 REGEXP '^\\-3\\.198899226233984e\\-288$', typeof(-3.198899226233984e-288)","result":{"rows":[[{"int":1},{"text":"real"}]]}}
 {"sql":"SELECT id, LPAD(note, 8, '.'), RPAD(note, 8, '.') FROM app_order ORDER BY id","result":{"rows":[[{"int":1},{"text":"...alpha"},{"text":"alpha..."}],[{"int":2},{"text":"...beta\n"},{"text":"beta\n..."}],[{"int":3},{"text":"...Gamma"},{"text":"Gamma..."}],[{"int":4},{"text":"...délta"},{"text":"délta..."}],[{"int":5},{"null":true},{"null":true}],[{"int":6},{"text":"a-slug-1"},{"text":"a-slug-1"}]]}}
 {"sql":"SELECT id, REVERSE(note), REPEAT(note, 2) FROM app_order ORDER BY id","result":{"rows":[[{"int":1},{"text":"ahpla"},{"text":"alphaalpha"}],[{"int":2},{"text":"\nateb"},{"text":"beta\nbeta\n"}],[{"int":3},{"text":"ammaG"},{"text":"GammaGamma"}],[{"int":4},{"text":"atléd"},{"text":"déltadélta"}],[{"int":5},{"null":true},{"null":true}],[{"int":6},{"text":"1-guls-a"},{"text":"a-slug-1a-slug-1"}]]}}
 {"sql":"SELECT id, MD5(note), SHA1(note), SHA256(note) FROM app_order ORDER BY id","result":{"rows":[[{"int":1},{"text":"2c1743a391305fbf367df8e4f069f9f9"},{"text":"be76331b95dfc399cd776d2fc68021e0db03cc4f"},{"text":"8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8"}],[{"int":2},{"text":"f0cf2a92516045024a0c99147b28f05b"},{"text":"6c007a14875d53d9bf0ef5a6fc0257c817f0fb83"},{"text":"f2c82decdd7181cf98945929a62598db7e6b477e11f6e0eb0ae97020eff151ad"}],[{"int":3},{"text":"d9cdb0f6e0d556347c10a8695545a4b5"},{"text":"cba508b12182b68f501d6af46c4f03f8fc5d2473"},{"text":"a8ab3d5805c9214bc66b794f599cbccd5a5958dc5a6a322ee81e3a68344c6db7"}],[{"int":4},{"text":"c2fba9b823a78d765be40675b999337a"},{"text":"438f2ef26fd6ab0652ffedd7d57e1a5ac9458d5f"},{"text":"6db26765db00df6b2985e3e49c4adcf7cd593b86c78afb46a5ab18ae4d865193"}],[{"int":5},{"null":true},{"null":true},{"null":true}],[{"int":6},{"text":"381bb6f5dfe603e15e3dcc557e38f0f3"},{"text":"d1db61f72e388e15b54fd856db0404ce131e1113"},{"text":"a1a214959c3124572f55329bb89ac9d2b6ddcad4060f6ffd70de0e17729f5183"}]]}}

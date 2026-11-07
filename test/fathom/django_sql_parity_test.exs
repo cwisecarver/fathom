@@ -199,6 +199,19 @@ defmodule Fathom.DjangoSqlParityTest do
                Connection.query(conn, "SELECT VAR_SAMP(qty) FROM app_order WHERE id = 1", [])
     end
 
+    test "REGEXP over a BLOB is NULL where Django matches the bytes repr", %{conn: conn} do
+      # Django: `str(b'1')` is the string "b'1'" (a debugging repr), so `x'31' REGEXP '^b'` is 1.
+      # fathom keeps NULL for a BLOB subject (expert review 2026-11-07 #25): mirroring the repr
+      # would allocate up to 4x the blob inside one uninterruptible call, for a lookup no app
+      # means. INTEGER and REAL ARE coerced (the corpus rows above); BLOB is the one non-text
+      # subject that is not, so a `filter(blob__regex=...)` never returns the row.
+      assert {:ok, %{rows: [[nil, "blob"]]}} =
+               Connection.query(conn, "SELECT x'31' REGEXP '^b', typeof(x'31')", [])
+
+      assert {:ok, %{rows: [[1, 0]]}} =
+               Connection.query(conn, "SELECT 31 REGEXP '^3', 31 REGEXP '^1'", [])
+    end
+
     test "both divergences make fathom MORE permissive, never less" do
       # The direction is the whole argument. A query that works on Django must work here; a query
       # that errors on Django may work here. The reverse would be a compatibility bug.
