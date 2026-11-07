@@ -300,6 +300,13 @@ defmodule Fathom.ShardExecutorTest do
   test "a raising statement gives the tenant a fixed message and logs the detail", %{shard: shard} do
     {:ok, conn} = ShardExecutor.open(shard)
 
+    # The `execute raised` line is rate-limited per NODE (`Fathom.LogLimiter`, 5 a second, expert
+    # review 2026-11-07 #69), and other tests' raising statements share that window. Seen failing in
+    # a full run (seed 883557, passing in isolation and at that seed on re-run): the window was
+    # already spent, the line was suppressed, and `log` was "". The test is about the log's CONTENT,
+    # not the limiter, so it starts from a fresh window.
+    Fathom.LogLimiter.reset(:execute_raised)
+
     {result, log} =
       ExUnit.CaptureLog.with_log(fn ->
         ShardExecutor.execute(conn, %Stmt{sql: "SELECT ?", args: :not_a_list})
