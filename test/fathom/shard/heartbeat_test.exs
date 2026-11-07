@@ -902,24 +902,35 @@ defmodule Fathom.Shard.HeartbeatTest do
       test_pid = self()
       handler = "lapsefan-#{System.unique_integer([:positive])}"
 
-      # Scoped to THIS test's heartbeat. Telemetry is node-global, so an unscoped handler also
-      # counted a lapse from any other heartbeat still alive on the node, and the asserts below
-      # match one literal `inline` value: a stray event with the right value made them pass for a
-      # lapse this test never caused. The emitter is the heartbeat itself (inline) or the task it
-      # started, whose `$callers` names it.
+      # Scoped to THIS test's heartbeat AND to lapses it raises from here on. Telemetry is
+      # node-global, so an unscoped handler also counted a lapse from any other heartbeat still
+      # alive on the node, and the asserts below match one literal `inline` value: a stray event
+      # with the right value made them pass for a lapse this test never caused. The emitter is the
+      # heartbeat itself (inline) or the task it started, whose `$callers` names it.
+      #
+      # The generation floor is the second half, and `$callers` alone is NOT enough: this very
+      # heartbeat's FIRST renewal (done in the outer setup) ends its pre-renewal episode and fans a
+      # lapse out through a task, which reports `lapse_broadcast` only AFTER its
+      # `Registry.dispatch/3` to every coordinator subscribed to the topic returns. With a few
+      # hundred leftover subscribers that is ~a millisecond, so the event lands after this attach
+      # and a `refute_received` sees `{:lapse_broadcast, false}` for a lapse the test never caused
+      # (full-suite flake, three failures; reproduced at ~100 subscribers on the topic). Every lapse
+      # the tests force carries a generation above the one sampled here.
+      baseline = Heartbeat.generation()
+
       :ok =
         :telemetry.attach(
           handler,
           [:fathom, :shard, :heartbeat, :lapse_broadcast],
           fn _e, _m, meta, _c ->
-            if hb in [self() | Process.get(:"$callers", [])],
+            if meta.generation > baseline and hb in [self() | Process.get(:"$callers", [])],
               do: send(test_pid, {:lapse_broadcast, meta.inline})
           end,
           nil
         )
 
       on_exit(fn -> :telemetry.detach(handler) end)
-      :ok
+      %{lapse_baseline: baseline}
     end
 
     # Forces the lapse edge: an expired deadline plus a renew tick.
@@ -951,14 +962,15 @@ defmodule Fathom.Shard.HeartbeatTest do
                        "the lapse."
     end
 
-    test "a lapse event from a different heartbeat is not counted as this one's" do
+    test "a lapse event from a different heartbeat is not counted as this one's", ctx do
       # Pins the scoping above: an emitter that is neither this test's heartbeat nor a task it
-      # started is dropped, whatever `inline` it carries.
+      # started is dropped, whatever `inline` it carries. The generation is ABOVE the floor so
+      # only the emitter check can drop it.
       for inline <- [false, true] do
         task =
           Task.async(fn ->
             :telemetry.execute([:fathom, :shard, :heartbeat, :lapse_broadcast], %{count: 1}, %{
-              generation: 0,
+              generation: ctx.lapse_baseline + 1_000,
               inline: inline
             })
           end)
@@ -966,6 +978,25 @@ defmodule Fathom.Shard.HeartbeatTest do
         Task.await(task)
       end
 
+      refute_received {:lapse_broadcast, _}
+    end
+
+    test "this heartbeat's own startup-episode event is not counted as a forced lapse",
+         %{pid: pid} = ctx do
+      # Pins the generation floor: the event the heartbeat's first renewal fans out carries a
+      # generation at or below the baseline sampled after it, and arrives late by design. Emitted
+      # here from a process whose `$callers` names the heartbeat — exactly what that task is.
+      task =
+        Task.async(fn ->
+          Process.put(:"$callers", [pid])
+
+          :telemetry.execute([:fathom, :shard, :heartbeat, :lapse_broadcast], %{count: 1}, %{
+            generation: ctx.lapse_baseline,
+            inline: false
+          })
+        end)
+
+      Task.await(task)
       refute_received {:lapse_broadcast, _}
     end
 
