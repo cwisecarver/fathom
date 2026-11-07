@@ -1438,9 +1438,15 @@ defmodule Fathom.Shard do
         # review 2026-10-13 #2). Without it the next stealer's touch chain restarts and the previous
         # holder's warm copy reads as a fork.
         Storage.release_lease(shard_id, Storage.with_clean_touch(lease), lease[:claim])
-        {:stop, {:shutdown, {:pull_failed, reason}}, %{id: shard_id}}
+        {:stop, {:shutdown, open_failure_reason(reason)}, %{id: shard_id}}
     end
   end
+
+  # An erased tenant's refusal (`object_gone/3`) stops with the SAME reason the pre-I/O gate in
+  # `handle_continue(:open)` uses, so `Shards.checkout/1`'s mapping gives the caller the 410 it would
+  # have had were the tombstone set loaded; everything else is a failed pull/revalidation.
+  defp open_failure_reason(:shard_tombstoned), do: :shard_tombstoned
+  defp open_failure_reason(reason), do: {:pull_failed, reason}
 
   # Expert review #3: a TAKEOVER's speculative pull (started before the lease
   # confirmed) can capture bytes from before the old owner's final in-flight flush
@@ -1642,9 +1648,10 @@ defmodule Fathom.Shard do
       # nil, so the first flush RECREATES the object via If-None-Match:* (never a
       # clobber). Drop the now-wrong provenance sidecar so a crash before that
       # flush doesn't strand the next open fencing on the vanished etag.
+      #
+      # UNLESS the id was ERASED (expert review 2026-11-07 #14): see `object_gone/3`.
       {:ok, nil} ->
-        Fathom.FS.rm(Provenance.sidecar_path(path))
-        {:ok, nil}
+        object_gone(shard_id, path, true)
 
       {:ok, current} when warm? ->
         adopt_provenance(path, current, :durable)
@@ -1654,6 +1661,54 @@ defmodule Fathom.Shard do
 
       {:error, reason} ->
         {:error, {:revalidate_failed, reason}}
+    end
+  end
+
+  # THE OBJECT IS GONE UNDER OUR LEASE, with a local copy in hand (expert review 2026-11-07 #14).
+  # Both "serve it and let the first flush re-create the object" stances above are right for a
+  # brand-new un-flushed shard and for an operator-deleted object, and WRONG for an ERASED tenant:
+  # a node that missed the delete (down during it, or holding a clean-retained copy) boots with an
+  # empty `Tombstones` set — the set loads asynchronously after the Edge starts, and reads "ok"
+  # until a load fails — and the stray request that lands opens the lease, finds no object, serves
+  # the residue and re-creates the erased object and its `.lock` on the next flush.
+  #
+  # The durable `tombstones/<id>` storage marker is the one fact that does not depend on that load
+  # and needs no Postgres (the review of 2026-10-13 #20 moved the LIST out of `init` on purpose, and
+  # this keeps that stance: one HEAD, only on this rare branch, never on a normal open):
+  #
+  #   * marker present: ERASE the local copy (no quarantine: erasure outranks forensics, as in
+  #     `erase_fenced!/1`) and refuse the open `:shard_tombstoned`.
+  #   * marker unreadable: refuse retryably and KEEP the copy. Serving blind is the resurrection;
+  #     the copy may still hold un-flushed writes of a live tenant, so it must not be deleted either.
+  #   * a claimed clean-retained copy with no marker: it holds nothing the store lacks, so there is
+  #     nothing to protect by re-creating the object from it — discard it and pull.
+  #   * otherwise: the original stance (`drop_sidecar?` says whether the sidecar names a vanished
+  #     etag and must go).
+  defp object_gone(shard_id, path, drop_sidecar?) do
+    case Storage.tombstone_present?(shard_id) do
+      {:ok, true} ->
+        drop_local(path)
+
+        Logger.warning(
+          "shard #{shard_id}: opened with a local copy and NO stored object, but the id has a " <>
+            "durable tombstone marker — erased the local copy and refused the open instead of " <>
+            "re-creating an erased tenant's object (expert review 2026-11-07 #14)"
+        )
+
+        {:error, :shard_tombstoned}
+
+      {:ok, false} ->
+        if Fathom.Shard.Retained.claimed?(path) do
+          if Fork.quarantine!(shard_id, path, :object_absent) == :ok,
+            do: repull(shard_id, path),
+            else: {:error, :quarantine_failed}
+        else
+          if drop_sidecar?, do: Fathom.FS.rm(Provenance.sidecar_path(path))
+          {:ok, nil}
+        end
+
+      {:error, reason} ->
+        {:error, {:tombstone_check_failed, reason}}
     end
   end
 
@@ -1687,16 +1742,17 @@ defmodule Fathom.Shard do
   # `nil` (not replicating, or a claim lease) keeps the dedicated etag read.
   defp post_lease_warm_check(shard_id, path, etag, head) do
     case warm_check_etag(shard_id, head) do
+      # Object gone with a live local copy: the un-flushed brand-new stance — serve
+      # warm, fence with nil so the first flush RECREATES it (an If-Match against a
+      # gone object could never succeed), and drop the dangling sidecar. First, and for a nil
+      # `etag` too (a copy born here against no object, whose sidecar already says so): the
+      # absence is exactly what `object_gone/3` must look at (expert review 2026-11-07 #14).
+      {:ok, nil} ->
+        object_gone(shard_id, path, etag != nil)
+
       # Unchanged since the pre-lease provenance check — the common warm restart.
       {:ok, ^etag} ->
         {:ok, etag}
-
-      # Object gone with a live local copy: the un-flushed brand-new stance — serve
-      # warm, fence with nil so the first flush RECREATES it (an If-Match against a
-      # gone object could never succeed), and drop the dangling sidecar.
-      {:ok, nil} ->
-        Fathom.FS.rm(Provenance.sidecar_path(path))
-        {:ok, nil}
 
       # The release-in-gap fork (#19): another owner acquired, flushed, and
       # released between our fork check and our acquire. The stored lineage moved

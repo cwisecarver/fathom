@@ -58,6 +58,16 @@ The directory row is kept tombstoned (not hard-deleted) as the permanent record 
 *data*, just the id + `deleted` status. `resolve`/`record_batch` on-conflict only bump recency, never
 status, so a late access can't un-delete it.
 
+**The boot window (expert review 2026-11-07 #14).** The set loads asynchronously after the Edge starts,
+so a freshly booted node answers "not tombstoned" until the load finishes (and keeps doing so if the
+load keeps failing). The open path therefore has one more guard that needs no Postgres and no loaded
+set: when an open finds a local copy and NO stored object, it HEADs the durable `tombstones/<id>`
+marker; present ⇒ the local copy is erased and the open refused `:shard_tombstoned` (a refused open is a
+410, like the set's). That branch is rare (a brand-new un-flushed shard, an operator-deleted object, an
+erased tenant's residue), so a normal open pays nothing. Not covered, and a parked maintainer decision
+(see `docs/component-notes.md`): a node with no local residue, booting with the directory unreachable,
+opens a fresh EMPTY shard for an erased id until the load succeeds.
+
 ### The physical erase (`DeleteJob` → `Tenants.purge/1`)
 
 ```

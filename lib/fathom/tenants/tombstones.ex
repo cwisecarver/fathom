@@ -31,6 +31,28 @@ defmodule Fathom.Tenants.Tombstones do
   Fathom has no BEAM cluster, so the one shared push channel is Postgres, and Oban's
   notifier is already running on it — best-effort, with the periodic refresh as the
   convergence backstop.
+
+  ## The load window (expert review 2026-11-07 #14)
+
+  `init/1` returns before either load runs (`handle_continue(:load)`; the 2026-10-13 #20 fix, kept on
+  purpose: a slow or down S3/Postgres must not block the supervisor), so DataPlane and Edge accept
+  traffic while the set is still EMPTY, and `DenyList.status/0` reads `:ok` until a load has failed
+  once. A stray request for an erased id in that window finds no tombstone. What closes it without
+  making admission wait for Postgres:
+
+    * the open path's absent-object branches (`Fathom.Shard`, `object_gone/3`) consult the durable
+      `tombstones/<id>` storage marker (`Storage.tombstone_present?/1`, one HEAD, PG-independent) when
+      a local copy exists and the object does not — the shape an erased tenant's residue has — and
+      refuse the open `:shard_tombstoned` after erasing the copy;
+    * `ErasureSweepJob` re-drives any purge whose object reappeared.
+
+  What is NOT done, and is a maintainer decision (it reverses the deliberate no-Postgres-at-boot
+  stance of review 2026-10-13 #20): holding admission until the DIRECTORY half of this set has loaded
+  (a synchronous load with a deadline in `init/1`, as `Suspensions.init/1` does, or `/health` 503
+  until `loaded: true`). The residual: a node with NO local residue, booting with the directory
+  unreachable, whose request for an erased id finds an absent object, opens a fresh EMPTY shard (the
+  "empty shard re-mint" variant) until the load succeeds. The options and trade-offs are in
+  `docs/component-notes.md`.
   """
   use GenServer
 
