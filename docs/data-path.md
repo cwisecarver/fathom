@@ -57,7 +57,18 @@ rows now cross process boundaries as one refc binary.)
 
 - **Cold start** — it **pulls** the shard from `Fathom.Shard.Storage` (only on a genuine cold start;
   a **present local file is authoritative**, so a node with un-flushed writes never re-pulls over
-  them). It also acquires the lease (see [single-writer](single-writer.md)).
+  them). It also acquires the lease (see [single-writer](single-writer.md)). Three rules keep this
+  from destroying data (expert review 2026-11-07 #9, #21, #28, #70):
+  - **Only a definite `ENOENT` is "cold".** The warm-vs-cold stat uses `Fathom.FS.presence/1`; any
+    other stat error (EIO, EACCES, ESTALE) fails the open (`{:local_stat_failed, reason}`) before the
+    lease and before any pull, instead of cold-pulling over a possibly-dirty copy.
+  - **What the pull reported decides, not what is on disk.** `Materializer.promote_pull/3` takes
+    `:bytes | :absent`; bytes reported with the `.pull` temp gone is `{:error, :pull_temp_missing}`
+    (the open fails and releases), never a "brand-new shard" fenced on the object's real etag.
+    `TempReaper` leaves the `.pull` family alone while a coordinator is registered for its shard.
+  - **The provenance sidecar is part of the open.** A failed sidecar write aborts the open, and a
+    warm takeover's adoption of the post-touch etag is fsynced. A damaged sidecar record reads
+    `:corrupt` (quarantine + re-pull), never a crash.
 - **Tracks its connections by monitoring the stream process.** The coordinator is the connection's
   **owner** (Filo's `Executor.owner/1` seam): each stream holding a handle monitors the coordinator
   and tears down — closing its exqlite connection — if the coordinator dies. This is what prevents
