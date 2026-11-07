@@ -317,9 +317,18 @@ the bucket underneath the fathom-managed snapshots above:
   [tenant-lifecycle.md](tenant-lifecycle.md#erasure-is-bounded-by-noncurrent-versions).
 - **Object Lock (or MFA-delete)** on the live prefix, and **cross-region/-account replication**, so
   a single bucket-level mistake or compromise can't erase every tenant at once.
-- **Least-privilege node credentials:** the data plane needs read/write on `<shard>.db` and the
-  `.lock`/`@version`/`@snap-` keys but should not hold broad `DeleteObject` on the live prefix —
-  scope deletes to the version/snapshot keys the retirement/retention paths actually remove.
+- **Least-privilege node credentials (expert review 2026-11-07 #36).** The data plane needs
+  `s3:GetObject`/`s3:PutObject` on `<shard>.db`, `<shard>.lock`, `@version`/`@snap-` keys and
+  `heartbeats/*`, and **`s3:DeleteObject` on three kinds of key it deletes at runtime**:
+  `<prefix>*.lock` (every clean idle drop, drain and lock release is a conditional DELETE of the lock —
+  a 403 there leaves the lock behind a live heartbeat, so no failover, migration or rebalance can move
+  that shard), `<prefix>heartbeats/*` (the heartbeat clear), and the keys of the shards it erases
+  (`<shard>.*` and `<shard>@*`; tenant erasure and the retirement/retention paths). It never needs
+  `DeleteObject` on `tombstones/*` (the marker is the erasure's own durable fact). Earlier text here
+  said to withhold broad `DeleteObject` from the live prefix and scope it to the version/snapshot keys:
+  following that literally strands every lock. The boot self-test now PUTs and DELETEs a `<node>.lock`
+  key and DELETEs under `heartbeats/`, so a policy that withholds either **refuses to boot** with a
+  message naming the missing permission instead of failing at the first drain after a deploy.
 
 ## Tenant engine limits and the checkpoint gate
 

@@ -275,6 +275,8 @@ defmodule Fathom.Shard.Storage.S3 do
       _ = Req.delete(req(), url: url_path(key))
     end
 
+    probe_lock_and_heartbeat_deletes!(key)
+
     :ok
   end
 
@@ -494,6 +496,55 @@ defmodule Fathom.Shard.Storage.S3 do
       {:error, reason} ->
         raise "shard storage fence self-test unreachable (#{label}): #{inspect(reason)}. " <>
                 "Refusing to boot with an unverified fence (expert review #8)."
+    end
+  end
+
+  # THE DATA PLANE'S RUNTIME DELETE PERMISSIONS (expert review 2026-11-07 #36). The fence self-test
+  # above probes conditional DELETE on `fence-probe/<node>` only. An operator who followed the old
+  # least-privilege advice in docs/durability.md ("no broad DeleteObject on the live prefix, scope it
+  # to the version/snapshot keys") passes it and then fails at runtime on the first clean idle drop,
+  # drain or lock release: every release is a DELETE of `<shard>.lock`, `clear_heartbeat` deletes
+  # `heartbeats/<owner>`, and a 403 there keeps the lock — the "lock names a LIVE node forever" state,
+  # silent and fleet-wide until the first drain after a deploy. So the boot probe PUTs and DELETEs a
+  # key shaped like a lock (`…<node>.lock`, which matches a `*.lock` policy resource) and DELETEs one
+  # under `heartbeats/` (a missing key: DELETE still needs the permission, answers 204/404 when it is
+  # held and 403 when it is not, and it leaves nothing behind for the heartbeat scan to read).
+  defp probe_lock_and_heartbeat_deletes!(probe_key) do
+    lock = probe_key <> ".lock"
+    probe_permission!(:put, lock, "PUT of a lock-shaped key (<shard>.lock)")
+    probe_permission!(:delete, lock, "DELETE of a lock-shaped key (<shard>.lock)")
+
+    probe_permission!(
+      :delete,
+      prefix() <> "heartbeats/fence-probe-" <> to_string(node()),
+      "DELETE under heartbeats/"
+    )
+  end
+
+  defp probe_permission!(method, key, label) do
+    request =
+      case method do
+        :put -> Req.put(req(), url: url_path(key), body: "fathom-permission-probe")
+        :delete -> Req.delete(req(), url: url_path(key))
+      end
+
+    case request do
+      {:ok, %{status: s}} when s in 200..299 or (method == :delete and s == 404) ->
+        :ok
+
+      {:ok, %{status: s}} ->
+        raise "shard storage permission self-test failed (#{label}): got #{s}. The data plane " <>
+                "writes and deletes this kind of key at runtime (every clean idle drop, drain and " <>
+                "lock release deletes <shard>.lock; the heartbeat clear deletes " <>
+                "heartbeats/<node>), and a store or IAM / bucket policy that refuses it leaves " <>
+                "every lock behind a live node's heartbeat, so no failover, migration or " <>
+                "rebalance can move those shards. Grant s3:PutObject and s3:DeleteObject on " <>
+                "`<prefix>*.lock` and `<prefix>heartbeats/*` (docs/durability.md) — refusing to " <>
+                "boot (expert review 2026-11-07 #36)."
+
+      {:error, reason} ->
+        raise "shard storage permission self-test unreachable (#{label}): #{inspect(reason)}. " <>
+                "Refusing to boot with unverified permissions (expert review 2026-11-07 #36)."
     end
   end
 
@@ -2295,7 +2346,9 @@ defmodule Fathom.Shard.Storage.S3 do
 
   @impl true
   def purge_shard(shard_id) do
-    with :ok <- purge_shard_page(shard_id, nil), do: abort_shard_uploads(shard_id, nil)
+    with :ok <- purge_delimited(shard_id, ".", nil),
+         :ok <- purge_delimited(shard_id, "@", nil),
+         do: abort_shard_uploads(shard_id, nil)
   end
 
   # In-progress multipart uploads are invisible to ListObjectsV2, so a steal-touch killed between
@@ -2357,18 +2410,25 @@ defmodule Fathom.Shard.Storage.S3 do
     end)
   end
 
-  # Full tenant erasure (#15): ListObjectsV2 over `<prefix><shard_id>` (a broad
-  # prefix that can also surface sibling ids like `<shard_id>2.db`), then delete
-  # only the keys whose id-delimiter is `.` or `@` — so purging `acme` never deletes
-  # `acme2`. Paginated; per-object DELETEs are issued as each page lands (fathom's
-  # thesis is small shards with few versions/snapshots, so the per-shard object
-  # count is tiny — no DeleteObjects batching needed, matching drop_* elsewhere).
-  defp purge_shard_page(shard_id, token) do
-    with {:ok, page} <- list_page(prefix() <> shard_id, token),
+  # Full tenant erasure (#15): ListObjectsV2 over the two DELIMITER-QUALIFIED prefixes `<prefix><id>.`
+  # (the live object, its `.lock`, `.db.tmp…`) and `<prefix><id>@` (versions, snapshots), deleting
+  # every key listed. The listing used to be the bare `<prefix><id>`, which also surfaces every
+  # SIBLING id (`acme2.db`, `acme-x.db`, …) in key order, so erasing `acme` in a fleet with a million
+  # `acme…` ids paged through ~1000 LISTs of keys it then discarded, twice per delete
+  # (`Tenants.purge` runs it twice), inside a 50-minute job that could therefore never finish (expert
+  # review 2026-11-07 #61). S3 sorts keys bytewise, so each qualified prefix is contiguous and holds
+  # only this id's keys; `shard_object_key?/2` stays as belt and braces (a store that matched
+  # prefixes loosely, or a future key shape). Shard ids never contain `.` or `@`
+  # (`Fathom.ShardId`), which is what makes the two prefixes complete. Paginated; per-object DELETEs
+  # are issued as each page lands (fathom's thesis is small shards with few versions/snapshots, so
+  # the per-shard object count is tiny — no DeleteObjects batching needed, matching drop_*
+  # elsewhere). `any_shard_object?/1` already used the same two prefixes.
+  defp purge_delimited(shard_id, delim, token) do
+    with {:ok, page} <- list_page(prefix() <> shard_id <> delim, token),
          :ok <- delete_keys(shard_object_keys(page.entries, shard_id)) do
       case page.next do
         nil -> :ok
-        next -> purge_shard_page(shard_id, next)
+        next -> purge_delimited(shard_id, delim, next)
       end
     end
   end

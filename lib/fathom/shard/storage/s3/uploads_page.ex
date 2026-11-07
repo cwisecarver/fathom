@@ -53,11 +53,18 @@ defmodule Fathom.Shard.Storage.S3.UploadsPage do
   defp event({:startDTD, _name, _public, _system}, _loc, _state),
     do: throw({:uploads_page_abort, :uploads_xml_dtd_refused})
 
-  defp event({:startElement, _uri, local, _qname, _attrs}, _loc, state) do
-    name = List.to_string(local)
-    upload = if name == "Upload", do: %{key: nil, upload_id: nil}, else: state.upload
-    %{state | path: [name | state.path], text: [], upload: upload}
+  # THE ROOT MUST BE `ListMultipartUploadsResult` (expert review 2026-11-07 #82, see `ListPage`): a
+  # well-formed document of any other shape used to parse as "no in-progress uploads", so the purge's
+  # abort step reported a clean erasure over a response that was never a listing.
+  defp event({:startElement, _uri, local, _qname, _attrs}, _loc, %{path: []} = state) do
+    case List.to_string(local) do
+      "ListMultipartUploadsResult" -> start_element("ListMultipartUploadsResult", state)
+      other -> throw({:uploads_page_abort, {:uploads_unexpected_root, other}})
+    end
   end
+
+  defp event({:startElement, _uri, local, _qname, _attrs}, _loc, state),
+    do: start_element(List.to_string(local), state)
 
   defp event({:characters, chars}, _loc, %{path: [_ | _]} = state),
     do: %{state | text: [chars | state.text]}
@@ -99,4 +106,9 @@ defmodule Fathom.Shard.Storage.S3.UploadsPage do
   end
 
   defp event(_other, _loc, state), do: state
+
+  defp start_element(name, state) do
+    upload = if name == "Upload", do: %{key: nil, upload_id: nil}, else: state.upload
+    %{state | path: [name | state.path], text: [], upload: upload}
+  end
 end

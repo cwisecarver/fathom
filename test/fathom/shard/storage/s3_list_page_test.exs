@@ -78,7 +78,7 @@ defmodule Fathom.Shard.Storage.S3ListPageTest do
 
     test "malformed or truncated XML is an error" do
       assert {:error, {:list_xml, _}} = ListPage.parse("<ListBucketResult><Contents>")
-      assert {:error, {:list_xml, _}} = ListPage.parse("<a><b></a>")
+      assert {:error, {:list_xml, _}} = ListPage.parse("<ListBucketResult><b></ListBucketResult>")
     end
 
     test "a DTD is refused (entity expansion is how a small body becomes a large one)" do
@@ -109,7 +109,10 @@ defmodule Fathom.Shard.Storage.S3ListPageTest do
     end
 
     # `pages` maps continuation-token (nil for the first request) -> response body. DELETEs are
-    # reported to the test as {:deleted, decoded_key}.
+    # reported to the test as {:deleted, decoded_key}; each object LIST as {:listed, token} and
+    # {:listed_prefix, prefix}. The `?uploads` listing (the purge's abort step) is answered with a real
+    # empty ListMultipartUploadsResult: the parser now refuses any other root (expert review
+    # 2026-11-07 #82), and an object-listing body there was only ever accepted by accident.
     defp serve(test_pid, pages) do
       plug = fn conn ->
         conn = Plug.Conn.fetch_query_params(conn)
@@ -121,9 +124,14 @@ defmodule Fathom.Shard.Storage.S3ListPageTest do
             Plug.Conn.send_resp(conn, 204, "")
 
           "GET" ->
-            token = conn.query_params["continuation-token"]
-            send(test_pid, {:listed, token})
-            Plug.Conn.send_resp(conn, 200, Map.fetch!(pages, token))
+            if Map.has_key?(conn.query_params, "uploads") do
+              Plug.Conn.send_resp(conn, 200, "<ListMultipartUploadsResult/>")
+            else
+              token = conn.query_params["continuation-token"]
+              send(test_pid, {:listed, token})
+              send(test_pid, {:listed_prefix, conn.query_params["prefix"]})
+              Plug.Conn.send_resp(conn, 200, Map.fetch!(pages, token))
+            end
         end
       end
 
@@ -229,6 +237,151 @@ defmodule Fathom.Shard.Storage.S3ListPageTest do
 
       serve(pid, %{nil => xml(contents("a.db", 10), truncated: true)})
       assert {:error, {:s3_list_parse, :list_truncated_without_token}} = S3.stored_usage()
+    end
+  end
+
+  describe "ListPage / UploadsPage refuse a document that is not their listing (expert review 2026-11-07 #82)" do
+    alias Fathom.Shard.Storage.S3.UploadsPage
+
+    test "an <Error>, an HTML page or a wrong root is an error, never an empty complete listing" do
+      # Pre-fix each of these was `{:ok, %{entries: [], next: nil}}`: a broken proxy's 200 became
+      # "the tenant has no objects" (purge: erased; any_shard_object?: false; tombstoned_ids: []).
+      for body <- [
+            "<Error><Code>AccessDenied</Code></Error>",
+            "<html/>",
+            ~s(<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>),
+            "<ListMultipartUploadsResult/>"
+          ] do
+        assert {:error, {:list_unexpected_root, _}} = ListPage.parse(body), body
+      end
+
+      for body <- ["<Error/>", "<html/>", "<ListBucketResult/>"] do
+        assert {:error, {:uploads_unexpected_root, _}} = UploadsPage.parse(body), body
+      end
+    end
+
+    test "the real roots, with and without a namespace, still parse" do
+      assert {:ok, %{entries: [], next: nil}} = ListPage.parse("<ListBucketResult/>")
+
+      assert {:ok, %{entries: [], next: nil}} =
+               ListPage.parse(
+                 ~s(<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>)
+               )
+
+      assert {:ok, %{uploads: [], next: nil}} = UploadsPage.parse("<ListMultipartUploadsResult/>")
+    end
+
+    # Not a property test (no StreamData in the project): every strict PREFIX of a valid page is
+    # malformed XML and must be an error, and no single-byte corruption may raise. A parser that
+    # exits on hostile input would kill the DeleteJob / the boot gate instead of failing the call.
+    test "every truncation is an error and no byte flip raises" do
+      body =
+        xml(
+          contents("acme.db", 1) <> contents("acme@v1.db", 2),
+          truncated: true,
+          token: "T1"
+        )
+
+      for n <- 0..(byte_size(body) - 1) do
+        assert {:error, _} = ListPage.parse(binary_part(body, 0, n)), "prefix of #{n} bytes"
+      end
+
+      for i <- 0..(byte_size(body) - 1), flip <- [0xFF, 0x00, ?<] do
+        head = binary_part(body, 0, i)
+        tail = binary_part(body, i + 1, byte_size(body) - i - 1)
+
+        assert match?(
+                 {tag, _} when tag in [:ok, :error],
+                 ListPage.parse(<<head::binary, flip, tail::binary>>)
+               )
+      end
+    end
+  end
+
+  describe "purge_shard lists only the delimiter-qualified prefixes (expert review 2026-11-07 #61)" do
+    # A tiny S3: the keys it holds, ListObjectsV2 by `prefix` with 1000-key pages and numeric
+    # continuation tokens, and DELETE. Every LIST is reported to the test.
+    defp fleet_store(test_pid, keys) do
+      plug = fn conn ->
+        conn = Plug.Conn.fetch_query_params(conn)
+
+        case conn.method do
+          "DELETE" ->
+            key = conn.request_path |> String.replace_prefix("/b/", "") |> URI.decode()
+            send(test_pid, {:deleted, key})
+            Plug.Conn.send_resp(conn, 204, "")
+
+          "GET" ->
+            if Map.has_key?(conn.query_params, "uploads") do
+              Plug.Conn.send_resp(conn, 200, "<ListMultipartUploadsResult/>")
+            else
+              prefix = conn.query_params["prefix"]
+              send(test_pid, {:listed_prefix, prefix})
+              start = String.to_integer(conn.query_params["continuation-token"] || "0")
+              matching = keys |> Enum.filter(&String.starts_with?(&1, prefix)) |> Enum.sort()
+              page = matching |> Enum.drop(start) |> Enum.take(1000)
+              more? = start + 1000 < length(matching)
+
+              body =
+                "<ListBucketResult><IsTruncated>#{more?}</IsTruncated>" <>
+                  if(more?,
+                    do: "<NextContinuationToken>#{start + 1000}</NextContinuationToken>",
+                    else: ""
+                  ) <>
+                  Enum.map_join(page, &"<Contents><Key>#{&1}</Key><Size>1</Size></Contents>") <>
+                  "</ListBucketResult>"
+
+              Plug.Conn.send_resp(conn, 200, body)
+            end
+        end
+      end
+
+      Application.put_env(:fathom, S3,
+        bucket: "b",
+        region: "us-east-1",
+        access_key_id: "k",
+        secret_access_key: "s",
+        endpoint: "https://s3.example",
+        path_style: true,
+        req_plug: plug
+      )
+    end
+
+    setup do
+      prev = Application.get_env(:fathom, S3)
+
+      on_exit(fn ->
+        if prev,
+          do: Application.put_env(:fathom, S3, prev),
+          else: Application.delete_env(:fathom, S3)
+      end)
+
+      %{test_pid: self()}
+    end
+
+    test "erasing `acme` among 2,500 sibling ids lists two prefixes and deletes only its own keys",
+         %{test_pid: pid} do
+      siblings = for i <- 1..2_500, do: "acme#{String.pad_leading("#{i}", 4, "0")}.db"
+      own = ["acme.db", "acme.lock", "acme@v1.db", "acme@snap-1.db"]
+      fleet_store(pid, siblings ++ own ++ ["other.db"])
+
+      assert :ok = S3.purge_shard("acme")
+
+      messages = drain([])
+      listed = for {:listed_prefix, p} <- messages, do: p
+      # Pre-fix: the bare prefix `acme`, three pages (2,504 keys) of which 2,500 are discarded.
+      assert listed == ["acme.", "acme@"], "LISTed #{inspect(listed)}"
+
+      deleted = for {:deleted, k} <- messages, do: k
+      assert Enum.sort(deleted) == Enum.sort(own)
+    end
+
+    defp drain(acc) do
+      receive do
+        msg -> drain([msg | acc])
+      after
+        0 -> Enum.reverse(acc)
+      end
     end
   end
 end

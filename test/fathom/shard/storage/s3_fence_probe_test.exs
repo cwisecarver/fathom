@@ -90,6 +90,66 @@ defmodule Fathom.Shard.Storage.S3FenceProbeTest do
     assert S3.verify_conditional_writes!() == :ok
   end
 
+  # Expert review 2026-11-07 #36. The old least-privilege advice (no broad DeleteObject on the live
+  # prefix) leaves a policy scoped to `fence-probe/*` + `@*` keys: it passes the conditional-DELETE
+  # probe on `fence-probe/<node>` and then 403s the first lock release / heartbeat clear at runtime,
+  # stranding every lock behind a live heartbeat. The boot probe now deletes a lock-shaped key and a
+  # `heartbeats/` key, so that policy fails boot.
+  describe "IAM: the runtime delete permissions are probed at boot (#36)" do
+    # A store that behaves, except DELETE is refused (403) for the keys `denied?.(path)` selects.
+    defp iam_store(denied?) do
+      store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
+
+      put_s3_config(fn conn ->
+        if conn.method == "DELETE" and denied?.(conn.request_path),
+          do: Plug.Conn.send_resp(conn, 403, "<Error><Code>AccessDenied</Code></Error>"),
+          else: S3EtagStore.serve(conn, store)
+      end)
+    end
+
+    test "a policy that withholds DeleteObject from *.lock fails boot" do
+      iam_store(&String.ends_with?(&1, ".lock"))
+
+      assert_raise RuntimeError,
+                   ~r/permission self-test failed \(DELETE of a lock-shaped key/,
+                   fn ->
+                     S3.verify_conditional_writes!()
+                   end
+    end
+
+    test "a policy that withholds DeleteObject from heartbeats/ fails boot" do
+      iam_store(&String.contains?(&1, "/heartbeats/"))
+
+      assert_raise RuntimeError,
+                   ~r/permission self-test failed \(DELETE under heartbeats\//,
+                   fn ->
+                     S3.verify_conditional_writes!()
+                   end
+    end
+
+    test "the documented least-privilege policy (no DeleteObject on lock or heartbeat keys) fails boot, and says why" do
+      iam_store(fn path ->
+        String.ends_with?(path, ".lock") or String.contains?(path, "/heartbeats/")
+      end)
+
+      error =
+        assert_raise RuntimeError, ~r/permission self-test failed/, fn ->
+          S3.verify_conditional_writes!()
+        end
+
+      assert error.message =~ "s3:DeleteObject"
+      assert error.message =~ "heartbeats/"
+    end
+
+    test "a policy that grants the lock and heartbeat keys passes, and leaves nothing behind" do
+      store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
+      put_s3_config(fn conn -> S3EtagStore.serve(conn, store) end)
+
+      assert S3.verify_conditional_writes!() == :ok
+      assert S3EtagStore.etag_of(store, "fence-probe/#{node()}.lock") == nil
+    end
+  end
+
   test "refuses to boot against a store that ignores conditional writes" do
     put_s3_config(&lax_store/1)
 

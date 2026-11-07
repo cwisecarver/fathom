@@ -52,11 +52,22 @@ defmodule Fathom.Shard.Storage.S3.ListPage do
   defp event({:startDTD, _name, _public, _system}, _loc, _state),
     do: throw({:list_page_abort, :list_xml_dtd_refused})
 
-  defp event({:startElement, _uri, local, _qname, _attrs}, _loc, state) do
-    name = List.to_string(local)
-    contents = if name == "Contents", do: %{key: nil, size: nil}, else: state.contents
-    %{state | path: [name | state.path], text: [], contents: contents}
+  # THE ROOT MUST BE `ListBucketResult` (expert review 2026-11-07 #82). Without the check ANY
+  # well-formed document parsed as an empty, complete listing: a broken proxy's 200 with an `<Error>`
+  # body, an HTML error page, a wrong-service response. That breaks this module's own invariant (never
+  # a short listing reported as complete) in the worst place: `purge_shard` reported a tenant erased
+  # with objects left, `any_shard_object?` answered `{:ok, false}`, and `tombstoned_ids` returned
+  # `{:ok, []}` into the boot re-mint gate. The name is fixed by the S3 API (every compatible store
+  # uses it, with or without a namespace), so a real response cannot be refused.
+  defp event({:startElement, _uri, local, _qname, _attrs}, _loc, %{path: []} = state) do
+    case List.to_string(local) do
+      "ListBucketResult" -> start_element("ListBucketResult", state)
+      other -> throw({:list_page_abort, {:list_unexpected_root, other}})
+    end
   end
+
+  defp event({:startElement, _uri, local, _qname, _attrs}, _loc, state),
+    do: start_element(List.to_string(local), state)
 
   defp event({:characters, chars}, _loc, %{path: [_ | _]} = state),
     do: %{state | text: [chars | state.text]}
@@ -101,4 +112,9 @@ defmodule Fathom.Shard.Storage.S3.ListPage do
   end
 
   defp event(_other, _loc, state), do: state
+
+  defp start_element(name, state) do
+    contents = if name == "Contents", do: %{key: nil, size: nil}, else: state.contents
+    %{state | path: [name | state.path], text: [], contents: contents}
+  end
 end
