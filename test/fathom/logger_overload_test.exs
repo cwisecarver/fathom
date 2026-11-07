@@ -12,20 +12,9 @@ defmodule Fathom.LoggerOverloadTest do
 
     * the LIVE default handler (the one the booted app is using) carries the policy;
     * a handler built from exactly those overload keys, writing to a device that never answers,
-      does not block 40 concurrent callers, while the same handler with OTP's defaults does.
+      does not block a caller, while the same handler with OTP's defaults does.
   """
   use ExUnit.Case, async: false
-
-  # A formatter that costs ~0.1 ms of CPU per event, so the handler's single process falls behind 40
-  # producers on any machine (without it the queue only builds when the scheduler happens to
-  # interleave the producers, and the control below is timing-dependent).
-  defmodule SlowFormatter do
-    @moduledoc false
-    def format(_event, _config) do
-      Enum.reduce(1..5_000, 0, fn i, acc -> :erlang.phash2({i, acc}) end)
-      "overload probe\n"
-    end
-  end
 
   @overload_keys [
     :sync_mode_qlen,
@@ -54,10 +43,32 @@ defmodule Fathom.LoggerOverloadTest do
     assert cfg.burst_limit_max_count >= 2_000
   end
 
-  # 40 processes log 100 lines each into a handler whose sink never answers. Returns how many of the
-  # 40 got all their calls back within `wait_ms`, and the slowest single call among those.
-  defp storm(overload, wait_ms) do
-    sink = spawn(fn -> Process.sleep(:infinity) end)
+  # The probe, built so the outcome is decided by `logger_olp`'s own rules and not by scheduling.
+  #
+  # `logger_olp` re-reads the queue length only when it HANDLES an event (`check_load`), and the mode
+  # it picks then is what every later caller sees. A dead sink blocks the olp inside that first
+  # event's write, so the mode is frozen at whatever the first event found. The probe therefore:
+  #
+  #   1. adds a handler whose device is a process that never answers,
+  #   2. SUSPENDS the olp and lets `queued` callers cast into its mailbox (async mode: no blocking),
+  #   3. resumes it; the first event it handles sees `queued` waiting and sets the mode from the
+  #      overload keys, then blocks in the write to the sink (the sink tells us when it arrives),
+  #   4. sends ONE more log call and reports whether it came back within `wait_ms`.
+  #
+  # Returns `:returned` (async or drop: the caller is never made to wait) or `:blocked` (sync mode:
+  # the caller is parked in a call to an olp that is stuck on the sink).
+  defp probe(overload, queued, wait_ms) do
+    test_pid = self()
+
+    sink =
+      spawn(fn ->
+        receive do
+          {:io_request, _from, _ref, _req} = req -> send(test_pid, {:sink_got, req})
+        end
+
+        Process.sleep(:infinity)
+      end)
+
     id = :"logger_overload_probe_#{System.unique_integer([:positive])}"
     filter_id = :"not_probe_#{System.unique_integer([:positive])}"
 
@@ -70,7 +81,7 @@ defmodule Fathom.LoggerOverloadTest do
         level: :all,
         filter_default: :log,
         filters: [only_probe: only_probe],
-        formatter: {SlowFormatter, %{}}
+        formatter: {:logger_formatter, %{template: [:msg, "\n"]}}
       })
 
     :ok =
@@ -80,44 +91,43 @@ defmodule Fathom.LoggerOverloadTest do
         {fn ev, _ -> if ev.meta[:probe], do: :stop, else: :ignore end, []}
       )
 
-    tasks =
-      for _ <- 1..40 do
-        Task.async(fn ->
-          for _ <- 1..100 do
-            started = System.monotonic_time(:millisecond)
-            :logger.warning("overload probe", %{probe: id})
-            System.monotonic_time(:millisecond) - started
-          end
-        end)
+    # `logger_h_common` registers the handler's olp as `<module>_<id>`.
+    olp_pid =
+      Process.whereis(:"logger_std_h_#{id}") || flunk("the probe handler's olp is not registered")
+
+    try do
+      :ok = :sys.suspend(olp_pid)
+      for _ <- 1..queued, do: :logger.warning("overload probe", %{probe: id})
+      {:message_queue_len, ^queued} = Process.info(olp_pid, :message_queue_len)
+      :ok = :sys.resume(olp_pid)
+
+      assert_receive {:sink_got, _}, 5_000
+
+      task = Task.async(fn -> :logger.warning("overload probe", %{probe: id}) end)
+
+      case Task.yield(task, wait_ms) do
+        {:ok, :ok} -> :returned
+        nil -> :blocked
       end
-
-    results = Task.yield_many(tasks, wait_ms)
-
-    # Cleanup BEFORE asserting: unblock the handler's writer, drop stuck callers, remove both the
-    # handler and the filter on the real one.
-    for {task, nil} <- results, do: Task.shutdown(task, :brutal_kill)
-    Process.exit(sink, :kill)
-    :logger.remove_handler_filter(:default, filter_id)
-    :logger.remove_handler(id)
-
-    maxes = for {_task, {:ok, durations}} <- results, do: Enum.max(durations)
-    {length(maxes), Enum.max([0 | maxes])}
+    after
+      Process.exit(sink, :kill)
+      :logger.remove_handler_filter(:default, filter_id)
+      :logger.remove_handler(id)
+    end
   end
 
   test "with the app's overload policy a stalled sink blocks no caller" do
-    {finished, slowest_ms} = storm(live_overload(), 5_000)
-
-    assert finished == 40, "only #{finished} of 40 callers got their log calls back"
-    assert slowest_ms < 1_000, "the slowest log call took #{slowest_ms} ms against a stalled sink"
+    assert probe(live_overload(), 50, 1_000) == :returned,
+           "a log call blocked behind a stalled sink with #{inspect(live_overload())}"
   end
 
-  # The control: same storm, OTP's defaults. If this stopped blocking, the test above would pass
-  # without the config and prove nothing.
-  test "the same storm DOES block callers under OTP's default policy" do
+  # The control: same probe, OTP's defaults. 50 queued lines is between sync_mode_qlen (10) and
+  # drop_mode_qlen (200), so the olp goes synchronous and the next caller parks. If this stopped
+  # blocking, the test above would pass without the config and prove nothing.
+  test "the same probe DOES block a caller under OTP's default policy" do
     defaults = %{sync_mode_qlen: 10, drop_mode_qlen: 200, flush_qlen: 1000}
-    {finished, _slowest_ms} = storm(defaults, 1_500)
 
-    assert finished < 40,
-           "all 40 callers finished under the OTP defaults: the fixture no longer reproduces the stall"
+    assert probe(defaults, 50, 500) == :blocked,
+           "the caller was not blocked under the OTP defaults: the fixture no longer reproduces the stall"
   end
 end
