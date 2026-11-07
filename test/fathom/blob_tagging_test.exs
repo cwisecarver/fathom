@@ -21,11 +21,18 @@ defmodule Fathom.BlobTaggingTest do
   @patched? Connection.tagged_reads?()
 
   setup do
-    {:ok, conn} =
-      Connection.open(
-        Path.join(System.tmp_dir!(), "blobtag-#{System.unique_integer([:positive])}.db")
+    # `System.unique_integer/1` restarts at 1 in every VM, and this file used to be left behind: 125
+    # stale `blobtag-N.db` accumulated in the tmp dir and a later run whose counter reached the same
+    # N opened a database that already had `b` (`{:error, "table b already exists"}` in setup, seed
+    # 292350). The name now carries the wall clock too and every file this test creates is removed.
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "blobtag-#{System.os_time(:nanosecond)}-#{System.unique_integer([:positive])}.db"
       )
 
+    on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(path <> s) end)
+    {:ok, conn} = Connection.open(path)
     on_exit(fn -> Connection.close(conn) end)
 
     :ok = Connection.exec(conn, "CREATE TABLE b (id INTEGER PRIMARY KEY, v)")
