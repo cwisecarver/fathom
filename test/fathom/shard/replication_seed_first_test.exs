@@ -110,6 +110,12 @@ defmodule Fathom.Shard.ReplicationSeedFirstTest do
     assert :ok = Session.commit(id, wal, coordinator)
     _ = collects(session!(id))
 
+    # The first commit acks once a quorum of seeds lands (round-9 quorum release), so the third
+    # follower's seed can still be in flight here. Stopping the Session then leaves that follower's
+    # waiter held: the restarted Session's push gets `:already_in_flight` from it next to an
+    # `:offset_mismatch` from another, quorum is impossible, and the commit below returned
+    # `{:no_quorum, :impossible}` (seed 333, about 1 run in 3 under --repeat-until-failure).
+    await_no_seeds!(id)
     Session.stop(id)
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
     assert :ok = Session.commit(id, wal, coordinator)
