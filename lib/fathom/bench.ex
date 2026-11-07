@@ -4524,6 +4524,12 @@ defmodule Fathom.Bench do
     Application.put_env(:fathom, :directory_touch, false)
     Application.put_env(:fathom, :lazy_migrate, false)
 
+    # The harness boots no supervision tree, so no Heartbeat: its coordinators open LEGACY on purpose
+    # (the arms that want heartbeat mode start one themselves). A node configured for the heartbeat
+    # refuses such an open (expert review 2026-11-07 #59), so state the mode instead of inheriting
+    # `heartbeat_server`'s prod default. Same effective topology as before — no series break.
+    Application.put_env(:fathom, :heartbeat_server, false)
+
     ensure_started(Registry, keys: :unique, name: Fathom.ShardRegistry)
     ensure_started(DynamicSupervisor, name: Fathom.ShardSupervisor, strategy: :one_for_one)
 

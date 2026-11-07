@@ -115,8 +115,21 @@ defmodule Fathom.Shard.Heartbeat do
   @doc "PubSub topic broadcast on a heartbeat lapse (`{:heartbeat_lapsed, generation}`)."
   def topic, do: @topic
 
-  @doc "Whether the heartbeat process is running (coordinators fall back to the legacy fence if not)."
+  @doc """
+  Whether the heartbeat process is running. Not the same question as `configured?/0`: a configured
+  node's Heartbeat is unregistered between a crash and its restart, and registered (but not yet
+  answering) while its `init/1` does storage I/O.
+  """
   def running?, do: Process.whereis(__MODULE__) != nil
+
+  @doc """
+  Whether this node is CONFIGURED to run the heartbeat (`:heartbeat_server`, default `true`; the test
+  config turns it off). The ONE reader: the supervision tree starts the process from it, and a
+  coordinator's open refuses (rather than silently latching legacy liveness for life) when it is `true`
+  and the heartbeat cannot answer (expert review 2026-11-07 #59).
+  """
+  @spec configured?() :: boolean()
+  def configured?, do: Application.get_env(:fathom, :heartbeat_server, true)
 
   # The status ETS row: {:status, generation, mono_deadline_ms, margin_ms, wall_deadline_ms,
   # skew_ms}, written

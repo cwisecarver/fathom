@@ -192,6 +192,11 @@ avoids). Before a flush it calls `Heartbeat.valid_for_write?(acquire_gen)`:
   remapped shard never double-writes.
 - If the **heartbeat process is down** entirely, the coordinator degrades to the **legacy per-shard
   renew fence** (renew the lease on a timer, self-fence on `:superseded`).
+  That degradation is for a coordinator that is ALREADY open. The mode is fixed at open, so a node
+  configured for the heartbeat (`:heartbeat_server`, the default) refuses an open while the heartbeat
+  cannot answer (a retryable 503 `{:heartbeat_unavailable, _}`, nothing acquired) rather than latching
+  legacy liveness for the coordinator's life; and a legacy coordinator's failing renewal starts the
+  write-fence clock like a heartbeat lapse does (expert review 2026-11-07 #59).
 - **A lapse that lands while a flush is in flight is re-armed when that flush ends.** The proactive
   lapse revalidation (`:revalidate_lapse`) never runs concurrently with a flush — it would race the
   flush task's lease merge (a stale lock etag merged over a fresh one reads as a steal) — so it skips

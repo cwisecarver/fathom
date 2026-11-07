@@ -1432,7 +1432,7 @@ defmodule Fathom.Application do
   # lease renewal). Gated like the listeners and off in test (the heartbeat tests
   # start it themselves), since it does periodic storage I/O.
   defp heartbeat_children do
-    if Application.get_env(:fathom, :heartbeat_server, true),
+    if Fathom.Shard.Heartbeat.configured?(),
       do: [Fathom.Shard.Heartbeat],
       else: []
   end

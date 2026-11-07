@@ -624,6 +624,58 @@ defmodule Fathom.Shard do
   end
 
   defp open_coordinator_stat_ok(state, shard_id, path, open_started, file?) do
+    case sample_acquire_gen() do
+      {:ok, acquire_gen} ->
+        open_coordinator_sampled(state, shard_id, path, open_started, file?, acquire_gen)
+
+      # Nothing is held yet (no lease, no pull, no fork task), so the pre-open stop leaves nothing
+      # behind: `{:shutdown, _}` like every other open refusal, so the `:transient` child is not
+      # restarted and `checkout/1` maps it to a retryable 503 (`ShardExecutor.open_error/1`).
+      {:error, reason} ->
+        Logger.warning(
+          "shard #{shard_id}: refusing to open: this node runs the heartbeat but it cannot answer " <>
+            "(#{inspect(reason)}); a coordinator opened now would latch LEGACY liveness for life"
+        )
+
+        {:stop, {:shutdown, reason}, state}
+    end
+  end
+
+  # THE LIVENESS MODE (`acquire_gen`) IS FIXED AT OPEN, SO IT MUST NEVER BE LEGACY BY ACCIDENT (expert
+  # review 2026-11-07 #59). Non-nil is heartbeat mode; nil is legacy (per-shard renew PUTs, no lapse
+  # subscription, the Session ack ungated). This used to be
+  # `if Heartbeat.running?(), do: Fence.generation(), else: nil`, and `Fence.generation/1` maps ANY
+  # exit to nil. The Heartbeat registers its name BEFORE `init/1` does its storage I/O, and is
+  # unregistered between a crash and its restart, so an open that overlapped either latched LEGACY for
+  # the coordinator's whole life — it never learned of a later lapse and, with the renewal failing,
+  # started no write-fence clock.
+  #
+  # So a node CONFIGURED for the heartbeat (`Heartbeat.configured?/0`, the default and prod) refuses
+  # the open with a retryable 503 when the generation cannot be read; legacy stays the answer when the
+  # config says so (tests, dev). The alternative, UPGRADING a legacy coordinator at its first
+  # revalidate, was rejected: a legacy coordinator receives no lapse broadcast, so nothing would
+  # trigger it, and the upgrade would have to prove that no steal happened while it was legacy — the
+  # very proof the generation baseline taken BEFORE the lease exists to give. The cost of refusing is
+  # a client retry for the length of a Heartbeat restart.
+  #
+  # Sampled BEFORE `acquire_lease`: the fence's invariant is "generation unchanged since acquire ⇒ no
+  # steal was possible," which only holds if the baseline predates ownership. Sampling it after
+  # acquire (and after the pull await, up to @pull_timeout later) let a lapse-and-steal in that gap
+  # bump the generation before we read it — the coordinator then recorded the post-steal value as its
+  # baseline and every later flush passed the fence unconditionally, clobbering the stealer
+  # (finding #5). Now it is sampled before the fork-evidence and pull tasks start too.
+  defp sample_acquire_gen do
+    running? = Heartbeat.running?()
+    gen = if running?, do: Fence.generation(), else: nil
+
+    cond do
+      is_integer(gen) -> {:ok, gen}
+      not Heartbeat.configured?() -> {:ok, nil}
+      true -> {:error, {:heartbeat_unavailable, if(running?, do: :booting, else: :down)}}
+    end
+  end
+
+  defp open_coordinator_sampled(state, shard_id, path, open_started, file?, acquire_gen) do
     # node()#<boot nonce> — boot-scoped lease identity (expert review #6): a lock
     # left by a previous incarnation of this node name is a FOREIGN owner, so it is
     # stolen (liveness check + epoch bump), never silently reclaimed at the same
@@ -670,14 +722,8 @@ defmodule Fathom.Shard do
 
     pull_task = if file?, do: nil, else: Materializer.start_pull(shard_id, path)
 
-    # Sample the heartbeat generation BEFORE acquire_lease. The fence's invariant is
-    # "generation unchanged since acquire ⇒ no steal was possible," which only holds if the
-    # baseline predates ownership. Sampling it after acquire (and after the pull await, up to
-    # @pull_timeout later) let a lapse-and-steal in that gap bump the generation before we read
-    # it — the coordinator then recorded the post-steal value as its baseline and every later
-    # flush passed the fence unconditionally, clobbering the stealer (finding #5). nil ⇒ legacy
-    # mode; Heartbeat.running?/0 already guards an early call.
-    acquire_gen = if Heartbeat.running?(), do: Fence.generation(), else: nil
+    # `acquire_gen` (nil = legacy by CONFIG) was sampled by `sample_acquire_gen/0`, before anything
+    # above started.
 
     case Storage.acquire_lease(shard_id, owner, ttl) do
       {:ok, lease} ->
@@ -7191,12 +7237,26 @@ defmodule Fathom.Shard do
       # Transient store error — a blip is not loss of ownership; keep serving and
       # retry. If it persists past the TTL another node will steal and the next
       # renewal will come back :superseded.
+      #
+      # BUT THE FAILURE STARTS THE WRITE-FENCE CLOCK (expert review 2026-11-07 #59). A legacy
+      # coordinator's only liveness signal is this renewal, and the clock used to start only from
+      # `:fence_skip` in a flush (a DIRTY shard) or a heartbeat lapse (heartbeat mode): a clean or
+      # read-mostly legacy shard on a node cut from storage observed nothing, the lock's TTL plus the
+      # steal margin passed, a peer became entitled to steal — and the first write after that was
+      # acked, with the clock starting from zero. `note_not_valid/1` only records the instant and arms
+      # the one-shot re-check; the fence publishes after `stealable_after_ms/1` of CONTINUOUS failure
+      # (the re-check reads "still set" as "no renewal has succeeded", see `write_fence_recheck/1`),
+      # and the next successful renewal above clears it. It starts at the FIRST failed renewal, one
+      # renew interval (ttl/3) after the last success, so it arms ttl/3 before the lock is stealable —
+      # the early direction, same as the heartbeat clock; back-dating it from the lock's expiry was
+      # rejected for the reason `apply_lapse_verdict(:skip, _)` gives. Heartbeat mode never renews per
+      # shard (`renew_task` is armed only when `acquire_gen == nil`), so this is legacy-only.
       {:error, reason} ->
         Logger.warning(
           "shard #{state.id}: lease renewal transient error (#{inspect(reason)}); retrying"
         )
 
-        {:noreply, schedule_renew(state)}
+        {:noreply, schedule_renew(note_not_valid(state))}
     end
   end
 

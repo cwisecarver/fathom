@@ -267,4 +267,41 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
       assert :sys.get_state(coordinator).not_valid_since == nil
     end)
   end
+
+  # Expert review 2026-11-07 #59. A legacy coordinator's only liveness signal is its per-shard
+  # renewal, and a FAILING renewal only logged: the clock started solely from a flush's `:fence_skip`
+  # (a dirty shard) or a heartbeat lapse (heartbeat mode). A clean legacy shard on a node cut from
+  # storage therefore observed nothing and never fenced. Clean on purpose: with no write no flush tick
+  # runs, so only the renewal result can start the clock here. The fence must also LIFT when renewal
+  # works again (nothing else clears it on a clean shard).
+  test "legacy mode: a failing renewal starts the clock on a CLEAN shard, and a success lifts the fence",
+       %{shard: shard} do
+    set_mode!(:legacy)
+
+    capture_log(fn ->
+      {:ok, coordinator} = Shards.ensure(shard)
+      assert_mode!(coordinator, :legacy)
+      refute Fathom.Shard.dirty?(coordinator), "fixture: the shard must be CLEAN"
+      assert :sys.get_state(coordinator).not_valid_since == nil
+
+      # The renewal timer runs every ttl/3 (500 ms here); stealable-after is margin + steal margin.
+      Application.put_env(:fathom, :storage_fault, :renew)
+
+      assert_receive :write_fenced,
+                     5_000,
+                     "a failing legacy renewal never started the write-fence clock"
+
+      assert WriteFence.fenced?(shard)
+
+      Application.delete_env(:fathom, :storage_fault)
+
+      Fathom.Test.Await.until(
+        fn -> not WriteFence.fenced?(shard) end,
+        "a renewal that succeeded again did not lift the fence",
+        5_000
+      )
+
+      assert :sys.get_state(coordinator).not_valid_since == nil
+    end)
+  end
 end

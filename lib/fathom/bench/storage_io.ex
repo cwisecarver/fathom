@@ -705,6 +705,10 @@ defmodule Fathom.Bench.StorageIO do
       Application.put_env(:fathom, :shard_flush_interval_ms, 0)
       Application.put_env(:fathom, :directory_touch, false)
       Application.put_env(:fathom, :lazy_migrate, false)
+
+      # No supervision tree, so no Heartbeat: legacy coordinators on purpose; a node configured for the
+      # heartbeat would refuse these opens (expert review 2026-11-07 #59).
+      Application.put_env(:fathom, :heartbeat_server, false)
       ensure_started(Registry, keys: :unique, name: Fathom.ShardRegistry)
       ensure_started(DynamicSupervisor, name: Fathom.ShardSupervisor, strategy: :one_for_one)
       ensure_started(Fathom.ShardLoad, [])

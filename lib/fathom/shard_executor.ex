@@ -1984,6 +1984,11 @@ defmodule Fathom.ShardExecutor do
   def open_error(:normal), do: retryable_open_error(:normal)
   def open_error({:open_failed, {:exit, _}} = reason), do: retryable_open_error(reason)
 
+  # The node runs the heartbeat but it cannot answer right now (booting or restarting): the open is
+  # refused BEFORE it acquires anything, so no coordinator latches legacy liveness for life (expert
+  # review 2026-11-07 #59). It clears when the Heartbeat is back, so it is a retry.
+  def open_error({:heartbeat_unavailable, _} = reason), do: retryable_open_error(reason)
+
   # Peer recovery heard too few definite answers to rule out a fresher replica (expert review
   # 2026-10-12 #5). Deliberate and bounded (`:replication_recovery_underquorum_window_ms`): the
   # client retries while the partition heals. Its own code so a rig run or an SDK log can tell it
