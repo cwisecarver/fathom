@@ -486,7 +486,7 @@ defmodule Fathom.Migrator.ShardMigration do
   # decides to DISCARD the keeper's acked tail, which is a data-loss decision for the operator, not
   # a timer. The marker clears when anyone opens the shard (the keeper's reopen flushes its tail; a
   # peer's open overwrites it and loses the tail) — an operator who knows the keeper's disk is gone
-  # opens the tenant once and the next retry proceeds. See docs/runbooks.
+  # opens the tenant once and the next retry proceeds. See docs/migration.md.
   #
   # Read immediately before the acquire, so a keeper that dirty-releases in the gap between the two
   # is still stolen: that window is one storage round trip wide, and closing it needs the acquire
