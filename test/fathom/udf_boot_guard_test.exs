@@ -56,6 +56,72 @@ defmodule Fathom.UdfBootGuardTest do
     end
   end
 
+  # Expert review 2026-11-07 #42. Symptom: the guard tested artifact EXISTENCE (`File.exists?`), so a
+  # wrong-arch / corrupt / too-old-SQLite artifact (or `SQLITE_EXTENSION=""`) booted healthy and then
+  # failed every tenant open while /health kept the node in the LB. Invariant: a configured artifact
+  # that does not LOAD refuses the prod boot, with or without ALLOW_NO_UDF (the ack means "run
+  # without the extension", which a configured-but-broken artifact is not).
+  describe "an artifact that exists but does not load (#42)" do
+    setup do
+      Application.put_env(:fathom, :env, :prod)
+      Application.delete_env(:fathom, :allow_no_udf)
+
+      on_exit(fn ->
+        # Leave no armed state pointing at the garbage path: the next open re-arms for the real one.
+        Application.delete_env(:fathom, :sqlite_extension)
+      end)
+
+      :ok
+    end
+
+    test "a 4-byte garbage artifact refuses to boot, ALLOW_NO_UDF or not" do
+      path = Path.join(System.tmp_dir!(), "garbage_udf_#{System.unique_integer([:positive])}.so")
+      File.write!(path, <<0, 1, 2, 3>>)
+      on_exit(fn -> File.rm(path) end)
+
+      Application.put_env(:fathom, :sqlite_extension, path)
+
+      assert Fathom.Shard.Extension.available?(),
+             "fixture: the garbage file must count as present"
+
+      assert_raise RuntimeError, ~r/configured but does not load/, fn ->
+        Fathom.Application.check_udf_extension!()
+      end
+
+      Application.put_env(:fathom, :allow_no_udf, true)
+
+      assert_raise RuntimeError, ~r/configured but does not load/, fn ->
+        Fathom.Application.check_udf_extension!()
+      end
+    end
+
+    test "an EMPTY SQLITE_EXTENSION (\"\" is a path string, not unset) refuses to boot" do
+      Application.put_env(:fathom, :sqlite_extension, "")
+
+      assert_raise RuntimeError, ~r/configured but does not load/, fn ->
+        Fathom.Application.check_udf_extension!()
+      end
+    end
+
+    test "the pure verdict: {:error, _} is refused with the ack, replication off, anything" do
+      for allow <- [true, false], repl <- [true, false] do
+        assert Fathom.Application.udf_extension_problem(%{
+                 env: :prod,
+                 extension: {:error, "dlopen failed"},
+                 allow_no_udf: allow,
+                 replication_enabled: repl
+               }) =~ "dlopen failed"
+      end
+
+      assert Fathom.Application.udf_extension_problem(%{
+               env: :dev,
+               extension: {:error, "dlopen failed"},
+               allow_no_udf: false,
+               replication_enabled: false
+             }) == nil
+    end
+  end
+
   test "prod with the extension present boots" do
     assert Fathom.Shard.Extension.available?(), "the extension is not built"
     Application.put_env(:fathom, :env, :prod)

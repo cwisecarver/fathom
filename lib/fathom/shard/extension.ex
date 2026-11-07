@@ -190,27 +190,68 @@ defmodule Fathom.Shard.Extension do
   defp arm(path, previous) do
     if previous, do: disarm(previous)
 
-    case control(path, &exec_row(&1, "SELECT fathom_auto_extension(1)", [])) do
-      {:ok, 1} ->
-        put_armed({path, :auto})
-        :auto
+    case arm_outcome(
+           path,
+           control(path, &exec_row(&1, "SELECT fathom_auto_extension(1)", [])),
+           &loads_per_connection?/1
+         ) do
+      {:error, _reason} = error ->
+        # NOT cached (expert review 2026-11-07 #42): a failure that is not "this artifact predates
+        # the control entry point" is retried by the next open, because it may be transient (EMFILE,
+        # ENOMEM while the first tenant opens). `Fathom.Application.check_udf_extension!/0` arms at
+        # boot, so a PERMANENT failure (wrong arch, SQLite older than the crate needs, a corrupt
+        # file) refuses the boot instead of surfacing as every tenant open failing.
+        error
 
-      {:error, reason} ->
-        # The control entry point is missing from an artifact built before r8 #14, but the
-        # per-connection one may still load: serve it the old way rather than fail every open.
-        if loads_per_connection?(path) do
-          Logger.warning(
-            "fathom_udf at #{path} has no auto-extension entry point (#{inspect(reason)}); " <>
-              "loading it per connection. Rebuild the artifact (mix compile.fathom_udf)."
-          )
-
-          put_armed({path, :per_open})
-          :per_open
-        else
-          {:error, reason}
-        end
+      mode ->
+        put_armed({path, mode})
+        mode
     end
   end
+
+  @doc false
+  # What a control-connection arming attempt means. Pure over its inputs (the control result and
+  # the per-connection probe), so the decision is testable without provoking a real transient
+  # failure.
+  #
+  # Only "the control entry point is absent" may fall back to `:per_open` — that is the one shape
+  # an artifact built before r8 #14 has, and it loads fine the old way. This used to fall back on
+  # ANY control failure, so a transient one (EMFILE/ENOMEM on the first open) followed by a
+  # `loads_per_connection?` that succeeded once pressure eased pinned the node to per-open loading
+  # for its whole life (`put_armed` is a `persistent_term`, never revisited): enable -> dlopen ->
+  # disable on every open, +45-60 us each, and the authorizer/pragma-guard install bypassed.
+  #
+  # The entry point's absence is recognised by the symbol NAME appearing in the error: that is what
+  # dlsym reports on every libc ("symbol not found", "undefined symbol", "Symbol not found: …"),
+  # whereas a failed dlopen names the PATH and never this symbol. Matching on the libc's own words
+  # would be per-platform; the name is not.
+  @spec arm_outcome(
+          Path.t(),
+          {:ok, term()} | {:error, term()},
+          (Path.t() -> boolean())
+        ) :: :auto | :per_open | {:error, term()}
+  def arm_outcome(_path, {:ok, 1}, _loads_per_connection?), do: :auto
+
+  def arm_outcome(_path, {:ok, other}, _loads_per_connection?),
+    do: {:error, {:unexpected_arm_result, other}}
+
+  def arm_outcome(path, {:error, reason} = error, loads_per_connection?) do
+    if control_entry_missing?(reason) and loads_per_connection?.(path) do
+      Logger.warning(
+        "fathom_udf at #{path} has no auto-extension entry point (#{inspect(reason)}); " <>
+          "loading it per connection. Rebuild the artifact (mix compile.fathom_udf)."
+      )
+
+      :per_open
+    else
+      error
+    end
+  end
+
+  defp control_entry_missing?(reason) when is_binary(reason),
+    do: String.contains?(reason, @control_entry)
+
+  defp control_entry_missing?(_reason), do: false
 
   defp disarm({path, :auto}) do
     _ = control(path, &exec_row(&1, "SELECT fathom_auto_extension(0)", []))
@@ -226,13 +267,20 @@ defmodule Fathom.Shard.Extension do
   # A `:persistent_term.put` triggers a global GC scan: bounded by config changes, never per open.
   defp put_armed(value), do: :persistent_term.put(@armed_key, value)
 
+  # A strict boolean. The `with` used to return a failed `Sqlite3.open`'s `{:error, _}` as-is, which
+  # is TRUTHY, so a node that could not even open its probe connection was told the artifact "loads
+  # per connection" (expert review 2026-11-07 #42).
   defp loads_per_connection?(path) do
-    with {:ok, conn} <- Sqlite3.open(":memory:") do
-      try do
-        do_load(conn, path) == :ok
-      after
-        Sqlite3.close(conn)
-      end
+    case Sqlite3.open(":memory:") do
+      {:ok, conn} ->
+        try do
+          do_load(conn, path) == :ok
+        after
+          Sqlite3.close(conn)
+        end
+
+      {:error, _reason} ->
+        false
     end
   end
 
@@ -370,6 +418,9 @@ defmodule Fathom.Shard.Extension do
   node without the artifact refuses to start unless `ALLOW_NO_UDF=true` acknowledges the
   downgrade (no engine PRAGMA authorizer, no deadline backstop, no size limits, no Django UDFs).
   Before that nothing called this, and a node built without cargo degraded silently.
+
+  This is PRESENCE, not loadability: a wrong-arch or corrupt artifact is `available?`. The boot
+  check therefore also asks `open_mode/0` (expert review 2026-11-07 #42).
   """
   @spec available?() :: boolean()
   def available?, do: path() != nil

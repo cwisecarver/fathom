@@ -242,7 +242,7 @@ defmodule Fathom.Application do
   def check_udf_extension! do
     case udf_extension_problem(%{
            env: Application.get_env(:fathom, :env),
-           extension: if(Fathom.Shard.Extension.available?(), do: :ok, else: :missing),
+           extension: udf_extension_status(),
            allow_no_udf: Application.get_env(:fathom, :allow_no_udf, false),
            replication_enabled: Application.get_env(:fathom, :replication_enabled, false)
          }) do
@@ -251,18 +251,57 @@ defmodule Fathom.Application do
     end
   end
 
+  # The extension's state as the boot check sees it: `:missing` (no artifact / disabled), `:ok`, or
+  # `{:error, reason}` when an artifact is configured but does NOT load. Existence alone proved
+  # nothing (expert review 2026-11-07 #42): a wrong-arch `.so`, a corrupt file, an exqlite whose
+  # bundled SQLite is older than the crate's floor, or `SQLITE_EXTENSION=""` all pass `File.exists?`
+  # and then failed EVERY tenant open while `/health` kept the node in the LB. So prod arms the
+  # auto-extension here, through `Extension.open_mode/0` — the same call the first tenant open
+  # would make, and safe at boot because `Application.start/2` runs before any tenant connects.
+  # Only called in prod: dev/test arm lazily on first open, as before.
+  defp udf_extension_status do
+    cond do
+      Application.get_env(:fathom, :env) != :prod ->
+        :ok
+
+      not Fathom.Shard.Extension.available?() ->
+        :missing
+
+      true ->
+        case Fathom.Shard.Extension.open_mode() do
+          {:error, reason} -> {:error, reason}
+          _armed -> :ok
+        end
+    end
+  end
+
   @doc """
   Why a node with this config must not boot given the state of the `fathom_udf` extension, or `nil`.
 
-  Pure over the passed map (keys: `:env`, `:extension` — `:ok` or `:missing`, `:allow_no_udf`,
-  `:replication_enabled`), so a test needs no global app env.
+  Pure over the passed map (keys: `:env`, `:extension` — `:ok`, `:missing`, or `{:error, reason}`
+  for an artifact that is present but does not load, `:allow_no_udf`, `:replication_enabled`), so a
+  test needs no global app env.
   """
   @spec udf_extension_problem(%{
           env: atom(),
-          extension: :ok | :missing,
+          extension: :ok | :missing | {:error, term()},
           allow_no_udf: boolean(),
           replication_enabled: boolean()
         }) :: String.t() | nil
+  # A present-but-unloadable artifact is refused whatever `ALLOW_NO_UDF` says. The ack means "I
+  # accept running WITHOUT the extension", but a configured artifact that fails to load is not that
+  # state: `Connection.open/2` fails every tenant open with it, so acknowledging it would boot a
+  # node that serves nothing. The way to run deliberately without the extension is to say so.
+  def udf_extension_problem(%{env: :prod, extension: {:error, reason}}) do
+    "config error: the fathom_udf SQLite extension is configured but does not load on this " <>
+      "prod node (#{inspect(reason)}). Every tenant open would fail while /health stayed green " <>
+      "(expert review 2026-11-07 #42) — typical causes are a wrong-architecture or corrupt " <>
+      "artifact, an empty SQLITE_EXTENSION, or an exqlite whose bundled SQLite is older than the " <>
+      "extension needs. Fix or rebuild the artifact. To run WITHOUT the extension on purpose, set " <>
+      "SQLITE_EXTENSION=false and ALLOW_NO_UDF=true (refused while replication is on: " <>
+      "REPLICATION_ENABLED=false)."
+  end
+
   def udf_extension_problem(%{env: :prod, extension: :missing} = cfg) do
     cond do
       cfg.replication_enabled == true ->
