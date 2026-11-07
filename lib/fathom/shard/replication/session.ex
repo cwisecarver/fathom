@@ -400,6 +400,11 @@ defmodule Fathom.Shard.Replication.Session do
        # `LagGauge` and the `:catchup` event count. False for a timer armed only as a safety net
        # behind fresh in-flight pushes, which every N > Q commit leaves at reply. See `arm_if_short/1`.
        catchup_lag: false,
+       # The newest `{gen, salt, extent}` this Session had read when the QUIET safety timer was armed
+       # (nil: nothing read yet, or no quiet timer). A fired timer calls a follower lagging only if it
+       # is still short of THIS, i.e. it has not even caught up to what the shard held an interval ago;
+       # short only of newer commits is a follower that is progressing. See `handle_info(:catch_up, _)`.
+       catchup_floor: nil,
        # A catch-up episode with a laggard still short after its ONE round (expert review 2026-10-21
        # r7 #8): the laggard's next advancing ack kicks the next round at once, instead of waiting a
        # whole `catchup_ms` for the timer. See `handle_info({:repl_reply, _, {:ack, ...}}, ...)`.
@@ -1281,8 +1286,13 @@ defmodule Fathom.Shard.Replication.Session do
         {:noreply, rearm_catchup(state)}
 
       :short ->
-        LagGauge.mark(self(), true)
-        state = internal_cycle(%{state | catchup_ref: nil, catchup_lag: true}, :catch_up)
+        # Marked only for a shortfall that has LASTED an interval: a follower short of what the shard
+        # held when this timer was armed. A follower short only of commits newer than that has
+        # advanced within the interval (its ack just landed, the next push is not out yet): the
+        # cycle still ships it, but it is not lag. An episode already marked stays marked.
+        lag? = state.catchup_lag or short_of_floor?(state)
+        if lag?, do: LagGauge.mark(self(), true)
+        state = internal_cycle(%{state | catchup_ref: nil, catchup_lag: lag?}, :catch_up)
 
         if state.catchup_ref == nil,
           do: {:noreply, clear_catchup(state)},
@@ -4186,10 +4196,20 @@ defmodule Fathom.Shard.Replication.Session do
 
   defp arm_quiet(state) do
     case retry_delay_ms(state.catchup_fails, []) do
-      0 -> state
-      ms -> %{state | catchup_ref: Process.send_after(self(), :catch_up, ms)}
+      0 ->
+        state
+
+      ms ->
+        %{
+          state
+          | catchup_ref: Process.send_after(self(), :catch_up, ms),
+            catchup_floor: newest_seen(state)
+        }
     end
   end
+
+  defp newest_seen(%{seen: [newest | _]}), do: newest
+  defp newest_seen(_state), do: nil
 
   # A quiet timer turned out to cover real lag: count it, once.
   defp escalate(%{catchup_lag: true} = state), do: state
@@ -4250,6 +4270,25 @@ defmodule Fathom.Shard.Replication.Session do
 
   def catch_up_need(_state), do: :short
 
+  # Is some free, non-seeding follower still short of the extent this Session had read when the
+  # quiet timer was armed? That is the evidence a shortfall lasted the interval (a follower that holds
+  # the arm-time extent advanced since, whatever has landed after). No floor (nothing had been read, or
+  # the timer was armed loud) is lag, the conservative answer. A WAL reset since the arm moves the
+  # head to a new `{gen, salt}` the old floor can never match, so a follower already current against
+  # the head also counts as past it.
+  defp short_of_floor?(
+         %{catchup_floor: {fgen, fsalt, fextent}, seen: [{gen, salt, extent} | _]} = state
+       ) do
+    now = System.monotonic_time(:millisecond)
+
+    Enum.any?(shippers(), fn s ->
+      not Map.has_key?(state.seeding, s) and not in_flight?(state, s, now) and
+        not holds?(state, s, gen, salt, extent) and not holds?(state, s, fgen, fsalt, fextent)
+    end)
+  end
+
+  defp short_of_floor?(_state), do: true
+
   defp holds?(state, shipper, gen, salt, extent),
     do:
       match?(
@@ -4306,7 +4345,7 @@ defmodule Fathom.Shard.Replication.Session do
   # it too; a Session killed without terminate is pruned by the gauge's liveness check.
   defp clear_catchup(state) do
     LagGauge.mark(self(), false)
-    %{state | catchup_ref: nil, catchup_lag: false, catchup_chase: false}
+    %{state | catchup_ref: nil, catchup_lag: false, catchup_chase: false, catchup_floor: nil}
   end
 
   # A CLEAN commit is the only thing that clears the failure count. Not tidiness: without it a

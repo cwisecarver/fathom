@@ -18,7 +18,7 @@ defmodule Fathom.Shard.ReplicationCatchupGaugeTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Fleet, Follower, LagGauge, Session, Shipper}
   alias Fathom.Shards
-  alias Fathom.Test.PausablePeer
+  alias Fathom.Test.{Await, PausablePeer}
 
   @registry Fathom.Shard.Replication.SessionRegistry
 
@@ -129,19 +129,7 @@ defmodule Fathom.Shard.ReplicationCatchupGaugeTest do
     end
   end
 
-  defp await!(fun, what, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        fun.() -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(10) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("never: #{what}")
-  end
+  defp await!(fun, what, timeout \\ 5_000), do: Await.until(fun, "never: #{what}", timeout)
 
   defp flush_events(acc \\ 0) do
     receive do
@@ -160,13 +148,12 @@ defmodule Fathom.Shard.ReplicationCatchupGaugeTest do
        ctx do
     # An interval the stream cannot outlast, so the safety timer NEVER fires inside this test.
     # What is pinned is the classification made AT ARM TIME, at each commit. A fired timer is a
-    # different judgement (a follower short with nothing in flight at that instant is `:short`,
-    # marked and counted — pinned by the held-follower test below), and at the prod 1 s default a
-    # loaded host that stretches 100 commits past one interval makes it fire mid-stream and catch a
-    # follower in the transient gap between its ack and the next commit's push: one `:catchup`
-    # event with nothing marked at any sample (full-suite seeds 400973, 998095; with a 150 ms
-    # interval the same single event, emitted from `arm_catchup/2` inside the timer's own cycle,
-    # reproduces in 1 run of 40).
+    # different judgement: it marks only a follower still short of the extent read when the timer was
+    # armed (pinned by the held-follower test and the transient-gap test below). Before that rule a
+    # loaded host that stretched 100 commits past one interval made the timer fire mid-stream and
+    # catch a follower in the transient gap between its ack and the next commit's push: one
+    # `:catchup` event with nothing marked at any sample (full-suite seeds 400973, 998095). The
+    # parked interval keeps this test about arm-time classification only.
     ctx = Map.merge(ctx, start!(ctx, 600_000))
 
     # Sampled right after each reply, when the two non-quorum pushes are still in flight — the
@@ -219,5 +206,45 @@ defmodule Fathom.Shard.ReplicationCatchupGaugeTest do
     {:ok, _} = PausablePeer.release(ctx.peer)
     await!(fn -> all_current?(ctx.session) end, "the released follower caught up", 10_000)
     await!(fn -> not marked?(ctx.session) end, "the mark cleared once every follower was current")
+  end
+
+  # Expert review 2026-11-07 (sweep question): `handle_info(:catch_up, ...)` judged `:short` at the
+  # timer's FIRE instant, which does not show the shortfall lasted an interval. On a busy N > Q shard
+  # a healthy follower is routinely short AND free for a moment: its ack for commit k lands, but
+  # commit k+1 (which skipped it `:already_in_flight`) is already the newest extent, and the next
+  # commit's push has not gone out yet. A fire inside that gap marked the Session and emitted
+  # `:catchup` for a follower that had advanced a millisecond ago (the "transient gap" the first test
+  # above parks its timer to avoid; full-suite seeds 400973, 998095). Deterministic here: the held
+  # reply stands for the follower's ack latency, the manual `:catch_up` for the timer firing.
+  test "a fire that finds a follower short only because its ack just landed marks nothing", ctx do
+    ctx = Map.merge(ctx, start!(ctx, 600_000))
+    %{peer: peer, session: session} = ctx
+
+    :ok = PausablePeer.pause(peer)
+    commit!(ctx, 1)
+    # The timer is armed (quiet) while the follower's push is in flight.
+    assert :sys.get_state(session).catchup_ref != nil, "the safety timer was not armed"
+
+    # Newer than the held push: skipped for this follower, so its ack can only reach the old extent.
+    commit!(ctx, 2)
+
+    {:ok, _} = PausablePeer.release(peer)
+    await!(fn -> :sys.get_state(session).inflight == %{} end, "the held ack landed")
+    # The next round's push (the fire's own cycle) is held too, so the follower stays behind.
+    :ok = PausablePeer.pause(peer)
+
+    state = :sys.get_state(session)
+    assert Session.catch_up_need(state) == :short, "the fixture must leave the follower short"
+    refute all_current?(session)
+    refute marked?(session)
+    flush_events()
+
+    send(session, :catch_up)
+    _ = :sys.get_state(session)
+
+    refute marked?(session),
+           "a follower that advanced moments ago was marked catching-up by a timer fire"
+
+    assert flush_events() == 0, "a :catchup event was emitted for a follower that is progressing"
   end
 end
