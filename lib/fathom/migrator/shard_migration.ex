@@ -467,7 +467,47 @@ defmodule Fathom.Migrator.ShardMigration do
     end
   end
 
+  # NEVER STEAL A DIRTY-RELEASE MARKER (expert review 2026-11-07 #22). Node K's drop flush failed
+  # (an S3 outage, a corrupt tail, an ambiguous PUT), so `keep_local_release_lease` kept K's local
+  # `.db` — holding writes the client was ACKED for but the store never received — and released the
+  # lock as a DIRTY marker (`Storage.with_dirty_release/1`). Every other consumer of that marker
+  # reads it (`RemoteFlush` fails closed); the migrator did not: a job landing on node M saw
+  # `Shards.drain` find nothing (M has no local copy), `acquire_lease` stole the marker, the job
+  # pulled the STALE stored object, replayed, flushed and cut over. K's next open read `:diverged`
+  # and quarantined its acked writes to `.forked.<ts>`, and the tenant served the migrated stale
+  # copy. `refuse_if_replica_ahead/2` does not help when the stored object is unstamped (a
+  # migration/restore/fork product) or replication is off. A migration is a deliberate actor that
+  # CAN read the marker, so it must: snooze `{:retry, :released_dirty}` (the job machinery already
+  # tolerates it — `drain_and_hold` snoozes on `:unflushed_local_copy` the same way), and the
+  # existing stall telemetry (`:migration_stalled`, `Migrator.status/0`'s `stalled`) makes a keeper
+  # that never comes back visible.
+  #
+  # NOT capped into "proceed anyway after N snoozes", although the panel floated it: proceeding
+  # decides to DISCARD the keeper's acked tail, which is a data-loss decision for the operator, not
+  # a timer. The marker clears when anyone opens the shard (the keeper's reopen flushes its tail; a
+  # peer's open overwrites it and loses the tail) — an operator who knows the keeper's disk is gone
+  # opens the tenant once and the next retry proceeds. See docs/runbooks.
+  #
+  # Read immediately before the acquire, so a keeper that dirty-releases in the gap between the two
+  # is still stolen: that window is one storage round trip wide, and closing it needs the acquire
+  # itself to report the marker it stole (a `Storage` contract change on both backends).
+  # `{:error, _}` (the lock cannot be read) falls through — the acquire fails the same way.
   defp hold_lease(shard_id, token, fun, remote_drained? \\ false) do
+    case Storage.released_dirty?(shard_id) do
+      true ->
+        Logger.info(
+          "shard #{shard_id}: its lease was released DIRTY (a keeper node holds acked writes the " <>
+            "store never received); not migrating over it"
+        )
+
+        {:retry, :released_dirty}
+
+      _clean_or_unreadable ->
+        acquire_and_hold(shard_id, token, fun, remote_drained?)
+    end
+  end
+
+  defp acquire_and_hold(shard_id, token, fun, remote_drained?) do
     case Storage.acquire_lease(shard_id, owner(token), ttl()) do
       {:error, {:held, holder, _stealable_at}} ->
         # Expert review 2026-10-10 #3: `Shards.drain/2` above only sees THIS node's Registry, so a

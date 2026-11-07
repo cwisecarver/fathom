@@ -148,7 +148,15 @@ both are now caught instead of silently forking the fleet:
 
 ## Oban jobs drive it, and the cold tail converges on its own
 
-- **`ShardMigrationJob`** (unique per shard) migrates one shard.
+- **`ShardMigrationJob`** (unique per shard) migrates one shard. A shard whose lease was released
+  **dirty** — a node's drop flush failed and it kept a local copy holding writes the store never
+  received — is NOT migrated over: the job snoozes `{:retry, :released_dirty}` (a revert likewise),
+  because the migration would pull the stale stored object and the keeper's next open would
+  quarantine its acked writes. It surfaces as a `stalled` migration (`Migrator.status/0`, the
+  `[:fathom, :migrator, :migration_stalled]` event with `reason: :released_dirty`) and clears when
+  the keeper reopens the shard and flushes. If the keeper's disk is gone for good, open the tenant
+  once from any node (a request to it): that overwrites the marker — and accepts the loss of the
+  keeper's tail — and the next retry proceeds.
 - **`ReconcileJob`** (hourly cron) is the key to *millions*: it asks the directory for laggards
   (`schema_version < HEAD`, `active`, and having **flushed at least once** — a row minted by a
   read-only request has no stored object to migrate, so it is not a laggard and cannot wedge
