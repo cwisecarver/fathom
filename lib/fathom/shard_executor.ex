@@ -195,12 +195,34 @@ defmodule Fathom.ShardExecutor do
     # The tenant gets a fixed message: the exception text carries module internals, paths and
     # pids (expert review 2026-10-13 #23). The detail goes to the server log.
     e ->
-      Logger.warning("shard #{shard_id} execute raised: #{Exception.message(e)}")
+      # Rate-limited per node (expert review 2026-11-07 #69): a tenant that finds one raising input
+      # could otherwise write a log line per request, node-wide. The first of each window is
+      # logged, and the next window's first carries how many were suppressed.
+      log_limited(:execute_raised, shard_id, fn ->
+        "execute raised: #{Exception.message(e)}"
+      end)
+
       {:error, %Error{message: "internal error executing statement", code: "SQLITE_ERROR"}}
   catch
     :exit, reason ->
-      Logger.warning("shard #{shard_id} execute exited: #{inspect(reason)}")
+      log_limited(:execute_exited, shard_id, fn -> "execute exited: #{inspect(reason)}" end)
       {:error, %Error{message: "shard connection unavailable", code: "SQLITE_ERROR"}}
+  end
+
+  defp log_limited(key, shard_id, message_fun) do
+    case Fathom.LogLimiter.check(key) do
+      :log ->
+        Logger.warning("shard #{shard_id} #{message_fun.()}")
+
+      {:log, suppressed} ->
+        Logger.warning(
+          "shard #{shard_id} #{message_fun.()} " <>
+            "(#{suppressed} similar warnings suppressed in the previous second)"
+        )
+
+      :suppress ->
+        :ok
+    end
   end
 
   defp do_execute(
@@ -360,6 +382,16 @@ defmodule Fathom.ShardExecutor do
            status: 400
          }}
 
+      # ONE STATEMENT PER `execute` (expert review 2026-11-07 #19). `sqlite3_prepare_v3` compiles the
+      # first statement and hands back the tail, and exqlite discards it, so `"INSERT …; INSERT …"`
+      # used to run one insert and answer success. The gates above look only at statement 1 as well,
+      # so this is refusal of a dropped tail, not a bypass fix. sqld refuses the same string; the
+      # multi-statement request is `sequence`. Checked after every gate so a blocked statement keeps
+      # reporting its own error, and before the quorum round so a refusal never waits on one. The
+      # hot path pays one `:binary.match` for the `;` byte; only a string containing one is scanned.
+      multiple_statements?(sql) ->
+        multiple_statements_error()
+
       # Last, because it may wait a replication round: every cheaper refusal above wins first.
       # ROLLBACK (either form) reads nothing and must stay possible, or a client is stuck inside a
       # transaction it is trying to abandon (the same exemption as the write fence above).
@@ -426,9 +458,22 @@ defmodule Fathom.ShardExecutor do
 
     read? = read_verb?(head)
 
+    # A CTE-prefixed `WITH … INSERT/UPDATE/DELETE` is DML, but the leading-keyword `dml?/1` cannot
+    # see it (expert review 2026-11-07 #68): it counted as a read, so a `… RETURNING` reported 0
+    # affected rows and no rowid while SQLite changed N. Decided by the CTE's MAIN verb, NOT by
+    # `changes > 0` as the review suggested: `sqlite3_changes()` is inherited across statements, so
+    # a read-only `WITH … SELECT` right after a write would report that write's count (the 2026-07-14
+    # #42 defect from the other side). Evaluated only for a `with` head, after every gate, so it is
+    # off the path of every other statement.
+    dml? = dml? or (not read? and cte_dml?(sql, head))
+
     # Expert review 2026-10-20-2027 #1: a transaction-control statement has no counters of its own;
-    # `Connection.query` skips both getters for it (see `txn_control?/1`).
-    control? = not dml? and not read? and txn_control?(head)
+    # `Connection.query` skips both getters for it (see `txn_control?/1`). Expert review 2026-11-07
+    # #68: so does DDL / ANALYZE / REINDEX. SQLite resets `sqlite3_changes()` / `last_insert_rowid()`
+    # for none of them, so `CREATE INDEX` after a 5-row INSERT reported 5 affected rows and the
+    # previous rowid. This flag only feeds the counters: durability is decided by `wrote?/4` from the
+    # statement text, and DDL is still classified a write there.
+    control? = not dml? and not read? and (ddl? or txn_control?(head) or maintenance?(head))
     # Read once per statement and shared with `maybe_replicate/6`: no extra `get_env`. With
     # replication ON a DML statement also needs the autocommit flag right after the step, which
     # `Connection.query` can return in the same dispatch as changes + rowid (expert review
@@ -592,6 +637,35 @@ defmodule Fathom.ShardExecutor do
          %Error{
            message: "result exceeded the #{cap}-row cap",
            code: "FILO_RESULT_TOO_LARGE",
+           status: 400
+         }}
+
+      {:error, {:non_finite_real, cols}} ->
+        query_error(:sql_error)
+
+        # The cell raised while the NIF built the row, after SQLite had stepped the statement: a DML
+        # `RETURNING` has already performed (and, on the reset, committed) its write. Same accounting
+        # as the row cap above.
+        unless read?, do: account_failed_write(pid, conn, shard_id, sql, head, repl_on?, opts)
+
+        {:error,
+         %Error{
+           message:
+             "a result column holds a non-finite REAL (Infinity), which cannot be returned " <>
+               "(Hrana carries no Infinity); result columns: #{Enum.join(cols, ", ")}",
+           code: "FILO_NON_FINITE_REAL",
+           status: 400
+         }}
+
+      {:error, {:bind_out_of_range, which}} ->
+        query_error(:sql_error)
+
+        {:error,
+         %Error{
+           message:
+             "integer value for #{which} is outside SQLite's signed 64-bit INTEGER range " <>
+               "(-9223372036854775808..9223372036854775807)",
+           code: "FILO_BIND_OUT_OF_RANGE",
            status: 400
          }}
 
@@ -1251,6 +1325,11 @@ defmodule Fathom.ShardExecutor do
     # schema before every one (expert review 2026-10-08 #9).
     cap_temp(conn)
 
+    # The main schema's change counter BEFORE the script, so the bump below fires only when the
+    # script actually moved it (expert review 2026-11-07 #20; the same gate as the statement path's
+    # 2026-10-01 perf #9). nil on a failed read counts as "moved", the safe direction.
+    schema_before = schema_version(conn)
+
     case Connection.exec_script(conn, sql) do
       :ok ->
         # THE DURABILITY TRAP (#34): `exec` bypasses the `wrote?`-based WriteCounter bump in the
@@ -1271,6 +1350,13 @@ defmodule Fathom.ShardExecutor do
         # A script is opaque and may contain DDL, so drop the statement cache unconditionally
         # (review 2026-07-24 #17). Scripts are migration-rare; the cost is irrelevant here.
         Connection.purge_statements(conn)
+
+        # …and every OTHER connection's (expert review 2026-11-07 #20). The purge above reaches only
+        # THIS stream's cache: a sibling stream, or a pooled handle, that had cached `SELECT *`
+        # kept the pre-ALTER column list while SQLite recompiled the statement at step and returned
+        # wider rows (two names over three-wide rows). Scripts were the one DDL path that skipped the
+        # bump.
+        bump_after_script(conn, schema_before)
         # On the template shard, a script is (part of) a migration — feed it to capture.
         # A Hrana `sequence` is opaque SQL text with no bind parameters, so there are no args
         # to record for it (unlike the `execute` path, where Django's parameterized statements
@@ -1336,6 +1422,9 @@ defmodule Fathom.ShardExecutor do
           mark_txn_write(conn)
           # Partial DDL is possible, so the cached column lists are as suspect as after success.
           Connection.purge_statements(conn)
+          # Partial DDL is just as visible to a sibling (a failed script is exactly where it
+          # happens: `ALTER TABLE …; <bad>`), so the node-wide bump is not for the success path only.
+          bump_after_script(conn, schema_before)
 
           _ =
             maybe_replicate(
@@ -1523,6 +1612,28 @@ defmodule Fathom.ShardExecutor do
     end
   end
 
+  # Does this single-statement string actually hold more than one statement? A string with no `;`
+  # byte cannot, so the ordinary statement pays one `:binary.match` and nothing else. A `;` inside
+  # a literal, identifier or comment is not a separator (the scanner tracks every quote form), and a
+  # trailing `;`, empty statements and a trailing comment do not make a second statement
+  # (`statement_fragments/1`).
+  defp multiple_statements?(sql) do
+    case :binary.match(sql, ";") do
+      :nomatch -> false
+      _ -> match?([_, _ | _], statement_fragments(sql))
+    end
+  end
+
+  defp multiple_statements_error do
+    {:error,
+     %Error{
+       message:
+         "execute accepts exactly one SQL statement; send several as a sequence (executescript)",
+       code: "FILO_MULTIPLE_STATEMENTS",
+       status: 400
+     }}
+  end
+
   # Introspects a statement without running it (the Hrana `describe` request, #34): its parameters,
   # result columns, and whether it's an EXPLAIN / read-only. `is_readonly` is the leading-keyword
   # classification (a SELECT/PRAGMA read vs a DML/DDL write) — the hint a libSQL client wants.
@@ -1574,6 +1685,11 @@ defmodule Fathom.ShardExecutor do
 
       denied = lifecycle_denied(shard_id) ->
         {:error, denied}
+
+      # `describe` prepares the first statement and drops the tail exactly as `execute` does, so
+      # `"select 1; garbage"` described fine (expert review 2026-11-07 #19).
+      multiple_statements?(sql) ->
+        multiple_statements_error()
 
       true ->
         :ok
@@ -1629,6 +1745,7 @@ defmodule Fathom.ShardExecutor do
   @impl true
   def close({pid, ref, conn, _shard_id, scope, _ver, opts}) do
     forget_txn_write(conn)
+    forget_ddl_in_txn(conn)
     forget_dirty_signalled(conn)
     if opts.template?, do: Capture.forget(conn)
 
@@ -2078,10 +2195,87 @@ defmodule Fathom.ShardExecutor do
   @dml_prefixes ~w(insert update delete replace)
 
   # Leading-keyword mutation detection so a `... RETURNING` write is classified as a mutation, not
-  # a query. A CTE-prefixed `WITH ... INSERT` is not detected here — Django emits plain
-  # `INSERT ... RETURNING "id"`, the case that matters; the CTE-DML edge falls back to the old
-  # column-based read classification.
+  # a query. A CTE-prefixed `WITH ... INSERT` is not detected HERE (this runs before the gates, and
+  # a CTE needs a scan); `run_statement/5` adds it through `cte_dml?/2` once the statement has
+  # passed them.
   defp dml?(head), do: Enum.any?(@dml_prefixes, &String.starts_with?(head, &1))
+
+  # Is a `WITH` statement's MAIN statement INSERT/UPDATE/DELETE/REPLACE? The CTE list is
+  # `name [(cols)] AS [[NOT] MATERIALIZED] (body) {, …}` followed by the main statement, so the main
+  # verb is the first word after a closing `)` at depth 0 that is not `AS` / `NOT` / `MATERIALIZED`
+  # and not preceded by `,`. Quotes, `[…]`, both comment forms and nested parentheses are skipped,
+  # so a `)` or a DML word inside a literal, an identifier or a comment cannot mislead it. An
+  # unparseable statement is "not DML": SQLite refuses or runs it, and the durability path never
+  # depends on this (`wrote?/4` decides it from `num_changes`).
+  defp cte_dml?(sql, "with" <> _) do
+    <<_with::binary-size(4), rest::binary>> = strip_lead_noise(sql)
+    cte_main_verb(rest, 0) in @dml_prefixes
+  end
+
+  defp cte_dml?(_sql, _head), do: false
+
+  defp cte_main_verb(<<>>, _depth), do: nil
+
+  defp cte_main_verb(<<"--", rest::binary>>, depth) do
+    {_comment, rest} = until(rest, "\n", "")
+    cte_main_verb(rest, depth)
+  end
+
+  defp cte_main_verb(<<"/*", rest::binary>>, depth) do
+    {_comment, rest} = until(rest, "*/", "")
+    cte_main_verb(rest, depth)
+  end
+
+  defp cte_main_verb(<<q, rest::binary>>, depth) when q in [?\', ?\", ?`] do
+    {_literal, rest} = quoted(rest, q, "")
+    cte_main_verb(rest, depth)
+  end
+
+  defp cte_main_verb(<<?[, rest::binary>>, depth) do
+    {_identifier, rest} = until(rest, "]", "")
+    cte_main_verb(rest, depth)
+  end
+
+  defp cte_main_verb(<<?(, rest::binary>>, depth), do: cte_main_verb(rest, depth + 1)
+  defp cte_main_verb(<<?), rest::binary>>, 1), do: cte_after_group(skip_noise(rest))
+  defp cte_main_verb(<<?), rest::binary>>, depth), do: cte_main_verb(rest, depth - 1)
+  defp cte_main_verb(<<_, rest::binary>>, depth), do: cte_main_verb(rest, depth)
+
+  # Just past a `)` that closed a depth-0 group: a `,` starts the next CTE, `AS` / `NOT` /
+  # `MATERIALIZED` means the `)` closed a column list and the body is still to come, and anything
+  # else is the main statement's verb.
+  defp cte_after_group(<<?,, rest::binary>>), do: cte_main_verb(rest, 0)
+
+  defp cte_after_group(bin) do
+    case read_word(bin, "") do
+      {"", _rest} -> nil
+      {word, rest} when word in ["as", "not", "materialized"] -> cte_main_verb(rest, 0)
+      {word, _rest} -> word
+    end
+  end
+
+  defp read_word(<<c, rest::binary>>, acc) when c in ?a..?z or c in ?A..?Z or c == ?_,
+    do: read_word(rest, <<acc::binary, c>>)
+
+  defp read_word(rest, acc), do: {String.downcase(acc), rest}
+
+  defp skip_noise(<<c, rest::binary>>) when c in [?\s, ?\t, ?\n, ?\r, ?\f], do: skip_noise(rest)
+
+  defp skip_noise(<<"--", rest::binary>>) do
+    {_comment, rest} = until(rest, "\n", "")
+    skip_noise(rest)
+  end
+
+  defp skip_noise(<<"/*", rest::binary>>) do
+    {_comment, rest} = until(rest, "*/", "")
+    skip_noise(rest)
+  end
+
+  defp skip_noise(bin), do: bin
+
+  # ANALYZE / REINDEX write the file but set no `sqlite3_changes()` of their own, like DDL.
+  @maintenance_prefixes ~w(analyze reindex)
+  defp maintenance?(head), do: Enum.any?(@maintenance_prefixes, &String.starts_with?(head, &1))
 
   # THE FENCE'S OWN PREDICATE. Deliberately separate from `dml?/1`, and deliberately FAIL-CLOSED.
   #
@@ -2641,6 +2835,29 @@ defmodule Fathom.ShardExecutor do
 
     :ok
   end
+
+  # The statement path's bump rules (see `run_statement/5`), for a script that has just run: bump
+  # when the main schema moved, then settle a `ddl_in_txn` mark left by an earlier statement that
+  # this script's COMMIT / ROLLBACK ended. A script cannot be classified by its leading keyword, so
+  # it is `PRAGMA schema_version` that decides, exactly as for one statement (expert review
+  # 2026-11-07 #20). The review recommended an UNCONDITIONAL bump; that would make every cached
+  # statement on every stream of every tenant on the node re-prepare after a data-only script too.
+  defp bump_after_script(conn, schema_before) do
+    case schema_version(conn) do
+      v when is_integer(v) and v == schema_before -> :ok
+      _ -> bump_schema_gen(conn)
+    end
+
+    bump_if_ddl_transaction_ended(conn)
+  end
+
+  # `close/1` MUST drop the mark (expert review 2026-11-07 #79): `Filo.Socket` runs every stream of
+  # a WebSocket in one long-lived process, so a stream that abandoned `BEGIN; CREATE TABLE …` left
+  # one dictionary entry per stream for the life of the socket, each pinning its `conn` NIF resource,
+  # and a pooled handle's next stream inherited a spurious "DDL in a transaction" that cost a
+  # node-wide bump. No bump is owed here: the transaction is rolled back with the stream, so the DDL
+  # never committed and no sibling can have cached a column list that is not the committed one.
+  defp forget_ddl_in_txn(conn), do: Process.delete({__MODULE__, :ddl_in_txn, conn})
 
   defp schema_version(conn) do
     case Connection.query(conn, "PRAGMA schema_version", [], deadline: true) do

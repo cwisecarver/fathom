@@ -1201,7 +1201,12 @@ defmodule Fathom.Shard.Connection do
     if not read? and busy_waiters?(), do: wake_after(conn, result)
     result
   rescue
-    e in ArgumentError -> {:error, Exception.message(e)}
+    # NOT a `{:badarg, _}` clause: on the Elixir this runs on, `Sqlite3.bind` raising
+    # `:erlang.error({:badarg, 9223372036854775808})` is already NORMALISED to an `ArgumentError`
+    # ("argument error: 9223372036854775808") before it reaches a rescue, so this clause caught it
+    # all along (expert review 2026-11-07 #69 claimed `query/4` did not rescue it; verified by
+    # execution that it does). What the tenant got was the opaque message, so name the cause.
+    e in ArgumentError -> {:error, bind_failure(e, args)}
   after
     # Idempotent; here so a raise cannot strand the gate ticket at the head of the queue.
     busy_ungate()
@@ -1231,7 +1236,10 @@ defmodule Fathom.Shard.Connection do
       try do
         with :ok <- bind_args(stmt, args),
              {:ok, rows, row_count} <-
-               reset_if_abandoned(stmt, step_all(conn, stmt, row_cap(), deadline_at, tag?)) do
+               reset_if_abandoned(
+                 stmt,
+                 step_guarded(conn, stmt, row_cap(), deadline_at, tag?, columns)
+               ) do
           # Post-step column read when the schema moved under this connection (expert review
           # 2026-08-26 #7). Only on the `:refresh` path — a DDL happened somewhere since this
           # statement was cached — so the ordinary hit pays nothing. See `cached_stmt/2` for why
@@ -1377,6 +1385,59 @@ defmodule Fathom.Shard.Connection do
       other -> other
     end
   end
+
+  # A REAL cell that is ±Infinity (`SELECT 9e999`, an overflowing `SUM`, a stored `1e999`) cannot be
+  # turned into an Erlang float: `enif_make_double` raises `badarg` while the NIF builds the row,
+  # which reached the tenant as the opaque "argument error" and made an Inf stored in a table
+  # unreadable (expert review 2026-11-07 #69). The raise leaves the statement mid-run, so the error
+  # is returned as a value and `reset_if_abandoned/2` resets it.
+  #
+  # Only the bare `"argument error"` message is claimed. Every other `ArgumentError` out of a step
+  # (the cross-connection guard has its own message) is not this and keeps unwinding.
+  #
+  # Which cell is not knowable: exqlite exposes no per-column getter and the exception discards the
+  # partial row, so the error names every result column. Exact for the aggregate case that matters
+  # (`SELECT sum(x)`), a short candidate list otherwise.
+  defp step_guarded(conn, stmt, cap, deadline_at, tag?, columns) do
+    step_all(conn, stmt, cap, deadline_at, tag?)
+  rescue
+    e in ArgumentError ->
+      if e.message == "argument error",
+        do: {:error, {:non_finite_real, columns}},
+        else: reraise(e, __STACKTRACE__)
+  end
+
+  # Names the bind that `Sqlite3.bind` rejected. SQLite INTEGER is a signed 64-bit value, and an
+  # Elixir integer outside that range raises `ArgumentError` with the value as the message. Only
+  # when the message IS that value is it reported as out of range; any other bind failure keeps its
+  # own message (e.g. "expected 2 arguments, got 1"). Cold path: runs only after a raise.
+  defp bind_failure(%ArgumentError{message: message}, args) do
+    {positional, named} =
+      case args do
+        {positional, named} -> {positional, named}
+        positional -> {positional, []}
+      end
+
+    positional_hit =
+      positional
+      |> Enum.with_index(1)
+      |> Enum.find_value(fn {value, index} ->
+        if rejected_int?(value, message), do: "parameter #{index}"
+      end)
+
+    hit =
+      positional_hit ||
+        Enum.find_value(named, fn {name, value} ->
+          if rejected_int?(value, message), do: "parameter #{inspect(to_string(name))}"
+        end)
+
+    if hit, do: {:bind_out_of_range, hit}, else: message
+  end
+
+  defp rejected_int?(value, message) when is_integer(value),
+    do: message == "argument error: " <> Integer.to_string(value)
+
+  defp rejected_int?(_value, _message), do: false
 
   defp retry_busy(conn, stmt, cap, deadline_at, tag?) do
     with {:ok, budget_ms} when budget_ms > 0 <- busy_retry_budget_ms(conn) do
@@ -1785,9 +1846,12 @@ defmodule Fathom.Shard.Connection do
   end
 
   # The row cap stops `collect/5` while the statement may still be mid-execution (after a
-  # `{:rows, _}` batch), and nothing else will reset it now that `multi_step`'s own resets are the
-  # only ones. After a `{:done, _}` the extra reset is a harmless no-op.
-  defp reset_if_abandoned(stmt, {:error, {:too_many_rows, _}} = err) do
+  # `{:rows, _}` batch), and so does a non-finite REAL cell (`step_guarded/6`): nothing else will
+  # reset it now that `multi_step`'s own resets are the only ones. After a `{:done, _}` the extra
+  # reset is a harmless no-op. For a DML `RETURNING` statement this reset is also what COMMITS the
+  # write in autocommit (expert review 2026-11-07 #5; `ShardExecutor` accounts for it).
+  defp reset_if_abandoned(stmt, {:error, {reason, _}} = err)
+       when reason in [:too_many_rows, :non_finite_real] do
     _ = Sqlite3.reset(stmt)
     err
   end
