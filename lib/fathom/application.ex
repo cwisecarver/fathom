@@ -518,12 +518,33 @@ defmodule Fathom.Application do
   # never be made durable. Both default under System.tmp_dir!(), so the unsafe arrangement is the
   # DEFAULT one. WARN rather than raise: a single-volume box is a legitimate small deployment, and
   # the back-pressure floor in `Follower` bounds the damage.
+  #
+  # EQUAL OR NESTED DIRS ARE REFUSED, not warned (expert review 2026-11-07 #37). With one directory
+  # (or one inside the other) a replica `<id>.db` is byte-identical in name to a live shard
+  # `<id>.db`: a node that follows S and then becomes its owner finds a replica `.db`+`-wal` at the
+  # live path with no provenance sidecar, which `Fork.resolve` quarantines as a planted fork or —
+  # with `:adopt_unprovenanced_warm` — adopts as the live database. `coordinated_here?` guards only
+  # a RUNNING coordinator, and the mount comparison below is blind to path equality. Compared on
+  # `Path.expand`ed segments, so `/a/b` vs `/a/bc` is not nesting; symlinks are NOT resolved (a
+  # link to the same directory is the operator's to avoid — the stat-based mount check cannot see
+  # it either).
   @doc false
+  @spec check_replication_disk!() :: nil
   def check_replication_disk! do
     if Application.get_env(:fathom, :env) == :prod and
          Application.get_env(:fathom, :replication_listen, false) == true do
       replica = Fathom.Shard.Replication.Follower.default_dir()
       data = Fathom.Shard.data_dir()
+
+      if dirs_overlap?(replica, data) do
+        raise "config error: the replication replica store (REPLICATION_DIR #{inspect(replica)}) " <>
+                "equals or is nested inside / around the live shard data dir (SHARD_DATA_DIR " <>
+                "#{inspect(data)}). A replica <id>.db would then share a path with the live " <>
+                "<id>.db: a node that follows a shard and later owns it finds a replica with no " <>
+                "provenance at the live path and quarantines or ADOPTS it as the tenant's " <>
+                "database (expert review 2026-11-07 #37). Give REPLICATION_DIR its own directory " <>
+                "that is not inside SHARD_DATA_DIR (and vice versa)."
+      end
 
       if same_volume?(replica, data) do
         Logger.warning(
@@ -538,6 +559,14 @@ defmodule Fathom.Application do
     end
 
     nil
+  end
+
+  @doc false
+  @spec dirs_overlap?(Path.t(), Path.t()) :: boolean()
+  def dirs_overlap?(a, b) do
+    sa = a |> Path.expand() |> Path.split()
+    sb = b |> Path.expand() |> Path.split()
+    List.starts_with?(sa, sb) or List.starts_with?(sb, sa)
   end
 
   # Compare the MOUNT, not the size. Two independent volumes of the same size are indistinguishable

@@ -240,4 +240,61 @@ defmodule Fathom.BootSecurityGuardsTest do
       assert Fathom.Application.check_local_storage_fleet!() == nil
     end
   end
+
+  describe "2026-11-07 #37 REPLICATION_DIR equal to or nested with SHARD_DATA_DIR refuses to boot" do
+    setup do
+      keys = [:replication_listen, :replication_dir, :shard_data_dir]
+      prev = Map.new(keys, &{&1, Application.fetch_env(:fathom, &1)})
+
+      on_exit(fn ->
+        for {k, v} <- prev do
+          case v do
+            {:ok, val} -> Application.put_env(:fathom, k, val)
+            :error -> Application.delete_env(:fathom, k)
+          end
+        end
+      end)
+
+      Application.put_env(:fathom, :env, :prod)
+      Application.put_env(:fathom, :replication_listen, true)
+      :ok
+    end
+
+    test "the same directory is refused" do
+      Application.put_env(:fathom, :replication_dir, "/var/lib/fathom/x")
+      Application.put_env(:fathom, :shard_data_dir, "/var/lib/fathom/x")
+
+      assert_raise RuntimeError, ~r/equals or is nested.*SHARD_DATA_DIR/s, fn ->
+        Fathom.Application.check_replication_disk!()
+      end
+    end
+
+    test "a replica dir inside the shard dir (and the reverse) is refused" do
+      Application.put_env(:fathom, :replication_dir, "/var/lib/fathom/shards/replicas")
+      Application.put_env(:fathom, :shard_data_dir, "/var/lib/fathom/shards")
+
+      assert_raise RuntimeError, ~r/equals or is nested/, fn ->
+        Fathom.Application.check_replication_disk!()
+      end
+
+      Application.put_env(:fathom, :replication_dir, "/var/lib/fathom")
+      Application.put_env(:fathom, :shard_data_dir, "/var/lib/fathom/shards")
+
+      assert_raise RuntimeError, ~r/equals or is nested/, fn ->
+        Fathom.Application.check_replication_disk!()
+      end
+    end
+
+    test "not prod, or not listening, is never refused" do
+      Application.put_env(:fathom, :replication_dir, "/var/lib/fathom/x")
+      Application.put_env(:fathom, :shard_data_dir, "/var/lib/fathom/x")
+
+      Application.put_env(:fathom, :env, :dev)
+      assert Fathom.Application.check_replication_disk!() == nil
+
+      Application.put_env(:fathom, :env, :prod)
+      Application.put_env(:fathom, :replication_listen, false)
+      assert Fathom.Application.check_replication_disk!() == nil
+    end
+  end
 end
