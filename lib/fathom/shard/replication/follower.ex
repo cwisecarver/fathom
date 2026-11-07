@@ -144,6 +144,15 @@ defmodule Fathom.Shard.Replication.Follower do
   # The OS boot this replica directory was last opened under; see `hold_torn_after_reboot/2`.
   @boot_id_file ".boot_id"
 
+  # The reboot hold's state, in the LOCK table (never the state table: `replica_shard_ids/1` runs
+  # `tab2list` over that one and must only ever see `{shard_id, state}` rows). While
+  # `{@reboot_hold_key, previous_boot, current_boot}` is present, every replica that has not been
+  # re-seeded since the boot reads TORN from `derive/3`; `{{@reboot_cleared_key, shard_id}, true}`
+  # records a replica a seed (or a recovery pull) made whole after the boot, so the marker pass
+  # neither marks it nor lets the hold re-tear it. See `arm_reboot_hold/2`.
+  @reboot_hold_key :__reboot_hold__
+  @reboot_cleared_key :__reboot_cleared__
+
   @typedoc "Proof of holding a shard's lock, handed back to `unlock_shard/2`."
   @type lock_token :: {:held, {String.t(), pid(), integer()}} | :reentrant
 
@@ -680,14 +689,15 @@ defmodule Fathom.Shard.Replication.Follower do
 
     :ets.insert(tab, {:__dir__, dir})
 
-    # Before any row can be derived or any peer asked: rows derive lazily from the files, so the
-    # torn markers must already be on disk when the first `state_of/2` runs.
-    hold_torn_after_reboot(name, dir)
-
     # Owned here for the same reason as the state table: it dies with this process, and a holder
     # whose release then raises is rescued (`unlock_shard/2`). See the lock section above.
     :ets.new(locks(name), [:named_table, :public, :set, write_concurrency: true])
     :ets.new(touches(name), [:named_table, :public, :set, write_concurrency: true])
+
+    # Before any row can be derived or any peer asked: rows derive lazily from the files, so the
+    # reboot hold must already be in force when the first `state_of/2` runs. O(1): it is a flag, not
+    # a marker per replica (expert review 2026-11-07 #72) — see `arm_reboot_hold/2`.
+    arm_reboot_hold(name, dir)
 
     # Which registry says "this node coordinates that shard" (`coordinated_here?/2`). `Fleet` passes
     # `Fathom.ShardRegistry`, so production always has it. The DEFAULT is off (`nil`) because a
@@ -777,6 +787,9 @@ defmodule Fathom.Shard.Replication.Follower do
     # Prime seed admission's volume reading (expert review 2026-10-22 r8 #10) in the background,
     # so the first seed begin after boot finds a value rather than reading one itself.
     refresh_disk_async(locks(name), dir, System.monotonic_time(:millisecond))
+
+    # The durable half of the reboot hold, off the listener's critical path (#72).
+    start_reboot_pass(name)
     {:noreply, state}
   end
 
@@ -2308,12 +2321,20 @@ defmodule Fathom.Shard.Replication.Follower do
         # The sidecars on disk are what the row would have said; assuming "untorn, lineage 0" left a
         # stale torn marker behind an untorn install. `nil` ordinal always rewrites that sidecar.
         _ ->
-          {Fathom.FS.exists?(torn_path(name, shard_id)), recovered_ownership(name, shard_id), nil}
+          {reboot_held?(name, shard_id) or Fathom.FS.exists?(torn_path(name, shard_id)),
+           recovered_ownership(name, shard_id), nil}
       end
 
     # Marker BEFORE the ETS row, so a crash between the two leaves the SAFE state: the marker
     # present and the replica treated as torn, never the reverse.
-    if was_torn? != state.torn, do: sync_torn_marker(name, shard_id, state)
+    if was_torn? != state.torn do
+      sync_torn_marker(name, shard_id, state)
+
+      # A transition to untorn is a seed (or a pulled replica) making the pair whole: from here the
+      # reboot hold must not claim it, and the marker pass must not mark it (#72).
+      if not state.torn, do: note_reboot_cleared(name, shard_id)
+    end
+
     ownership = {state.lineage, state.epoch}
     if ownership != was_ownership, do: sync_ownership(name, shard_id, ownership)
     ordinal = {Map.get(state, :wal_ordinal, 0), state.salt1}
@@ -2652,9 +2673,6 @@ defmodule Fathom.Shard.Replication.Follower do
     reap_stale_seed_temps(temps, list_dir(temps))
   end
 
-  # RAW (expert review 2026-10-21 r7 #10): `File.ls/1` is a `file_server_2` call that builds the
-  # whole name list in that shared process and copies it to the caller; `:prim_file` does the
-  # readdir in the calling process.
   # A FOLLOWER THAT LOST POWER FORGETS WHAT IT ACKED (Jepsen 2026-10-28, the first power-loss run,
   # shard 15). Followers ack from RAM (`:replication_fsync` off), so after an OS crash a replica can
   # hold LESS than it acked, yet its files still describe a coherent, rankable position. Recovery
@@ -2672,7 +2690,27 @@ defmodule Fathom.Shard.Replication.Follower do
   #
   # No readable boot id (not Linux) turns the check off. A directory with no recorded boot (first
   # start, or the first start of a release with this check) has nothing to compare and is trusted.
-  defp hold_torn_after_reboot(name, dir) do
+  #
+  # THE MARKERS ARE WRITTEN AFTER LISTEN, NOT IN `init/1` (expert review 2026-11-07 #72). The pass
+  # used to list the whole replica directory and do one fsynced atomic write per `.db` serially before
+  # `init/1` returned — and since `Fleet` precedes `Edge`, before Hrana and /health listened — so a
+  # node holding ~667k replicas served nothing for minutes after every power loss, exactly when the
+  # fleet is already degraded; and a failed marker write was a `MatchError` that crash-looped init.
+  # Now `init/1` only sets an O(1) flag in the lock table. While it is set `derive/3` answers TORN for
+  # every replica that has not been re-seeded since the boot, so nothing is rankable before it has
+  # been marked — the safety is the flag, the markers are its durable form. The pass
+  # (`reboot_pass/3`, a linked process started from `handle_continue(:boot_housekeeping)`) writes the
+  # markers under each shard's lock, skips a replica a seed already made whole, and writes the new
+  # boot id ONLY when every replica is marked, so a crash part-way re-arms the hold on the next start
+  # (the crash-repeat semantics the old code had). A marker write that fails is logged and retried
+  # until it succeeds; the hold stays in force meanwhile, which is the safe direction.
+  #
+  # WHY THE OBVIOUS SHORTCUT IS WRONG: "just derive torn from the boot id and skip the markers". The
+  # marker is what survives the NEXT restart — the flag lives in ETS and dies with the process, and
+  # the new boot id is written once the pass is done, after which nothing else says "these files no
+  # longer prove what was acked". Without a marker per replica the first restart after the pass would
+  # trust them all again.
+  defp arm_reboot_hold(name, dir) do
     case boot_id() do
       nil ->
         :ok
@@ -2685,24 +2723,199 @@ defmodule Fathom.Shard.Replication.Follower do
             :ok
 
           {:ok, previous} ->
-            ids =
-              for entry <- list_dir(dir),
-                  String.ends_with?(entry, ".db"),
-                  do: String.replace_suffix(entry, ".db", "")
+            hold_for_reboot(name, dir, previous, current)
 
-            Enum.each(ids, fn id -> :ok = sync_torn_marker(name, id, %{torn: true}) end)
-
-            Logger.warning(
-              "replication follower: the OS rebooted since #{dir} was last opened (boot " <>
-                "#{previous} -> #{current}); holding #{length(ids)} replica(s) torn until " <>
-                "re-seeded, since frames acked from RAM may be gone"
-            )
-
-            :ok = Fathom.Shard.Storage.atomic_write(recorded, current)
-
+          # A first start has nothing to compare and is trusted. This O(1) write stays inline and
+          # keeps its `:ok =`: an unwritable replica directory is not a follower worth starting.
           {:error, :enoent} ->
             :ok = Fathom.Shard.Storage.atomic_write(recorded, current)
+
+          # Not knowing which boot this directory was last opened under is not "no reboot": hold.
+          {:error, reason} ->
+            hold_for_reboot(name, dir, "unreadable (#{inspect(reason)})", current)
         end
+    end
+  end
+
+  defp hold_for_reboot(name, dir, previous, current) do
+    :ets.insert(locks(name), {@reboot_hold_key, String.trim(previous), current})
+
+    Logger.warning(
+      "replication follower: the OS rebooted since #{dir} was last opened (boot " <>
+        "#{String.trim(previous)} -> #{current}); holding every replica torn until re-seeded, " <>
+        "since frames acked from RAM may be gone"
+    )
+  end
+
+  # Whether the reboot hold currently claims `shard_id`: in force, and no seed has made this replica
+  # whole since the boot. One ETS read when no hold is armed (every start but the first after a
+  # reboot).
+  defp reboot_held?(name, shard_id) do
+    tab = locks(name)
+    :ets.member(tab, @reboot_hold_key) and not :ets.member(tab, {@reboot_cleared_key, shard_id})
+  rescue
+    ArgumentError -> false
+  end
+
+  defp note_reboot_cleared(name, shard_id) do
+    tab = locks(name)
+
+    if :ets.member(tab, @reboot_hold_key),
+      do: :ets.insert(tab, {{@reboot_cleared_key, shard_id}, true})
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc false
+  # Whether the post-reboot marker pass is still running (the hold still in force). Test seam.
+  @spec reboot_pass_pending?(atom()) :: boolean()
+  def reboot_pass_pending?(name \\ __MODULE__),
+    do: :ets.member(locks(name), @reboot_hold_key)
+
+  defp start_reboot_pass(name) do
+    case :ets.lookup(locks(name), @reboot_hold_key) do
+      [{_key, _previous, current}] ->
+        dir = dir(name)
+
+        # Linked, so it dies with the follower; it exits `:normal` on every path that is not a kill
+        # (an abnormal exit would take the listener down through `handle_info({:EXIT, ...})`).
+        spawn_link(fn ->
+          Process.set_label(:replication_follower_reboot_pass)
+          reboot_pass(name, dir, current)
+        end)
+
+        :ok
+
+      [] ->
+        :ok
+    end
+  end
+
+  defp reboot_pass(name, dir, current) do
+    ids =
+      dir
+      |> reboot_pass_listing()
+      |> Enum.filter(&String.ends_with?(&1, ".db"))
+      |> Enum.map(&String.replace_suffix(&1, ".db", ""))
+      |> Enum.filter(&Fathom.ShardId.valid?/1)
+
+    mark_reboot_torn(name, ids)
+    record_boot_id(Path.join(dir, @boot_id_file), current)
+    tab = locks(name)
+    :ets.delete(tab, @reboot_hold_key)
+    :ets.match_delete(tab, {{@reboot_cleared_key, :_}, :_})
+
+    Logger.info(
+      "replication follower: marked #{length(ids)} replica(s) torn after the reboot hold; " <>
+        "boot #{current} recorded"
+    )
+  rescue
+    # The follower stopped under the pass (its tables are gone): nothing left to mark, and the boot
+    # id is NOT recorded, so the next start re-arms the hold.
+    ArgumentError -> :ok
+  end
+
+  # A listing that FAILS is not an empty directory: the pass would then mark nothing, record the new
+  # boot id and lift the hold, trusting every replica a reboot may have shortened. (`list_dir/1`
+  # answers `[]` on error, which is right for the housekeeping that only ever reaps; wrong here.)
+  defp reboot_pass_listing(dir) do
+    case :prim_file.list_dir(dir) do
+      {:ok, entries} ->
+        Enum.map(entries, &IO.chardata_to_string/1)
+
+      {:error, reason} ->
+        Logger.warning(
+          "replication follower: could not list #{dir} for the post-reboot marker pass " <>
+            "(#{inspect(reason)}); retrying"
+        )
+
+        receive do
+        after
+          reboot_pass_retry_ms() -> :ok
+        end
+
+        reboot_pass_listing(dir)
+    end
+  end
+
+  # Marks `ids`, then retries the ones that failed until none has: a failed write is logged and
+  # tried again, never a crash (the hold stays in force, so a replica that is not yet marked still
+  # reads torn).
+  defp mark_reboot_torn(_name, []), do: :ok
+
+  defp mark_reboot_torn(name, ids) do
+    failed = Enum.reject(ids, &(mark_reboot_torn_one(name, &1) == :ok))
+
+    if failed != [] do
+      Logger.warning(
+        "replication follower: could not mark #{length(failed)} replica(s) torn after the " <>
+          "reboot (e.g. #{hd(failed)}); they stay held torn and the pass retries"
+      )
+
+      receive do
+      after
+        reboot_pass_retry_ms() -> :ok
+      end
+
+      mark_reboot_torn(name, failed)
+    end
+  end
+
+  defp mark_reboot_torn_one(name, shard_id) do
+    with :ok <- before_reboot_mark(shard_id) do
+      case with_shard_lock(name, shard_id, lock_wait_ms(), fn ->
+             mark_reboot_torn_locked(name, shard_id)
+           end) do
+        :ok -> :ok
+        {:error, _} = err -> err
+      end
+    end
+  end
+
+  # Under the shard's lock, so it cannot interleave with a seed install (which would otherwise lose
+  # its clearing to this late marker) or a forget (which would otherwise get a stray marker for a
+  # replica that no longer exists).
+  defp mark_reboot_torn_locked(name, shard_id) do
+    cond do
+      :ets.member(locks(name), {@reboot_cleared_key, shard_id}) -> :ok
+      Fathom.FS.presence(db_path(name, shard_id)) == :absent -> :ok
+      Fathom.FS.presence(torn_path(name, shard_id)) == :present -> :ok
+      true -> sync_torn_marker(name, shard_id, %{torn: true})
+    end
+  end
+
+  defp record_boot_id(recorded, current) do
+    case Fathom.Shard.Storage.atomic_write(recorded, current) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "replication follower: could not record boot #{current} in #{recorded} " <>
+            "(#{inspect(reason)}); retrying"
+        )
+
+        receive do
+        after
+          reboot_pass_retry_ms() -> :ok
+        end
+
+        record_boot_id(recorded, current)
+    end
+  end
+
+  defp reboot_pass_retry_ms,
+    do: Application.get_env(:fathom, :replication_reboot_pass_retry_ms, 5_000)
+
+  # Test seam for the marker pass (expert review 2026-11-07 #72), the way `recovery_ask_crash_hook`
+  # is for the recovery window: called with the shard id before each replica is marked, `:ok`
+  # proceeds and `{:error, reason}` counts as a failed marker write. Unset in every real config.
+  defp before_reboot_mark(shard_id) do
+    case Application.get_env(:fathom, :replication_reboot_mark_hook) do
+      nil -> :ok
+      hook -> hook.(shard_id)
     end
   end
 
@@ -2720,6 +2933,9 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
+  # RAW (expert review 2026-10-21 r7 #10): `File.ls/1` is a `file_server_2` call that builds the
+  # whole name list in that shared process and copies it to the caller; `:prim_file` does the
+  # readdir in the calling process.
   defp list_dir(dir) do
     case :prim_file.list_dir(dir) do
       {:ok, entries} -> Enum.map(entries, &IO.chardata_to_string/1)
@@ -2958,7 +3174,7 @@ defmodule Fathom.Shard.Replication.Follower do
            name,
            shard_id,
            header,
-           marker != :absent,
+           marker != :absent or reboot_held?(name, shard_id),
            recovered_ownership(name, shard_id),
            log?
          )}
