@@ -34,7 +34,17 @@ defmodule Fathom.RestoreDrillJob do
   sample size) — set it (and the daily `Oban` crontab entry's cadence) to size drill coverage to your
   fleet + S3 GET budget. Read-only: it only pulls objects, never writes them.
   """
-  use Oban.Worker, queue: :migrations, max_attempts: 1
+  use Oban.Worker,
+    queue: :migrations,
+    max_attempts: 1,
+    # A daily cron must not stack behind a drill that outlasts its day (expert review 2026-11-07 #78:
+    # every cron worker is unique). Same shape as `RebalanceJob`: `:executing` is NOT counted, so a
+    # row stranded by a dead node cannot block the drill until Lifeline rescues it.
+    unique: [
+      fields: [:worker, :queue],
+      period: :infinity,
+      states: [:available, :scheduled, :retryable]
+    ]
 
   require Logger
 

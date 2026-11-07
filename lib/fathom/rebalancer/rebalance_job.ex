@@ -11,7 +11,23 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   `LoadSamples.since/1` + `Overrides.all/0` + `Rebalancer.lb_backends/0`, runs the policy,
   and enqueues unique-per-shard handoffs (a shard already mid-handoff is a no-op).
   """
-  use Oban.Worker, queue: :rebalance, max_attempts: 1
+  use Oban.Worker,
+    queue: :rebalance,
+    max_attempts: 1,
+    # No pile-up (expert review 2026-11-07 #78): the cron inserts one of these EVERY MINUTE, and a tick
+    # blocked past that (each of its steps is a Postgres call) was joined by the next minute's, so a
+    # brown-out stacked ticks that then ran back to back, held `Fathom.Repo` connections, and took
+    # the `:rebalance` queue's slots from `HandoffJob`. `fields: [:worker, :queue]` because the cron
+    # job has empty args; no period limit (`:infinity`: the keyword list would otherwise inherit
+    # Oban's 60 s window); and `:executing` is deliberately NOT in `states`, unlike `ReconcileJob`'s:
+    # a node that dies mid-tick strands its row `:executing` until Lifeline's 60 min `rescue_after`,
+    # and counting it would block the rebalancer (and `Commands.prune_terminal`) for that hour. Without
+    # it the queue still holds at most one running tick plus one waiting.
+    unique: [
+      fields: [:worker, :queue],
+      period: :infinity,
+      states: [:available, :scheduled, :retryable]
+    ]
 
   require Logger
   import Ecto.Query, only: [from: 2]
