@@ -69,6 +69,7 @@ defmodule Fathom.Shard do
     Position,
     PromoteOnOpen,
     Provenance,
+    Quarantine,
     Storage,
     WriteCounter
   }
@@ -5134,9 +5135,12 @@ defmodule Fathom.Shard do
       state.path <>
         ".fenced.#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
 
-    case Fathom.FS.rename(state.path, dest) do
+    # Companions first, all-or-nothing, every result checked (`Quarantine.move_aside/2`, expert
+    # review 2026-11-07 #83): the `.db` used to move first with the `-wal`/`-shm` best-effort after
+    # it, so a crash between the two left a WAL-less `.db` or an orphan `-wal` at the live path, where
+    # it replays onto the next database of the same name.
+    case Quarantine.move_aside(state.path, dest) do
       :ok ->
-        Enum.each(["-wal", "-shm"], &Fathom.FS.rename(state.path <> &1, dest <> &1))
         Fathom.FS.rm(Provenance.sidecar_path(state.path))
         unflushed = max(WriteCounter.count(state.id) - state.flushed_through, 0)
 

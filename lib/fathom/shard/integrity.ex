@@ -24,6 +24,7 @@ defmodule Fathom.Shard.Integrity do
   require Logger
 
   alias Fathom.Shard.Connection
+  alias Fathom.Shard.Quarantine
 
   # Run `PRAGMA quick_check` on the file at `path`; `:ok` iff SQLite reports the single row "ok".
   # Cheap (shards are small by premise). Public so the corrupt-flush guard is testable directly
@@ -225,7 +226,7 @@ defmodule Fathom.Shard.Integrity do
   # dirty with an unchanged `etag`, so the next periodic flush snapshots that empty file and PUTs it
   # over the good stored object with a valid If-Match — destroying the only good copy. The serving
   # path therefore refuses the flush and leaves the file alone; see verify_and_snapshot/2.
-  @spec quarantine_corrupt!(Path.t(), String.t(), term()) :: :ok
+  @spec quarantine_corrupt!(Path.t(), String.t(), term()) :: :ok | {:error, term()}
   def quarantine_corrupt!(path, shard_id, reason) do
     # `.corrupt.<ms>-<unique>`, and the -wal/-shm RENAMED alongside — mirroring quarantine_fenced!/
     # quarantine_fork! (expert review 2026-09-05 #17). Two fixes over the old `<second>` + `File.rm`:
@@ -240,14 +241,29 @@ defmodule Fathom.Shard.Integrity do
     dest =
       "#{path}.corrupt.#{System.system_time(:millisecond)}-#{System.unique_integer([:positive])}"
 
-    _ = Fathom.FS.rename(path, dest)
-    Enum.each(["-wal", "-shm"], &Fathom.FS.rename(path <> &1, dest <> &1))
+    # Companions first, all-or-nothing, every result checked (`Quarantine.move_aside/2`, expert
+    # review 2026-11-07 #83). The `.db` used to move first with the `-wal`/`-shm` best-effort after
+    # it (and the `.db` result discarded), so a crash between the two, or one failed rename, left a
+    # WAL-less `.db` or an orphan `-wal` at the live path, where it replays onto a future database of
+    # the same name. On failure nothing moved: the corrupt copy stays where it was, loudly.
+    result = Quarantine.move_aside(path, dest)
 
-    Logger.error(
-      "shard #{shard_id}: local db failed quick_check (#{inspect(reason)}); REFUSING flush so the " <>
-        "last good stored object stays authoritative; quarantined corrupt copy to #{dest}"
-    )
+    case result do
+      :ok ->
+        Logger.error(
+          "shard #{shard_id}: local db failed quick_check (#{inspect(reason)}); REFUSING flush so " <>
+            "the last good stored object stays authoritative; quarantined corrupt copy to #{dest}"
+        )
+
+      {:error, move_reason} ->
+        Logger.error(
+          "shard #{shard_id}: local db failed quick_check (#{inspect(reason)}); REFUSING flush so " <>
+            "the last good stored object stays authoritative; corrupt-copy quarantine FAILED " <>
+            "(#{inspect(move_reason)}), nothing was moved and the copy stays at #{path}"
+        )
+    end
 
     :telemetry.execute([:fathom, :shard, :corrupt_flush], %{count: 1}, %{shard_id: shard_id})
+    result
   end
 end
