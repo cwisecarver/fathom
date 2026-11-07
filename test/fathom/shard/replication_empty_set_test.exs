@@ -91,7 +91,13 @@ defmodule Fathom.Shard.ReplicationEmptySetTest do
 
         # The window: `Fleet.init/1` published `[]` and `Membership` has not republished.
         Fleet.publish([])
-        on_exit(fn -> Fleet.publish(running) end)
+
+        # NO `on_exit(Fleet.publish(running))` here. ExUnit terminates `start_supervised!` children
+        # BEFORE it runs `on_exit` callbacks, so by then `Membership.terminate/2` has already
+        # retracted the set and a republish would LEAVE THREE DEAD SHIPPER NAMES in `:persistent_term`
+        # for every later test (seed 169289: `RecoveryPrefetchTest` then asked 3 dead followers and
+        # refused its open with `UnderQuorum` 0-of-2). The in-test republish below, and `Membership`'s
+        # retraction when the Fleet stops, are the whole cleanup.
         assert Fleet.shippers() == [], "precondition: the published set is not empty"
 
         assert {:error, {:no_quorum, :impossible}} = Session.commit(id, wal, coordinator),

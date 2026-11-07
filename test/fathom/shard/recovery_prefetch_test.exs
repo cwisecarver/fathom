@@ -41,6 +41,10 @@ defmodule Fathom.Shard.RecoveryPrefetchTest do
     File.mkdir_p!(dir)
     prev = Map.new(@env, &{&1, Application.get_env(:fathom, &1)})
     prev_running = Fleet.running()
+    # Hermetic like the sibling recovery tests: the peer recovery ask reads `Fleet.running/0`, a
+    # `:persistent_term` that outlives every Fleet, so a stale set left by an earlier test turns
+    # this open into an `UnderQuorum` refusal (0 of 2 answered) instead of the open under test.
+    Fleet.publish([])
 
     on_exit(fn ->
       Shards.stop(id)
