@@ -1673,6 +1673,54 @@ defmodule Fathom.Directory do
   end
 
   @doc """
+  The rows that still name a retained copy long after it should have been retired (expert review
+  2026-11-07 #54), oldest cutover first, capped at `limit`: `retained_version IS NOT NULL`,
+  `cutover_at` older than `cutoff` (the caller passes now minus the retention window minus a
+  grace), and NO live `RetirementJob` already queued, running or backing off for that
+  `(shard_id, version)`. Returns `[{shard_id, retained_version, cutover_at}]`.
+
+  The job exclusion is in the query, so a sweep never stacks a second job behind one that is still
+  retrying, AND a row whose job is live drops out of the page — the next hourly run reaches the rows
+  behind it instead of re-reading the same oldest `limit` forever (no cursor needed). The anti-join
+  is over the few live jobs that belong to OVERDUE rows; the week-after-a-rollout population of
+  future-scheduled retirements is only touched when many rows are overdue at once, as one hash
+  anti-join.
+
+  `active` and `suspended` only: those are the tenants that serve (or resume), and a `deleted`
+  row's objects belong to the purge. `retained_version != schema_version` skips a row whose
+  pointer names the LIVE version — `RetirementJob.perform/1` would cancel it `:version_live` every
+  hour, forever.
+
+  NO INDEX, deliberately (the review said "measure first"). `retained_version` has none, so this
+  is a sequential scan of `shards`, once an hour: MEASURED 43 ms per 1 000 000 rows (parallel seq
+  scan, 100 overdue, cached). A partial index `(cutover_at, shard_id) WHERE retained_version IS NOT
+  NULL` was built and measured against it: on a 200k-row copy of the table, 50 000 Recorder touches
+  wrote 31-49 MB of WAL with the index vs 25-38 MB without (14-50 % more per touch, across three
+  rounds), because `shards` updates are non-HOT and a rollout puts EVERY row inside the index's
+  predicate for the following week. A write tax on the hottest table every second for a week, to
+  save tens of milliseconds an hour, is the wrong trade. Revisit with the partial index only if
+  the table reaches ~100M rows.
+  """
+  @spec retirement_overdue(DateTime.t(), pos_integer()) ::
+          [{String.t(), non_neg_integer(), DateTime.t()}]
+  def retirement_overdue(%DateTime{} = cutoff, limit) when is_integer(limit) and limit > 0 do
+    Repo.all(
+      from s in Shard,
+        where: not is_nil(s.retained_version) and s.cutover_at < ^cutoff,
+        where: s.status in ["active", "suspended"] and s.retained_version != s.schema_version,
+        where:
+          fragment(
+            "NOT EXISTS (SELECT 1 FROM oban_jobs j WHERE j.worker = 'Fathom.Migrator.RetirementJob' AND j.state IN ('scheduled','available','executing','retryable','suspended') AND j.args->>'shard_id' = ? AND (j.args->>'version')::bigint = ?)",
+            s.shard_id,
+            s.retained_version
+          ),
+        order_by: [asc: s.cutover_at, asc: s.shard_id],
+        limit: ^limit,
+        select: {s.shard_id, s.retained_version, s.cutover_at}
+    )
+  end
+
+  @doc """
   How many shards are quarantined (`migration_failed` — set when a forward migration
   or a revert exhausts its attempts). A gauge next to `count_laggards/1` so quarantine
   growth is observable instead of silently accumulating (expert review #24).

@@ -7,6 +7,12 @@ defmodule Fathom.Migrator.ErasureSweepJob do
       attempts (long storage outage) or whose enqueue failed leaves a tombstoned tenant's objects in
       storage with nothing to re-drive the purge. Re-enqueue the (unique, idempotent) DeleteJob for
       recently tombstoned rows that still have any stored object.
+    * **retirement re-drive** (expert review 2026-11-07 #54): a `RetirementJob` that exhausted its
+      attempts (or was pruned/lost) leaves the retained `<shard>@<version>` copy — a full duplicate
+      of the tenant — and its `shards.retained_version` pointer forever; nothing else ever
+      re-enqueues it. Re-enqueue the (idempotent, per-`(shard, version)`-unique) `RetirementJob` for
+      every row whose cutover is older than the retention window plus a day and that still names a
+      retained copy. See `redrive_retirements/0`.
     * **promotion-snapshot expiry** (expert review 2026-10-12 #8): expire the pre-promotion
       snapshots whose `promotion_snapshot_at` stamp has aged out.
 
@@ -56,6 +62,7 @@ defmodule Fathom.Migrator.ErasureSweepJob do
   require Logger
 
   alias Fathom.{Directory, Snapshots}
+  alias Fathom.Migrator.RetirementJob
   alias Fathom.Shard.Storage
   alias Fathom.Snapshots.Retention
   alias Fathom.Tenants.DeleteJob
@@ -83,10 +90,64 @@ defmodule Fathom.Migrator.ErasureSweepJob do
     if is_nil(cursor) do
       sweep_promotion_snapshots()
       sweep_scratch_forks()
+      redrive_retirements()
     end
 
     redrive_deletes(cursor)
     :ok
+  end
+
+  # Expert review 2026-11-07 #54. A `RetirementJob` ends terminally (attempts exhausted, pruned,
+  # lost) and the retained `<shard>@<version>` copy — a complete duplicate of the tenant — plus its
+  # `shards.retained_version` pointer then leak forever: the moduledoc's "an S3 lifecycle rule
+  # backstops any it misses" never shipped, `reconcile_retained/2` only CLEARS pointers to copies
+  # that are already absent, and no other code enqueues one. The rows that still name a retained
+  # copy a day past the window (`RetirementJob.retention_seconds/0` plus `@retire_grace_s`) with no
+  # live job of their own are the ones whose job did not do its work; re-enqueue it. Idempotent:
+  # `drop_version` of an absent object is `:ok`, `clear_retained_version/2` is conditional, and
+  # `RetirementJob.perform/1` refuses a live version and an in-flight revert.
+  #
+  # The no-live-job exclusion is in `Directory.retirement_overdue/2`'s query, so an hourly sweep
+  # never stacks a second job behind one that is still backing off, and a row whose job is live
+  # drops out of the next page (a backlog drains `@retire_page` rows per run, oldest first). The
+  # insert is `Oban.insert_all/1` — no worker-level `unique:` exists, on purpose — and this worker
+  # is itself a unique singleton, so nothing races the exclusion.
+  @retire_grace_s 24 * 3600
+  @retire_page 1_000
+
+  @doc false
+  @spec redrive_retirements() :: non_neg_integer()
+  def redrive_retirements do
+    cutoff = DateTime.add(now(), -(RetirementJob.retention_seconds() + @retire_grace_s), :second)
+
+    case Directory.retirement_overdue(cutoff, @retire_page) do
+      [] ->
+        0
+
+      rows ->
+        n =
+          rows
+          |> Enum.map(fn {shard_id, version, _cutover_at} ->
+            RetirementJob.redrive_changeset(shard_id, version)
+          end)
+          |> Oban.insert_all()
+          |> length()
+
+        Logger.warning(
+          "erasure sweep: re-enqueued #{n} overdue retirement(s) (retained copies whose " <>
+            "RetirementJob did not complete within the retention window plus a day)"
+        )
+
+        n
+    end
+  rescue
+    e ->
+      Logger.warning("erasure sweep: retirement re-drive failed (#{inspect(e)}); continuing")
+      0
+  catch
+    :exit, reason ->
+      Logger.warning("erasure sweep: retirement re-drive failed (#{inspect(reason)}); continuing")
+      0
   end
 
   # Expert review 2026-10-15 #19. The restore drill drops its scratch fork in an `after`, which a

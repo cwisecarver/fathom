@@ -400,4 +400,113 @@ defmodule Fathom.Migrator.ErasureSweepJobTest do
       assert %{status: "deleted"} = Fathom.Repo.get_by(Directory.Shard, shard_id: gone)
     end
   end
+
+  # Expert review 2026-11-07 #54. A `RetirementJob` that failed 5 times in ~90 s (Oban's default
+  # backoff) was discarded, and nothing ever re-enqueued it: the retained `<shard>@<version>` copy —
+  # a full duplicate of the tenant — and its `retained_version` pointer leaked forever. The moduledoc
+  # promised "an S3 lifecycle rule backstops any it misses"; no such rule ships.
+  describe "retirement re-drive and retry shape (expert review 2026-11-07 #54)" do
+    alias Fathom.Migrator.RetirementJob
+
+    @day 24 * 3600
+
+    # A tenant at v2 whose backup `@1` should have been retired `age_days` ago.
+    defp insert_retained!(id, age_days, opts \\ []) do
+      at = DateTime.add(DateTime.utc_now(), -round(age_days * @day), :second)
+
+      Fathom.Repo.insert_all(Directory.Shard, [
+        %{
+          shard_id: id,
+          schema_version: Keyword.get(opts, :schema_version, 2),
+          status: Keyword.get(opts, :status, "active"),
+          retained_version: Keyword.get(opts, :retained_version, 1),
+          cutover_at: at,
+          last_active_at: at,
+          updated_at: at,
+          inserted_at: at
+        }
+      ])
+    end
+
+    defp retained_object!(id) do
+      put_object!(id)
+      assert :ok = Storage.retain(id, 1)
+      assert Storage.version_present?(id, 1), "fixture: the retained @1 must exist"
+    end
+
+    test "an overdue retained copy is re-enqueued once, and the job drops it and clears the pointer" do
+      id = "redrive_#{System.unique_integer([:positive])}"
+      retained_object!(id)
+      insert_retained!(id, 9)
+
+      assert ErasureSweepJob.redrive_retirements() == 1
+      assert_enqueued(worker: RetirementJob, args: %{"shard_id" => id, "version" => 1})
+
+      # An hourly sweep must not stack a second job behind one that is still live.
+      assert ErasureSweepJob.redrive_retirements() == 0
+      assert [_one] = all_enqueued(worker: RetirementJob, args: %{"shard_id" => id})
+
+      assert :ok = perform_job(RetirementJob, %{"shard_id" => id, "version" => 1})
+      refute Storage.version_present?(id, 1), "the retained copy must be dropped"
+      assert {:ok, %{retained_version: nil}} = Directory.get(id)
+    end
+
+    test "only what is genuinely overdue is selected" do
+      tag = System.unique_integer([:positive])
+      overdue = "rd_over_#{tag}"
+      suspended = "rd_susp_#{tag}"
+      in_window = "rd_win_#{tag}"
+      live_version = "rd_live_#{tag}"
+      deleted = "rd_del_#{tag}"
+      no_pointer = "rd_none_#{tag}"
+
+      insert_retained!(overdue, 9)
+      insert_retained!(suspended, 9, status: "suspended")
+      # 7 d retention + 1 d grace: 7.5 d old is still the original job's to do.
+      insert_retained!(in_window, 7.5)
+      # The pointer names the LIVE version: RetirementJob would cancel it :version_live forever.
+      insert_retained!(live_version, 9, schema_version: 1, retained_version: 1)
+      insert_retained!(deleted, 9, status: "deleted")
+      insert_retained!(no_pointer, 9, retained_version: nil)
+
+      # A row whose retirement is still PENDING (a revert's reschedule, a job backing off) is the
+      # job's to finish: a re-drive dropping it now would shorten that backup's retention.
+      pending = "rd_pend_#{tag}"
+      insert_retained!(pending, 9)
+      {:ok, _} = Oban.insert(RetirementJob.schedule_changeset(pending, 1))
+
+      assert ErasureSweepJob.redrive_retirements() == 2
+
+      enqueued =
+        all_enqueued(worker: RetirementJob)
+        |> Enum.map(& &1.args["shard_id"])
+        |> Enum.reject(&(&1 == pending))
+
+      assert Enum.sort(enqueued) == Enum.sort([overdue, suspended])
+
+      assert [_only_the_original] =
+               all_enqueued(worker: RetirementJob, args: %{"shard_id" => pending})
+    end
+
+    test "the cron run drives it (a continuation does not repeat the page)" do
+      id = "redrive_cron_#{System.unique_integer([:positive])}"
+      insert_retained!(id, 9)
+
+      assert :ok = perform_job(ErasureSweepJob, %{})
+      assert_enqueued(worker: RetirementJob, args: %{"shard_id" => id, "version" => 1})
+    end
+
+    # Oban's default backoff is `15 + 2^attempt` seconds: five attempts inside ~90 s, so any storage
+    # brownout longer than that discarded every retirement that started early in it — and a
+    # rollout schedules ALL of its retirements for the same hours, a week later.
+    test "the retry window outlasts a brownout: many attempts, long capped backoff" do
+      max_attempts = RetirementJob.new(%{shard_id: "x", version: 1}).changes.max_attempts
+      assert max_attempts >= 10
+
+      gaps = for a <- 1..(max_attempts - 1), do: RetirementJob.backoff(%Oban.Job{attempt: a})
+      assert Enum.all?(gaps, &(&1 >= 120)), "the first retry must not come within the minute"
+      assert Enum.max(gaps) <= 3 * 3600, "capped, so a long outage is retried every few hours"
+      assert Enum.sum(gaps) >= 6 * 3600, "the window must cover an hours-long brownout"
+    end
+  end
 end

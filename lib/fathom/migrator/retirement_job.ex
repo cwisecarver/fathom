@@ -1,10 +1,29 @@
 defmodule Fathom.Migrator.RetirementJob do
   @moduledoc """
   Drops a shard's retained old version once the retention window has passed.
-  Scheduled by `Fathom.Migrator.ShardMigrationJob` for `now + retention` after a
-  cutover; an S3 lifecycle rule backstops any it misses.
+  Scheduled by the cutover transaction (`Fathom.Migrator.ShardMigration`, the retirement outbox)
+  for `now + retention`; `Fathom.Migrator.ErasureSweepJob` RE-DRIVES any whose job was lost or
+  exhausted (below). There is no S3 lifecycle rule behind it: nothing in `deploy/` or the durability
+  runbook expires `<shard>@<version>` keys, so a retirement that never lands leaks a full copy of
+  the tenant forever.
 
-  ## No `unique:`, deliberately (expert review 2026-08-26 #36)
+  ## Retry shape (expert review 2026-11-07 #54)
+
+  `max_attempts: 10` with a capped exponential `backoff/1` (2 minutes doubling to a 3 hour cap,
+  about 10 hours in all). Oban's default backoff (`15 + 2^attempt` seconds) exhausted five attempts in
+  ~90 seconds, so any storage brownout longer than that discarded every retirement that started
+  early in it — and a rollout schedules ALL its retirements for the same hours, 7 days later.
+
+  ## Re-drive (expert review 2026-11-07 #54)
+
+  A job can still end terminally (a brownout past ten hours, a permanent 403, a pruned discard), so
+  `ErasureSweepJob` selects `shards.retained_version IS NOT NULL AND cutover_at` older than the
+  retention window plus a day, with no live job of its own (`Directory.retirement_overdue/2`), and
+  enqueues this worker for each (`redrive_changeset/2`). Idempotent: `drop_version` of an absent
+  object is `:ok`, `Directory.clear_retained_version/2` is conditional, and `perform/1` already
+  refuses a live version and an in-flight revert.
+
+  ## No worker-level `unique:`, deliberately (expert review 2026-08-26 #36)
 
   Every other per-shard worker — `ShardMigrationJob`, `RevertJob`, `DeleteJob`, `RevokeJob`,
   `HandoffJob` — declares `unique: [keys: [:shard_id], period: :infinity, states: [...]]`, and
@@ -12,14 +31,16 @@ defmodule Fathom.Migrator.RetirementJob do
   default. This job is absent from that list on purpose, so the omission is not mistaken for the
   same bug those five were fixed for:
 
+    * a shard legitimately has SEVERAL retirements in flight at once (a forward migration retires
+      `@v`, a later revert retires its backup `@v+1`), so uniqueness on `shard_id` alone would
+      silently drop the second and leak it;
     * its work is a `drop_version` — idempotent, and an already-dropped object is a no-op; and
-    * it is enqueued from the cutover transaction's outbox, not from a request path or a sweep,
-      so there is no "two callers race to enqueue" shape for uniqueness to protect against.
-
-  If it ever gains a second enqueue site, it needs the same `unique:` block AND a line in that
-  test's worker list.
+    * the cutover enqueues it from the transaction's outbox, not from a request path, so there is no
+      "two callers race to enqueue" shape for a worker-level uniqueness to protect against. The one
+      place that CAN double-enqueue — the re-drive sweep — excludes a row that already has a live
+      job for its `(shard_id, version)` in its own selection query.
   """
-  use Oban.Worker, queue: :retirement, max_attempts: 5
+  use Oban.Worker, queue: :retirement, max_attempts: 10
 
   import Ecto.Query, only: [from: 2]
 
@@ -39,6 +60,27 @@ defmodule Fathom.Migrator.RetirementJob do
   @spec schedule_changeset(String.t(), non_neg_integer()) :: Ecto.Changeset.t()
   def schedule_changeset(shard_id, version),
     do: new(%{shard_id: shard_id, version: version}, schedule_in: @retention_seconds)
+
+  @doc "The retention window, in seconds (a version's `@v` object is dropped this long after its cutover)."
+  @spec retention_seconds() :: pos_integer()
+  def retention_seconds, do: @retention_seconds
+
+  @doc """
+  A changeset for the re-drive sweep: due NOW. It carries no uniqueness of its own — the sweep's
+  selection query (`Directory.retirement_overdue/2`) already excludes a `(shard_id, version)` with a
+  live job, which is what lets it insert with `Oban.insert_all/1`.
+  """
+  @spec redrive_changeset(String.t(), non_neg_integer()) :: Ecto.Changeset.t()
+  def redrive_changeset(shard_id, version), do: new(%{shard_id: shard_id, version: version})
+
+  # 2 minutes doubling to a 3 hour cap (expert review 2026-11-07 #54). Oban's default,
+  # `15 + 2^attempt` seconds, spent all five attempts inside ~90 s.
+  @backoff_base_s 120
+  @backoff_cap_s 3 * 60 * 60
+
+  @impl Oban.Worker
+  def backoff(%Oban.Job{attempt: attempt}) when attempt >= 1,
+    do: min(@backoff_base_s * Integer.pow(2, attempt - 1), @backoff_cap_s)
 
   # Bound the run under Lifeline's `rescue_after` (config.exs, 60 min) so a wedged job ends instead
   # of being rescued while its process is still alive (expert review 2026-10-13 #6). Oban's default
@@ -69,7 +111,7 @@ defmodule Fathom.Migrator.RetirementJob do
       # up-front cancel can't reach a retirement that already dequeued (executing is uncancellable),
       # so this side must check. Cancelled, not snoozed: if the revert lands the version is live
       # (drop would be wrong); if it fails, or the retirement was unrelated, the copy leaks until
-      # the S3 lifecycle backstop — the recoverable direction.
+      # the retirement re-drive (`ErasureSweepJob`) — the recoverable direction.
       revert_in_flight?(shard_id) ->
         {:cancel, :revert_in_flight}
 

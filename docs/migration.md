@@ -163,7 +163,12 @@ both are now caught instead of silently forking the fleet:
   `converged`) and enqueues them. You never push to millions of shards — a tenant that
   was asleep during the rollout gets migrated the next time reconcile sweeps (or when it next
   wakes). The tail **converges**.
-- **`RetirementJob`** drops retained old versions past their `retain_until`.
+- **`RetirementJob`** drops a retained old version 7 days after its cutover. It retries for about
+  ten hours with a capped backoff, and the hourly `ErasureSweepJob` **re-drives** any row that
+  still names a retained copy a day past its window (a job that was discarded, pruned or lost):
+  there is no S3 lifecycle rule behind it, so without the re-drive a missed retirement leaks a full
+  duplicate of the tenant forever. A successful revert drops its own restore source
+  (`<shard>@<landing>`) once its cutover commits.
 - **`RevertJob`** flips the fleet pointer back (see below).
 
 Directory lifecycle `status` runs `active ⇄ migrating` on the migrate path — a shard returns to
