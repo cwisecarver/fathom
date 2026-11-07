@@ -145,7 +145,10 @@ defmodule Fathom.Tenants do
   a just-migrated template without waiting for the idle flush). The flush is non-disruptive (`src`
   keeps serving) but **local** — see `Fathom.Shards.flush/1`; on a multi-node fleet flush `src` on its
   home node first. Refuses `{:error, :already_exists}`/`{:error, :tombstoned}` (dst taken in the
-  directory), `{:error, :dst_exists}` (dst already has a stored object), `{:error, :dst_busy}` (dst is
+  directory — or src/dst deleted DURING the fork: the tombstones are re-checked after the copy and
+  before the dst row is registered, the copy is purged and no row or token is produced; expert review
+  2026-11-07 #16),
+  `{:error, :dst_exists}` (dst already has a stored object), `{:error, :dst_busy}` (dst is
   being opened/forked concurrently — its lease is held), `{:error, :no_source}` (src has no stored
   object / directory row), the flush error if `flush_source` fails, `{:error, :invalid_shard_id}`, or
   `{:error, {:token_mint_failed, reason}}` (the fork succeeded but no token could be minted — mint
@@ -161,6 +164,7 @@ defmodule Fathom.Tenants do
          {:ok, src_row} <- fetch_src(src),
          :ok <- maybe_flush_source(src, opts),
          :ok <- fork_into_leased_dst(src, dst),
+         :ok <- discard_if_erased(src, dst),
          :ok <- register_fork(dst, Keyword.get(opts, :scratch, false)),
          {:ok, result} <- tenant_result(dst, warnings, opts) do
       {:ok, Map.put(result, :source_flushed_at, source_flushed_at(src_row, opts))}
@@ -201,7 +205,9 @@ defmodule Fathom.Tenants do
             renewer = start_fork_renewer(dst, lease)
 
             try do
-              Storage.fork_shard(src, dst)
+              with :ok <- Storage.fork_shard(src, dst) do
+                discard_if_erased(src, dst)
+              end
             after
               stop_fork_renewer(renewer)
               # Keeps a takeover's lineage claim (expert review 2026-10-12 #3).
@@ -223,6 +229,52 @@ defmodule Fathom.Tenants do
       {:error, reason} ->
         {:error, {:drain_failed, reason}}
     end
+  end
+
+  # A DELETE THAT LANDED DURING THE FORK (expert review 2026-11-07 #16). `fetch_src/1` and
+  # `refuse_if_taken/1` read the directory row and the tombstone set ONCE, before the optional source
+  # flush and the dst lease. `delete/1` tombstones synchronously but erases asynchronously, so a delete
+  # in that window left the source's object in place and `Storage.fork_shard/2` (an atomic server-side
+  # copy) copied the erased tenant's bytes to a new id, which `register_fork/1` then made a live
+  # `active` row and `tenant_result/3` handed an `rw` token for — erased data outside every deletion
+  # guarantee, with no tombstone, marker or purge. `Snapshots.create/restore` re-check after their copy
+  # for the same reason (reviews 2026-10-12 #20 / 10-15 #13); fork had the same shape and no guard.
+  #
+  # Re-checked AFTER the copy, with the dst lease still held (`purge_shard` under it is safe: a missing
+  # lock releases as success), and again before the row is registered, so no row and no token exist for
+  # a tombstoned side. Either side counts: a tombstoned dst is a destination deleted mid-fork.
+  #
+  # Deliberately NOT `delete(dst)`: that would tombstone the destination id permanently. The copy is
+  # simply purged and the fork refused, so the id stays free. The tombstone set is node-local, so a
+  # delete on another node is seen once its NOTIFY lands; the hourly `ErasureSweepJob` re-drive of the
+  # SOURCE's purge is the backstop for the sliver, and the directory row is consulted too.
+  defp discard_if_erased(src, dst) do
+    if erased_id?(src) or erased_id?(dst) do
+      case Storage.purge_shard(dst) do
+        :ok ->
+          {:error, :tombstoned}
+
+        {:error, reason} = error ->
+          Logger.error(
+            "fork #{src} -> #{dst}: a delete landed mid-fork and the copied object could NOT be " <>
+              "purged (#{inspect(reason)}); #{dst} holds an erased tenant's data and has no " <>
+              "directory row — purge it by hand (Storage.purge_shard/1)"
+          )
+
+          error
+      end
+    else
+      :ok
+    end
+  end
+
+  defp erased_id?(id) do
+    Tombstones.tombstoned?(id) or
+      match?({:ok, %{status: "deleted"}}, Directory.get(id))
+  rescue
+    _ -> Tombstones.tombstoned?(id)
+  catch
+    :exit, _ -> Tombstones.tombstoned?(id)
   end
 
   # Renews the fork's dst lease every ttl/3 while the copy runs; linked so a crashed caller tears it

@@ -68,6 +68,11 @@ erased tenant's residue), so a normal open pays nothing. Not covered, and a park
 (see `docs/component-notes.md`): a node with no local residue, booting with the directory unreachable,
 opens a fresh EMPTY shard for an erased id until the load succeeds.
 
+**A delete during a fork (expert review 2026-11-07 #16).** `fork/3` re-checks the source's and the
+destination's tombstone after the copy (dst lease held) and again before registering the dst row; if
+either side was deleted the copy is purged and the fork returns `{:error, :tombstoned}` — no row, no
+token. The destination id is NOT tombstoned by this (that would make it permanently unusable).
+
 ### The physical erase (`DeleteJob` → `Tenants.purge/1`)
 
 ```
