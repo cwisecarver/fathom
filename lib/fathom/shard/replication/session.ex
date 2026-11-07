@@ -47,6 +47,7 @@ defmodule Fathom.Shard.Replication.Session do
   alias Fathom.Shard.Replication.Protocol, as: ReplProtocol
   alias Fathom.Shard.Replication.Protocol.Push
   alias Fathom.Shard.Replication.Protocol.SeedBegin
+  alias Fathom.Shard.Replication.QuorumFence
   alias Fathom.Shard.Replication.SeedGate
   alias Fathom.Shard.Replication.SeedPin
   alias Fathom.Shard.Replication.Shipper
@@ -74,6 +75,11 @@ defmodule Fathom.Shard.Replication.Session do
   # `reconcile/2`'s `:offset_mismatch` branch then finds nothing and throws the correction away, so
   # the primary never learns where the follower actually is and re-plans from a position it has
   # already been told is wrong — a laggard stranded permanently rather than for one round.
+  #
+  # `:overloaded` is NOT cleared here, but it is not simply kept either: `reconcile/2` has its own
+  # clause, because a refusal of the follower's FIRST outstanding push leaves nothing outstanding
+  # (expert review 2026-11-07 #44), and only a refusal over a re-sent stale entry may belong to an
+  # earlier push.
   #
   # Found by `replication_seed_test.exs`'s "a held laggard reply strands it" once
   # `Fathom.Test.PausablePeer` made the race deterministic; it is a regression this list narrows
@@ -366,6 +372,10 @@ defmodule Fathom.Shard.Replication.Session do
        # shard's waiter without trusting an `inflight` entry that outlived its push (expert review
        # 2026-10-17 #9). Never cleaned: bounded by the follower count, and read only beside `inflight`.
        inflight_at: %{},
+       # Shippers this Session pushed to while an earlier push of theirs was still recorded in
+       # `inflight` (a re-send over a stale entry). `reconcile/2` keeps their entry on a local
+       # `:overloaded` refusal; any other shipper's first-push refusal drops it (review 2026-11-07 #44).
+       repeated: MapSet.new(),
        # Shippers with a seed in flight. A seed can be a whole database, so starting a second one
        # for the same follower because the next commit also saw :unknown_shard would multiply a
        # large transfer by the write rate.
@@ -581,8 +591,20 @@ defmodule Fathom.Shard.Replication.Session do
     {:reply, reply, state} = do_commit(wal_path, state, deadline, mode)
 
     # No caller in the round hears `:ok` unless the fdatasync started for it succeeded too.
-    {reply, state} =
+    {gated, state} =
       if gated?, do: gate_on_wal_sync(reply, pre, state, deadline), else: {reply, state}
+
+    # THE QUORUM VERDICT MUST NOT VANISH BEHIND A SYNC FAILURE (expert review 2026-11-07 #73). A round
+    # whose quorum failed AND whose deferred fdatasync failed (or was still pending) answers only
+    # `wal_sync_failed`, and the executor's `mark_if_unconfirmed/2` rightly leaves that alone: a
+    # failed local sync has its own fence, the poison. But the poison refuses ACKS; it is not a read
+    # fence, and an `{:open, _}` failure does not even poison. With no mark, `confirm_quorum/3` is
+    # never armed and reads keep returning a locally committed write no quorum holds (Jepsen finding
+    # 7, reachable again under `REPLICATION_DEFERRED_WAL_SYNC`). Only this process knows the verdict,
+    # so it marks here. Marking in the executor on EVERY error instead (the review's other option)
+    # would also fence a shard whose quorum HELD and only the sync failed, a spurious read outage.
+    fence_if_quorum_hidden(reply, gated, state.shard_id)
+    reply = gated
 
     for from <- batch, do: GenServer.reply(from, reply)
 
@@ -800,6 +822,13 @@ defmodule Fathom.Shard.Replication.Session do
         {reply, state}
     end
   end
+
+  # `reply` is the quorum round's verdict, `gated` what the caller will be told after the sync gate.
+  # A failed round hidden behind a sync failure still leaves a commit that is visible and unreplicated.
+  defp fence_if_quorum_hidden({:error, _}, {:error, {:wal_sync_failed, _}}, shard_id),
+    do: QuorumFence.mark(shard_id)
+
+  defp fence_if_quorum_hidden(_reply, _gated, _shard_id), do: :ok
 
   @doc false
   @spec commit_outcome(term()) :: :ok | :no_quorum | :timeout | :other
@@ -2142,10 +2171,26 @@ defmodule Fathom.Shard.Replication.Session do
         {shipper, now}
       end
 
+    # A push to a shipper that ALREADY has an entry re-sends over a stale one (only reachable past
+    # `timeout()`, see `ship_planned/5`): its `:overloaded` refusal may be about the earlier push, so
+    # `reconcile/2` must keep the entry. Everything else this round sends is that shipper's FIRST
+    # outstanding push. Empty in steady state, so the common round allocates nothing here.
+    again = for {shipper, _} <- plans, Map.has_key?(state.inflight, shipper), do: shipper
+
+    repeated =
+      if again == [] and MapSet.size(state.repeated) == 0 do
+        state.repeated
+      else
+        state.repeated
+        |> MapSet.difference(MapSet.new(Map.keys(sent_at)))
+        |> MapSet.union(MapSet.new(again))
+      end
+
     state = %{
       state
       | inflight: Map.merge(expectations(plans, header), state.inflight),
-        inflight_at: Map.merge(state.inflight_at, sent_at)
+        inflight_at: Map.merge(state.inflight_at, sent_at),
+        repeated: repeated
     }
 
     case needed do
@@ -2272,11 +2317,28 @@ defmodule Fathom.Shard.Replication.Session do
       # forever — which `settle_inflight/3` then burns a whole deadline on.
       #
       # Only `:offset_mismatch` above CONSUMES the entry (it needs the recorded generation and salt
-      # to build the correction); these merely drop it. `:already_in_flight` and `:overloaded` fall
-      # through to the catch-all and KEEP it — see `@settled_rejects` for why that distinction is
-      # load-bearing rather than tidy.
+      # to build the correction); these merely drop it. `:already_in_flight` falls through to the
+      # catch-all and KEEPS it, and `:overloaded` has its own clause below — see `@settled_rejects`
+      # for why those distinctions are load-bearing rather than tidy.
       {shipper, reason, _at}, acc when reason in @settled_rejects ->
         %{acc | inflight: Map.delete(acc.inflight, shipper)}
+
+      # `:overloaded` is ALSO local (the byte budget in `Shipper.push/2`, or the shipper's mailbox
+      # bound), but unlike `:already_in_flight` it says nothing about an earlier push: it is what a
+      # refused push answers whether or not the follower owes a reply to another. So the entry
+      # survives only when it can belong to an EARLIER push — one this Session re-sent over a stale
+      # entry (`repeated`). When this round's push was the follower's first outstanding one (the
+      # normal case), the refusal means nothing was sent and nothing is outstanding: keeping the
+      # entry made the follower read "busy" for up to `2 * timeout()` and every commit in that
+      # window wait out its deadline for a reply that was never coming (expert review 2026-11-07
+      # #44). Dropping it on EVERY `:overloaded` would re-break `@settled_rejects`' warning above for
+      # the repeated case; testing "waiter exists" in `Shipper` before `overloaded?/1` (the
+      # review's other half) cannot help, since the budget refusal is decided in the CALLER, which
+      # cannot see the shipper's waiters.
+      {shipper, :overloaded, _at}, acc ->
+        if MapSet.member?(acc.repeated, shipper),
+          do: acc,
+          else: %{acc | inflight: Map.delete(acc.inflight, shipper)}
 
       # Our own shipper refused locally; the follower never saw this frame and still owes a reply to
       # an earlier one. Keep the expectation so that reply can still be reconciled.

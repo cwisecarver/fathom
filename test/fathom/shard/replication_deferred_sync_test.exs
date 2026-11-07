@@ -21,7 +21,7 @@ defmodule Fathom.Shard.ReplicationDeferredSyncTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Replication.{Fleet, Follower, Session, WalSync}
+  alias Fathom.Shard.Replication.{Fleet, Follower, QuorumFence, Session, WalSync}
   alias Filo.Stmt
   import Fathom.Test.ReplicationCase, only: [session!: 1]
 
@@ -574,6 +574,39 @@ defmodule Fathom.Shard.ReplicationDeferredSyncTest do
       assert {:error, %Filo.Error{code: "FILO_WAL_SYNC_FAILED"}} =
                run(h, "INSERT INTO t VALUES (2)"),
              "the fallback acked on a shard whose Session saw a failed fdatasync"
+    end
+
+    # Expert review 2026-11-07 #73. A round whose quorum FAILED and whose deferred fdatasync ALSO
+    # failed reported only `wal_sync_failed`: `gate_on_wal_sync/4` discarded the quorum verdict, and
+    # the executor deliberately does not mark on a failed local sync ("it has its own fence", the
+    # poison). But the poison only refuses further ACKS, and an `{:open, _}` failure does not even
+    # poison, so `confirm_quorum/3` was never armed: reads of the locally committed, unreplicated
+    # write kept being served, and a read the client saw could vanish when ownership moved (Jepsen
+    # finding 7, reachable again under this flag). The quorum is failed here by the real overload
+    # (`:replication_max_queue_bytes` of 1: every shipper refuses locally); the sync by the seam.
+    test "a failed quorum hidden behind a failed deferred sync still fences the shard", ctx do
+      followers = replicate!(ctx.root)
+      Application.put_env(:fathom, :replication_deferred_wal_sync, true)
+      h = stream!(ctx.id, followers)
+      assert sync_mode(elem(h, 2)) == 1
+
+      seam!(:ok)
+      {:ok, _} = run(h, "CREATE TABLE t (k INTEGER PRIMARY KEY)")
+      assert QuorumFence.marked(ctx.id) == nil, "fixture: the shard is fenced before the failure"
+
+      Application.put_env(:fathom, :replication_max_queue_bytes, 1)
+      on_exit(fn -> Application.delete_env(:fathom, :replication_max_queue_bytes) end)
+      seam!({:error, {:open, :emfile}})
+
+      assert {:error, %Filo.Error{code: "FILO_WAL_SYNC_FAILED"}} =
+               run(h, "INSERT INTO t VALUES (1)")
+
+      assert QuorumFence.marked(ctx.id) != nil,
+             "the quorum failure was hidden behind the sync failure and never fenced the shard " <>
+               "(pre-fix: nil, so reads of the unreplicated write are served)"
+
+      # The fence does its job: a read now needs a confirming round, and that round fails.
+      assert {:error, %Filo.Error{}} = run(h, "SELECT k FROM t")
     end
   end
 end

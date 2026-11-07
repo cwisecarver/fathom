@@ -216,6 +216,24 @@ defmodule Fathom.Shard.Replication.Shipper do
   @spec connected?(GenServer.server()) :: boolean()
   def connected?(shipper), do: GenServer.call(shipper, :connected?)
 
+  @doc """
+  Answer every outstanding waiter `:disconnected`, for a shipper that is about to be stopped.
+
+  A `Shipper` does not trap exits, so stopping one under `DynamicSupervisor.terminate_child/2`
+  never runs `terminate/2` and its waiters were simply abandoned: each Session that had a push in
+  flight to it kept that `inflight` entry for a process that no longer existed (expert review
+  2026-11-07 #44, "same class"), and a catch-up cycle then settled on it until its deadline.
+  Trapping exits instead was rejected: it would swallow the `{:EXIT, …}` of the writer and socket
+  this process links to, which today crash it into a clean restart. Best effort, never raises: a
+  shipper that is already gone has no waiters left to answer.
+  """
+  @spec retire(GenServer.server()) :: :ok
+  def retire(shipper) do
+    GenServer.call(shipper, :retire, 1_000)
+  catch
+    :exit, _ -> :ok
+  end
+
   # ------------------------------------------------------------------------------------------
   # server
   # ------------------------------------------------------------------------------------------
@@ -278,6 +296,17 @@ defmodule Fathom.Shard.Replication.Shipper do
 
   @impl true
   def handle_call(:connected?, _from, state), do: {:reply, state.sock != nil, state}
+
+  # A shipper about to be stopped by a membership swap answers every outstanding waiter first
+  # (`retire/1`). The socket is left alone: the process is terminated right after, and the link
+  # close that follows would only repeat what this says.
+  def handle_call(:retire, _from, state) do
+    for {shard, from} <- state.waiters do
+      send(from, {:repl_reply, state.id, {:reject, shard, :disconnected, 0}})
+    end
+
+    {:reply, :ok, %{state | waiters: %{}, seeds: MapSet.new(), reply_check: nil}}
+  end
 
   def handle_call({:seed_chunk, _shard_id, _frame}, _from, %{sock: nil} = state),
     do: {:reply, {:error, :disconnected}, state}

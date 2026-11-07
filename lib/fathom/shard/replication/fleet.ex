@@ -386,8 +386,14 @@ defmodule Fathom.Shard.Replication.Fleet do
   @spec stop_shipper(atom()) :: :ok
   def stop_shipper(name) do
     case Process.whereis(name) do
-      nil -> :ok
-      pid -> DynamicSupervisor.terminate_child(@shippers_sup, pid)
+      nil ->
+        :ok
+
+      pid ->
+        # Answer any push still waiting on this shipper BEFORE it dies, or its Sessions keep an
+        # in-flight entry for a process that is gone (expert review 2026-11-07 #44).
+        Fathom.Shard.Replication.Shipper.retire(pid)
+        DynamicSupervisor.terminate_child(@shippers_sup, pid)
     end
 
     :ok

@@ -371,6 +371,15 @@ never "covered" for a checkpoint or an idle close; and a tenant commit is refuse
 valid single-node configuration with replication on (`Fleet.validate_quorum!/0` refuses the boot).
 Catch-up and idle-close rounds, which ack nobody, keep the old hold.
 
+A push this node's own shipper refuses (`:overloaded`: the node byte budget or the shipper mailbox)
+leaves nothing outstanding, so the Session drops its in-flight entry and the next commit ships at
+once instead of waiting out its deadline on a reply that was never coming (expert review
+2026-11-07 #44); only a refusal over a re-sent stale entry keeps it. A shipper retired by a
+membership swap answers its outstanding waiters `:disconnected` first (`Shipper.retire/1`). And with
+`REPLICATION_DEFERRED_WAL_SYNC` on, a failed quorum round whose fdatasync also failed still marks
+`QuorumFence` (the Session marks it; the executor only sees `wal_sync_failed`), so reads of the
+unreplicated commit are fenced behind a confirming round (#73).
+
 ## The gap this closes
 
 A **process** crash (BEAM death, OOM kill, redeploy) loses nothing, and that does not depend on
