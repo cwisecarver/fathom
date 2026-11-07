@@ -275,34 +275,51 @@ defmodule Fathom.Shard.Replication.Membership do
 
   # START new, PUBLISH, STOP departed — see the moduledoc. Raises only from `init/1`'s call, where
   # a failure to start the very first shippers should fail the boot.
+  #
+  # THE SHIPPER'S IDENTITY IS ITS ENDPOINT, not only its node (expert review 2026-11-07 #48). This
+  # used to key the swap on `node_key` alone: a follower that came back on a NEW address (a roster
+  # node restarted onto a new IP, same `node_key`) was already "running", so no shipper was started,
+  # `Fleet.publish/1` recorded the new host beside the OLD shipper — which kept its `host`/`port`
+  # from `init/1` and redialed the dead address every 500 ms for the life of the primary. Folding
+  # host and port into the name makes a changed endpoint a NEW name, and a new name already flows
+  # through the ordered start-new, publish, stop-departed swap, so a commit still never reads a name
+  # whose process does not exist. (Stopping the old shipper and starting a new one under the SAME
+  # name was the obvious alternative and is wrong for that reason: `GenServer.cast` to an
+  # unregistered atom drops silently, and the commit then waits out its whole timeout.) The
+  # follower's per-shipper record in each Session starts empty under the new name, which is right:
+  # a different address may be a different disk, and an unknown position is reset-and-seeded.
   defp apply_set!(desired) do
-    running = Map.new(Fleet.running(), fn {key, _h, _p, name} -> {key, name} end)
+    running = Fleet.running()
+    running_names = MapSet.new(running, &elem(&1, 3))
 
     named =
       Enum.map(desired, fn {node_key, host, port} ->
-        {node_key, host, port, shipper_name(node_key)}
+        {node_key, host, port, shipper_name(node_key, host, port)}
       end)
 
-    for {node_key, host, port, name} <- named, not Map.has_key?(running, node_key) do
+    for {_node_key, host, port, name} <- named, not MapSet.member?(running_names, name) do
       Fleet.start_shipper!(name, host, port)
     end
 
     Fleet.publish(named)
 
-    desired_keys = MapSet.new(desired, &elem(&1, 0))
+    desired_names = MapSet.new(named, &elem(&1, 3))
 
-    for {node_key, name} <- running, not MapSet.member?(desired_keys, node_key) do
+    for {_node_key, _host, _port, name} <- running, not MapSet.member?(desired_names, name) do
       Fleet.stop_shipper(name)
     end
 
     :ok
   end
 
-  # Derived from node_key rather than an index, so a node keeps its shipper process across a
+  # Derived from the endpoint rather than an index, so a follower keeps its shipper process across a
   # membership change that only reorders the set — an index-based name would restart every shipper
-  # whenever one node was added in the middle, dropping four healthy sockets to add one.
-  defp shipper_name(node_key) do
-    Module.concat(Shipper, "N_" <> Base.url_encode64(node_key, padding: false))
+  # whenever one node was added in the middle, dropping four healthy sockets to add one. NUL-joined
+  # before encoding so no `node_key`/host/port triple can collide with another. One atom per
+  # distinct endpoint ever dialed: bounded by fleet churn, the same order as the old per-node atoms.
+  defp shipper_name(node_key, host, port) do
+    ident = Enum.join([node_key, to_string(host), Integer.to_string(port)], <<0>>)
+    Module.concat(Shipper, "N_" <> Base.url_encode64(ident, padding: false))
   end
 
   defp boot_error(:static_list_too_small) do

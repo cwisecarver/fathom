@@ -360,6 +360,11 @@ supply `quorum+1`. Liveness still never filters the push set — the staleness w
 A membership change is not free: a newly added follower holds no base copy, so its first push
 rejects and triggers a seed **per shard**, over the one socket that also carries every other shard.
 
+A shipper's identity is its endpoint (`node_key`, host, port), not the node alone: a follower that
+comes back on a new address gets a NEW shipper through the same start-new, publish, stop-departed
+swap, instead of the old shipper redialing the dead address until the primary restarts (expert
+review 2026-11-07 #48).
+
 A tenant commit is acked only on bytes it knows were read and shipped (expert review 2026-11-07
 #10, #17). Two states used to read as "nothing left to ship" and so acked `:ok`: a **blind
 wal-index** (the `-shm` unreadable for the round, so `Wal.read_held/2` could only repeat the

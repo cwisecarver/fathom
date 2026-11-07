@@ -15,7 +15,8 @@ defmodule Fathom.Shard.ReplicationMembershipTest do
   use Fathom.DataCase, async: false
 
   alias Fathom.Rebalancer.Nodes
-  alias Fathom.Shard.Replication.{Fleet, Membership}
+  alias Fathom.Shard.Replication.{Fleet, Membership, Shipper}
+  import Fathom.Test.ReplicationCase, only: [start_followers!: 3]
 
   setup do
     prev =
@@ -119,7 +120,7 @@ defmodule Fathom.Shard.ReplicationMembershipTest do
       assert keys() == ~w(f1 f2 f3 f4)
 
       # The three survivors keep their sockets. An index-derived shipper name would have restarted
-      # them all; the name is derived from node_key precisely so it does not.
+      # them all; the name is derived from the endpoint (node_key, host, port) precisely so it does not.
       for {k, pid} <- before do
         now = Fleet.running() |> Enum.find(&(elem(&1, 0) == k)) |> elem(3) |> Process.whereis()
         assert now == pid, "#{k}'s shipper was restarted by an unrelated membership change"
@@ -142,6 +143,51 @@ defmodule Fathom.Shard.ReplicationMembershipTest do
 
       ref = Process.monitor(gone_pid)
       assert_receive {:DOWN, ^ref, :process, ^gone_pid, _}, 2_000
+    end
+
+    # Expert review 2026-11-07 #48. The swap used to be keyed by node_key alone, so a follower that
+    # came back on a NEW address kept its old shipper (host/port are fixed in `Shipper.init/1`),
+    # which redialed the dead address forever while `Fleet.running/0` and `health/0` showed the new
+    # one beside `connected?: false`. Static source is enough to reach it: `refresh/0` re-reads
+    # `:replication_followers`. A REAL follower listens on the new port, so "connected" can only mean
+    # the shipper dialed it.
+    test "a follower whose advertised address changed is re-dialed on the new endpoint" do
+      root = Path.join(System.tmp_dir!(), "memb_redial_#{System.unique_integer([:positive])}")
+      File.mkdir_p!(root)
+      on_exit(fn -> File.rm_rf(root) end)
+      [{_name, live_port}] = start_followers!(root, 1, "memb")
+
+      start_membership!()
+      assert keys() == ~w(f1 f2 f3)
+      {_, _, 9101, old_name} = Enum.find(Fleet.running(), &(elem(&1, 0) == "f1"))
+      old_pid = Process.whereis(old_name)
+      assert is_pid(old_pid)
+      refute Shipper.connected?(old_name), "precondition: nothing listens on the old endpoint"
+
+      Application.put_env(
+        :fathom,
+        :replication_followers,
+        [{"f1", "127.0.0.1", live_port} | Enum.drop(followers(3), 1)]
+      )
+
+      assert {:ok, _} = Membership.refresh()
+
+      assert {_, _, ^live_port, new_name} = Enum.find(Fleet.running(), &(elem(&1, 0) == "f1"))
+
+      assert new_name != old_name,
+             "the published shipper is still the one that dials the old port"
+
+      assert new_name in Fleet.shippers()
+
+      Fathom.Test.Await.until(
+        fn -> Shipper.connected?(new_name) end,
+        "f1's shipper never connected on its NEW endpoint (pre-fix it kept redialing the old one)"
+      )
+
+      # The departed shipper is stopped, and the follower's unchanged peers were not restarted.
+      ref = Process.monitor(old_pid)
+      assert_receive {:DOWN, ^ref, :process, ^old_pid, _}, 2_000
+      assert length(Fleet.shippers()) == 3
     end
 
     # THIS DOES NOT PROVE THE SWAP ORDERING, and must not be read as if it did.
