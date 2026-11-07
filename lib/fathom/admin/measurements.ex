@@ -455,8 +455,20 @@ defmodule Fathom.Admin.Measurements do
     # `inode_measurements/1` (`df -Pi`) per directory: four subprocesses per poll on a follower.
     # A directory the combined read cannot answer falls back to the old per-directory pair, so a
     # `df` that prints something unexpected costs the saving, never the gauge.
-    readings = volume_readings(Enum.map(dirs, &elem(&1, 1)))
+    # BOUNDED AND SINGLE-FLIGHT (expert review 2026-11-07 #76): the poller is ONE process that runs
+    # every gauge serially, and this read used to be a bare `System.cmd("df")`, so a `statfs` that
+    # hangs (an EBS / NFS brown-out, the same event that hangs SQLite's fsyncs) blinded every gauge on
+    # the node for the length of the stall, including the dirty-IO run queue the stall is diagnosed
+    # with. See `bounded_read/2`. A blocked read publishes nothing this tick.
+    readings = bounded_read(:volumes, fn -> volume_readings(Enum.map(dirs, &elem(&1, 1))) end)
 
+    case readings do
+      {:ok, readings} -> emit_disk(dirs, readings)
+      _blocked -> :ok
+    end
+  end
+
+  defp emit_disk(dirs, readings) do
     for {{label, path}, reading} <- Enum.zip(dirs, readings),
         {:ok, %{total_bytes: total, free_bytes: free} = r} <- [reading || per_dir_reading(path)] do
       if label == "data", do: put_data_free_bytes(free)
@@ -485,16 +497,97 @@ defmodule Fathom.Admin.Measurements do
 
   # The old per-directory path (`disksup` bytes + `df -Pi` inodes), in the combined shape.
   defp per_dir_reading(path) do
-    with {:ok, bytes} <- disk_info(path) do
+    with {:ok, {:ok, bytes}} <- bounded_read(:disksup, fn -> disk_info(path) end) do
       inodes =
-        case inode_info(path) do
-          {:ok, i} -> i
-          :error -> %{total_inodes: nil, free_inodes: nil}
+        case bounded_read(:inodes, fn -> inode_info(path) end) do
+          {:ok, {:ok, i}} -> i
+          _ -> %{total_inodes: nil, free_inodes: nil}
         end
 
       {:ok, Map.merge(bytes, inodes)}
+    else
+      _ -> :error
     end
   end
+
+  # ONE read of each kind at a time, none of them able to hold the poller (expert review 2026-11-07
+  # #76). The read runs in its own process, registered under a name per KIND: registering is the
+  # single-flight claim (atomic, and released by the VM when the process exits however it exits, so
+  # there is no stale claim to expire). A caller that finds the name taken gets `:busy` at once; one
+  # that waits longer than `:disk_poll_timeout_ms` (default 2 s) gets `:timeout`, and in both cases
+  # the OS `df` — which may be stuck in an uninterruptible `statfs` that no signal ends — is LEFT
+  # RUNNING and counted, not killed and replaced: the follower's `Task.yield || Task.shutdown`
+  # pattern frees the poller but starts one more D-state `df` per tick for as long as the stall
+  # lasts (the review's trap; the Port closes when its owner dies, the process does not).
+  #
+  # The reply goes to an ALIAS the caller drops after a timeout, so a late answer is discarded by the
+  # VM instead of accumulating in the poller's mailbox (a long-lived process, one message per stall).
+  @spec bounded_read(atom(), (-> term())) :: {:ok, term()} | :busy | :timeout | :error
+  defp bounded_read(kind, fun) do
+    reply_to = :erlang.alias([:explicit_unalias])
+    name = runner_name(kind)
+
+    spawn(fn ->
+      reply =
+        try do
+          Process.register(self(), name)
+        rescue
+          ArgumentError -> :busy
+        else
+          true -> run_read(fun)
+        end
+
+      send(reply_to, {reply_to, reply})
+    end)
+
+    timeout = Application.get_env(:fathom, :disk_poll_timeout_ms, 2_000)
+
+    reply =
+      receive do
+        {^reply_to, reply} -> reply
+      after
+        timeout ->
+          :erlang.unalias(reply_to)
+
+          # The answer may have landed between the timeout and the unalias.
+          receive do
+            {^reply_to, reply} -> reply
+          after
+            0 -> :timeout
+          end
+      end
+
+    note_blocked(kind, reply)
+    reply
+  end
+
+  defp run_read(fun) do
+    {:ok, fun.()}
+  rescue
+    _ -> :error
+  catch
+    _, _ -> :error
+  end
+
+  defp note_blocked(kind, reply) when reply in [:busy, :timeout] do
+    case Fathom.LogLimiter.check(:disk_read_blocked, 1, 60_000) do
+      :suppress ->
+        :ok
+
+      _log ->
+        Logger.warning(
+          "disk gauge: the #{kind} read (`df`/disksup) did not answer (#{reply}); the volume's " <>
+            "free-space gauges are not being updated. A hung `statfs` (a storage stall) is the " <>
+            "usual cause. Logged once per minute."
+        )
+    end
+  end
+
+  defp note_blocked(_kind, _reply), do: :ok
+
+  defp runner_name(:volumes), do: Fathom.Admin.Measurements.DfVolumes
+  defp runner_name(:disksup), do: Fathom.Admin.Measurements.DfDisksup
+  defp runner_name(:inodes), do: Fathom.Admin.Measurements.DfInodes
 
   # INODES, NOT ONLY BYTES (expert review 2026-10-21 r7 #24). An A2 replica is 5 files (`.db`,
   # `-wal` and three sidecars of under 64 bytes), so a follower of small tenants exhausts ext4's
