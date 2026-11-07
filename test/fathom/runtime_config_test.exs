@@ -602,4 +602,41 @@ defmodule Fathom.RuntimeConfigTest do
       end
     end
   end
+
+  # The follower's free-space floor was an app-env-only knob (`Follower.disk_free_floor_bytes/0`)
+  # while the operator log lines for a refusal told the operator to act on the volume; a release
+  # could not tune it at all. Same parse helper as the sibling REPLICATION_*_BYTES knobs.
+  describe "REPLICATION_DISK_FREE_FLOOR_BYTES" do
+    test "unset or blank says nothing (the follower's 1 GiB default survives)" do
+      for v <- [nil, ""] do
+        refute Keyword.has_key?(
+                 prod_config(%{"REPLICATION_DISK_FREE_FLOOR_BYTES" => v}),
+                 :replication_disk_free_floor_bytes
+               )
+      end
+    end
+
+    test "a value sets the floor, and 0 is a value (no floor), not 'unset'" do
+      assert Keyword.fetch!(
+               prod_config(%{"REPLICATION_DISK_FREE_FLOOR_BYTES" => "536870912"}),
+               :replication_disk_free_floor_bytes
+             ) == 536_870_912
+
+      assert Keyword.fetch!(
+               prod_config(%{"REPLICATION_DISK_FREE_FLOOR_BYTES" => "0"}),
+               :replication_disk_free_floor_bytes
+             ) == 0
+    end
+
+    test "a non-integer is a boot error naming the variable" do
+      for bad <- ["1GiB", "1.5", "abc"] do
+        error =
+          assert_raise RuntimeError, fn ->
+            prod_config(%{"REPLICATION_DISK_FREE_FLOOR_BYTES" => bad})
+          end
+
+        assert error.message =~ "REPLICATION_DISK_FREE_FLOOR_BYTES must be an integer"
+      end
+    end
+  end
 end

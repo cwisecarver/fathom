@@ -1881,7 +1881,8 @@ defmodule Fathom.Shard.Replication.Follower do
               "nothing of: the replica volume (#{dir(name)}) is below its free-space floor, or a " <>
               "seed of this shard was just refused for its size. Primaries are answered a settled " <>
               "`:internal`, not a seed request. Free space on the replica volume, or give " <>
-              "REPLICATION_DIR its own volume. (Logged once per 30 s.)"
+              "REPLICATION_DIR its own volume (or tune REPLICATION_DISK_FREE_FLOOR_BYTES). " <>
+              "(Logged once per 30 s.)"
           )
       end
 
@@ -2161,8 +2162,9 @@ defmodule Fathom.Shard.Replication.Follower do
         "below its free-space floor (bytes or inodes). That shard's RPO stays at its stored object — the pre-A2 " <>
         "behaviour — which is correct; a full volume would instead break THIS node's own tenants, " <>
         "whose flushes and cold-open pulls all need the same disk. Free space on it, or give " <>
-        "REPLICATION_DIR its own volume (the floor is the :replication_disk_free_floor_bytes app " <>
-        "env, default 1 GiB; no env var sets it)."
+        "REPLICATION_DIR its own volume (the byte floor is REPLICATION_DISK_FREE_FLOOR_BYTES, " <>
+        "default 1 GiB; the inode floor is the :replication_disk_free_floor_inodes app env, " <>
+        "default 50000, with no env var)."
     )
 
     :telemetry.execute([:fathom, :replication, :disk_pressure], %{count: 1}, %{

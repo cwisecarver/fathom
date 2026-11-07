@@ -1099,6 +1099,16 @@ if n = env_nonneg_int.("REPLICATION_MAX_QUEUE_BYTES") do
   config :fathom, :replication_max_queue_bytes, n
 end
 
+# The free-space FLOOR on the replica volume (default 1 GiB, read by `Follower`).
+# Below it (or below the inode floor) a follower REFUSES to seed a shard: that shard's RPO stays at
+# its stored object (the pre-A2 behaviour), because a full replica volume would instead break this
+# node's own tenants, whose flushes and cold-open pulls need the same disk. The operator log lines
+# that report a refusal tell the operator to free space or move `REPLICATION_DIR` to its own volume;
+# this is the knob for a volume that is legitimately small or large. `0` removes the floor.
+if n = env_nonneg_int.("REPLICATION_DISK_FREE_FLOOR_BYTES") do
+  config :fathom, :replication_disk_free_floor_bytes, n
+end
+
 # How long after a push OUR OWN shipper refused before the session retries it (default 1000 ms).
 #
 # A push can be refused locally without ever reaching the follower — `:already_in_flight` (that
