@@ -434,7 +434,13 @@ defmodule Fathom.HranaAuthRevocationTest do
         :ets.info(Revocations, :size) + 200
       )
 
+      # The eviction backoff / pending flag are node-global: a terminal-state test below leaves a
+      # one-second backoff behind that would otherwise silence the NEXT test's eviction.
+      Revocations.reset_eviction_state()
+
       on_exit(fn ->
+        Revocations.reset_eviction_state()
+
         if prev,
           do: Application.put_env(:fathom, :hrana_revocation_max_entries, prev),
           else: Application.delete_env(:fathom, :hrana_revocation_max_entries)
@@ -445,13 +451,30 @@ defmodule Fathom.HranaAuthRevocationTest do
 
     defp settle, do: :sys.get_state(Revocations)
 
+    # Updated 2026-11-07 (#29). This asserted `size <= cap` right after a tight burst, which held
+    # only because EVERY insert at the cap queued its own eviction request — the very backlog #29
+    # removes. Now at most one request is in the mailbox, so a burst can overshoot until the next
+    # insert re-arms it; what is pinned is that eviction keeps making progress and converges.
     test "the table stays bounded at the cap with realistic floor-1 rows" do
       cap = Revocations.max_entries()
       for _ <- 1..(cap * 2), do: Revocations.put(uniq(), 1)
       settle()
 
+      # Each further insert at the cap re-arms one batch; the table must come back under the cap.
+      rounds =
+        Enum.reduce_while(1..5_000, 0, fn n, _ ->
+          if :ets.info(Revocations, :size) <= cap do
+            {:halt, n}
+          else
+            Revocations.put(uniq(), 1)
+            settle()
+            {:cont, n}
+          end
+        end)
+
       assert :ets.info(Revocations, :size) <= cap,
-             "floor-1 rows were never evicted: size #{:ets.info(Revocations, :size)} > cap #{cap}"
+             "floor-1 rows were never evicted: size #{:ets.info(Revocations, :size)} > cap #{cap} " <>
+               "after #{rounds} re-arming inserts"
     end
 
     test "a revoked floor (> 1) survives eviction pressure" do
@@ -488,15 +511,125 @@ defmodule Fathom.HranaAuthRevocationTest do
       pid = Process.whereis(Revocations)
       :erlang.suspend_process(pid)
 
+      over =
+        try do
+          for _ <- 1..(cap + 10), do: Revocations.put(uniq(), 1)
+          assert :ets.info(Revocations, :size) > cap, "the caller evicted inline"
+          :ets.info(Revocations, :size)
+        after
+          :erlang.resume_process(pid)
+        end
+
+      settle()
+
+      # ONE batch ran (<= 1% of the cap): the table is still over the cap, but strictly smaller. The
+      # old per-insert cast queued a request for EVERY insert and drained to the cap; #29 removed
+      # that backlog (see the "terminal state" tests below), and this pins what remains: the
+      # eviction ran in the GenServer, after the resume.
+      assert :ets.info(Revocations, :size) < over, "the GenServer never evicted"
+    end
+
+    # Expert review 2026-11-07 #29. With R revoked (floor > 1) rows >= the cap, `evict_unrevoked/0`
+    # finds nothing to delete after walking the whole table, yet every insert still queued another
+    # such scan (an unbounded mailbox ahead of every revoke notification). The fixture is the
+    # terminal state itself: the table holds ONLY revoked floors, over the cap. Pre-fix the GenServer
+    # receives one `:evict` per insert (the receive trace counts them); now at most one is ever
+    # queued, and once an eviction deletes nothing the casts stop for the backoff.
+    defp evict_requests_received(pid) do
+      receive do
+        {:trace, ^pid, :receive, {:"$gen_cast", :evict}} -> 1 + evict_requests_received(pid)
+        {:trace, ^pid, :receive, _other} -> evict_requests_received(pid)
+      after
+        0 -> 0
+      end
+    end
+
+    defp fill_with_revoked_floors!(cap) do
+      for _ <- 1..(cap + 10), do: :ets.insert(Revocations, {uniq(), 3, nil, 0})
+      assert :ets.info(Revocations, :size) >= cap, "fixture: the table must be at the cap"
+
+      # ... and there is NOTHING evictable: drop every unrevoked row other tests left behind.
+      :ets.select_delete(Revocations, [
+        {{:"$1", :"$2", :_, :_}, [{:is_binary, :"$1"}, {:"=<", :"$2", 1}], [true]}
+      ])
+
+      assert Revocations.evict_unrevoked() == 0, "fixture: nothing may be evictable"
+    end
+
+    test "terminal state: at most one eviction request is ever queued, however many inserts" do
+      cap = Revocations.max_entries()
+      fill_with_revoked_floors!(cap)
+      pid = Process.whereis(Revocations)
+      :erlang.trace(pid, true, [:receive])
+      :erlang.suspend_process(pid)
+
       try do
-        for _ <- 1..(cap + 10), do: Revocations.put(uniq(), 1)
-        assert :ets.info(Revocations, :size) > cap, "the caller evicted inline"
+        # New revoked floors arriving at the cap: each is an insert that, pre-fix, cast `:evict`.
+        for _ <- 1..200, do: Revocations.put(uniq(), 3)
+
+        assert {:message_queue_len, queued} = Process.info(pid, :message_queue_len)
+        assert queued <= 1, "#{queued} eviction requests are queued behind each other"
       after
         :erlang.resume_process(pid)
       end
 
       settle()
-      assert :ets.info(Revocations, :size) <= cap
+      # Nothing was evictable, so the run deleted nothing and set the backoff: a further burst
+      # must not queue a single request more.
+      for _ <- 1..200, do: Revocations.put(uniq(), 3)
+      settle()
+
+      :erlang.trace(pid, false, [:receive])
+      received = evict_requests_received(pid)
+
+      assert received <= 2,
+             "#{received} eviction scans ran against a table with nothing evictable"
+    end
+
+    test "the eviction flag is released after a run, so a later insert can evict again" do
+      cap = Revocations.max_entries()
+      for _ <- 1..(cap * 2), do: :ets.insert(Revocations, {uniq(), 1, nil, 0})
+      before = :ets.info(Revocations, :size)
+
+      Revocations.put(uniq(), 1)
+      settle()
+      mid = :ets.info(Revocations, :size)
+      assert mid < before, "the first insert at the cap must trigger a batch"
+
+      # The flag cleared after that run; the table is still over the cap, so the NEXT insert evicts.
+      Revocations.put(uniq(), 1)
+      settle()
+      assert :ets.info(Revocations, :size) < mid, "a latched pending flag blocked later eviction"
+    end
+
+    # `apply_rows/1` runs INSIDE the GenServer, and cast `:evict` once per ROW of a reload page: a
+    # full reload of N >= cap revoked rows queued ~(N - cap) requests ahead of every later
+    # notification. Driven the way the reload drives it: a `{:full_page, ref, rows}` message.
+    test "a full-reload page of revoked rows requests eviction once, not once per row" do
+      cap = Revocations.max_entries()
+      pid = Process.whereis(Revocations)
+      ref = make_ref()
+
+      :sys.replace_state(pid, fn state ->
+        %{state | full: %{ref: ref, mon: make_ref(), pid: self(), cursor: nil, count: 0}}
+      end)
+
+      on_exit(fn -> :sys.replace_state(Revocations, fn state -> %{state | full: nil} end) end)
+
+      rows = for _ <- 1..(cap + 50), do: {uniq(), 3, nil}
+      :erlang.trace(pid, true, [:receive])
+      send(pid, {:full_page, ref, rows})
+      settle()
+      settle()
+      :erlang.trace(pid, false, [:receive])
+
+      received = evict_requests_received(pid)
+
+      assert received <= 2,
+             "the page queued #{received} eviction requests (one per row past the cap)"
+
+      for {shard, 3, nil} <- Enum.take(rows, 3),
+          do: assert([{^shard, 3, nil, _}] = :ets.lookup(Revocations, shard))
     end
   end
 

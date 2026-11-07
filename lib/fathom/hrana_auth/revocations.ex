@@ -105,6 +105,18 @@ defmodule Fathom.HranaAuth.Revocations do
   @overlap_ms 60_000
   @default_full_reload_ms 86_400_000
 
+  # Eviction flow control (expert review 2026-11-07 #29): two signed `:atomics` slots in a
+  # `:persistent_term`, created once per VM (a replace would trigger a global GC; a restarted
+  # GenServer reuses it and only resets `@evict_pending`).
+  #   * `@evict_pending` (1) — CAS'd 0 -> 1 by the caller that casts `:evict`, cleared by the
+  #     GenServer after the run, so the mailbox never holds more than one eviction request.
+  #   * `@no_evict_until` (2) — a monotonic-ms instant before which no cast is made, set when an
+  #     eviction deleted nothing (every row is a revoked floor).
+  @evict_key {__MODULE__, :evict_flags}
+  @evict_pending 1
+  @no_evict_until 2
+  @no_evictable_backoff_ms 1_000
+
   @doc false
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -190,6 +202,7 @@ defmodule Fathom.HranaAuth.Revocations do
   def init(_opts) do
     # public read_concurrency: verify/2 runs in the stream process and reads directly.
     :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
+    init_evict_flags()
 
     # Cold-miss single-flight (expert review 2026-10-29 #20). Keyed per shard, so no cross-shard
     # contention; `write_concurrency` because every cold miss writes.
@@ -275,9 +288,23 @@ defmodule Fathom.HranaAuth.Revocations do
 
   @impl true
   def handle_cast(:evict, state) do
-    # A burst of casts at the cap collapses: once a batch has brought the table under the cap the
-    # rest are no-ops.
-    if :ets.info(@table, :size) >= max_entries(), do: evict_unrevoked()
+    # `:evict_pending` was CAS'd 0 -> 1 by whoever cast this, so at most ONE of these is ever in the
+    # mailbox; it is cleared AFTER the run (`after`), so a raise cannot leave it latched.
+    try do
+      if :ets.info(@table, :size) >= max_entries() do
+        deleted = evict_unrevoked()
+
+        # Nothing evictable: every row is a revoked floor (> 1), which this table must never drop,
+        # so the table sits at or over the cap for good. Without a terminal state each insert queued
+        # another O(table) scan that deleted nothing (expert review 2026-11-07 #29). Drop casts for
+        # a second; the next one re-checks, in case a row's TTL entry became evictable.
+        if deleted == 0,
+          do: :atomics.put(evict_flags(), @no_evict_until, now_ms() + @no_evictable_backoff_ms)
+      end
+    after
+      :atomics.put(evict_flags(), @evict_pending, 0)
+    end
+
     {:noreply, state}
   end
 
@@ -660,22 +687,77 @@ defmodule Fathom.HranaAuth.Revocations do
     ArgumentError -> :none
   end
 
-  defp insert(shard_id, version, bumped_at, now) do
-    request_eviction_at_cap()
+  defp insert(shard_id, version, bumped_at, now, evict? \\ true) do
+    if evict?, do: request_eviction_at_cap()
     :ets.insert(@table, {shard_id, version, bumped_at, now + ttl_ms()})
   rescue
     ArgumentError -> :ok
   end
 
-  # Bound the table (perf review 2026-10-14 #23; expert review 2026-11-04 #2). The caller (a hello
-  # or the GenServer itself) does only an O(1) size check and, at the cap, a cast; the eviction runs
-  # in this GenServer (`evict_unrevoked/0`). It used to be an inline `match_delete` in the caller's
-  # process that targeted floor 0 while real rows carry floor 1 (`token_version` defaults to 1), so
-  # it deleted nothing, the table grew without bound, and every insert at the cap paid a full-table
-  # scan under the write lock. Not just "change the pattern to 1": a one-shot wipe is a node-wide
-  # wave of cold storage-floor reads, hence a bounded batch.
+  # Bound the table (perf review 2026-10-14 #23; expert review 2026-11-04 #2, 2026-11-07 #29). The
+  # caller (a hello or the GenServer itself) does only an O(1) size check and, at the cap, one
+  # atomic CAS and at most one cast; the eviction runs in this GenServer (`evict_unrevoked/0`). It
+  # used to be an inline `match_delete` in the caller's process that targeted floor 0 while real
+  # rows carry floor 1 (`token_version` defaults to 1), so it deleted nothing, the table grew without
+  # bound, and every insert at the cap paid a full-table scan under the write lock. Not just "change
+  # the pattern to 1": a one-shot wipe is a node-wide wave of cold storage-floor reads, hence a
+  # bounded batch.
+  #
+  # TERMINAL STATE (2026-11-07 #29). With R revoked (floor > 1) rows >= the cap, `evict_unrevoked/0`
+  # walks the WHOLE table (a bounded `select` that never finds its batch) and deletes nothing, yet
+  # each insert still queued another one — and a full reload of N >= cap revoked rows queued one per
+  # row, ahead of the `{:notification, …}` and `:bulk_refresh` messages that carry later revokes, so
+  # a revoke on another node was not applied here for as long as the backlog lasted. Now: (1) the
+  # `@evict_pending` flag means one request in the mailbox at a time; (2) an eviction that deleted
+  # nothing sets `@no_evict_until`, and casts are dropped until then; (3) `apply_rows/1` checks once
+  # per PAGE, not per row. The cap is NOT raised and floor > 1 rows are NOT evicted: the first would
+  # hide the problem, the second removes the stale-serve source — the revocation property itself.
   defp request_eviction_at_cap do
-    if :ets.info(@table, :size) >= max_entries(), do: GenServer.cast(__MODULE__, :evict)
+    if :ets.info(@table, :size) >= max_entries(), do: cast_evict()
+  end
+
+  defp cast_evict do
+    case :persistent_term.get(@evict_key, nil) do
+      # The GenServer never started: there is nothing to cast to.
+      nil ->
+        :ok
+
+      flags ->
+        if now_ms() >= :atomics.get(flags, @no_evict_until) and
+             :atomics.compare_exchange(flags, @evict_pending, 0, 1) == :ok,
+           do: GenServer.cast(__MODULE__, :evict)
+
+        :ok
+    end
+  end
+
+  defp init_evict_flags do
+    flags =
+      case :persistent_term.get(@evict_key, nil) do
+        nil ->
+          flags = :atomics.new(2, signed: true)
+          :persistent_term.put(@evict_key, flags)
+          flags
+
+        existing ->
+          existing
+      end
+
+    # A previous incarnation may have died with a request in flight (flag latched at 1, cast lost),
+    # and with a backoff pending: both start clean.
+    :atomics.put(flags, @evict_pending, 0)
+    :atomics.put(flags, @no_evict_until, -9_223_372_036_854_775_808)
+  end
+
+  defp evict_flags, do: :persistent_term.get(@evict_key)
+
+  @doc false
+  # Test seam: the eviction backoff and the pending flag are node-global (they outlive a test), so a
+  # test that left the table "terminal" would silence the next test's eviction for a second.
+  @spec reset_eviction_state() :: :ok
+  def reset_eviction_state do
+    init_evict_flags()
+    :ok
   end
 
   @doc """
@@ -712,15 +794,15 @@ defmodule Fathom.HranaAuth.Revocations do
   # A late/duplicate notification must never LOWER the floor below what this node already knows
   # (versions only rise). When the version rises, adopt the incoming bump instant; a stale
   # same-version notification keeps whatever grace this node already had.
-  defp put_max(shard_id, version, bumped_at) do
+  defp put_max(shard_id, version, bumped_at, evict? \\ true) do
     now = System.monotonic_time(:millisecond)
 
     case :ets.lookup(@table, shard_id) do
       [{^shard_id, current, current_bumped, _expires}] when current >= version ->
-        insert(shard_id, current, current_bumped, now)
+        insert(shard_id, current, current_bumped, now, evict?)
 
       _ ->
-        insert(shard_id, version, bumped_at, now)
+        insert(shard_id, version, bumped_at, now, evict?)
     end
   rescue
     ArgumentError -> :ok
@@ -796,8 +878,15 @@ defmodule Fathom.HranaAuth.Revocations do
     :exit, reason -> {:error, inspect(reason)}
   end
 
+  # One eviction check per PAGE, not per row (expert review 2026-11-07 #29): this runs INSIDE the
+  # GenServer, and a per-row self-cast over a reload of N >= cap revoked rows queued ~(N - cap)
+  # requests ahead of every notification that arrived later.
   defp apply_rows(rows) do
-    Enum.each(rows, fn {shard_id, version, bumped_at} -> put_max(shard_id, version, bumped_at) end)
+    Enum.each(rows, fn {shard_id, version, bumped_at} ->
+      put_max(shard_id, version, bumped_at, false)
+    end)
+
+    request_eviction_at_cap()
   end
 
   defp mark_fresh, do: :ets.insert(@table, {@bulk_marker, now_ms()})
