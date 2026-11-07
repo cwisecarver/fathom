@@ -1955,8 +1955,9 @@ defmodule Fathom.Directory do
   `{shard_id, version, bumped_at}` after `cursor` (`""` for the first page), ordered by `shard_id`
   and capped at `limit`.
 
-  `token_version` defaults to 1 and only `revoke/1`, `rotate/1`, and the reconcile sweep's
-  `raise_token_version/2` raise it. The set is normally a tiny fraction of the fleet, but a
+  `token_version` defaults to 1 and only `revoke/1`, `rotate/1`, `Tenants.delete/1` (through
+  `revoke/1`), the id-reuse seed in `Tenants.provision/2` / `register_fork/2`, and the reconcile
+  sweep's `raise_token_version/2` raise it. The set is normally a tiny fraction of the fleet, but a
   fleet-wide `revoke_issued_before` makes it the fleet, so the FULL reload (boot, then daily) pages
   through it rather than materializing it (expert review 2026-10-13 #10); the steady-state refresh
   is `revoked_floors_since/1`. Served by `shards_revoked_token_version_index`.

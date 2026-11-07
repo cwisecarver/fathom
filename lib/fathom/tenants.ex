@@ -232,7 +232,7 @@ defmodule Fathom.Tenants do
   end
 
   # A DELETE THAT LANDED DURING THE FORK (expert review 2026-11-07 #16). `fetch_src/1` and
-  # `refuse_if_taken/1` read the directory row and the tombstone set ONCE, before the optional source
+  # `refuse_if_taken/1` read the directory row and the tombstone gate a single time, before the optional source
   # flush and the dst lease. `delete/1` tombstones synchronously but erases asynchronously, so a delete
   # in that window left the source's object in place and `Storage.fork_shard/2` (an atomic server-side
   # copy) copied the erased tenant's bytes to a new id, which `register_fork/1` then made a live
