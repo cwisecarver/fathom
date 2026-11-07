@@ -227,18 +227,67 @@ defmodule Fathom.Application do
   # ATTACH-only authorizer. Refuse to boot instead, unless the operator acknowledges the downgrade
   # with ALLOW_NO_UDF=true (`:allow_no_udf`). Also trips on an explicit `:sqlite_extension false`,
   # which is the same downgrade chosen on purpose.
+  #
+  # Expert review 2026-11-07 #24: with replication ON the extension is not an optional degradation,
+  # so `ALLOW_NO_UDF` does NOT cover it. Without the extension a tenant handle is `:skipped`:
+  # SQLite's built-in `wal_autocheckpoint=4000` owns the WAL-hook slot, there is no registry and no
+  # `fathom_wal_replicated`, and `Session.ensure_registered/2` latches `registered: :unavailable`
+  # and keeps shipping and ACKING. A commit crossing 4000 frames then runs the built-in PASSIVE
+  # checkpoint inside the commit and the next writer restarts the log before the Session reads the
+  # previous commit's frames — a quorum-acked write on no replica (the 2026-10-15 #1 window; see the
+  # "extension NOT loaded" note in `replication/session.ex`). The remedy is not an ack but a choice:
+  # build the extension, or turn replication off. Replication is on by default in prod, so this is
+  # the default posture of an image built without cargo.
   @doc false
   def check_udf_extension! do
-    if Application.get_env(:fathom, :env) == :prod and
-         not Fathom.Shard.Extension.available?() and
-         not Application.get_env(:fathom, :allow_no_udf, false) do
-      raise "config error: the fathom_udf SQLite extension is not available on this prod node " <>
-              "(artifact missing — was the image built without cargo? — or :sqlite_extension " <>
-              "disabled). Without it tenant handles lose the engine PRAGMA authorizer, the " <>
-              "statement-deadline backstop, the SQLite size limits and Django's UDFs. " <>
-              "Build the extension, or set ALLOW_NO_UDF=true to boot degraded on purpose."
+    case udf_extension_problem(%{
+           env: Application.get_env(:fathom, :env),
+           extension: if(Fathom.Shard.Extension.available?(), do: :ok, else: :missing),
+           allow_no_udf: Application.get_env(:fathom, :allow_no_udf, false),
+           replication_enabled: Application.get_env(:fathom, :replication_enabled, false)
+         }) do
+      nil -> nil
+      message -> raise message
     end
   end
+
+  @doc """
+  Why a node with this config must not boot given the state of the `fathom_udf` extension, or `nil`.
+
+  Pure over the passed map (keys: `:env`, `:extension` — `:ok` or `:missing`, `:allow_no_udf`,
+  `:replication_enabled`), so a test needs no global app env.
+  """
+  @spec udf_extension_problem(%{
+          env: atom(),
+          extension: :ok | :missing,
+          allow_no_udf: boolean(),
+          replication_enabled: boolean()
+        }) :: String.t() | nil
+  def udf_extension_problem(%{env: :prod, extension: :missing} = cfg) do
+    cond do
+      cfg.replication_enabled == true ->
+        "config error: the fathom_udf SQLite extension is not available on this prod node " <>
+          "(artifact missing — was the image built without cargo? — or :sqlite_extension " <>
+          "disabled) AND replication is ON. Without the extension SQLite's built-in " <>
+          "autocheckpoint runs inside the commit and can restart the WAL before the A2 " <>
+          "replicator reads it, so a write acknowledged by a quorum can be on no replica " <>
+          "(expert review 2026-11-07 #24). ALLOW_NO_UDF does not cover this. Build the " <>
+          "extension, or set REPLICATION_ENABLED=false to run without replication."
+
+      cfg.allow_no_udf == true ->
+        nil
+
+      true ->
+        "config error: the fathom_udf SQLite extension is not available on this prod node " <>
+          "(artifact missing — was the image built without cargo? — or :sqlite_extension " <>
+          "disabled). Without it tenant handles lose the engine PRAGMA authorizer, the " <>
+          "statement-deadline backstop, the SQLite size limits and Django's UDFs. " <>
+          "Build the extension, or set ALLOW_NO_UDF=true to boot degraded on purpose " <>
+          "(only possible with replication off: REPLICATION_ENABLED=false)."
+    end
+  end
+
+  def udf_extension_problem(_cfg), do: nil
 
   # Expert review #16: when the S3 backend is configured, verify at boot that the
   # store actually ENFORCES conditional writes — every safety property (lease mutual

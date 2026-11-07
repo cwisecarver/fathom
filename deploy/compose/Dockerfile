@@ -28,7 +28,7 @@ RUN apt-get update -y && apt-get install -y build-essential git curl patch \
 # Rust, for native/fathom_udf — the loadable SQLite extension (engine PRAGMA authorizer, deadline
 # backstop, size limits, Django UDFs). `mix compile.fathom_udf` SKIPS without cargo, and since
 # expert review 2026-10-10 #8 a prod node without the artifact REFUSES TO BOOT (ALLOW_NO_UDF=true
-# overrides) — so this image must build it.
+# overrides it only with REPLICATION_ENABLED=false) — so this image must build it.
 # Toolchain pinned to 1.98.0 (the version `rustc --version` reports on the build host), not
 # `stable`, so the same Dockerfile does not produce a different extension binary as stable moves.
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
