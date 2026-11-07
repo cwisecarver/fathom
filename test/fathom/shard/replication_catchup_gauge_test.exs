@@ -158,8 +158,16 @@ defmodule Fathom.Shard.ReplicationCatchupGaugeTest do
 
   test "N=4/Q=2, every follower healthy: 100 commits mark nothing and emit no catchup event",
        ctx do
-    # The prod default interval, so a slow ack on a loaded host is not mistaken for lag.
-    ctx = Map.merge(ctx, start!(ctx, 1_000))
+    # An interval the stream cannot outlast, so the safety timer NEVER fires inside this test.
+    # What is pinned is the classification made AT ARM TIME, at each commit. A fired timer is a
+    # different judgement (a follower short with nothing in flight at that instant is `:short`,
+    # marked and counted — pinned by the held-follower test below), and at the prod 1 s default a
+    # loaded host that stretches 100 commits past one interval makes it fire mid-stream and catch a
+    # follower in the transient gap between its ack and the next commit's push: one `:catchup`
+    # event with nothing marked at any sample (full-suite seeds 400973, 998095; with a 150 ms
+    # interval the same single event, emitted from `arm_catchup/2` inside the timer's own cycle,
+    # reproduces in 1 run of 40).
+    ctx = Map.merge(ctx, start!(ctx, 600_000))
 
     # Sampled right after each reply, when the two non-quorum pushes are still in flight — the
     # moment the unfixed `arm_if_short/1` marked the Session.
@@ -172,9 +180,10 @@ defmodule Fathom.Shard.ReplicationCatchupGaugeTest do
     marked = Enum.count(samples, &elem(&1, 0))
     armed = Enum.count(samples, &elem(&1, 1))
 
-    await!(fn -> all_current?(ctx.session) end, "every follower current after the stream")
-    # Let any timer armed by the last commit fire and clear.
-    await!(fn -> :sys.get_state(ctx.session).catchup_ref == nil end, "the safety timer cleared")
+    # No wait on "every follower current" or on the timer clearing: with the timer parked an
+    # interval away, a straggler left short by the last commit is the TIMER's to bring current, and
+    # every `:catchup` event this scenario can emit comes from a commit's arm, which the loop above
+    # has already run.
 
     events = flush_events()
 
