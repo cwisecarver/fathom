@@ -30,14 +30,15 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
   end
 
   # `file_version` stamps the STORED object's `user_version`; the directory row is always v1. A
-  # value above the job's target makes a stored file that is ahead of it.
-  defp seed_v1!(shard, file_version \\ 1) do
+  # value above the job's target makes a stored file that is ahead of it. `name` is the one seeded
+  # row, so two seeds of the same shard are distinguishable by content, not only by stamp.
+  defp seed_v1!(shard, file_version \\ 1, name \\ "alice") do
     seed =
       Path.join(System.tmp_dir!(), "seedjob_#{shard}_#{System.unique_integer([:positive])}.db")
 
     {:ok, conn} = Connection.open(seed)
     :ok = Connection.exec(conn, "CREATE TABLE app_thing (id INTEGER PRIMARY KEY, name TEXT)")
-    :ok = Connection.exec(conn, "INSERT INTO app_thing (id, name) VALUES (1, 'alice')")
+    :ok = Connection.exec(conn, "INSERT INTO app_thing (id, name) VALUES (1, '#{name}')")
 
     :ok =
       Connection.exec(
@@ -61,6 +62,25 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     {:ok, _} = Directory.resolve(shard)
     {:ok, _} = Directory.cutover(shard, 1)
     :ok
+  end
+
+  # What a stored object actually holds: its `user_version` stamp and its `app_thing` names. Read
+  # from a scratch COPY (opening the stored file in place would add -wal/-shm beside it).
+  defp object_facts(path) do
+    scratch =
+      Path.join(System.tmp_dir!(), "facts_#{System.unique_integer([:positive])}.db")
+
+    File.cp!(path, scratch)
+    {:ok, conn} = Connection.open(scratch)
+
+    try do
+      {:ok, version} = Connection.pragma(conn, "user_version")
+      {:ok, %{rows: rows}} = Connection.query(conn, "SELECT name FROM app_thing ORDER BY id", [])
+      {version, List.flatten(rows)}
+    after
+      Connection.close(conn)
+      for s <- ["", "-wal", "-shm"], do: File.rm(scratch <> s)
+    end
   end
 
   defp put_foreign_lock(shard) do
@@ -438,10 +458,25 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
   # vN-1/vN tolerance, so parking a shard two versions below what the app expects trades "on the
   # bad schema" for "on a schema nothing running can read". So the revert restores v1 and enqueues
   # the forward climb back to v2.
+  #
+  # The LIVE OBJECT must really be at v3 for any of that to be tested (expert review 2026-11-07
+  # #86). This fixture used to leave the stored object stamped v1 and cut only the directory to v3,
+  # so `do_revert` took its crash-forward branch ("live already at the target version: just finish
+  # the cutover") and never reached retain/restore: the test passed with `Storage.restore` removed.
+  # Now the stored object is v3 bytes (a distinguishable row), @1 holds the v1 bytes, and the
+  # assertions are on the OBJECTS: live is the v1 bytes again, and the pre-revert v3 bytes survive
+  # at @3 for the retention window.
   test "a chain-jumped shard reverts to its retained copy and is sent forward to the target",
        %{shard: shard} do
     seed_v1!(shard)
     :ok = Storage.retain(shard, 1)
+    # The live object moves on to v3 and holds a row the v1 copy does not.
+    seed_v1!(shard, 3, "bob-on-v3")
+    live = Path.join(remote_dir(), "#{shard}.db")
+    assert object_facts(live) == {3, ["bob-on-v3"]}, "the fixture's live object must be v3"
+    assert object_facts(Path.join(remote_dir(), "#{shard}@1.db")) == {1, ["alice"]}
+    pre_revert_live = File.read!(live)
+
     # A REAL cutover: live at v3, and the column records that @1 is what was retained.
     {:ok, _} = Directory.cutover(shard, 3, 1)
 
@@ -457,6 +492,14 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     # Landed on the retained copy ...
     assert {:ok, %{schema_version: 1, status: "active"}} = Directory.get(shard),
            "the revert should have restored the retained v1 rather than quarantining"
+
+    # ... the LIVE OBJECT is the v1 bytes again, not just the directory row ...
+    assert object_facts(live) == {1, ["alice"]},
+           "the stored object must have been restored to the retained v1 copy"
+
+    # ... and the discarded v3 writes are recoverable, byte for byte, at @3.
+    assert File.read!(Path.join(remote_dir(), "#{shard}@3.db")) == pre_revert_live,
+           "the pre-revert live object must be retained at <shard>@3"
 
     # ... and is on its way back to the version the fleet asked for. Without this the shard sits
     # below the fleet forever, which is the failure mode that made "revert as far back as it can
