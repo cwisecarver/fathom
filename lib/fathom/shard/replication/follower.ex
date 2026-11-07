@@ -2848,8 +2848,11 @@ defmodule Fathom.Shard.Replication.Follower do
   # current WAL from offset 0 (routinely 4-16 MB) and the follower runs a FULL absorb of bytes it
   # already held, per active followed shard, on every restart and idle-row sweep.
   #
-  # A shard whose WAL cannot be read is simply not recovered: it stays unknown and gets a normal
-  # seed. Skipping is always safe here; claiming bytes we cannot verify is not.
+  # A shard whose WAL cannot be read is NOT "unknown": its `.db` exists, so it recovers TORN (see
+  # `derive/3`; expert review 2026-11-07 #18). Skipping it used to be called "always safe", but an
+  # unknown shard answers a position query with a definite "I hold nothing", which counts toward the
+  # recovery floor. Claiming bytes we cannot verify is still not safe; claiming "nothing" over files
+  # that exist is not either.
   defp recover_shard(tab, name, shard_id) do
     if Fathom.Tenants.Tombstones.tombstoned?(shard_id) do
       # A replica of a DELETED tenant (expert review 2026-09-29 #5): the delete happened while this
@@ -2865,7 +2868,7 @@ defmodule Fathom.Shard.Replication.Follower do
       # forget it ran cost 6 unlinks of files that, after the first erase, never exist. No row is
       # resident here (`rederive_locked/2` only gets here without one), and the lock is held.
       if replica_files?(name, shard_id), do: forget(name, shard_id)
-      false
+      nil
     else
       recover_live_shard(tab, name, shard_id)
     end
@@ -2880,14 +2883,18 @@ defmodule Fathom.Shard.Replication.Follower do
     # under this WAL's salts, which a zeroed tail is not. Frames are written POSITIONALLY
     # (`write_frame/4`), so resuming at the lower offset overwrites the junk rather than appending
     # after it.
-    case derive_state(name, shard_id) do
+    case derive(name, shard_id, true) do
       nil ->
-        false
+        nil
 
-      state ->
+      {:held, state} ->
         :ets.insert(tab, {shard_id, state})
         touch(name, shard_id)
-        true
+        state
+
+      # Answered, NOT cached: see `derive/3`.
+      {:transient, state} ->
+        state
     end
   end
 
@@ -2896,16 +2903,62 @@ defmodule Fathom.Shard.Replication.Follower do
   # equivalence check all call it, so they can never disagree.
   # `log?` false for the sweep's equivalence check, which runs every round on a row it keeps.
   defp derive_state(name, shard_id, log? \\ true) do
-    with {:ok, header} <- Wal.read(wal_path(name, shard_id)),
-         true <- Fathom.FS.exists?(db_path(name, shard_id)) do
-      # Carry `torn` across the restart (expert review 2026-08-20 #11b). `FollowerLog.seeded/4`
-      # stamps `torn: false` because a real SEED is the one event that rebuilds both files
-      # together — but this is not a seed, it is a recovery, and the marker on disk is the only
-      # thing that remembers the two files were a generation apart when we went down.
-      torn? = Fathom.FS.exists?(torn_path(name, shard_id))
-      recovered_state(name, shard_id, header, torn?, recovered_ownership(name, shard_id), log?)
-    else
-      _ -> nil
+    case derive(name, shard_id, log?) do
+      {_kind, state} -> state
+      nil -> nil
+    end
+  end
+
+  # `{:held, state}` (the files say so, cache it), `{:transient, state}` (answer it, do not cache it)
+  # or nil (nothing here).
+  #
+  # AN UNREADABLE REPLICA IS NOT AN ABSENT ONE (expert review 2026-11-07 #18). `nil` is the answer
+  # that becomes the position query's definite "I hold nothing", which `Recovery.answered/3` counts
+  # toward the `N - Q + 1` floor. A `-wal` that exists over a `.db` but cannot be read — the
+  # zero-filled header an OS crash can leave (`{:error, :not_a_wal}`), `:emfile` under fd pressure —
+  # used to fall into that `else _ -> nil`, so a replica holding the acked tail behind a damaged WAL
+  # header let the recovering node reach the floor on "nothing"s and open from the stale object. The
+  # empty-WAL branch below already recovers such a replica TORN (silent to a query, never counted,
+  # never ranked, re-seeded on its next push); this is the same answer for the unreadable one.
+  #
+  # ONLY A DETERMINISTIC DAMAGE (`:not_a_wal`) IS CACHED. A transient failure (EMFILE, EIO, an
+  # `:eacces` that clears) would otherwise poison the row until a re-seed, and a re-seed of a replica
+  # that may be the only holder of the tail is exactly what must not be forced by a passing error.
+  # So it is answered torn from the files each time, the way `rederive/2`'s busy path already does.
+  # NO `.db` ⇒ nothing a recovery could build on, and a follower that never held the shard has no
+  # files at all: both still answer a definite "nothing" (the documented requirement).
+  defp derive(name, shard_id, log?) do
+    db? = Fathom.FS.exists?(db_path(name, shard_id))
+
+    case Wal.read(wal_path(name, shard_id)) do
+      {:ok, header} when db? ->
+        # Carry `torn` across the restart (expert review 2026-08-20 #11b). `FollowerLog.seeded/4`
+        # stamps `torn: false` because a real SEED is the one event that rebuilds both files
+        # together — but this is not a seed, it is a recovery, and the marker on disk is the only
+        # thing that remembers the two files were a generation apart when we went down.
+        torn? = Fathom.FS.exists?(torn_path(name, shard_id))
+
+        {:held,
+         recovered_state(name, shard_id, header, torn?, recovered_ownership(name, shard_id), log?)}
+
+      {:ok, _header} ->
+        nil
+
+      {:error, reason} when db? ->
+        if log? do
+          Logger.warning(
+            "replication follower: the replica of #{shard_id} exists but its WAL cannot be read " <>
+              "(#{inspect(reason)}); holding it as torn (unrankable, not counted) until it is " <>
+              "re-seeded or the failure clears"
+          )
+        end
+
+        {lineage, _epoch} = recovered_ownership(name, shard_id)
+        kind = if reason == :not_a_wal, do: :held, else: :transient
+        {kind, %{FollowerLog.seeded(0, 0, 0, 0, lineage) | torn: true}}
+
+      {:error, _reason} ->
+        nil
     end
   end
 
@@ -3058,12 +3111,7 @@ defmodule Fathom.Shard.Replication.Follower do
         s
 
       [] ->
-        if recover_shard(tab, name, shard_id) do
-          case :ets.lookup(tab, shard_id) do
-            [{^shard_id, s}] -> s
-            [] -> nil
-          end
-        end
+        recover_shard(tab, name, shard_id)
     end
   end
 

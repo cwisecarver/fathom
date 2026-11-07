@@ -221,6 +221,11 @@ Refinements (expert review 2026-10-13 #5, #14, #15, #40):
   copy that fails VERIFICATION stays fenced and torn (unverifiable bytes must not be rankable) and is
   replaced by a pull: `begin_seed(pull: true)` does not apply the deposed-primary lineage fence to a
   torn row (an untorn higher-lineage row still refuses, typed `:stale_lineage`).
+- A replica whose files exist but cannot be **read** (expert review 2026-11-07 #18; a `-wal` that is not
+  WAL magic, or a read error such as EMFILE) answers `torn`, never a definite "nothing": it may hold the
+  acked tail, and "nothing" would count toward the floor. Only the deterministic damage is cached as a
+  torn row; a transient error is answered from the files each time. A follower that never held the
+  shard (no `.db`) still answers a definite "nothing".
 
 N and Q are this node's peer set and `REPLICATION_QUORUM`, which assumes a symmetric fleet with one
 quorum. The floor applies only against a rankable object stamp, so a brand-new shard is never
