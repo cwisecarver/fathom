@@ -792,6 +792,12 @@ defmodule Fathom.Shards do
   2026-08-26 #5; before it, this sentence described a property the code did not have). Wire it as a release **pre-stop** (`bin/fathom rpc
   "Fathom.Shards.drain_all()"`) ahead of SIGTERM — see `docs/runbooks/cluster.md`. It never
   `end_draining`s: the node is on its way down, and a cancelled drain resets the flag explicitly.
+
+  While the flag is set a request-path checkout that would start a coordinator is refused with the
+  retryable `{:error, :draining}` (expert review 2026-11-07 #46), so a drained shard is not
+  re-opened — and its lease re-taken — by the next request; coordinators that still registered after
+  the first snapshot are drained by a final sweep with the budget that is left. A cancelled drain
+  MUST `HealthPlug.end_draining/0`, or this node refuses every cold open.
   """
   @spec drain_all(pos_integer()) :: %{
           drained: non_neg_integer(),
@@ -807,6 +813,24 @@ defmodule Fathom.Shards do
     deadline = System.monotonic_time(:millisecond) + budget_ms
     pids = registered_coordinators()
 
+    first = drain_batch(pids, deadline, budget_ms)
+
+    # THE FINAL SWEEP (expert review 2026-11-07 #46). The snapshot above is taken ONCE, so a
+    # coordinator that registered after it — a request that passed the cold-open gate in
+    # `do_ensure/3` just before `begin_draining/0`, or a bare `ensure/1` from an admin / flush path,
+    # neither of which that gate covers — is not in it and used to be left for the supervisor
+    # teardown's unbounded path. Anything registered by now is drained with what is left of the
+    # budget; the tally is the sum of both batches.
+    seen = MapSet.new(pids, fn {_id, pid} -> pid end)
+
+    case Enum.reject(registered_coordinators(), fn {_id, pid} -> MapSet.member?(seen, pid) end) do
+      [] -> first
+      late -> Map.merge(first, drain_batch(late, deadline, budget_ms), fn _k, a, b -> a + b end)
+    end
+  end
+
+  # One bounded, wave-sliced drain of `pids` against `deadline` (see the slice note below).
+  defp drain_batch(pids, deadline, budget_ms) do
     # A SLICE OF THE BUDGET, NOT ALL OF IT (expert review 2026-08-26 #5).
     #
     # This used to pass `deadline - now` to every coordinator, i.e. the WHOLE remaining budget,
@@ -1251,6 +1275,21 @@ defmodule Fathom.Shards do
           # Only on this cold-open branch, so a running shard's checkout never pays for it.
           {:ok, []} ->
             cond do
+              # A DRAINING NODE OPENS NOTHING COLD (expert review 2026-11-07 #46). `drain_all/1`
+              # flips `HealthPlug` to draining and snapshots the coordinators once, but nothing on
+              # the data path read the flag: the moment a coordinator exited, the next request took
+              # this branch and started a NEW one that re-acquired the lease it had just released
+              # (and was not in the snapshot), so a survivor saw `{:shard_held, draining_node}` until
+              # the supervisor teardown, and the bounded-drain guarantee was void on a live fleet.
+              # The shipped OSS nginx has no active health check and keeps pooled keepalives, so the
+              # LB keeps sending. Refused with the retryable `:draining` (`FILO_DRAINING`, 503; the
+              # shipped nginx retries a 503 on the next upstream). Request-path checkouts only
+              # (`refusal_cache?`): a bare `ensure/1` — `flush_kept_local`, admin, bench — is not a
+              # request and still opens. Cold branch only, so a running shard's checkout is
+              # untouched; one persistent_term read.
+              refusal_cache? and Fathom.HealthPlug.draining?() ->
+                {:error, :draining}
+
               Fathom.Shards.MigrationGate.closed?(shard_id) ->
                 {:error, {:shard_migrating, :drained_for_migration}}
 

@@ -174,6 +174,11 @@ defmodule Fathom.FlushStormTest do
       prev = Application.get_env(:fathom, :drain_on_shutdown)
       on_exit(fn -> restore(:drain_on_shutdown, prev) end)
 
+      # `prep_stop/1` runs the REAL `drain_all/1`, which flips the node-global draining flag and never
+      # clears it. Since expert review 2026-11-07 #46 a draining node refuses every cold open, so a
+      # leaked flag fails every later test that opens a shard.
+      on_exit(fn -> Fathom.HealthPlug.end_draining() end)
+
       Application.put_env(:fathom, :drain_on_shutdown, true)
       assert Fathom.Application.prep_stop(:whatever) == :whatever
     end

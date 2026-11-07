@@ -214,6 +214,76 @@ defmodule Fathom.ShardsDrainAllTest do
     assert probe() == {200, "ok"}
   end
 
+  # Expert review 2026-11-07 #46. `drain_all/1` flipped the draining flag and snapshotted the
+  # coordinators ONCE, but nothing on the data path read the flag: the moment a coordinator exited,
+  # the next request took the cold branch and started a NEW coordinator that re-acquired the lease it
+  # had just released (and was not in the snapshot). Both liveness modes, the mode asserted: the open
+  # path differs (heartbeat acquire vs per-shard renew).
+  for mode <- [:legacy, :heartbeat] do
+    test "a draining node refuses cold opens: a drained shard is not re-taken (#{mode})", %{
+      ids: [id | _]
+    } do
+      case unquote(mode) do
+        :legacy ->
+          refute Fathom.Shard.Heartbeat.running?(), "legacy mode needs the heartbeat OFF"
+
+        :heartbeat ->
+          hb = start_supervised!({Fathom.Shard.Heartbeat, ttl_ms: 30_000})
+          _ = :sys.get_state(hb)
+          assert Fathom.Shard.Heartbeat.running?()
+      end
+
+      pid = open_idle!(id)
+
+      case unquote(mode) do
+        :legacy -> assert is_nil(Fathom.Shard.acquire_gen(pid)), "expected LEGACY liveness"
+        :heartbeat -> refute is_nil(Fathom.Shard.acquire_gen(pid)), "expected HEARTBEAT liveness"
+      end
+
+      ref = Process.monitor(pid)
+      result = Shards.drain_all(3_000)
+      assert result.drained >= 1, "fixture: the shard must have drained (#{inspect(result)})"
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}, 3_000
+      assert HealthPlug.draining?()
+
+      # The request path: refused with the retryable error, and nothing was started.
+      assert {:error, :draining} = Shards.checkout(id),
+             "a draining node re-opened a shard it had just drained"
+
+      assert [] = Registry.lookup(Fathom.ShardRegistry, id)
+
+      assert %{status: 503, code: "FILO_DRAINING"} = ShardExecutor.open_error(:draining)
+
+      # A bare `ensure/1` (flush_kept_local, admin, bench) is not a request and still opens.
+      assert {:ok, _pid} = Shards.ensure(id)
+    end
+  end
+
+  test "a coordinator that registered after the first snapshot is drained by the final sweep", %{
+    ids: [busy_id, late_id | _]
+  } do
+    # One shard with a stream checked out keeps the first batch in flight (`draining: true`, waiting
+    # for the stream); a second coordinator is started by a bare `ensure/1` — which the cold-open
+    # gate does not cover — while that batch runs, so it is NOT in the first snapshot. The stream is
+    # then returned, the first batch finishes, and the late coordinator must have been drained too.
+    {:ok, busy, busy_ref, _path} = Shards.checkout(busy_id)
+    drain = Task.async(fn -> Shards.drain_all(10_000) end)
+
+    Fathom.Test.Await.until(
+      fn -> :sys.get_state(busy).draining end,
+      "the first batch never started draining the busy shard"
+    )
+
+    {:ok, late} = Shards.ensure(late_id)
+    late_down = Process.monitor(late)
+    Fathom.Shard.checkin(busy, busy_ref)
+
+    result = Task.await(drain, 15_000)
+
+    assert_receive {:DOWN, ^late_down, :process, ^late, _}, 5_000
+    assert result.drained >= 2, "the late coordinator was not counted: #{inspect(result)}"
+  end
+
   defp probe do
     conn = HealthPlug.call(Plug.Test.conn(:get, "/health"), [])
     {conn.status, conn.resp_body}

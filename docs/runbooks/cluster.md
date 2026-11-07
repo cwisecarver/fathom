@@ -160,6 +160,14 @@ deregisters it and stops routing here first), then fans out `request_drain` acro
 coordinator — refuse new checkouts → let in-flight streams finish → flush + release the lease + stop —
 with bounded concurrency and a bounded overall budget. It returns `%{drained, busy, timed_out}`.
 
+**A draining node opens nothing cold (expert review 2026-11-07 #46).** While the draining flag is set, a
+request that would start a coordinator is refused with the retryable `FILO_DRAINING` (503) instead of
+re-opening the shard the drain just released and re-taking its lease. This matters because the shipped
+OSS nginx has no active health check and keeps pooled keepalives, so it keeps sending to a node whose
+`/health` already says 503; `proxy_next_upstream … http_503` retries the request on the next upstream.
+Shards that are already open keep serving until their drain. If you cancel a drain you started with the
+rpc, `Fathom.HealthPlug.end_draining()` it, or this node refuses every cold open.
+
 **Open connections are asked to close (expert review 2026-10-10 panel2 H4).** When a coordinator
 starts draining it tells each connection holder to let go: a WebSocket closes with code 1001 once
 none of its streams is inside a transaction, and an HTTP baton stream that is not in a transaction
