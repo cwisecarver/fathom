@@ -32,6 +32,7 @@ defmodule Fathom.Migrator.RevertJob do
 
   alias Fathom.Migrator.ShardMigration
   alias Fathom.Migrator.ShardMigrationJob
+  alias Fathom.Shard.Storage
 
   # Bound the run under Lifeline's `rescue_after` (config.exs, 60 min) so a wedged job ends instead
   # of being rescued while its process is still alive (expert review 2026-10-13 #6). Oban's default
@@ -58,7 +59,7 @@ defmodule Fathom.Migrator.RevertJob do
     # still deleted it (its skip-when-live guard reads the directory, which says
     # from_version until our cutover). Cancelling up front is safe even if the revert
     # then fails or is refused: a retained copy that outlives its drop merely leaks
-    # until the S3 lifecycle backstop; a deleted restore source quarantines the shard
+    # until the retirement re-drive (`ErasureSweepJob`); a deleted restore source quarantines the shard
     # unrecoverably. An already-EXECUTING retirement is uncancellable — that side is
     # closed by RetirementJob's revert-in-flight guard.
     cancelled = cancel_retirement(shard_id, landing)
@@ -74,7 +75,19 @@ defmodule Fathom.Migrator.RevertJob do
       # The revert backed the live vN object up as <shard>@<from> (finding #13) and its cutover
       # enqueued that object's retention deletion atomically (the outbox, expert review 2026-07-18
       # #5), so a Postgres blip can't leak it and this path needn't re-enqueue.
+      #
+      # `<shard>@<landing>` is a different matter (expert review 2026-11-07 #62). It was the restore
+      # SOURCE, and `Storage.restore/3` downloads it without moving it, so it is now a second full
+      # copy of what is live — with its retirement cancelled up front and nothing rescheduling it
+      # (the cutover enqueues only the BACKUP's). Drop it here, once the cutover has committed.
+      # NOT `reschedule_retirement/3`: after the revert `landing` IS the live version, so
+      # `RetirementJob.perform/1` would cancel itself `:version_live` and the copy would still leak.
+      # The bare `:ok` clause above is deliberately left alone: it is a completed revert's no-op
+      # retry and "touches no storage" is its pinned invariant. And the drop comes BEFORE
+      # `climb_back/3`: a chain-jumper's forward climb re-retains `@landing` as ITS backup, which a
+      # drop landing after it would delete out from under its retirement job and `retained_version`.
       {:ok, %{from: _backed_up}} ->
+        drop_landing_copy(shard_id, landing)
         climb_back(shard_id, landing, to_version)
 
       {:retry, reason} ->
@@ -337,12 +350,33 @@ defmodule Fathom.Migrator.RevertJob do
 
   # Re-insert the retirement `cancel_retirement/2` cancelled, but only when one was actually
   # cancelled (otherwise it already ran, or never existed). Best-effort: a failed insert only leaks
-  # the copy until the S3 lifecycle backstop, which is the state the cancel already accepted.
+  # the copy until the retirement re-drive (`ErasureSweepJob`) picks it up, which is the state the
+  # cancel already accepted.
   defp reschedule_retirement(_shard_id, _version, 0), do: :ok
 
   defp reschedule_retirement(shard_id, version, _cancelled) do
     Oban.insert(Fathom.Migrator.RetirementJob.schedule_changeset(shard_id, version))
     :ok
+  end
+
+  # Best-effort, and never a reason to fail the job: the revert has LANDED (the cutover committed),
+  # so an error here would re-run a completed revert, and `handle_error/5` would quarantine a
+  # healthy shard on the last attempt. A failed drop leaks the copy — the pre-fix state, logged
+  # loudly so it is visible; there is no retirement to re-drive it (it names the live version).
+  defp drop_landing_copy(shard_id, landing) do
+    case Storage.drop_version(shard_id, landing) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "shard #{shard_id}: reverted to v#{landing} but could not drop the restore source " <>
+            "#{shard_id}@#{landing} (#{inspect(reason)}); it is now a redundant full copy of the " <>
+            "live object and nothing will retire it — delete it by hand"
+        )
+
+        :ok
+    end
   end
 
   defp cancel_retirement(shard_id, version) do

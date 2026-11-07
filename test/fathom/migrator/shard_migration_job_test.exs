@@ -771,6 +771,71 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 2})
   end
 
+  # Expert review 2026-11-07 #62. `Storage.restore/3` DOWNLOADS `<shard>@<landing>` without moving
+  # it, so after a successful revert it is a second full copy of the live object; its retirement was
+  # cancelled up front and the cutover schedules only the BACKUP's (`@from`), so it leaked until the
+  # shard happened to migrate again (a permanent revert never healed). The revert now drops it once
+  # the cutover has committed. Pre-fix `@1` is still on disk.
+  test "a successful revert drops the restore source: <shard>@<landing> does not leak (#62)",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+
+    assert File.exists?(Path.join(remote_dir(), "#{shard}@1.db")),
+           "fixture: the forward migration must have retained @1 (the revert's restore source)"
+
+    assert :ok = perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 1})
+
+    refute File.exists?(Path.join(remote_dir(), "#{shard}@1.db")),
+           "the restore source is now a redundant full copy of the live object with no retirement"
+
+    # The BACKUP of the discarded v2 is the one that stays, and keeps its scheduled retirement.
+    assert File.exists?(Path.join(remote_dir(), "#{shard}@2.db"))
+    assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 2})
+    assert {:ok, %{schema_version: 1, retained_version: 2}} = Directory.get(shard)
+  end
+
+  # The drop must come BEFORE the chain-jumper's forward climb: that migration re-retains `@landing`
+  # as ITS backup and schedules ITS retirement, which a drop landing afterwards would delete out
+  # from under both the job and `retained_version`.
+  test "a chain-jumper's revert drops @landing before the climb, which re-retains it (#62)",
+       %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+
+    {:ok, _} =
+      Migrator.release(3, "v3", [
+        "ALTER TABLE app_thing ADD COLUMN extra TEXT",
+        "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0003', 'now')"
+      ])
+
+    # v1 -> v3 in ONE job: only @1 is retained, so a revert to v2 lands on v1 and climbs back.
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 3})
+    assert {:ok, %{schema_version: 3, retained_version: 1}} = Directory.get(shard)
+    assert File.exists?(Path.join(remote_dir(), "#{shard}@1.db"))
+
+    # What `Migrator.revert(3, 2)` does first: yank v3, so HEAD is the revert target and the climb's
+    # forward job stops at v2.
+    :ok = Migrator.yank(3)
+
+    capture_log(fn ->
+      assert :ok = perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 2})
+    end)
+
+    refute File.exists?(Path.join(remote_dir(), "#{shard}@1.db")),
+           "@1 was the restore source and must be dropped before the climb"
+
+    assert_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => shard, "target" => 2})
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+
+    assert File.exists?(Path.join(remote_dir(), "#{shard}@1.db")),
+           "the climb retains @1 again as its own backup"
+
+    assert {:ok, %{schema_version: 2, retained_version: 1}} = Directory.get(shard)
+    assert_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
+  end
+
   # Expert review 2026-10-12 #29. Symptom: RevertJob cancels the landing copy's retirement up front,
   # then a refusal or terminal failure left the shard un-reverted with NO retirement pending, so the
   # retained copy leaked until the S3 lifecycle backstop.
