@@ -1520,7 +1520,12 @@ defmodule Fathom.Shards do
   # dst that already has a stored object (`:dst_exists`), so a flushed-then-forgotten
   # shard is never overwritten.
   defp novel_shard?(shard_id) do
-    not Fathom.FS.exists?(Fathom.Shard.db_path(shard_id)) and not known_to_directory?(shard_id)
+    # `presence/1 == :absent`, not `not exists?/1` (expert review 2026-11-07 #21): an indeterminate
+    # stat (EIO, EACCES, ESTALE) over a shard that DOES have an unflushed local copy must not read
+    # as "novel" — that licenses the template fork, which would put a stored object under a copy
+    # whose sidecar says "born against no object" and quarantine its acked writes at the next open.
+    Fathom.FS.presence(Fathom.Shard.db_path(shard_id)) == :absent and
+      not known_to_directory?(shard_id)
   end
 
   # How many least-recently-used shards to probe for idleness before giving up and

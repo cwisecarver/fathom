@@ -125,6 +125,27 @@ defmodule Fathom.FSBypassTest do
       refute FS.exists?(Path.join(dir, "nope"))
     end
 
+    # expert review 2026-11-07 #21: `exists?/1` reads EVERY stat error as "no file", which is what
+    # let a stat hiccup read as a cold open and delete a dirty warm copy. `presence/1` keeps
+    # "definitely absent" apart from "could not tell". A symlink loop is a real, portable stat
+    # failure other than ENOENT (a path that cannot be searched would also stop the test reading it).
+    test "presence/1 tells :absent (ENOENT only) apart from an indeterminate stat", %{
+      tmp_dir: dir
+    } do
+      f = Path.join(dir, "f")
+      File.write!(f, "x")
+      loop = Path.join(dir, "loop")
+      :ok = File.ln_s(loop, loop)
+
+      assert FS.presence(f) == :present
+      assert FS.presence(dir) == :present
+      assert FS.presence(Path.join(dir, "nope")) == :absent
+      assert FS.presence(loop) == {:error, :eloop}
+
+      # The collapse `presence/1` exists to avoid, pinned so the two are never merged again.
+      refute FS.exists?(loop)
+    end
+
     test "stat returns File.Stat, honours :time", %{tmp_dir: dir} do
       f = Path.join(dir, "f")
       File.write!(f, "abc")

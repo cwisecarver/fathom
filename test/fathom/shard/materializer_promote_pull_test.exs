@@ -35,7 +35,7 @@ defmodule Fathom.Shard.MaterializerPromotePullTest do
     on_exit(fn -> Application.delete_env(:fathom, :promote_pull_crash_hook) end)
 
     assert_raise RuntimeError, "node died here", fn ->
-      Materializer.promote_pull(path, "\"new-etag\"")
+      Materializer.promote_pull(path, "\"new-etag\"", :bytes)
     end
 
     refute File.exists?(path) and Provenance.read(path) == {:ok, "\"new-etag\""},
@@ -49,7 +49,7 @@ defmodule Fathom.Shard.MaterializerPromotePullTest do
     :ok = Provenance.write(path, "\"old-etag\"")
     File.write!(Materializer.pull_temp(path), "fresh")
 
-    assert {:ok, "\"new-etag\""} = Materializer.promote_pull(path, "\"new-etag\"")
+    assert {:ok, "\"new-etag\""} = Materializer.promote_pull(path, "\"new-etag\"", :bytes)
     assert File.read!(path) == "fresh"
     assert Provenance.read(path) == {:ok, "\"new-etag\""}
   end

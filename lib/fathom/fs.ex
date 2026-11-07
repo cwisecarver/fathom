@@ -12,6 +12,32 @@ defmodule Fathom.FS do
   Listings of the fleet-sized data dir go through `list_dir_isolated/1`, never `File.ls/1`.
   """
 
+  @doc """
+  Whether `path` exists, **telling "no such file" apart from "could not tell"**: `:present`,
+  `:absent` (the stat said `:enoent` and nothing else), or `{:error, posix}` for every other
+  failure (EIO, EACCES after a uid change, ESTALE on a network mount, ENOTDIR, ...).
+
+  Use this, never `exists?/1`, for any decision where "absent" leads to DESTROYING or
+  SUPERSEDING bytes (the warm-vs-cold open decision, "nothing to flush", "novel shard", the
+  takeover-absent test). `exists?/1` collapses every `{:error, _}` to `false`, so a stat hiccup
+  at the wrong instant read as "no local file" and the cold pull then `rm`'d a dirty warm `.db`
+  and `-wal` (expert review 2026-11-07 #21). The right response to `{:error, _}` is to refuse
+  the operation, not to pick a side.
+  """
+  @spec presence(Path.t()) :: :present | :absent | {:error, File.posix()}
+  def presence(path) do
+    case :file.read_file_info(IO.chardata_to_string(path), [:raw]) do
+      {:ok, _info} -> :present
+      {:error, :enoent} -> :absent
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Best-effort existence: every stat error reads as `false`. Fine where a wrong "no" only costs a
+  skipped optimisation or a redundant create; WRONG wherever "no" licenses deleting or
+  overwriting something — use `presence/1` there (see its doc).
+  """
   @spec exists?(Path.t()) :: boolean()
   def exists?(path), do: type(path) != nil
 

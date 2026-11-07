@@ -194,7 +194,12 @@ defmodule Fathom.Shard.TempReaper do
   end
 
   defp sweep_listing(dir, names) do
-    temps = for name <- names, Storage.temp_orphan?(name), do: Path.join(dir, name)
+    temps =
+      for name <- names,
+          Storage.temp_orphan?(name),
+          not pull_temp_owned?(name),
+          do: Path.join(dir, name)
+
     reaped = Storage.reap_named_temps(temps, @stale_after_ms)
     if reaped > 0, do: Logger.info("shard temp reaper: reaped #{reaped} orphaned temp(s)")
     sweep_quarantines(Shard.quarantine_files_in(names, dir))
@@ -202,6 +207,40 @@ defmodule Fathom.Shard.TempReaper do
     # The same listing indexes and evicts clean-retained copies (expert review 2026-10-20-2027 #22).
     Fathom.Shard.Retained.reconcile(names, dir)
     reaped + sweep_scratch()
+  end
+
+  # THE `.pull` FAMILY IS NOT AN ORPHAN WHILE A COORDINATOR IS OPEN FOR ITS SHARD (expert review
+  # 2026-11-07 #9). The pull task renames `<id>.db.pull.dl.N` → `<id>.db.pull` and parks its
+  # `{:ok, etag}` reply in the coordinator's mailbox, and the completed `.pull` then sits untouched
+  # for the whole `acquire_lease` (the steal path is GET lock + heartbeat GET + HEAD + PUT + touch,
+  # each with Req's retry ladder). The age gate below is the temp's MTIME — the download's, not the
+  # coordinator's — on a wall clock: a slow acquire (> 120 s, an S3 brownout) or a forward clock step
+  # (a real rig hazard) makes every such temp "stale" at once, and the reaper unlinked the bytes the
+  # coordinator was about to promote. mtime says how old a file is; only the Registry says whether
+  # something still owns it, so ownership is the test and mtime stays a second gate for the rest.
+  #
+  # Registry-registered is the right owner test: `Shard.start_link/1` registers the shard id before
+  # `handle_continue(:open)` runs, so it covers an open parked anywhere in the pull/acquire/promote
+  # window, and a coordinator that is gone has nothing to promote the temp (the next open reaps its
+  # own `.pull` family by name at its start). A lookup that RAISES (the partition's ETS table is being
+  # rebuilt) reads as "owned": skipping a sweep entry costs a 5-minute delay, unlinking a live
+  # pull's temp costs an open. The unlink itself is also made harmless on the other side:
+  # `Materializer.promote_pull/3` refuses a vanished temp instead of reading it as "brand-new".
+  #
+  # Not extended to the other temp families (`.snap`, `.z`, `.promote`...): their writers are
+  # tasks that finish inside one flush, and a killed one is exactly the orphan this reaper exists for.
+  defp pull_temp_owned?(name) do
+    case :binary.split(name, ".db.pull") do
+      [id, _suffix] ->
+        try do
+          Registry.lookup(Fathom.ShardRegistry, id) != []
+        rescue
+          ArgumentError -> true
+        end
+
+      _not_a_pull_family_name ->
+        false
+    end
   end
 
   # Age-gated reap of the scratch dir (see `scratch_dir/0`). Entries may be files or directories.

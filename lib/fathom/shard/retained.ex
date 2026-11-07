@@ -88,10 +88,15 @@ defmodule Fathom.Shard.Retained do
   @doc """
   True iff a local file exists that may hold writes the stored object lacks — i.e. it exists and is
   not marked clean-retained (claimed or not).
+
+  Every stat error answers toward TRUE ("may hold unflushed writes"): the callers (drain, migration,
+  flush, evict) use it to decide whether the local copy must be protected, so reading an
+  indeterminate stat as "no local file" would let them proceed past a dirty copy (expert review
+  2026-11-07 #21). A marker stat that errors likewise reads as "not retained".
   """
   @spec unflushed_local?(Path.t()) :: boolean()
   def unflushed_local?(path) do
-    Fathom.FS.exists?(path) and not Fathom.FS.exists?(marker(path)) and
+    Fathom.FS.presence(path) != :absent and not Fathom.FS.exists?(marker(path)) and
       not Fathom.FS.exists?(claimed_marker(path))
   end
 

@@ -16,7 +16,7 @@ defmodule Fathom.Shard.Materializer do
       via `Storage.pull/2`. (The warm-follower cache fast path was removed 2026-09-14 when
       WarmFollower was retired in favour of A2 — see the warm-follower-removal history.)
     * `await_pull/3` resolves the object etag for the flush fence — from the speculative pull's
-      temp (`promote_pull/2` lands it), or, on a warm restart with no pull, from the local copy's
+      temp (`promote_pull/3` lands it), or, on a warm restart with no pull, from the local copy's
       PROVENANCE sidecar (never "whatever the store holds now", which let a stale fork clobber a
       newer lineage).
     * `abandon_pull/2` kills the speculative pull and drops its temp when the lease is lost.
@@ -118,15 +118,18 @@ defmodule Fathom.Shard.Materializer do
 
   def await_pull(task, path, _shard_id) do
     case Task.yield(task, @pull_timeout) || kill_pull(task) do
+      # The pull's REPORT is passed through as a fact (`:bytes` / `:absent`), never re-derived from
+      # whether the temp is on disk: a temp that vanished after a `{:ok, etag}` reply is an ERROR,
+      # not a brand-new shard (expert review 2026-11-07 #9).
       {:ok, {:ok, etag}} ->
-        promote_pull(path, etag)
+        promote_pull(path, etag, :bytes)
 
       # No bytes written — a brand-new shard, or a steal sentinel (expert review 2026-08-01
-      # #24). `promote_pull/2`'s else branch is exactly this case: it stamps the "derived from
+      # #24). `promote_pull/3`'s `:absent` clause is exactly this case: it stamps the "derived from
       # no object" sentinel sidecar and carries the fence etag, so the first flush is a
       # conditional create rather than a blind overwrite.
       {:ok, {:absent, etag}} ->
-        promote_pull(path, etag)
+        promote_pull(path, etag, :absent)
 
       {:ok, {:error, _} = error} ->
         rm_pull_temp(path)
@@ -152,75 +155,129 @@ defmodule Fathom.Shard.Materializer do
     end
   end
 
-  # A new shard has no object, so the pull wrote no temp — leave the path absent (the first
-  # connection creates it empty). Otherwise move the temp into place. Carries the object etag
-  # through for the flush fence.
-  @spec promote_pull(Path.t(), String.t() | nil) :: {:ok, String.t() | nil} | {:error, term()}
-  def promote_pull(path, etag) do
+  # Land a finished pull. The third argument is what the pull REPORTED, and it — not the temp's
+  # presence — picks the branch:
+  #
+  #   * `:bytes` (`{:ok, etag}`): the object's bytes are in `<path>.pull`; move them into place.
+  #     A MISSING temp is `{:error, :pull_temp_missing}`. The clause used to be selected by
+  #     `exists?(temp)`, so a temp that vanished between the pull's reply and this call (the
+  #     `TempReaper` unlinked a completed `.pull` whose 120 s mtime gate had passed while the
+  #     coordinator sat in a slow `acquire_lease`, or any stat error) fell to the brand-new-shard
+  #     branch, which returned the object's REAL etag as the flush fence with no bytes installed:
+  #     an empty database fenced on the real object, flushed over it by the first write or the
+  #     idle drop (expert review 2026-11-07 #9). Refusing fails the open retryably and the lease
+  #     is released with the clean-touch marker; the retry re-pulls.
+  #   * `:absent` (`{:absent, etag}`): nothing was written — no object, or a steal sentinel — so
+  #     leave the path absent (the first connection creates it empty) and stamp the explicit
+  #     "born against no object" sentinel. Any `<path>.pull` on disk was NOT written by this pull
+  #     (the open-time reap is age-gated, so a young one from a crashed previous incarnation
+  #     survives it); it is removed here rather than ever being adopted as this shard's `.db`.
+  #
+  # Both carry the object etag through for the flush fence.
+  @spec promote_pull(Path.t(), String.t() | nil, :bytes | :absent) ::
+          {:ok, String.t() | nil} | {:error, term()}
+  def promote_pull(path, etag, :bytes) do
     temp = pull_temp(path)
 
-    if Fathom.FS.exists?(temp) do
-      # Remove any stale sidecars BEFORE the pulled file lands (expert review #18): a
-      # crash between drop_local's two File.rm calls (db deleted, -wal not yet) leaves
-      # an orphan WAL, and SQLite's first open would run WAL recovery against it —
-      # replaying a different generation's frames into the freshly pulled database
-      # (resurrected deletes, torn pages, or a malformed db, then flushed back as the
-      # durable object). A pulled object is always a self-contained checkpointed
-      # image, so any sidecars next to it are by definition stale.
-      Fathom.FS.rm(path <> "-wal")
-      Fathom.FS.rm(path <> "-shm")
+    case Fathom.FS.presence(temp) do
+      :present ->
+        install_pull(path, temp, etag)
 
-      # …and any `.db` ALREADY at the path, BEFORE the sidecar is written (expert review 2026-10-08
-      # #10). Sidecar-first below is safe only if a crash between it and the rename leaves "a
-      # sidecar with no `.db`". On a REPULL (`Fathom.Shard.repull/2`, after revalidation judged the
-      # first pull stale) the path already holds that stale pull, so the residue was the STALE
-      # bytes paired with the NEWER etag — the next open read the sidecar as a match, served the
-      # stale copy, and its first flush If-Matched the newer object and overwrote it: a silent
-      # rollback of acked writes. Those bytes were already judged stale and no connection has
-      # opened them (the pull runs inside the open), so removing them first loses nothing.
-      Fathom.FS.rm(path)
+      :absent ->
+        rm_pull_temp(path)
+        {:error, :pull_temp_missing}
 
-      # Establish provenance BEFORE the pulled file becomes authoritative (expert
-      # review 2026-07-14 #5). Writing the sidecar AFTER the rename left a crash
-      # window: an authoritative warm `.db` with NO sidecar. The next warm open reads
-      # `:missing` (Fork.evidence → :no_sidecar ⇒ warm, await_pull(nil) → adopt the store's
-      # CURRENT etag), so if another node stole+wrote+released the shard in between
-      # (reachable on a persisted/remounted `:shard_data_dir`), the stale local copy
-      # is served and fenced with the NEW lineage's etag — its first flush If-Matches
-      # and clobbers the newer owner's writes (the #1 clobber, through the promote's
-      # crash hole). Sidecar-first inverts the residue to an orphan `<path>.etag` with
-      # no `.db`, which is harmless: warm detection gates on Fathom.FS.exists?(path) (the
-      # `.db`, see handle_continue's `warm?`), and the brand-new-open branch below
-      # File.rm's a stale sidecar before landing. The sidecar path is `<path>.etag`,
-      # derived from the FINAL path, so it's writable before the rename.
-      Provenance.write(path, etag)
+      # Cannot tell either: do not install and do not remove — the bytes may be fine.
+      {:error, reason} ->
+        {:error, {:pull_temp_unreadable, reason}}
+    end
+  end
+
+  def promote_pull(path, etag, :absent) do
+    # Brand-new shard: no object, so the pull wrote no temp. This used to `File.rm` the
+    # sidecar, which left every born-empty shard with NO PROVENANCE BY CONSTRUCTION — and
+    # "absent sidecar" was then read as "legacy file, adopt whatever etag the store holds
+    # now". That is the clobber the sidecar exists to prevent, reachable with no attacker at
+    # all (expert review 2026-08-01 #2):
+    #
+    #   node A opens a new shard and takes writes, dying before its first flush. The LB
+    #   reroutes to B, which serves, flushes (the object now EXISTS), idles and releases
+    #   cleanly. A comes back on a persisted :shard_data_dir, sees its local `.db`, reads
+    #   `:missing`, opens WARM, adopts the store's current etag — and its first flush
+    #   If-Matches successfully, destroying every write B acknowledged.
+    #
+    # So record the absence EXPLICITLY. `Provenance.no_object_sentinel/0` means "this file was
+    # created locally against no stored object", which is a provenance claim the open path can
+    # check (see Fork.evidence/2) rather than an absence it has to guess about.
+    _ = Fathom.FS.rm(pull_temp(path))
+
+    case Provenance.write_no_object(path) do
+      :ok -> {:ok, etag}
+      {:error, reason} -> {:error, {:sidecar_write_failed, reason}}
+    end
+  end
+
+  defp install_pull(path, temp, etag) do
+    # Remove any stale sidecars BEFORE the pulled file lands (expert review #18): a
+    # crash between drop_local's two File.rm calls (db deleted, -wal not yet) leaves
+    # an orphan WAL, and SQLite's first open would run WAL recovery against it —
+    # replaying a different generation's frames into the freshly pulled database
+    # (resurrected deletes, torn pages, or a malformed db, then flushed back as the
+    # durable object). A pulled object is always a self-contained checkpointed
+    # image, so any sidecars next to it are by definition stale.
+    #
+    # NB this is also why the open's warm-vs-cold stat must be definite (expert review
+    # 2026-11-07 #21): everything below is destructive to whatever is at `path`. A caller that
+    # reaches here with a DIRTY warm copy at `path` has misjudged warm-vs-cold; the only caller
+    # that legitimately has a `.db` here is `Fathom.Shard.repull/2`, whose copy was already
+    # judged stale. The review's alternative (rename an existing `.db` aside to `.stale.<ms>`
+    # instead of removing it) was NOT taken: it would leave a shard-sized file per repull that
+    # nothing reaps, to guard a state the definite stat now keeps unreachable.
+    Fathom.FS.rm(path <> "-wal")
+    Fathom.FS.rm(path <> "-shm")
+
+    # …and any `.db` ALREADY at the path, BEFORE the sidecar is written (expert review 2026-10-08
+    # #10). Sidecar-first below is safe only if a crash between it and the rename leaves "a
+    # sidecar with no `.db`". On a REPULL (`Fathom.Shard.repull/2`, after revalidation judged the
+    # first pull stale) the path already holds that stale pull, so the residue was the STALE
+    # bytes paired with the NEWER etag — the next open read the sidecar as a match, served the
+    # stale copy, and its first flush If-Matched the newer object and overwrote it: a silent
+    # rollback of acked writes. Those bytes were already judged stale and no connection has
+    # opened them (the pull runs inside the open), so removing them first loses nothing.
+    Fathom.FS.rm(path)
+
+    # Establish provenance BEFORE the pulled file becomes authoritative (expert
+    # review 2026-07-14 #5). Writing the sidecar AFTER the rename left a crash
+    # window: an authoritative warm `.db` with NO sidecar. The next warm open reads
+    # `:missing` (Fork.evidence → :no_sidecar ⇒ warm, await_pull(nil) → adopt the store's
+    # CURRENT etag), so if another node stole+wrote+released the shard in between
+    # (reachable on a persisted/remounted `:shard_data_dir`), the stale local copy
+    # is served and fenced with the NEW lineage's etag — its first flush If-Matches
+    # and clobbers the newer owner's writes (the #1 clobber, through the promote's
+    # crash hole). Sidecar-first inverts the residue to an orphan `<path>.etag` with
+    # no `.db`, which is harmless: warm detection gates on the `.db`'s presence (see
+    # `open_coordinator_claimed/4`), and the brand-new-open branch removes a stale sidecar
+    # before landing. The sidecar path is `<path>.etag`, derived from the FINAL path, so it's
+    # writable before the rename.
+    #
+    # The write's RESULT gates the rename (expert review 2026-11-07 #28). It was ignored, so a
+    # failed 177-byte write (ENOSPC right after a shard-sized pull) still renamed the pulled
+    # `.db` into place beside a stale or absent sidecar, and the next warm open read `:corrupt` /
+    # `:missing` / `{:diverged, ..}` and quarantined a lineage-correct copy. Abort instead, and drop
+    # the temp: the retry re-pulls anyway, and the temp is shard-sized on a volume that just ran out
+    # of room. The plain (non-fsynced) write stays — this is a cold pull with no local acked writes,
+    # and an fsync here was measured at +24-28% cold_open_p50.
+    with :ok <- Provenance.write(path, etag) do
       before_promote_rename(path)
 
       case Fathom.FS.rename(temp, path) do
-        :ok ->
-          {:ok, etag}
-
-        {:error, _} = err ->
-          err
+        :ok -> {:ok, etag}
+        {:error, _} = err -> err
       end
     else
-      # Brand-new shard: no object, so the pull wrote no temp. This used to `File.rm` the
-      # sidecar, which left every born-empty shard with NO PROVENANCE BY CONSTRUCTION — and
-      # "absent sidecar" was then read as "legacy file, adopt whatever etag the store holds
-      # now". That is the clobber the sidecar exists to prevent, reachable with no attacker at
-      # all (expert review 2026-08-01 #2):
-      #
-      #   node A opens a new shard and takes writes, dying before its first flush. The LB
-      #   reroutes to B, which serves, flushes (the object now EXISTS), idles and releases
-      #   cleanly. A comes back on a persisted :shard_data_dir, sees its local `.db`, reads
-      #   `:missing`, opens WARM, adopts the store's current etag — and its first flush
-      #   If-Matches successfully, destroying every write B acknowledged.
-      #
-      # So record the absence EXPLICITLY. `Provenance.no_object_sentinel/0` means "this file was
-      # created locally against no stored object", which is a provenance claim the open path can
-      # check (see Fork.evidence/2) rather than an absence it has to guess about.
-      Provenance.write_no_object(path)
-      {:ok, etag}
+      {:error, reason} ->
+        rm_pull_temp(path)
+        {:error, {:sidecar_write_failed, reason}}
     end
   end
 

@@ -80,10 +80,15 @@ defmodule Fathom.Shard.Provenance do
   # POSITIVE provenance claim rather than an absent sidecar (expert review 2026-08-01 #2).
   @no_object_sentinel "-"
 
-  @spec write_no_object(String.t()) :: :ok
+  @spec write_no_object(String.t()) :: :ok | {:error, File.posix()}
   def write_no_object(path), do: write(path, @no_object_sentinel)
 
-  @spec write(String.t(), String.t() | nil) :: :ok
+  # `:ok | {:error, posix}` (expert review 2026-11-07 #28). It always answered `:ok` and logged, so
+  # `promote_pull/3` renamed a pulled `.db` into place with a stale or ABSENT sidecar (ENOSPC right
+  # after a shard-sized pull is the realistic trigger) and a later warm open read `:corrupt` /
+  # `:missing` / `{:diverged, ..}` and quarantined a lineage-correct copy. The result is the
+  # caller's to act on: the open paths abort the open on `{:error, _}`.
+  @spec write(String.t(), String.t() | nil) :: :ok | {:error, File.posix()}
   def write(_path, nil), do: :ok
 
   def write(path, etag) do
@@ -108,8 +113,12 @@ defmodule Fathom.Shard.Provenance do
       end
 
     case Fathom.FS.write(sidecar_path(path), bytes) do
-      :ok -> :ok
-      {:error, reason} -> Logger.warning("etag sidecar write failed: #{inspect(reason)}")
+      :ok ->
+        :ok
+
+      {:error, reason} = error ->
+        Logger.warning("etag sidecar write failed: #{inspect(reason)}")
+        error
     end
   end
 
@@ -122,7 +131,7 @@ defmodule Fathom.Shard.Provenance do
   # one path durability.md documents as loss-free (disk intact). storage.ex applies this same
   # fsync+rename reasoning to every OBJECT file, but not to the file that decides whether the object
   # is trusted. Cost: two metadata ops and one fsync on a ~40-byte file, beside a full-object PUT.
-  @spec write_durable(String.t(), String.t() | nil) :: :ok
+  @spec write_durable(String.t(), String.t() | nil) :: :ok | {:error, File.posix()}
   def write_durable(_path, nil), do: :ok
 
   def write_durable(path, etag) do
@@ -132,8 +141,12 @@ defmodule Fathom.Shard.Provenance do
 
   defp durable_put(path, etag) do
     case put_record(path, etag, nil) do
-      :ok -> :ok
-      {:error, reason} -> Logger.warning("durable etag sidecar write failed: #{inspect(reason)}")
+      :ok ->
+        :ok
+
+      {:error, reason} = error ->
+        Logger.warning("durable etag sidecar write failed: #{inspect(reason)}")
+        error
     end
   end
 
@@ -168,7 +181,9 @@ defmodule Fathom.Shard.Provenance do
          :ok <- pwrite_nosync(sidecar, record) do
       :ok
     else
-      _no_record_or_failed -> durable_put(path, etag)
+      _no_record_or_failed ->
+        _ = durable_put(path, etag)
+        :ok
     end
   end
 
@@ -349,23 +364,37 @@ defmodule Fathom.Shard.Provenance do
     |> String.pad_leading(@crc_width, "0")
   end
 
+  # NEVER raises on a damaged record (expert review 2026-11-07 #70). The size guard alone is not
+  # shape: the separator at byte 168 and the newline at byte 177 lie OUTSIDE the CRC's coverage
+  # (it covers the 167-byte body), so damage to just those two bytes passed the guard and hit an
+  # unguarded binary match — a `MatchError` out of `read/1`, which crash-looped the open (`{:open_failed,
+  # %MatchError{}}` on every retry until an operator deleted `<id>.db.etag`) and killed the flush
+  # task in `record_intent_in_place/3` every interval. A record that does not parse is `:error`,
+  # which `read/1` maps to `:corrupt` (a recoverable quarantine, the safe direction) and
+  # `record_intent/2` leaves alone (the stamp after the PUT then rewrites the whole record).
   defp parse_record(bin) when byte_size(bin) == @record_size do
-    <<body::binary-size(@body_size), " ", crc::binary-size(@crc_width), "\n">> = bin
+    case bin do
+      <<body::binary-size(@body_size), " ", crc::binary-size(@crc_width), "\n">> ->
+        if crc_hex(body) == crc, do: parse_body(body), else: :error
 
-    if crc_hex(body) == crc, do: parse_body(body), else: :error
+      _damaged_separator_or_newline ->
+        :error
+    end
   end
 
   defp parse_record(_), do: :error
 
   defp parse_body(body) do
-    @record_magic <> rest = body
+    case body do
+      <<@record_magic, etag::binary-size(@etag_width), " ", intent::binary-size(@intent_width),
+        " ", prev::binary-size(@intent_width)>> ->
+        case String.trim_trailing(etag) do
+          "" -> :error
+          etag -> {:ok, etag, blank_nil(intent), blank_nil(prev)}
+        end
 
-    <<etag::binary-size(@etag_width), " ", intent::binary-size(@intent_width), " ",
-      prev::binary-size(@intent_width)>> = rest
-
-    case String.trim_trailing(etag) do
-      "" -> :error
-      etag -> {:ok, etag, blank_nil(intent), blank_nil(prev)}
+      _not_a_record_body ->
+        :error
     end
   end
 
@@ -398,11 +427,16 @@ defmodule Fathom.Shard.Provenance do
   def make_durable(path) do
     test_hook(:make_durable, path)
 
-    case read(path) do
-      {:ok, etag} -> write_durable(path, etag)
-      :no_object -> write_durable(path, @no_object_sentinel)
-      _ -> :ok
-    end
+    # The write's failure is logged by `durable_put/2`; there is no open to abort here (the first
+    # write is already acked), so the result is dropped.
+    _ =
+      case read(path) do
+        {:ok, etag} -> write_durable(path, etag)
+        :no_object -> write_durable(path, @no_object_sentinel)
+        _ -> :ok
+      end
+
+    :ok
   end
 
   # TEST SEAM (expert review 2026-10-17 #5): the durable sidecar writes now run OFF the coordinator

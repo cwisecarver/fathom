@@ -559,7 +559,7 @@ defmodule Fathom.Shard do
     # here globbed `<base>.{dl,snap,tmp,pull}*`, and `Path.wildcard` can't prefix-optimize
     # a `*`-in-filename pattern, so it full-`readdir`d the fleet-sized shard data dir on
     # EVERY open — tens-to-hundreds of ms at 30k–105k shards, re-paid on every idle
-    # re-open. A stale `.pull` would otherwise be adopted by promote_pull/2 as this
+    # re-open. A stale `.pull` would otherwise be adopted by promote_pull/3 as this
     # shard's db, so this direct-name reap is ALSO the pull's collision guard. The
     # uniquely-suffixed orphans (`.dl.*`/`.snap.*`/`.tmp.*` from externally-killed
     # pulls/snapshots — expert review round-2 #27) are swept amortized by
@@ -592,6 +592,33 @@ defmodule Fathom.Shard do
     # in favor of Storage.reap_named_temps/2 above — but the heap-shrink is the load-bearing
     # part at density, independent of that.)
     :erlang.garbage_collect()
+    # A surviving `.recovering` marker means the previous open died between installing the pulled
+    # object and finishing the peer ask, so the file on disk is an unvetted pull: purge it and open
+    # COLD, which recovers again (expert review 2026-10-13 #4). One stat per open.
+    _ = PromoteOnOpen.purge_if_recovering(path)
+
+    # The warm-vs-cold decision. `Fathom.FS.exists?/1` read ANY stat error as "no local file", and
+    # the cold pull then `rm`'d the dirty warm `.db` and its `-wal` (`Materializer.promote_pull/3`
+    # removes whatever sits at the path before landing the pulled object) — acked-unflushed tenant
+    # writes destroyed by an EIO/EACCES/ESTALE at exactly this stat (expert review 2026-11-07 #21).
+    # Only a definite ENOENT is "cold"; an indeterminate stat fails the open BEFORE the lease and
+    # before any pull, so nothing is held and nothing is touched. Same stance as every other open
+    # failure: `{:shutdown, _}`, the `:transient` child is not restarted, the client retries.
+    case Fathom.FS.presence(path) do
+      {:error, reason} ->
+        Logger.error(
+          "shard #{shard_id}: cannot tell whether a local copy exists (stat of #{path} failed: " <>
+            "#{inspect(reason)}); refusing to open rather than risk a cold pull over a dirty copy"
+        )
+
+        {:stop, {:shutdown, {:local_stat_failed, reason}}, state}
+
+      presence ->
+        open_coordinator_stat_ok(state, shard_id, path, open_started, presence == :present)
+    end
+  end
+
+  defp open_coordinator_stat_ok(state, shard_id, path, open_started, file?) do
     # node()#<boot nonce> — boot-scoped lease identity (expert review #6): a lock
     # left by a previous incarnation of this node name is a FOREIGN owner, so it is
     # stolen (liveness check + epoch bump), never silently reclaimed at the same
@@ -621,11 +648,8 @@ defmodule Fathom.Shard do
     # so every quarantine/adopt branch is unchanged. The rare diverged-warm case now pulls
     # sequentially after the acquire instead of overlapped — the common warm path drops to
     # 2 RTTs (the post-lease re-check stays: it is the release-in-gap authority, round-2 #19).
-    # A surviving `.recovering` marker means the previous open died between installing the pulled
-    # object and finishing the peer ask, so the file on disk is an unvetted pull: purge it and open
-    # COLD, which recovers again (expert review 2026-10-13 #4). One stat per open.
-    _ = PromoteOnOpen.purge_if_recovering(path)
-    file? = Fathom.FS.exists?(path)
+    # `file?` was decided by the stat in `open_coordinator_claimed/4`, which also ran the
+    # `.recovering` purge first.
     # Gathers evidence only — the verdict is `resolve_fork/4`, after the lease is held. See
     # `fork_evidence/2`: this HEAD races the steal-touch that `acquire_lease` performs, so a
     # decision made here can mistake our own touch for a fork.
@@ -657,7 +681,7 @@ defmodule Fathom.Shard do
         # exit in between strands it. The comment on `fork_task` above describes this hazard
         # precisely and review 2026-08-01 #33 fixed ONE instance of it (a raise inside
         # `fork_evidence/2`) by rescuing inside that Task. The class survived: `resolve_fork/4`,
-        # `revalidate_takeover/5` and `promote_pull/2` all run storage/File calls DIRECTLY in this
+        # `revalidate_takeover/5` and `promote_pull/3` all run storage/File calls DIRECTLY in this
         # process, unrescued. `start_pull/2` is rescued and returns `{:error, _}`, which reaches
         # the `else` branch of `open_with_lease/8` and releases — but a raise from the coordinator's
         # own HEAD (`Req.TransportError` under load is the realistic trigger) does not.
@@ -1481,15 +1505,13 @@ defmodule Fathom.Shard do
         # contract.
         case Provenance.read(path) do
           {:ok, provenance} when is_binary(pre) and provenance == pre ->
-            Provenance.write(path, post)
-            {:ok, post}
+            adopt_provenance(path, post, :durable)
 
           # The touch's ORIGIN (expert review 2026-10-12 #10): `pre` was itself only a clean
           # visitor's touch of this file's provenance, recorded in the marker we stole — the same
           # bytes, so the same argument as the clause above.
           {:ok, provenance} when is_binary(origin) and provenance == origin ->
-            Provenance.write(path, post)
-            {:ok, post}
+            adopt_provenance(path, post, :durable)
 
           # Finding #6: a never-flushed local shard carries the `-` (no object) sidecar. If this
           # node crashed before this shard's first flush and restarted on the same disk, its OWN
@@ -1501,8 +1523,7 @@ defmodule Fathom.Shard do
           # clause. Without it the tenant's acked, fsynced writes are quarantined and an EMPTY db is
           # served on a same-node restart, on the one path where the disk is intact.
           :no_object when is_nil(pre) ->
-            Provenance.write(path, post)
-            {:ok, post}
+            adopt_provenance(path, post, :durable)
 
           _ ->
             if Fork.quarantine!(shard_id, path, :diverged) == :ok do
@@ -1528,13 +1549,43 @@ defmodule Fathom.Shard do
       # `etag == pre` unambiguously means the pre-touch object. Only reachable on the cold
       # (non-warm) takeover path — the warm clause above catches warm? == true first.
       is_binary(pre) and etag == pre ->
-        Provenance.write(path, post)
-        {:ok, post}
+        # A COLD pull (no local acked writes), so the plain write — but its failure still fails the
+        # open (expert review 2026-11-07 #28): the pulled `.db` is already in place beside the
+        # sidecar naming the PRE-touch etag.
+        adopt_provenance(path, post, :plain)
 
       true ->
         # A cold pull that raced the touch captured pre-touch bytes from a diverged
         # lineage (etag != pre — a zombie flush landed before the touch): re-pull.
         repull(shard_id, path)
+    end
+  end
+
+  # Adopt the post-touch / current etag as THIS open's provenance, and FAIL THE OPEN if the sidecar
+  # cannot be written (expert review 2026-11-07 #28). Both halves were wrong: the result was
+  # ignored, and a WARM takeover replaced the previous DURABLE record with a plain `write_file`
+  # (open + O_TRUNC + write, no fsync) while the file is dirty from the previous life. The first-write
+  # `make_durable` runs only on `:became_dirty`, so a read-only reopen kept the downgraded sidecar
+  # until the next flush tick, and an OS crash there left an empty/torn one — `:corrupt` → a
+  # self-inflicted false fork that quarantines acked writes existing only locally (and on replicas).
+  #
+  #   * `:durable` — a warm copy that may hold acked writes: `write_durable/2` (in-place pwrite +
+  #     fsync when the file already holds a record, temp+rename once for a legacy one). Takeover
+  #     opens are rare, so this is off the +24-28% cold_open_p50 that motivated the plain write.
+  #   * `:plain` — a cold pull, nothing acked locally: the cheap write stays.
+  #
+  # An open that fails here releases the lease with the clean-touch marker (`open_with_lease/9`'s
+  # `else`), so the retry cannot loop on a half-adopted state.
+  defp adopt_provenance(path, etag, mode) do
+    result =
+      case mode do
+        :durable -> Provenance.write_durable(path, etag)
+        :plain -> Provenance.write(path, etag)
+      end
+
+    case result do
+      :ok -> {:ok, etag}
+      {:error, reason} -> {:error, {:sidecar_write_failed, reason}}
     end
   end
 
@@ -1591,8 +1642,7 @@ defmodule Fathom.Shard do
         {:ok, nil}
 
       {:ok, current} when warm? ->
-        Provenance.write(path, current)
-        {:ok, current}
+        adopt_provenance(path, current, :durable)
 
       {:ok, _newer} ->
         repull(shard_id, path)
@@ -1607,12 +1657,13 @@ defmodule Fathom.Shard do
   defp repull(shard_id, path) do
     result =
       case Storage.pull(shard_id, Materializer.pull_temp(path)) do
-        # `promote_pull/2` already distinguishes the two by checking whether the temp exists, so
-        # both shapes route through it: bytes ⇒ promote + stamp the object's etag as provenance;
-        # no bytes ⇒ the born-empty branch, which stamps the "no object" sentinel sidecar. The
-        # fence etag is carried through either way (expert review 2026-08-01 #24).
-        {:ok, new_etag} -> Materializer.promote_pull(path, new_etag)
-        {:absent, new_etag} -> Materializer.promote_pull(path, new_etag)
+        # `promote_pull/3` takes the pull's REPORT as a fact rather than re-deriving it from the
+        # temp's presence: bytes ⇒ promote + stamp the object's etag as provenance (a missing temp
+        # is an error, never "brand-new"); no bytes ⇒ the born-empty branch, which stamps the "no
+        # object" sentinel sidecar. The fence etag is carried through either way (expert review
+        # 2026-08-01 #24; expert review 2026-11-07 #9).
+        {:ok, new_etag} -> Materializer.promote_pull(path, new_etag, :bytes)
+        {:absent, new_etag} -> Materializer.promote_pull(path, new_etag, :absent)
         {:error, reason} -> {:error, {:revalidate_failed, reason}}
       end
 
@@ -1668,7 +1719,7 @@ defmodule Fathom.Shard do
   end
 
   # The pull / warm-promotion / open-materialization path moved to `Fathom.Shard.Materializer`
-  # (2026-09-13, Phase 4): start_pull/2, await_pull/3, promote_pull/2, abandon_pull/2, pull_temp/1
+  # (2026-09-13, Phase 4): start_pull/2, await_pull/3, promote_pull/3, abandon_pull/2, pull_temp/1
   # (public), and rm_pull_temp (private). It is the concern that blocks on the S3 GET.
 
   # Best-effort, mirroring Heartbeat.broadcast_lapse: a missing PubSub (the
@@ -2618,7 +2669,11 @@ defmodule Fathom.Shard do
       # `:ok` rather than an error, and it is sound: every write goes through SQLite to
       # `state.path`, so no file means no writes landed. The dirty flag here is a conservative
       # UNKNOWN, not evidence of anything to upload.
-      not Fathom.FS.exists?(state.path) ->
+      # `presence/1 == :absent`, not `not exists?/1` (expert review 2026-11-07 #21): an
+      # indeterminate stat must NOT settle flush waiters as "nothing to make durable" — a
+      # fork-before-flush caller would proceed over unflushed writes. It falls through to the flush,
+      # which fails loudly if the file really is unreadable.
+      Fathom.FS.presence(state.path) == :absent ->
         {:noreply, schedule_flush(settle_waiters(state, :nothing_to_flush))}
 
       true ->
@@ -3877,7 +3932,7 @@ defmodule Fathom.Shard do
             # not quarantining is correct and must stay, so re-tagging means changing a value two
             # paths agree on to fix one of them. The guard is local to the path that differs.
             {:error, {:corrupt_local, reason}} ->
-              if Fathom.FS.exists?(state.path),
+              if Fathom.FS.presence(state.path) != :absent,
                 do: Integrity.quarantine_corrupt!(state.path, state.id, reason)
 
               # Nothing was stamped, so keep the lineage claim (expert review 2026-10-12 #3).

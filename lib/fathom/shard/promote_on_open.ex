@@ -512,8 +512,11 @@ defmodule Fathom.Shard.PromoteOnOpen do
   #     unoverridable (`Promote.fresher?(_, nil)`), so "no bytes", not "no stamp", is the test. It
   #     is also backend-neutral: S3 leaves a steal sentinel with no position, Local leaves nothing.
   defp absent_takeover?(stamp, path, lease) do
+    # `presence/1 == :absent`: an indeterminate stat is not "no local file" (expert review
+    # 2026-11-07 #21) — promoting a peer's replica over a local copy that may hold acked writes is
+    # the clobber the third condition exists to prevent.
     not Recovery.rankable_stamp?(stamp) and took_from_another_holder?(lease, lease.owner) and
-      not Fathom.FS.exists?(path)
+      Fathom.FS.presence(path) == :absent
   end
 
   # THE RESURRECTION GUARD for `absent_takeover?/3`. A purged tenant has no object either, and a
@@ -712,7 +715,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
                  Position.lineage_to_store(lineage)
                )
              end) do
-        # SIDECAR FIRST, like `Materializer.promote_pull/2` (expert review 2026-10-12 #22). Writing the
+        # SIDECAR FIRST, like `Materializer.promote_pull/3` (expert review 2026-10-12 #22). Writing the
         # sidecar AFTER the rename left a crash window: the live `.db` is the promoted bytes while the
         # sidecar still names the pre-promotion etag, which the next open reads as a divergence
         # (`Fork.resolve` → `:fork`), quarantining a shard-sized copy that equals the object and
@@ -723,7 +726,19 @@ defmodule Fathom.Shard.PromoteOnOpen do
         # the promoted object is already published and a cold open pulls exactly those bytes.
         # (The pre-promotion `.db` is already ASIDE — `publish_promoted/6` — so there is nothing
         # live to remove here; expert review 2026-10-13 #22.)
-        Provenance.write(path, new_etag)
+        #
+        # The write's result gates the rename (expert review 2026-11-07 #28): landing the promoted
+        # bytes beside a stale or absent sidecar is the false fork this ordering exists to prevent.
+        # Raising routes to `abandon_open/5` exactly like the failed rename below.
+        case Provenance.write(path, new_etag) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            raise "shard #{shard_id}: promoted object published but its provenance sidecar could " <>
+                    "not be written (#{inspect(reason)}); refusing to land it beside a stale sidecar"
+        end
+
         before_promote_rename(path)
 
         case Fathom.FS.rename(temp, path) do
