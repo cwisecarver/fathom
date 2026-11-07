@@ -198,14 +198,12 @@ defmodule Fathom.Shard.Storage.S3 do
     probe_status!(key, [{"if-none-match", "*"}], [412], "If-None-Match enforcement")
 
     # A fenced PUT against a MISSING key must also be refused: AWS answers 404 NoSuchKey, others
-    # 412. `flush/6` maps both to :superseded (expert review 2026-10-12 #22); a store answering 2xx
-    # here would let a fenced flush resurrect a purged object.
-    probe_status!(
-      key <> ".absent",
-      [{"if-match", ~s("fathom-bogus-etag")}],
-      [404, 412],
-      "If-Match on a missing key"
-    )
+    # 412. `flush/6` and `put_lock` map both to :superseded / :precondition_failed (expert review
+    # 2026-10-12 #22) — but a 404 only when the body says `<Code>NoSuchKey</Code>` (expert review
+    # 2026-11-07 #11), so the probe must hold the store to the SAME predicate: a bare or
+    # differently-coded 404 would boot healthy and then never self-fence a deposed owner. A store
+    # answering 2xx here would let a fenced flush resurrect a purged object.
+    probe_fenced_put_missing_key!(key <> ".absent")
 
     # Round-2 #4: the steal fence is only real if a touch produces a GENUINELY new
     # etag — on MD5-etag stores a plain self-copy does NOT rotate (same bytes, same
@@ -473,6 +471,42 @@ defmodule Fathom.Shard.Storage.S3 do
                   "conditional writes the single-writer lease and flush fence depend on — " <>
                   "refusing to boot (expert review #16)."
         end
+
+      {:error, reason} ->
+        raise "shard storage fence self-test unreachable (#{label}): #{inspect(reason)}. " <>
+                "Refusing to boot with an unverified fence (expert review #16)."
+    end
+  end
+
+  # The missing-key sibling of probe_status!/4: 412 passes, and 404 passes ONLY when the error
+  # document is `NoSuchKey` — the exact verdict `flush/6` and `put_lock` act on (`no_such_key?/1`).
+  defp probe_fenced_put_missing_key!(key) do
+    label = "If-Match on a missing key"
+
+    case Req.put(req(),
+           url: url_path(key),
+           body: "fathom-fence-probe",
+           headers: [{"if-match", ~s("fathom-bogus-etag")}]
+         ) do
+      {:ok, %{status: 412}} ->
+        :ok
+
+      {:ok, %{status: 404, body: body}} ->
+        if no_such_key?(body) do
+          :ok
+        else
+          raise "shard storage fence self-test failed (#{label}): the store answered 404 " <>
+                  "WITHOUT a <Code>NoSuchKey</Code> error document (bare or differently coded, " <>
+                  "e.g. NoSuchBucket). Runtime treats a fenced-PUT 404 as a superseded lease " <>
+                  "only for NoSuchKey, so a deposed owner on this store would never self-fence — " <>
+                  "refusing to boot (expert review 2026-11-07 #11)."
+        end
+
+      {:ok, %{status: s}} ->
+        raise "shard storage fence self-test failed (#{label}): expected 412 or 404 " <>
+                "NoSuchKey, got #{s}. This store does not enforce the conditional writes the " <>
+                "single-writer lease and flush fence depend on — refusing to boot " <>
+                "(expert review #16)."
 
       {:error, reason} ->
         raise "shard storage fence self-test unreachable (#{label}): #{inspect(reason)}. " <>

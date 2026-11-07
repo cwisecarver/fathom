@@ -5,8 +5,8 @@ defmodule Fathom.Shard.Storage.S3FencedPut404Test do
   a fenced flush against a purged object surfaced `{:s3_put_status, 404}` — a generic transient
   error — instead of the self-fence/reconcile verdict. The invariant: a fenced (If-Match) PUT
   answered 404 is `:superseded`; a create-only (If-None-Match) PUT answered 404 (missing bucket)
-  stays a plain error. The boot probe accepts 404 or 412 for a fenced PUT to a missing key and
-  refuses a store that accepts it.
+  stays a plain error. The boot probe accepts 412, or 404 only with a `NoSuchKey` error document
+  (the runtime's own predicate), for a fenced PUT to a missing key, and refuses anything else.
 
   The in-process doubles (`Storage.Local`, hence `FaultyStorage`) already model the missing-object
   fenced flush as `:superseded` (`expected_etag != current`), so this S3-wire case is the one only
@@ -83,17 +83,64 @@ defmodule Fathom.Shard.Storage.S3FencedPut404Test do
     assert {:error, {:s3_put_status, 404}} = S3.flush("shard_x", tmp, nil)
   end
 
+  # Expert review 2026-11-07 #11 follow-up: the probe accepted ANY 404 here, but the runtime maps
+  # a fenced-PUT 404 to a self-fence verdict only for NoSuchKey. A store answering a bare or
+  # differently-coded 404 booted healthy and its deposed owners never self-fenced. The first test
+  # here previously answered a BARE 404 and expected boot to pass — it pinned the defect.
   describe "boot probe: If-Match on a missing key" do
-    test "accepts a store that answers 404 (AWS)" do
+    defp absent_put?(conn),
+      do: conn.method == "PUT" and String.ends_with?(conn.request_path, ".absent")
+
+    test "accepts a store that answers 404 NoSuchKey (AWS)" do
       store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
 
       put_s3_config(fn conn ->
-        if conn.method == "PUT" and String.ends_with?(conn.request_path, ".absent"),
-          do: Plug.Conn.send_resp(conn, 404, ""),
+        if absent_put?(conn),
+          do: Plug.Conn.send_resp(conn, 404, S3EtagStore.error_body("NoSuchKey")),
           else: S3EtagStore.serve(conn, store)
       end)
 
       assert S3.verify_conditional_writes!() == :ok
+    end
+
+    test "accepts a store that answers 412" do
+      store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
+
+      put_s3_config(fn conn ->
+        if absent_put?(conn),
+          do: Plug.Conn.send_resp(conn, 412, S3EtagStore.error_body("PreconditionFailed")),
+          else: S3EtagStore.serve(conn, store)
+      end)
+
+      assert S3.verify_conditional_writes!() == :ok
+    end
+
+    test "refuses a store that answers a bare 404 (runtime would not self-fence)" do
+      store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
+
+      put_s3_config(fn conn ->
+        if absent_put?(conn),
+          do: Plug.Conn.send_resp(conn, 404, ""),
+          else: S3EtagStore.serve(conn, store)
+      end)
+
+      assert_raise RuntimeError, ~r/If-Match on a missing key.*WITHOUT a <Code>NoSuchKey/s, fn ->
+        S3.verify_conditional_writes!()
+      end
+    end
+
+    test "refuses a store that answers 404 with a different code (NoSuchBucket)" do
+      store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
+
+      put_s3_config(fn conn ->
+        if absent_put?(conn),
+          do: Plug.Conn.send_resp(conn, 404, S3EtagStore.error_body("NoSuchBucket")),
+          else: S3EtagStore.serve(conn, store)
+      end)
+
+      assert_raise RuntimeError, ~r/If-Match on a missing key.*WITHOUT a <Code>NoSuchKey/s, fn ->
+        S3.verify_conditional_writes!()
+      end
     end
 
     test "refuses a store that lets a fenced PUT create a missing key" do
