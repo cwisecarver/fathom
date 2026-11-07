@@ -125,6 +125,30 @@ defmodule FathomWeb.Api.TenantController do
     |> Map.take(["snapshot", "snapshot_id", "scope", "label", "force"])
     |> Enum.reject(fn {_k, v} -> is_nil(v) end)
     |> Map.new()
+    |> put_fork_detail(conn)
+  end
+
+  # A fork is the cheapest whole-tenant exfiltration for a `manage` key — the data is readable with
+  # the freshly minted `dst` token — yet the row recorded only the SOURCE (`shard_id`), so "who
+  # copied tenant X, and to which id?" was unanswerable (expert review 2026-11-07 #39). The
+  # destination is an id, never a credential, and is recorded only once `Fathom.ShardId.cast/1` accepts it
+  # (canonical form, so `ACME` and `acme` read the same): the request body is attacker-controlled,
+  # and an unvalidated string must not ride into the audit table. `to` is `fork/2`'s alias for
+  # `dst`. An id the cast refuses is simply absent (the row's outcome is `error` anyway).
+  defp put_fork_detail(detail, conn) do
+    if action_name(conn) == :fork do
+      detail =
+        case Fathom.ShardId.cast(conn.params["dst"] || conn.params["to"]) do
+          {:ok, dst} -> Map.put(detail, "dst", dst)
+          :error -> detail
+        end
+
+      if truthy?(conn.params["flush_source"]),
+        do: Map.put(detail, "flush_source", true),
+        else: detail
+    else
+      detail
+    end
   end
 
   # POST /api/tenants  {"shard_id": "acme"}

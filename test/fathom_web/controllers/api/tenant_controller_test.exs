@@ -286,6 +286,63 @@ defmodule FathomWeb.Api.TenantControllerTest do
               |> post("/api/tenants/api_fs_fl/fork", %{dst: "api_fd_fl", flush_source: true})).status ==
                404
     end
+
+    # Expert review 2026-11-07 #39. The fork's audit row recorded only the SOURCE (`shard_id`): `dst`,
+    # `to` and `flush_source` were not in the detail allow-list, and `Tenants.fork` writes no audit
+    # of its own — so "who copied tenant X, and to which id?" was unanswerable, for the cheapest
+    # whole-tenant exfiltration a `manage` key has. The destination is an id, so it is recorded —
+    # canonical, and only once `ShardId.cast/1` accepts it.
+    test "the audit row records the fork DESTINATION, canonicalised (#39)", %{conn: conn} do
+      src = "api_audit_src_#{System.unique_integer([:positive])}"
+      put_shard(src)
+
+      # No stored object -> 404, but the attempt is audited with its destination all the same.
+      assert (conn
+              |> auth()
+              |> post("/api/tenants/#{src}/fork", %{dst: "API_Audit_DST", flush_source: true})).status ==
+               404
+
+      assert [row] = Fathom.Audit.list(shard_id: src)
+      assert row.action == "fork"
+      assert row.outcome == "error"
+      assert row.detail["dst"] == "api_audit_dst"
+      assert row.detail["flush_source"] == true
+    end
+
+    test "`to` is `dst`'s alias in the audit too", %{conn: conn} do
+      src = "api_audit_to_#{System.unique_integer([:positive])}"
+      put_shard(src)
+
+      conn |> auth() |> post("/api/tenants/#{src}/fork", %{to: "api_audit_to_dst"})
+
+      assert [%{detail: %{"dst" => "api_audit_to_dst"}}] = Fathom.Audit.list(shard_id: src)
+    end
+
+    test "an invalid destination is NOT written into the audit table", %{conn: conn} do
+      src = "api_audit_bad_#{System.unique_integer([:positive])}"
+      put_shard(src)
+      hostile = "x'); DROP TABLE audit_events; -- " <> String.duplicate("z", 500)
+
+      assert (conn |> auth() |> post("/api/tenants/#{src}/fork", %{dst: hostile})).status == 400
+
+      assert [row] = Fathom.Audit.list(shard_id: src)
+
+      refute Map.has_key?(row.detail, "dst"),
+             "an unvalidated, attacker-controlled string was audited"
+
+      refute Map.has_key?(row.detail, "flush_source")
+    end
+
+    test "only a fork audits a destination: another action's `dst` param is not recorded", %{
+      conn: conn
+    } do
+      id = "api_audit_flush_#{System.unique_integer([:positive])}"
+      put_shard(id)
+
+      conn |> auth() |> post("/api/tenants/#{id}/flush", %{dst: "someone_else"})
+
+      for row <- Fathom.Audit.list(shard_id: id), do: refute(Map.has_key?(row.detail, "dst"))
+    end
   end
 
   describe "snapshots + restore (PITR, #12)" do
