@@ -208,6 +208,84 @@ defmodule Fathom.Shard.Storage.StealWatchTest do
     assert Storage.steal_watch_window_ms() == ttl + 5_000
   end
 
+  # Expert review 2026-11-07 #60. A steal whose touch fails rolls the lock back by REWRITING it
+  # (`{dead owner, epoch + 2}`, new etag), and the watch keys on the lock's fingerprint, so our own
+  # rollback restarted the run: the retry the rollback exists to enable then waited a further full
+  # window (35 s in prod) for a hold this node had already watched sit unchanged for the whole one.
+  # The rollback now carries the watch across the rewrite — and ONLY the lock half of its key: the
+  # owner's heartbeat and any other change to the lock still restart it.
+  describe "a failed steal-touch's rollback" do
+    defp start_dead_store do
+      now = Storage.now_ms()
+      store = start_store(now, now - 120_000, now - 120_000)
+      # Assert the fixture is the one we named: a hold this node has to WATCH before it may steal.
+      assert S3.lease_holder(@shard) == {:held, @owner}
+      store
+    end
+
+    defp fail_next_touch(store) do
+      id = S3EtagStore.inject(store, %{method: "PUT", key: @data_key}, {:status, 500})
+      id
+    end
+
+    defp watched_and_touch_failed(store) do
+      assert {:error, {:held, @owner, _}} = S3.acquire_lease(@shard, "thief@node#inc2", 30_000)
+      age_watch(@window)
+      touch = fail_next_touch(store)
+
+      assert {:error, {:transient_lookup, {:touch_failed, _}}} =
+               S3.acquire_lease(@shard, "thief@node#inc2", 30_000)
+
+      assert S3EtagStore.fired(store, touch) == 1, "the touch fault never fired"
+
+      lock = Jason.decode!(S3EtagStore.body_of(store, @lock_key))
+
+      assert lock["owner"] == @owner and lock["epoch"] == 7,
+             "fixture: the steal was not rolled back"
+    end
+
+    test "does not restart the watch: the retry is not made to wait a second window" do
+      store = start_dead_store()
+      watched_and_touch_failed(store)
+
+      assert {:ok, %{took_over: true, epoch: 8}} =
+               S3.acquire_lease(@shard, "thief@node#inc2", 30_000),
+             "the rollback restarted the clock-free watch: a transient touch failure cost the " <>
+               "retry a further full window"
+    end
+
+    test "still restarts it when the owner's HEARTBEAT moves" do
+      store = start_dead_store()
+      watched_and_touch_failed(store)
+
+      put_object(
+        store,
+        @hb_key,
+        Storage.encode_heartbeat(%{owner: @owner, expires_at_ms: Storage.now_ms() - 119_000})
+      )
+
+      assert {:error, {:held, @owner, _}} = S3.acquire_lease(@shard, "thief@node#inc2", 30_000),
+             "a renewing owner must restart the watch even across our own rollback"
+    end
+
+    test "still restarts it when the lock is rewritten by anyone else" do
+      store = start_dead_store()
+      watched_and_touch_failed(store)
+
+      put_object(
+        store,
+        @lock_key,
+        Storage.encode_lease(%{
+          owner: @owner,
+          epoch: 7,
+          expires_at_ms: Storage.now_ms() - 119_000
+        })
+      )
+
+      assert {:error, {:held, @owner, _}} = S3.acquire_lease(@shard, "thief@node#inc2", 30_000)
+    end
+  end
+
   describe "watch_since/3" do
     test "an unchanged fingerprint keeps its start" do
       assert Storage.watch_since({:fp, 100}, :fp, 900) == {100, false}

@@ -29,7 +29,12 @@ defmodule Fathom.Test.S3EtagStore do
       seq: 0,
       # Optional: the epoch-ms this store reports as its response `Date` (the store's own clock). nil ⇒
       # no Date header, so callers fall back to their local clock. Used to model clock skew (#13).
-      date_ms: nil
+      date_ms: nil,
+      # Injected faults (`inject/4`), the ids they have fired under, and the status a conditional
+      # PUT against a missing key answers (`set_missing_if_match_status/2`).
+      faults: [],
+      fired: %{},
+      missing_if_match: 412
     }
   end
 
@@ -112,6 +117,23 @@ defmodule Fathom.Test.S3EtagStore do
   def serve(%Plug.Conn{} = conn, agent) do
     {:ok, body, conn} = read_full_body(conn, "")
     key = strip_bucket(conn.request_path)
+
+    case take_fault(agent, conn, key) do
+      nil ->
+        dispatch(conn, agent, key, body)
+
+      %{apply: false} = fault ->
+        fault_response(conn, fault.response)
+
+      # APPLY-THEN-FAIL: the store does the work, the caller is told something else. The handler's
+      # own response is discarded, which is the whole point.
+      %{apply: true} = fault ->
+        _ = dispatch(conn, agent, key, body)
+        fault_response(conn, fault.response)
+    end
+  end
+
+  defp dispatch(conn, agent, key, body) do
     query = URI.decode_query(conn.query_string || "")
 
     cond do
@@ -159,6 +181,111 @@ defmodule Fathom.Test.S3EtagStore do
         Plug.Conn.send_resp(conn, 500, "unexpected #{conn.method} #{conn.request_path}")
     end
   end
+
+  # --- injected faults (expert review 2026-11-07, test-harness-fidelity #5 / s3-storage #7) ---
+
+  @doc """
+  Arms a fault: the next request(s) matching `match` get `response` instead of the store's own.
+
+  Exists because the double could not express the failures a real store produces AROUND a write.
+  Every fault the suite injected before failed BEFORE the write applied (or was a bespoke wrapper
+  around `serve/2` in one test file), so a PUT that LANDED while its reply was lost — Req never
+  retries a PUT, a reset connection and a 5xx from a store that applied it are both real — was
+  inexpressible, and with it the whole class of bugs that live in the gap (a steal whose lock write
+  landed, a lease create that landed, a conditional write answered 404/409 by AWS).
+
+  `match` is a map; every key must hold for the request:
+
+    * `:method` — `"GET" | "HEAD" | "PUT" | "DELETE" | "POST"`
+    * `:key` — the bucket-stripped object key (`"shard.lock"`)
+    * `:cond` — `:if_match` (the request carries `If-Match`) or `:if_none_match`
+    * `:after` — a fault id from an earlier `inject/4`: matches only once THAT fault has fired, which
+      is how a test stages "the write landed, and from then on reads fail"
+
+  `response` is `{:transport_error, reason}` (a lost reply: `:timeout`, `:closed`, …),
+  `{:status, code}` or `{:status, code, body}` (`error_body/2` builds an AWS error document).
+
+  Options: `apply: true` makes the store PERFORM the request first and discard its own response
+  (default `false`: the request is refused and changes nothing); `times: n | :infinity` (default 1).
+
+  Returns an id for `fired/2`. A test whose fault never fired exercised the happy path, so assert it.
+  """
+  def inject(agent, match, response, opts \\ []) when is_map(match) do
+    fault = %{
+      id: System.unique_integer([:positive]),
+      match: match,
+      response: response,
+      apply: Keyword.get(opts, :apply, false),
+      times: Keyword.get(opts, :times, 1)
+    }
+
+    Agent.update(agent, &%{&1 | faults: &1.faults ++ [fault]})
+    fault.id
+  end
+
+  @doc "How many times the fault `id` (from `inject/4`) has fired."
+  def fired(agent, id), do: Agent.get(agent, &Map.get(&1.fired, id, 0))
+
+  @doc "Disarms every fault that has not fired out."
+  def clear_faults(agent), do: Agent.update(agent, &%{&1 | faults: []})
+
+  @doc """
+  What a conditional PUT (`If-Match`) against a key that does NOT exist answers: `412` (MinIO, and
+  the default, since most of the suite predates this) or `404` (AWS S3: `NoSuchKey`). The repo's own
+  contract — `S3.flush/6`'s fenced-PUT 404, the boot probe accepting either — is that a real store
+  may say 404, so a test of a path that reads that status must be able to ask for it.
+  """
+  def set_missing_if_match_status(agent, status) when status in [404, 412],
+    do: Agent.update(agent, &%{&1 | missing_if_match: status})
+
+  @doc """
+  An AWS-shaped error document, the way real S3 answers: `<Error><Code>NoSuchKey</Code>…`. A 404 is
+  `NoSuchKey` for a missing object and `NoSuchBucket` for a missing bucket, and only the body tells
+  them apart.
+  """
+  def error_body(code, message \\ "injected by S3EtagStore"),
+    do:
+      ~s(<?xml version="1.0" encoding="UTF-8"?><Error><Code>#{code}</Code><Message>#{message}</Message></Error>)
+
+  defp take_fault(agent, conn, key) do
+    Agent.get_and_update(agent, fn
+      %{faults: []} = s ->
+        {nil, s}
+
+      %{faults: faults, fired: fired} = s ->
+        case Enum.split_while(faults, &(not fault_matches?(&1.match, conn, key, fired))) do
+          {_, []} ->
+            {nil, s}
+
+          {before, [fault | rest]} ->
+            left =
+              case fault.times do
+                :infinity -> [fault | rest]
+                1 -> rest
+                n -> [%{fault | times: n - 1} | rest]
+              end
+
+            {fault,
+             %{s | faults: before ++ left, fired: Map.update(s.fired, fault.id, 1, &(&1 + 1))}}
+        end
+    end)
+  end
+
+  defp fault_matches?(match, conn, key, fired) do
+    Enum.all?(match, fn
+      {:method, method} -> conn.method == method
+      {:key, k} -> key == k
+      {:cond, :if_match} -> Plug.Conn.get_req_header(conn, "if-match") != []
+      {:cond, :if_none_match} -> Plug.Conn.get_req_header(conn, "if-none-match") != []
+      {:after, id} -> Map.get(fired, id, 0) > 0
+    end)
+  end
+
+  defp fault_response(conn, {:transport_error, reason}),
+    do: Req.Test.transport_error(conn, reason)
+
+  defp fault_response(conn, {:status, code}), do: Plug.Conn.send_resp(conn, code, "")
+  defp fault_response(conn, {:status, code, body}), do: Plug.Conn.send_resp(conn, code, body)
 
   # --- handlers ---
 
@@ -260,7 +387,11 @@ defmodule Fathom.Test.S3EtagStore do
         if_none_match == ["*"] and current != nil ->
           {{412, nil}, s}
 
-        if_match != [] and (current == nil or hd(if_match) != etag(current)) ->
+        # A conditional PUT against a key that is not there: AWS says 404 NoSuchKey, MinIO 412.
+        if_match != [] and current == nil ->
+          {{s.missing_if_match, nil}, s}
+
+        if_match != [] and hd(if_match) != etag(current) ->
           {{412, nil}, s}
 
         true ->
@@ -271,6 +402,13 @@ defmodule Fathom.Test.S3EtagStore do
     |> case do
       {200, new_etag} ->
         conn |> Plug.Conn.put_resp_header("etag", new_etag) |> Plug.Conn.send_resp(200, "")
+
+      {404, _} ->
+        Plug.Conn.send_resp(
+          conn,
+          404,
+          error_body("NoSuchKey", "The specified key does not exist.")
+        )
 
       {412, _} ->
         Plug.Conn.send_resp(conn, 412, "")

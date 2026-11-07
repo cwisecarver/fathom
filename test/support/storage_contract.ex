@@ -226,6 +226,22 @@ defmodule Fathom.Test.StorageContract do
         end
       end
 
+      describe "#{inspect(unquote(backend))} — a takeover lease says what it took over" do
+        test "took_over, prev_owner and the marker's last holder reach the lease" do
+          # The coordinator's takeover decisions (promote-on-open's absent-object ask and warm
+          # skip, the recovery responder floor) key on exactly these fields.
+          id = sid("takeover")
+          {:ok, first} = @backend.acquire_lease(id, "a@node#1", 30_000)
+          :ok = @backend.release_lease_keeping_claim(id, first, nil)
+
+          assert {:ok, lease} = @backend.acquire_lease(id, "b@node#2", 30_000)
+          assert lease.took_over == true
+          assert lease.prev_owner == Fathom.Shard.Storage.released_owner()
+          assert lease.released_by == "a@node#1"
+          assert Fathom.Shard.Storage.floor_owner(lease) == "a@node#1"
+        end
+      end
+
       describe "#{inspect(unquote(backend))} — the copy primitives" do
         test "fork_shard refuses an absent source and an occupied destination" do
           assert {:error, :no_source} = @backend.fork_shard(sid("nosrc"), sid("dst"))

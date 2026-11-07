@@ -110,7 +110,13 @@ defmodule Fathom.Shard.Storage do
           # A fresh create that followed a 412 on a lock which then vanished (S3 `acquire_existing/4`
           # `:not_found`): a holder released mid-acquire, so the open re-checks its pre-lease pull
           # (expert review 2026-10-17 #1). Client-side only, never serialized.
-          optional(:recreated) => true
+          optional(:recreated) => true,
+          # An INTERRUPTED STEAL, written in the same single PUT as the steal itself (expert review
+          # 2026-11-07 #6): this lock was taken from `:prev_owner` and its steal-touch has not been
+          # confirmed. Serialized with `:prev_owner` (see `pending_steal/3`); anything that
+          # rewrites the body without carrying it (a renew) clears it. The same owner's next
+          # acquire reads it as "my steal never completed" and redoes the touch.
+          optional(:touch_pending) => true
         }
 
   @typedoc """
@@ -992,6 +998,21 @@ defmodule Fathom.Shard.Storage do
   end
 
   @doc """
+  `lease` marked as an INTERRUPTED STEAL of `prev_owner`'s lock `source` (expert review 2026-11-07
+  #6): the body the steal PUT writes. The marker rides in that one PUT, so it exists exactly when
+  the lock does — whatever happens to the PUT's reply — and the same owner's next acquire, which
+  would otherwise read an ordinary lock of its own, knows the steal-touch is owed. It also carries
+  what the success path puts on the lease from `source` (`released_by`, and the touch provenance of
+  a clean released marker), which the rewritten body would otherwise lose.
+  """
+  @spec pending_steal(lease(), String.t(), map()) :: lease()
+  def pending_steal(lease, prev_owner, source) when is_binary(prev_owner) do
+    lease
+    |> Map.merge(Map.take(source, [:released_by, :touched_from, :touched_to]))
+    |> Map.merge(%{touch_pending: true, prev_owner: prev_owner})
+  end
+
+  @doc """
   Re-rotate the object's etag when a flush landed back on `expected_etag` (expert review
   2026-10-13 #17). See the `retouch/2` callback.
   """
@@ -1360,11 +1381,24 @@ defmodule Fathom.Shard.Storage do
         _ -> base
       end
 
-    # Touch provenance rides only on a released marker (expert review 2026-10-12 #10); absent
-    # otherwise, so every other lock body is byte-identical to before.
+    # Touch provenance rides only on a released marker (expert review 2026-10-12 #10) or an
+    # interrupted steal that took one over (#6); absent otherwise, so every other lock body is
+    # byte-identical to before.
+    base =
+      case lease do
+        %{touched_from: from, touched_to: to} when is_binary(from) and is_binary(to) ->
+          Map.merge(base, %{"touched_from" => from, "touched_to" => to})
+
+        _ ->
+          base
+      end
+
+    # THE INTERRUPTED-STEAL MARKER (expert review 2026-11-07 #6). Rides in the SAME single PUT as the
+    # steal, so whatever happens to that PUT's reply, the lock itself says "this was taken from
+    # `prev_owner` and the steal-touch is unconfirmed". Old nodes ignore the unknown keys.
     case lease do
-      %{touched_from: from, touched_to: to} when is_binary(from) and is_binary(to) ->
-        Jason.encode!(Map.merge(base, %{"touched_from" => from, "touched_to" => to}))
+      %{touch_pending: true, prev_owner: prev} when is_binary(prev) ->
+        Jason.encode!(Map.merge(base, %{"touch_pending" => true, "prev_owner" => prev}))
 
       _ ->
         Jason.encode!(base)
@@ -1393,9 +1427,21 @@ defmodule Fathom.Shard.Storage do
             _ -> lease
           end
 
+        lease =
+          case m do
+            %{"touched_from" => from, "touched_to" => to}
+            when is_binary(from) and is_binary(to) ->
+              Map.merge(lease, %{touched_from: from, touched_to: to})
+
+            _ ->
+              lease
+          end
+
+        # An interrupted steal (#6): `touch_pending` is only meaningful with the owner it was taken
+        # from, so a body carrying one without the other decodes as an ordinary lock.
         case m do
-          %{"touched_from" => from, "touched_to" => to} when is_binary(from) and is_binary(to) ->
-            {:ok, Map.merge(lease, %{touched_from: from, touched_to: to})}
+          %{"touch_pending" => true, "prev_owner" => prev} when is_binary(prev) ->
+            {:ok, Map.merge(lease, %{touch_pending: true, prev_owner: prev})}
 
           _ ->
             {:ok, lease}
@@ -1913,6 +1959,35 @@ defmodule Fathom.Shard.Storage do
 
     :ets.insert(@steal_watch_table, {shard_id, fingerprint, now})
     :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc """
+  Re-keys `shard_id`'s steal watch from the lock fingerprint `from_lock_fp` to `to_lock_fp` WITHOUT
+  restarting its clock (expert review 2026-11-07 #60). The one caller is a failed steal's rollback:
+  it rewrites the dead owner's lock (new epoch, new etag), which changes the fingerprint
+  `steal_watch_remaining_ms/2` keys on, and `watch_since/3` restarts the run on ANY change — so the
+  retry that the rollback exists to enable waited a further full `ttl + steal_margin` (35 s in
+  prod) for a hold this node had ALREADY watched sit unchanged for the whole window.
+
+  Sound because the watch's claim is about the DEAD OWNER's hold, and the lock change here was OUR
+  write, not a renewal: a live owner cannot renew the lock (our steal moved it, and the rollback is
+  conditional on it still being ours), and a renewing heartbeat changes the heartbeat half of the
+  fingerprint, which is left exactly as it was and so still restarts the watch. Only an entry that
+  matches `{other, from_lock_fp, _}` is carried; anything else (the entry was overwritten, the watch
+  is off) is left alone, which can only make the next steal later, never earlier.
+  """
+  @spec carry_steal_watch(String.t(), String.t(), term(), term()) :: :ok
+  def carry_steal_watch(shard_id, other, from_lock_fp, to_lock_fp) do
+    case steal_watch_entry(shard_id) do
+      {{^other, ^from_lock_fp, hb_fp}, since} ->
+        :ets.insert(@steal_watch_table, {shard_id, {other, to_lock_fp, hb_fp}, since})
+        :ok
+
+      _ ->
+        :ok
+    end
   rescue
     ArgumentError -> :ok
   end

@@ -80,6 +80,16 @@ need 5 MiB) and refuses to boot unless the store refuses a bogus `x-amz-copy-sou
 bogus `If-Match` on Complete, and honours `x-amz-copy-source-range`. Verified against MinIO
 (Chainguard build) on 2026-10-13; the store must keep passing it.
 
+**An ambiguous steal (expert review 2026-11-07 #6).** The steal is two writes, the lock PUT and then
+this touch, and a lock PUT whose reply is lost leaves a lock naming the stealer with no touch
+behind it. The steal PUT therefore carries `touch_pending` + `prev_owner` in its own body; the
+same owner's next acquire reads them as "my steal never finished" and redoes the touch, returning
+the lease a completed steal returns (`took_over`, `prev_owner`, the touch's etags), so promote-on-open
+and the recovery floor exclusion run. A rollback to `{dead owner, epoch + 2}` runs on an ambiguous
+PUT as a belt (never a delete, never back to `epoch`), and a failed touch's rollback re-keys the
+steal watch instead of restarting it, so the retry is not made to wait a second window
+(`component-notes.md`).
+
 **Incomplete multipart uploads.** A node killed between the touch's create and complete leaves an
 open upload holding server-side copies of up to a whole shard, invisible to ListObjectsV2. Two
 backstops (expert review 2026-10-13 #21):
