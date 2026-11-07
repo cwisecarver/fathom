@@ -238,4 +238,102 @@ defmodule Fathom.HranaTokenLedgerTest do
                "second round of client disconnects"
     end
   end
+
+  # Expert review 2026-11-07 #33. `stream_issued_before/2` selected "ever minted", but the contract
+  # is "a token from that mint STILL VERIFIES". Under the prod config (`HRANA_AUTH=required` refuses
+  # to boot without a finite max age) every tenant minted before the cutoff kept a ledger row that
+  # never went away, and every 60 s console mint stayed in the sweep too — so the scalpel for "a
+  # laptop lost Feb 15" revoked every tenant an operator ever looked at (`revoke/1` bumps the SHARD
+  # floor, killing every token of that shard, including ones minted after the cutoff).
+  describe "the sweep selects only mints that still verify (#33)" do
+    setup do
+      prev = Application.get_env(:fathom, :hrana_token_max_age)
+      Application.put_env(:fathom, :hrana_token_max_age, 3600)
+
+      on_exit(fn ->
+        if is_nil(prev),
+          do: Application.delete_env(:fathom, :hrana_token_max_age),
+          else: Application.put_env(:fathom, :hrana_token_max_age, prev)
+      end)
+
+      :ok
+    end
+
+    defp ago(seconds), do: DateTime.add(DateTime.utc_now(), -seconds, :second)
+
+    # A ledger row as `token_for/2` would have written it `age_s` ago for a token living `life_s`.
+    defp issued!(id, age_s, life_s, actor) do
+      {:ok, _} = Directory.resolve(id)
+
+      :ok =
+        Ledger.record(
+          shard_id: id,
+          token_version: 1,
+          actor: actor,
+          minted_at: ago(age_s),
+          expires_at: DateTime.add(ago(age_s), life_s, :second)
+        )
+    end
+
+    test "an expired mint and an expired console mint are not selected; a live one is" do
+      expired = shard("exp")
+      console = shard("con")
+      live = shard("liv")
+      legacy = shard("leg")
+
+      # 10 days ago, valid for an hour: long expired.
+      issued!(expired, 10 * 86_400, 3600, "mix fathom.token")
+      # An operator's console run last week: a 60 s token.
+      issued!(console, 7 * 86_400, 60, "console:alice")
+      # Minted 10 minutes before the cutoff, valid for an hour: it STILL verifies.
+      issued!(live, 600, 3600, "mix fathom.token")
+
+      # A row from before the column existed (NULL expiry): it may still verify, so it is kept.
+      {:ok, _} = Directory.resolve(legacy)
+      :ok = Ledger.record(shard_id: legacy, token_version: 1, minted_at: ago(600))
+
+      assert [%{expires_at: nil}] = Ledger.outstanding(legacy)
+      assert Ledger.outstanding(expired) == [], "an expired mint is not outstanding"
+      assert Ledger.outstanding(console) == [], "a console mint past its 60 s is not outstanding"
+      assert [_] = Ledger.outstanding(live)
+
+      cutoff = DateTime.add(DateTime.utc_now(), -60, :second)
+      assert {:ok, 2} = HranaAuth.revoke_issued_before(cutoff, async: false)
+
+      # The expired ones were NOT revoked: their floor is still 1.
+      assert Directory.token_version(expired) == 1
+      assert Directory.token_version(console) == 1
+      # The two that may still verify were.
+      assert Directory.token_version(live) == 2
+      assert Directory.token_version(legacy) == 2
+    end
+
+    test "token_for records the expiry the token itself carries" do
+      id = shard("rec")
+      {:ok, _} = Directory.resolve(id)
+
+      before = DateTime.utc_now()
+      {:ok, _} = HranaAuth.token_for(id, actor: "mix fathom.token")
+      # The console's per-token ttl back-dates `signed_at`, so the token starts life partly spent.
+      {:ok, _} = HranaAuth.token_for(id, actor: "console:alice", ttl: 60)
+
+      assert [normal, console] = Ledger.history(id) |> Enum.sort_by(& &1.actor, :desc)
+      assert normal.actor == "mix fathom.token"
+
+      assert DateTime.diff(normal.expires_at, before, :second) in 3598..3602
+
+      assert DateTime.diff(console.expires_at, before, :second) in 58..62,
+             "a 60 s console mint must record a ~60 s expiry (got #{inspect(console.expires_at)})"
+    end
+
+    test "with no max age nothing expires, so nothing is recorded as expiring" do
+      Application.put_env(:fathom, :hrana_token_max_age, :infinity)
+      id = shard("inf")
+      {:ok, _} = Directory.resolve(id)
+      {:ok, _} = HranaAuth.token_for(id, ttl: 60)
+
+      assert [%{expires_at: nil}] = Ledger.history(id)
+      assert [_] = Ledger.outstanding(id)
+    end
+  end
 end

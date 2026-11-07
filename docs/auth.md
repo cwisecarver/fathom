@@ -187,7 +187,9 @@ tenant, or with what scope. The only fleet-wide lever was rotating `secret_key_b
 invalidates every tenant's token simultaneously: an outage, not a revocation.
 
 **The ledger** (`hrana_token_issuances`, `Fathom.HranaAuth.Ledger`) records one row per mint —
-shard, `token_version`, scope, actor, `minted_at`. It stores the **claims, never the secret**:
+shard, `token_version`, scope, actor, `minted_at`, and `expires_at` (the instant the token stops
+verifying, the same value as its own `"e"` claim; NULL when nothing expires or the row predates the
+column). It stores the **claims, never the secret**:
 a Hrana token is verified by signature, not by lookup, so persisting anything derived from the
 secret would add a credential to steal while answering no question the claims cannot. (That is
 stricter than `api_keys`, which keeps a SHA-256 hash *because* those are looked up.)
@@ -212,8 +214,13 @@ Fathom.HranaAuth.revoke_issued_before(cutoff, limit: 10)
 Fathom.HranaAuth.revoke_issued_before(cutoff, async: false)
 ```
 
-It bumps the floor on every shard the ledger shows with an **outstanding** token issued before the
-cutoff, and is **idempotent** — re-running the same cutoff is a no-op rather than a second round of
+It bumps the floor on every shard the ledger shows with a token issued before the cutoff that
+**still verifies** — not yet expired (`expires_at` NULL or in the future) and not already below the
+floor — so an expired token, or one of the query console's 60-second mints, is not a reason to
+revoke its shard (the bump kills every token of the shard, including ones minted after the cutoff).
+A row with no recorded expiry is kept: it may still verify, and for an incident tool the safe
+direction is to revoke too much rather than miss a live token. It is **idempotent** — re-running
+the same cutoff is a no-op rather than a second round of
 client disconnects, which is what makes it safe to retry or run from a cron.
 
 It deliberately depends on the ledger, so a mint that failed to record is invisible to it. The

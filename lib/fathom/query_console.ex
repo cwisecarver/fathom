@@ -247,8 +247,9 @@ defmodule Fathom.QueryConsole do
   # of console use that set is every tenant an operator ever looked at — so an incident-response
   # sweep scoped to one leaked laptop would disconnect a large, arbitrary slice of the fleet. The
   # ledger's careful "under-reports, which is the safe direction" reasoning is defeated by a writer
-  # that OVER-reports. The `console:` actor prefix is deliberately distinct from the controller's
-  # `admin:` so a future `shards_issued_before/1` can exclude console mints outright.
+  # that OVER-reports. (Fixed at the reader, expert review 2026-11-07 #33: the ledger now records
+  # each mint's `expires_at`, so a 60 s console mint drops out of the sweep once it has expired.
+  # The `console:` actor prefix stays distinct from the controller's `admin:` for the audit.)
   defp auth_header(shard_id, sql, opts) do
     case Application.get_env(:fathom, :hrana_auth, :disabled) do
       :disabled ->

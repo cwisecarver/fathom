@@ -326,7 +326,18 @@ defmodule Fathom.HranaAuth do
       # authoritative act and a ledger outage must never fail it. An incomplete ledger
       # under-reports what is outstanding, which is the safe direction for
       # `revoke_issued_before/2` — it revokes less than it might, never more.
-      Ledger.record(shard_id: canonical, token_version: version, scope: scope, actor: actor)
+      #
+      # `expires_at` is the token's OWN `"e"` claim (`put_expiry/2`: `signed_at + max_age`, console
+      # ttl back-dating included), so the ledger can answer "does a token from this mint still
+      # verify?" without re-deriving it from a config that may have changed since (expert review
+      # 2026-11-07 #33). nil when nothing expires.
+      Ledger.record(
+        shard_id: canonical,
+        token_version: version,
+        scope: scope,
+        actor: actor,
+        expires_at: expires_at(payload)
+      )
 
       {:ok, Phoenix.Token.sign(secret!(), @salt, payload, sign_opts)}
     end
@@ -381,6 +392,10 @@ defmodule Fathom.HranaAuth do
         payload
     end
   end
+
+  # The `"e"` claim as a `DateTime`, for the issuance ledger; nil when the token does not expire.
+  defp expires_at(%{"e" => e}) when is_integer(e), do: DateTime.from_unix!(e, :second)
+  defp expires_at(_payload), do: nil
 
   defp backdate(sign_opts, nil), do: sign_opts
 
@@ -444,10 +459,14 @@ defmodule Fathom.HranaAuth do
   lost last Tuesday") the available responses were "revoke one shard at a time from a list nobody
   kept" or "take the fleet down".
 
-  Bumps the `token_version` floor on every shard the ledger shows with an outstanding token issued
-  before `cutoff`. **Idempotent**: `Ledger.shards_issued_before/1` only returns shards whose floor
-  has not already moved past the issuance, so re-running the same cutoff is a no-op rather than a
-  second round of disconnects.
+  Bumps the `token_version` floor on every shard the ledger shows with a token issued before
+  `cutoff` that STILL VERIFIES — not yet expired (the ledger records each mint's `expires_at`; a
+  mint with no recorded expiry is kept, the safe direction for an incident tool) and not already
+  below the shard's floor. A token whose max age passed, or one of the console's 60 s mints, is no
+  longer a reason to revoke its shard: the floor bump kills EVERY token of the shard, so selecting
+  by "ever minted" turned the scalpel into a fleet-wide revoke (expert review 2026-11-07 #33).
+  **Idempotent**: a shard whose floor has already moved past the issuance is not selected again, so
+  re-running the same cutoff is a no-op rather than a second round of disconnects.
 
   Options:
 

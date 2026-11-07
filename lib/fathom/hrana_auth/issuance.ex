@@ -25,13 +25,19 @@ defmodule Fathom.HranaAuth.Issuance do
     field :actor, :string
     field :minted_at, :utc_datetime_usec
 
+    # The instant the token stops VERIFYING (`signed_at + max_age`, the same value as the token's own
+    # `"e"` claim; expert review 2026-11-07 #33). NULL = it never expires (`:infinity` max age) or the
+    # row predates the column; both mean "may still verify", so a sweep keeps them (the safe
+    # direction for an incident tool).
+    field :expires_at, :utc_datetime_usec
+
     timestamps(type: :utc_datetime_usec)
   end
 
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(issuance, attrs) do
     issuance
-    |> cast(attrs, [:shard_id, :token_version, :scope, :actor, :minted_at])
+    |> cast(attrs, [:shard_id, :token_version, :scope, :actor, :minted_at, :expires_at])
     |> validate_required([:shard_id, :token_version, :minted_at])
     |> validate_inclusion(:scope, @scopes)
     # `actor` is provenance for a human reading an audit, not an authorization input. Bounded so a

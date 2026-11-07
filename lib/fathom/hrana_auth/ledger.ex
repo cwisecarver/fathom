@@ -35,7 +35,8 @@ defmodule Fathom.HranaAuth.Ledger do
       token_version: Keyword.fetch!(attrs, :token_version),
       scope: to_string(Keyword.get(attrs, :scope, :rw)),
       actor: Keyword.get(attrs, :actor),
-      minted_at: Keyword.get(attrs, :minted_at, DateTime.utc_now())
+      minted_at: Keyword.get(attrs, :minted_at, DateTime.utc_now()),
+      expires_at: Keyword.get(attrs, :expires_at)
     })
     |> Repo.insert()
     |> case do
@@ -77,18 +78,23 @@ defmodule Fathom.HranaAuth.Ledger do
 
   @doc """
   Issuances for `shard_id` that are still **outstanding** — their embedded `token_version` is at or
-  above the shard's current revocation floor, so a token from that mint still verifies.
+  above the shard's current revocation floor AND the token has not expired, so a token from that
+  mint still verifies.
 
   This is the question the ledger exists to answer, and it is why the rows are append-only: history
-  is not edited by a revoke, it is reinterpreted against the floor.
+  is not edited by a revoke, it is reinterpreted against the floor and the clock. An issuance with
+  no recorded `expires_at` (a non-expiring token, or a row from before the column) is kept: it MAY
+  still verify, and for an incident tool that is the safe direction (expert review 2026-11-07 #33).
   """
   @spec outstanding(String.t()) :: [Issuance.t()]
   def outstanding(shard_id) do
     floor = Fathom.Directory.token_version(shard_id) || 1
+    now = DateTime.utc_now()
 
     Repo.all(
       from i in Issuance,
         where: i.shard_id == ^shard_id and i.token_version >= ^floor,
+        where: is_nil(i.expires_at) or i.expires_at > ^now,
         order_by: [desc: i.minted_at]
     )
   end
@@ -122,9 +128,22 @@ defmodule Fathom.HranaAuth.Ledger do
   `[:shard_id, :minted_at]`, so the `minted_at` range scan is the only selective step. Paging by
   `shard_id` leans on the second of those. `EXPLAIN` this if issuances ever densify — the finding
   flags it as the thing most likely to stop being true.
+
+  **Only mints that STILL VERIFY (expert review 2026-11-07 #33).** The predicate also requires the
+  token not to have expired (`expires_at` NULL or in the future). It used to select "ever minted":
+  under the prod config (`HRANA_AUTH=required` refuses to boot without a finite max age) every
+  tenant minted before the cutoff kept a row that never went away, and every 60 s console mint
+  stayed in the sweep too, so a scalpel for "a laptop lost on Feb 15" revoked every tenant an
+  operator ever looked at. `revoke/1` then bumps the shard's floor, which kills EVERY token of the
+  shard, so over-selecting here is not harmless — it is the blast radius. A NULL `expires_at`
+  (non-expiring tokens, rows from before the column) is kept: it may still verify, and for an
+  incident tool the safe direction is to revoke too much rather than miss a live token. The `now`
+  is taken once, when the stream is built, so every page judges expiry by the same instant.
   """
   @spec stream_issued_before(DateTime.t(), pos_integer()) :: Enumerable.t()
   def stream_issued_before(%DateTime{} = cutoff, page_size \\ 1_000) do
+    now = DateTime.utc_now()
+
     Stream.resource(
       fn -> "" end,
       fn last ->
@@ -136,6 +155,7 @@ defmodule Fathom.HranaAuth.Ledger do
               where:
                 i.minted_at < ^cutoff and i.token_version >= s.token_version and
                   i.shard_id > ^last,
+              where: is_nil(i.expires_at) or i.expires_at > ^now,
               distinct: true,
               order_by: [asc: i.shard_id],
               limit: ^page_size,
