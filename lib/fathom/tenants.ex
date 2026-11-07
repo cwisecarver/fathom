@@ -980,12 +980,24 @@ defmodule Fathom.Tenants do
 
     eligible = for {_, id} when id != nil <- checked, uniq: true, do: id
 
+    # `ordered: true` IS LOAD-BEARING (expert review 2026-11-07 #66). The `{:exit, reason}` result of
+    # a timed-out stop carries no id, so it is attributed by POSITION: `Enum.zip(eligible)` is only
+    # right when results arrive in input order. With `ordered: false` they arrive in COMPLETION order
+    # and a hung stop in the middle was blamed on the LAST id: the hung shard had no entry (its result
+    # read `{id, nil}`, neither `:ok` nor an error), an unrelated shard was recorded as failed and had
+    # its own `:ok` overwritten, and `LocalEraser.erase_now/1` could return `nil`. Ordering only
+    # affects DELIVERY (head-of-line), not execution: all `max_concurrency` tasks still run at once.
+    # The `:erase_local_stop` / `:erase_local_stop_timeout_ms` env seams exist so a test can hang one
+    # stop without a two-minute wait.
+    stop = Application.get_env(:fathom, :erase_local_stop, &Shards.stop/1)
+    timeout = Application.get_env(:fathom, :erase_local_stop_timeout_ms, 120_000)
+
     stopped =
-      Task.async_stream(eligible, fn id -> {id, Shards.stop(id)} end,
+      Task.async_stream(eligible, fn id -> {id, stop.(id)} end,
         max_concurrency: 8,
-        timeout: 120_000,
+        timeout: timeout,
         on_timeout: :kill_task,
-        ordered: false
+        ordered: true
       )
       |> Enum.zip(eligible)
       |> Map.new(fn
