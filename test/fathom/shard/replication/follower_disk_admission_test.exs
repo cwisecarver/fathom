@@ -171,7 +171,7 @@ defmodule Fathom.Shard.Replication.FollowerDiskAdmissionTest do
     task =
       Task.async(fn -> Follower.begin_seed(name, %{}, begin("cd_same", 999))["cd_same"] end)
 
-    assert %{failed: true} = Task.await(task)
+    assert %{failed: true, refusal: :replica_busy} = Task.await(task)
 
     me = self()
 

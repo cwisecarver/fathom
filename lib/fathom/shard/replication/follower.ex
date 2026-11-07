@@ -1581,8 +1581,16 @@ defmodule Fathom.Shard.Replication.Follower do
   # bytes it does not have.
 
   @doc false
-  @spec begin_seed(atom(), map(), Protocol.SeedBegin.t()) :: map()
-  def begin_seed(name, seeds, %Protocol.SeedBegin{} = b) do
+  # `opts`: `pull: true` when the caller is `Recovery` pulling a replica THIS node asked for. A
+  # refusal is then a TYPED entry — `%{failed: true, refusal: reason}` under the shard id, `reason`
+  # one of `:disk_floor | :tombstoned | :stale_lineage | :replica_busy` — instead of the silence a
+  # primary-to-follower seed gets (expert review 2026-11-07 #4). Silence is right for a primary's
+  # seed: that shard's RPO simply stays at its stored object. It is wrong for a recovery pull,
+  # whose bytes ARE the acked tail: the pull read "the sink said nothing" as `:no_seed_in_flight`,
+  # i.e. the same as "no peer is ahead", and the open served the stale object.
+  @spec begin_seed(atom(), map(), Protocol.SeedBegin.t(), keyword()) :: map()
+  def begin_seed(name, seeds, %Protocol.SeedBegin{} = b, opts \\ []) do
+    pull? = Keyword.get(opts, :pull, false)
     # A second `seed_begin` for a shard already streaming means the previous one will never
     # complete; drop its files rather than leak them.
     seeds = discard_seed(seeds, b.shard_id)
@@ -1601,16 +1609,16 @@ defmodule Fathom.Shard.Replication.Follower do
     # forks on this path at all (`disk_free/1`). Refused here, the begin answers exactly as the
     # in-lock refusal did (the shard absent from `seeds`).
     if reserve_headroom?(name, b) do
-      locked_begin(name, seeds, b, id)
+      locked_begin(name, seeds, b, id, pull?)
     else
-      refuse_seed(name, seeds, b)
+      refuse_seed(name, seeds, b, pull?)
     end
   end
 
-  defp locked_begin(name, seeds, b, id) do
+  defp locked_begin(name, seeds, b, id, pull?) do
     case lock_shard(name, id, lock_wait_ms()) do
       {:ok, lock} ->
-        case checked_begin(name, seeds, b, lock) do
+        case checked_begin(name, seeds, b, lock, pull?) do
           %{^id => %{lock: ^lock}} = opened ->
             opened
 
@@ -1629,18 +1637,18 @@ defmodule Fathom.Shard.Replication.Follower do
         )
 
         # Failed, not absent, so `seed_end` answers a reject the primary re-seeds on.
-        Map.put(seeds, b.shard_id, %{name: name, failed: true})
+        Map.put(seeds, b.shard_id, %{name: name, failed: true, refusal: :replica_busy})
     end
   end
 
-  defp checked_begin(name, seeds, b, lock) do
+  defp checked_begin(name, seeds, b, lock, pull?) do
     cond do
       # Never re-create a replica of a DELETED tenant (expert review 2026-09-29 #5): after
       # `Tombstones` erases it, a straggling push answers `:unknown_shard` and the primary's reflex
       # is to seed it straight back. Dropping the begin leaves no temps and never acks.
       Fathom.Tenants.Tombstones.tombstoned?(b.shard_id) ->
         Logger.info("replication follower refusing to seed #{b.shard_id}: tenant is deleted")
-        seeds
+        refused(seeds, name, b, :tombstoned, pull?)
 
       # A seed from a LOWER lineage than the replica we already hold is a deposed primary — or a
       # REPLAYED `seed_begin` (expert review 2026-09-29 #17): the frame MAC covers the header but no
@@ -1654,7 +1662,7 @@ defmodule Fathom.Shard.Replication.Follower do
             "below the replica's (deposed primary or replayed frame)"
         )
 
-        seeds
+        refused(seeds, name, b, :stale_lineage, pull?)
 
       true ->
         open_seed_temps(name, seeds, b, lock)
@@ -1672,6 +1680,14 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   defp stale_lineage_seed?(_name, _begin), do: false
+
+  # A refused begin. Silent (the shard absent from `seeds`) for a primary's seed; a typed failed
+  # entry for a recovery pull (see `begin_seed/4`). `failed: true` is what makes `finish_seed/3`
+  # and `write_chunk/5` treat it as a dead seed, so no caller needs to know the entry is special.
+  defp refused(seeds, _name, _b, _reason, false), do: seeds
+
+  defp refused(seeds, name, %Protocol.SeedBegin{} = b, reason, true),
+    do: Map.put(seeds, b.shard_id, %{name: name, failed: true, refusal: reason})
 
   # DISK BACK-PRESSURE ON THE REPLICA STORE (expert review 2026-08-20 #23).
   #
@@ -1944,7 +1960,7 @@ defmodule Fathom.Shard.Replication.Follower do
   defp disk_free_floor_inodes,
     do: Application.get_env(:fathom, :replication_disk_free_floor_inodes, 50_000)
 
-  defp refuse_seed(name, seeds, %Protocol.SeedBegin{} = b) do
+  defp refuse_seed(name, seeds, %Protocol.SeedBegin{} = b, pull?) do
     Logger.warning(
       "replication follower REFUSING to seed #{b.shard_id}: the replica volume (#{dir(name)}) is " <>
         "below its free-space floor (bytes or inodes). That shard's RPO stays at its stored object — the pre-A2 " <>
@@ -1957,7 +1973,7 @@ defmodule Fathom.Shard.Replication.Follower do
       shard_id: b.shard_id
     })
 
-    seeds
+    refused(seeds, name, b, :disk_floor, pull?)
   end
 
   defp disk_free_floor_bytes,

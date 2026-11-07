@@ -150,27 +150,73 @@ defmodule Fathom.Shard.Replication.Recovery do
   agreement**: an unreachable fleet yields `:none`, which is the stored object, which is the
   pre-A2 behaviour.
 
-  Ties go to the local replica (no transfer for no gain) and are then broken by `node_key`, so two
-  nodes recovering the same shard make the same choice rather than each picking a different peer.
+  Ties go to the local replica (no transfer for no gain) and are then broken by
+  `phash2({shard_id, node_key})` (expert review 2026-11-07 #4(c)): still deterministic per shard,
+  so two nodes recovering the SAME shard make the same choice, but a failover wave over many
+  shards spreads its pulls across the tied peers instead of sending every one of them to the
+  highest `node_key` — one peer's 256-connection accept cap is shared with its shipper links.
+  With no `shard_id` (nil) the tie falls back to `node_key` order.
   """
   @spec choose(position() | nil, map() | :absent | nil, [{endpoint(), position() | nil}]) ::
           :none | :local | {:pull, endpoint(), position()}
-  def choose(local, object_stamp, offers) do
-    ahead = Enum.filter(offers, fn {_endpoint, pos} -> Promote.fresher?(pos, object_stamp) end)
-
-    case ahead do
+  @spec choose(
+          position() | nil,
+          map() | :absent | nil,
+          [{endpoint(), position() | nil}],
+          String.t() | nil
+        ) :: :none | :local | {:pull, endpoint(), position()}
+  def choose(local, object_stamp, offers, shard_id \\ nil) do
+    case ahead_ranked(object_stamp, offers, shard_id) do
       [] ->
         if Promote.fresher?(local, object_stamp), do: :local, else: :none
 
-      _ ->
-        {endpoint, pos} = Enum.max_by(ahead, fn {{key, _h, _p}, pos} -> {rank(pos), key} end)
-
+      [{endpoint, pos} | _] ->
         # `>=`, so an equal peer does not cost a database transfer. Transitivity does the rest: the
         # winner is already strictly ahead of the object, so a local copy at least equal to it is
         # too, and `:local` is safe without re-testing.
         if local && rank(local) >= rank(pos), do: :local, else: {:pull, endpoint, pos}
     end
   end
+
+  @doc """
+  The peers `choose/3` would fall back to if pulling its winner fails: the OTHER offers ranked
+  EXACTLY equal to `winner_pos`, in the same tie order (expert review 2026-11-07 #4(b)). Pure.
+
+  ONLY EQUALS, never a lower-ranked offer that is merely ahead of the object. The winner is the
+  best of the offers consulted, and so the one that carries every quorum-acked write the floor
+  guarantees; a lower-ranked peer may lack the acked tail the winner holds, and pulling it would
+  let the open succeed and serve — then re-stamp over — a database that has silently lost writes.
+  Failing the pull and refusing for the window is the safe direction for that case; an equal peer
+  holds the same position, so nothing is lost by taking it.
+  """
+  @spec pull_alternates(
+          map() | :absent | nil,
+          [{endpoint(), position() | nil}],
+          String.t() | nil,
+          endpoint(),
+          position()
+        ) :: [{endpoint(), position()}]
+  def pull_alternates(object_stamp, offers, shard_id, winner, winner_pos) do
+    top = rank(winner_pos)
+
+    object_stamp
+    |> ahead_ranked(offers, shard_id)
+    |> Enum.filter(fn {endpoint, pos} -> endpoint != winner and rank(pos) == top end)
+  end
+
+  # Offers strictly ahead of the object, best first: rank descending, then the per-shard spread of
+  # the tie, then `node_key` so the order is total even on a hash collision.
+  defp ahead_ranked(object_stamp, offers, shard_id) do
+    offers
+    |> Enum.filter(fn {_endpoint, pos} -> Promote.fresher?(pos, object_stamp) end)
+    |> Enum.sort_by(
+      fn {{key, _h, _p}, pos} -> {rank(pos), tie_spread(shard_id, key), key} end,
+      :desc
+    )
+  end
+
+  defp tie_spread(nil, _key), do: 0
+  defp tie_spread(shard_id, key), do: :erlang.phash2({shard_id, key})
 
   # RANKS ON THE LINEAGE, the same key `Promote.fresher?/2` uses (expert review 2026-08-24 #12).
   # This used to read `epoch`, which on a replica is the primary's LOCK epoch — reset to 1 on every
@@ -262,8 +308,11 @@ defmodule Fathom.Shard.Replication.Recovery do
   did before this existed.
 
   `{:refuse, %UnderQuorum{}}` when too few peers answered to rule out a fresher replica and the
-  shard's under-quorum window is still open — see "The responder floor" below. The caller refuses
-  the open with a retryable error.
+  shard's under-quorum window is still open — see "The responder floor" below — or when a peer WAS
+  chosen and the pull failed (expert review 2026-11-07 #4; a peer provably ahead of the object holds
+  acked history, so a failed pull is an unconfirmed decision, not "nothing is ahead"). The caller
+  refuses the open with a retryable error. After the window the pull failure opens best-effort
+  from the stored object (`:none`) with an error log.
 
   Options:
 
@@ -470,15 +519,31 @@ defmodule Fathom.Shard.Replication.Recovery do
   end
 
   # Enough answers: any under-quorum episode is over, and the choice is the ordinary one.
+  #
+  # THE EPISODE IS CLEARED BY THE DECISION, NOT BEFORE IT (expert review 2026-11-07 #4). A chosen
+  # pull that then FAILS routes through `error_window/3`, which anchors a window of its own in the
+  # same per-shard row. Clearing the row here first would make every retry of a persistently failing
+  # pull a FRESH first refusal, so the window would never expire and "availability is traded for at
+  # most one window" (2026-10-12 Q1 = A) would become "refused indefinitely". `decide/8` clears the
+  # row for every outcome but a pull, and a pull clears it only when it succeeds.
   defp settle(shard_id, object_stamp, local, follower, answers, needed, opts) do
-    if needed > 1, do: clear_underquorum(shard_id)
-    decide(shard_id, object_stamp, local, follower, answers, needed, opts)
+    decide(shard_id, object_stamp, local, follower, answers, needed, opts, needed > 1)
   end
 
-  defp decide(shard_id, object_stamp, local, follower, answers, needed, opts) do
-    choice = choose(local, object_stamp, offers(answers))
+  defp decide(shard_id, object_stamp, local, follower, answers, needed, opts, clear? \\ false) do
+    offers = offers(answers)
+    choice = choose(local, object_stamp, offers, shard_id)
     log_takeover(shard_id, choice, local, answers, needed, opts)
-    act(shard_id, choice, local, follower, opts)
+
+    case choice do
+      {:pull, endpoint, pos} ->
+        alternates = pull_alternates(object_stamp, offers, shard_id, endpoint, pos)
+        pull_first(shard_id, [{endpoint, pos} | alternates], follower, opts)
+
+      other ->
+        if clear?, do: clear_underquorum(shard_id)
+        act(other, local)
+    end
   end
 
   # A takeover's recovery decision used to log nothing when it chose the stored object, so a lost
@@ -571,11 +636,38 @@ defmodule Fathom.Shard.Replication.Recovery do
     end
   end
 
-  defp act(_shard_id, :none, _local, _follower, _opts), do: :none
-  defp act(_shard_id, :local, local, _follower, _opts), do: {:ok, local}
+  defp act(:none, _local), do: :none
+  defp act(:local, local), do: {:ok, local}
 
-  defp act(shard_id, {:pull, endpoint, pos}, _local, follower, opts),
-    do: pull(shard_id, endpoint, pos, follower, opts)
+  # A FAILED PULL IS AN UNCONFIRMED DECISION, NOT A "NO" (expert review 2026-11-07 #4). `choose/4`
+  # said a peer is provably ahead of the object and the floor was met, so what that peer holds is
+  # quorum-acked history the object lacks. The pull used to answer `:none` on every failure — the
+  # same value as "no peer is ahead" — and the open then served the stale object, whose first flush
+  # re-stamps over the only copies of the tail. A failed PROMOTION already refuses for the window
+  # (`PromoteOnOpen`, Jepsen 2026-10-24); a failed pull is that same decision one step earlier, so
+  # it takes the same `error_window/3`: refuse inside the window so the client retries and recovery
+  # re-runs, best-effort (error-logged) after it.
+  #
+  # The candidates are the chosen peer, then peers ranked EXACTLY equal to it (`pull_alternates/5`;
+  # NEVER a lower-ranked one, which could lack the tail the winner holds). A refusal by THIS node's
+  # own sink (`{:seed_refused, _}`: disk floor, tombstone, busy) is not the peer's fault, and another
+  # peer would meet the same refusal, so it ends the attempt at once.
+  defp pull_first(shard_id, [{endpoint, pos} | rest], follower, opts) do
+    case pull(shard_id, endpoint, pos, follower, opts) do
+      {:ok, installed} ->
+        clear_underquorum(shard_id)
+        {:ok, installed}
+
+      {:error, {:seed_refused, _} = reason} ->
+        error_window(shard_id, {:pull_failed, reason}, opts)
+
+      {:error, reason} when rest == [] ->
+        error_window(shard_id, {:pull_failed, reason}, opts)
+
+      {:error, _reason} ->
+        pull_first(shard_id, rest, follower, opts)
+    end
+  end
 
   # `outcome` is a bounded set (`:refused` | `:opened_best_effort` | `:skipped_error`), so it is safe as a metric tag.
   defp emit_underquorum(%UnderQuorum{} = e, outcome) do
@@ -1102,7 +1194,7 @@ defmodule Fathom.Shard.Replication.Recovery do
           "shard #{shard_id}: could not reach #{key} to pull a replica: #{inspect(reason)}"
         )
 
-        :none
+        {:error, {:connect, reason}}
     end
   end
 
@@ -1136,9 +1228,9 @@ defmodule Fathom.Shard.Replication.Recovery do
 
       {:ok, installed}
     else
-      other ->
-        Logger.warning("shard #{shard_id}: replica pull from #{key} failed: #{inspect(other)}")
-        :none
+      {:error, reason} ->
+        Logger.warning("shard #{shard_id}: replica pull from #{key} failed: #{inspect(reason)}")
+        {:error, reason}
     end
   end
 
@@ -1167,11 +1259,23 @@ defmodule Fathom.Shard.Replication.Recovery do
   defp handle_frame(sock, follower, shard_id, deadline, seeds, ordinal, bytes) do
     case Protocol.decode(bytes) do
       {:ok, %Protocol.SeedBegin{shard_id: ^shard_id} = begin} ->
-        seeds = Follower.begin_seed(follower, seeds, begin)
-        # The ordinal rides in the seed's own state so the install stamps it under the shard lock
-        # (expert review 2026-10-10 #22) instead of a read-modify-write after the lock is released.
-        seeds = Follower.stamp_seed_ordinal(seeds, shard_id, ordinal)
-        receive_seed(sock, follower, shard_id, deadline, seeds, ordinal)
+        # `pull: true`: this node asked for these bytes, so a refusal is a TYPED REPLY
+        # (`{:seed_refused, reason}`), not the silence a primary-to-follower seed gets
+        # (expert review 2026-11-07 #4). Streaming the rest of the database into a sink that has
+        # already said no would only burn the transfer, so a refused begin ends the pull here.
+        seeds = Follower.begin_seed(follower, seeds, begin, pull: true)
+
+        case Map.get(seeds, shard_id) do
+          %{refusal: reason} ->
+            abort(seeds, {:error, {:seed_refused, reason}})
+
+          _opened ->
+            # The ordinal rides in the seed's own state so the install stamps it under the shard
+            # lock (expert review 2026-10-10 #22) instead of a read-modify-write after the lock is
+            # released.
+            seeds = Follower.stamp_seed_ordinal(seeds, shard_id, ordinal)
+            receive_seed(sock, follower, shard_id, deadline, seeds, ordinal)
+        end
 
       {:ok, {:seed_chunk, ^shard_id, part, seq, chunk}} ->
         seeds = Follower.write_chunk(seeds, shard_id, part, seq, chunk)

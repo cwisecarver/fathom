@@ -281,6 +281,11 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
   end
 
   setup do
+    # The under-quorum window table (owned by `Fleet`'s supervisor in a running app). A failed pull
+    # now routes through `Recovery.error_window/3`, and with no table it fails OPEN to `:none`
+    # (`underquorum_step/1` rescues the missing table) — so a test that does not create it cannot
+    # tell a refusing pull from a silent one.
+    Recovery.init_table()
     id = "recov_#{System.unique_integer([:positive])}"
 
     # The cross-fleet path only ranks when the lineage travels, and it travels only with the wire
@@ -651,6 +656,8 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     victim = "#{id}_victim"
     db = :crypto.strong_rand_bytes(2_048)
 
+    test = self()
+
     port =
       start_fake_peer(fn
         sock, {:position_query, asked} ->
@@ -662,11 +669,14 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
               epoch: 9,
               wal_gen: 5,
               salt1: 7,
+              wal_ordinal: 6,
               next_offset: 99_999
             })
           )
 
         sock, {:replica_request, _asked} ->
+          send(test, :pull_requested)
+
           :gen_tcp.send(
             sock,
             Protocol.encode_seed_begin(%SeedBegin{
@@ -687,11 +697,17 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
           :ok
       end)
 
-    assert :none =
+    # A failed pull is an unconfirmed decision, not a "no" (expert review 2026-11-07 #4): the open
+    # is REFUSED for the window rather than served from the stored object. This line used to
+    # assert `:none`, which pinned the silent degradation.
+    assert {:refuse, %Recovery.UnderQuorum{shard_id: ^id}} =
              Recovery.best_replica(id, stamp(9, 5, 0),
                follower: survivor,
                peers: [{"liar", "127.0.0.1", port}]
              )
+
+    assert_received :pull_requested,
+                    "the fake peer was never asked for its replica, so nothing here pulled"
 
     # Neither the shard we asked for nor the one the bytes named. A frame naming a different shard
     # is refused outright rather than filed under its own id, because accepting it would let any
@@ -706,6 +722,8 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     {survivor, _} = start_follower("recov_surv")
     db = :crypto.strong_rand_bytes(4_096)
 
+    test = self()
+
     port =
       start_fake_peer(fn
         sock, {:position_query, asked} ->
@@ -715,11 +733,13 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
               epoch: 9,
               wal_gen: 5,
               salt1: 7,
+              wal_ordinal: 6,
               next_offset: 99_999
             })
           )
 
         sock, {:replica_request, asked} ->
+          send(test, :pull_requested)
           # Declares 4096 bytes of database and sends 1024, then commits. A short install would be
           # a database missing pages — it opens cleanly and reads wrong.
           :gen_tcp.send(
@@ -746,11 +766,14 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
           :ok
       end)
 
-    assert :none =
+    assert {:refuse, %Recovery.UnderQuorum{shard_id: ^id}} =
              Recovery.best_replica(id, stamp(9, 5, 0),
                follower: survivor,
                peers: [{"short", "127.0.0.1", port}]
              )
+
+    assert_received :pull_requested,
+                    "the fake peer was never asked for its replica, so nothing here pulled"
 
     assert is_nil(Follower.state_of(survivor, id))
 
@@ -761,6 +784,8 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
   test "a source that aborts mid-stream leaves the survivor on the stored object", %{id: id} do
     {survivor, _} = start_follower("recov_surv")
 
+    test = self()
+
     port =
       start_fake_peer(fn
         sock, {:position_query, asked} ->
@@ -770,11 +795,14 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
               epoch: 9,
               wal_gen: 5,
               salt1: 7,
+              wal_ordinal: 6,
               next_offset: 99_999
             })
           )
 
         sock, {:replica_request, asked} ->
+          send(test, :pull_requested)
+
           :gen_tcp.send(
             sock,
             Protocol.encode_seed_begin(%SeedBegin{
@@ -796,11 +824,14 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
           :ok
       end)
 
-    assert :none =
+    assert {:refuse, %Recovery.UnderQuorum{shard_id: ^id}} =
              Recovery.best_replica(id, stamp(9, 5, 0),
                follower: survivor,
                peers: [{"aborter", "127.0.0.1", port}]
              )
+
+    assert_received :pull_requested,
+                    "the fake peer was never asked for its replica, so nothing here pulled"
 
     assert is_nil(Follower.state_of(survivor, id))
   end

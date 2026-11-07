@@ -200,6 +200,15 @@ Refinements (expert review 2026-10-13 #5, #14, #15, #40):
 - The expiry leaves a **tombstone** for one window, so a best-effort open that fails is not re-refused
   for a fresh 60 s. Rows untouched for two windows are swept when a refusal inserts a new row and the
   table has grown past 256.
+- A **failed or refused pull** (expert review 2026-11-07 #4) goes through the same window. `choose/4`
+  has already said a peer is provably ahead of the object, so a pull that fails (connect closed by
+  the peer's accept cap, source abort, timeout, this node's own seed sink refusing on its disk floor
+  or a tombstone) is an unconfirmed decision, not "no peer is ahead": the open is refused with the
+  retryable 503 inside the window (`outcome: :skipped_error`) and opens best-effort, error-logged,
+  after it. The pull first tries peers ranked exactly equal to the winner, never a lower-ranked one
+  (it may lack the acked tail). A refusal by this node's own sink ends the attempt at once. Ties
+  between equal peers are spread per shard by `phash2({shard_id, node_key})`, so a failover wave
+  does not send every pull to the highest `node_key`.
 
 N and Q are this node's peer set and `REPLICATION_QUORUM`, which assumes a symmetric fleet with one
 quorum. The floor applies only against a rankable object stamp, so a brand-new shard is never
