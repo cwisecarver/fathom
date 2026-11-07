@@ -689,6 +689,74 @@ defmodule Fathom.Shard.HeartbeatTest do
              "must survive #10"
   end
 
+  # Expert review 2026-11-07 #31. `owner/0` is `<node_key>#<nonce>` since 2026-10-15 #17, but
+  # `clear_previous_incarnation/0` still built the predecessor as `<node()>#<nonce>`. With NODE_KEY set
+  # (the chaos rig and the fleet docs require it) that object never exists: `judge_previous/1` read
+  # `:not_found`, returned `:ok` WITHOUT clearing or `mark_incarnation_dead/1`, and the recheck branch
+  # was unreachable, so the same-machine fast restart did nothing and a hard crash leaked one heartbeat
+  # object. Both existing tests above build `prev_owner` from `node()` and never set `:node_key`, so
+  # test and code agreed and both disagreed with prod. These two use a key that is not `node()`.
+  describe "with NODE_KEY set (expert review 2026-11-07 #31)" do
+    setup do
+      Fathom.Test.Env.put!(:node_key, "fathomx")
+
+      inc_file = Path.join(Path.dirname(Fathom.Shard.db_path("x")), ".incarnation")
+      prev_content = File.read(inc_file)
+      File.mkdir_p!(Path.dirname(inc_file))
+
+      on_exit(fn ->
+        case prev_content do
+          {:ok, c} -> File.write!(inc_file, c)
+          _ -> File.rm(inc_file)
+        end
+      end)
+
+      :ok = stop_supervised(Fathom.Shard.Heartbeat)
+      %{inc_file: inc_file}
+    end
+
+    test "a stale previous incarnation is cleared and proven dead at boot", %{inc_file: inc_file} do
+      File.write!(inc_file, "deadnonce31")
+      prev_owner = "fathomx#deadnonce31"
+
+      assert prev_owner == Heartbeat.owner_for("deadnonce31"),
+             "fixture: the predecessor's owner must be the node_key form"
+
+      refute prev_owner =~ to_string(node()), "fixture: node_key must differ from node()"
+      {:ok, _} = Storage.renew_heartbeat(prev_owner, -60_000)
+      on_exit(fn -> Storage.clear_heartbeat(prev_owner) end)
+
+      pid = start_supervised!({Heartbeat, ttl_ms: @ttl}, id: :heartbeat_nodekey_stale)
+      _ = :sys.get_state(pid)
+
+      assert Storage.read_heartbeat(prev_owner) == :not_found,
+             "the predecessor's heartbeat (named by node_key) was never looked up"
+
+      assert Storage.incarnation_dead?(prev_owner),
+             "a proven-dead predecessor must be marked so its fresh locks are stealable"
+    end
+
+    test "a fresh previous incarnation is re-checked, and cleared when its expiry is frozen",
+         %{inc_file: inc_file} do
+      File.write!(inc_file, "livenonce31")
+      prev_owner = Heartbeat.owner_for("livenonce31")
+      {:ok, _} = Storage.renew_heartbeat(prev_owner, 60_000)
+      on_exit(fn -> Storage.clear_heartbeat(prev_owner) end)
+      ref = attach_recheck()
+
+      # A small TTL keeps the scheduled re-check (one renew interval + 1 s) short.
+      pid = start_supervised!({Heartbeat, ttl_ms: 300}, id: :heartbeat_nodekey_fresh)
+      _ = :sys.get_state(pid)
+
+      assert {:ok, _} = Storage.read_heartbeat(prev_owner),
+             "a still-fresh predecessor must not be cleared before the re-check"
+
+      assert_receive {:recheck, ^ref, ^prev_owner, :cleared}, 5_000
+      assert Storage.read_heartbeat(prev_owner) == :not_found
+      assert Storage.incarnation_dead?(prev_owner)
+    end
+  end
+
   # Expert review #8: the lapse generation was process-local state resetting to 0 on
   # restart, so a coordinator that acquired at generation 0 of the PREVIOUS heartbeat
   # incarnation compared 0 != 0 → false → :ok, and flushed without revalidating — even

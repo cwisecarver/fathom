@@ -83,7 +83,18 @@ defmodule Fathom.Shard.Heartbeat do
   same-name zombie (a replaced pod still S3-reachable) renews its OWN per-
   incarnation heartbeat object rather than sharing ours.
   """
-  def owner, do: "#{Fathom.Rebalancer.node_key()}##{incarnation()}"
+  def owner, do: owner_for(incarnation())
+
+  @doc """
+  The owner string for boot nonce `nonce`: `<node_key>#<nonce>`. The ONE builder (expert review
+  2026-11-07 #31): `owner/0` and the previous-incarnation lookup in `clear_previous_incarnation/0`
+  each built it by hand, and when 2026-10-15 #17 moved `owner/0` from `node()` to the node key the
+  lookup was left behind, so with `NODE_KEY` set the node never found its own predecessor's
+  heartbeat (the same-machine fast restart and the leaked-object cleanup silently did nothing).
+  Anything that must name an incarnation of THIS node calls this.
+  """
+  @spec owner_for(String.t()) :: String.t()
+  def owner_for(nonce), do: "#{Fathom.Rebalancer.node_key()}##{nonce}"
 
   @doc false
   # The boot nonce, set by Fathom.Application.start before the tree (race-free).
@@ -721,7 +732,7 @@ defmodule Fathom.Shard.Heartbeat do
     action =
       case File.read(path) do
         {:ok, prev} when prev != "" and prev != current ->
-          judge_previous("#{node()}##{prev}")
+          judge_previous(owner_for(prev))
 
         _ ->
           :ok
