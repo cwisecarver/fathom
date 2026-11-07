@@ -19,7 +19,7 @@ defmodule Fathom.Shard.ReplicationCatchupHolTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Fleet, Follower, Session, Shipper}
   alias Fathom.Shards
-  alias Fathom.Test.PausablePeer
+  alias Fathom.Test.{Await, PausablePeer}
 
   @registry Fathom.Shard.Replication.SessionRegistry
   @keys [
@@ -50,20 +50,6 @@ defmodule Fathom.Shard.ReplicationCatchupHolTest do
     end)
 
     %{id: id, root: root}
-  end
-
-  defp await!(fun, what, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        fun.() -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(10) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("never: #{what}")
   end
 
   defp all_current?(session) do
@@ -116,7 +102,7 @@ defmodule Fathom.Shard.ReplicationCatchupHolTest do
     )
 
     start_supervised!(Fleet)
-    await!(fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end, "shippers connect")
+    Await.until(fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end, "shippers connect")
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -129,7 +115,7 @@ defmodule Fathom.Shard.ReplicationCatchupHolTest do
     for n <- [a, b, c], do: Follower.seed(n, id, epoch, 0, 0, 0, lineage)
     assert :ok = Session.commit(id, wal, coordinator)
     [{session, _}] = Registry.lookup(@registry, id)
-    await!(fn -> :sys.get_state(session).inflight == %{} end, "first commit settles")
+    Await.until(fn -> :sys.get_state(session).inflight == %{} end, "first commit settles")
 
     # C falls far behind: its replies are held, so after its first push every commit skips it.
     :ok = PausablePeer.pause(peer)
@@ -141,7 +127,7 @@ defmodule Fathom.Shard.ReplicationCatchupHolTest do
 
     # C answers its one push and is FREE but ~80 KB (5+ capped pushes) behind; then slow again.
     {:ok, _} = PausablePeer.release(peer)
-    await!(fn -> :sys.get_state(session).inflight == %{} end, "C's held reply settles")
+    Await.until(fn -> :sys.get_state(session).inflight == %{} end, "C's held reply settles")
     :ok = PausablePeer.pause(peer)
     refute all_current?(session), "C is not behind; the test exercises nothing"
 
@@ -157,11 +143,19 @@ defmodule Fathom.Shard.ReplicationCatchupHolTest do
            "a tenant commit waited #{ms} ms behind a catch-up cycle (it settled on a slow " <>
              "follower between rounds instead of shipping one round)"
 
-    assert PausablePeer.held(peer) >= 1, "the catch-up sent C nothing; the test exercised nothing"
+    # AWAIT it, do not read it: the commit above returns at the quorum (A and B), so C's catch-up push
+    # is still on its way (shipper -> peer -> follower -> reply held by the peer) when it returns.
+    # `held` counts the REPLIES the peer has taken from C, so reading it right here raced that round
+    # trip and failed once in a precommit ("the catch-up sent C nothing", seed 269119) though the
+    # catch-up had sent it.
+    Await.until(
+      fn -> PausablePeer.held(peer) >= 1 end,
+      "the catch-up sent C nothing; the test exercised nothing"
+    )
 
     # C answers again. With no tenant traffic it must still be driven to current, at its ack pace:
     # one round per catch-up interval (5 s here) would need 25 s or more.
     {:ok, _} = PausablePeer.release(peer)
-    await!(fn -> all_current?(session) end, "C converges with no tenant traffic", 3_000)
+    Await.until(fn -> all_current?(session) end, "C converges with no tenant traffic", 3_000)
   end
 end

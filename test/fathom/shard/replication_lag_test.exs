@@ -92,7 +92,7 @@ defmodule Fathom.Shard.ReplicationLagTest do
   test "an acked commit emits one commit event (ok, native duration) and lag_info answers", ctx do
     %{id: id, root: root} = ctx
     followers = start_followers!(root, 3, "rl")
-    enable_replication!(followers)
+    enable_replication!(followers, connected: :all)
     {coordinator, path} = open_shard!(id)
     for {n, _} <- followers, do: Follower.seed(n, id, 0, 0, 0, 0)
 
@@ -131,6 +131,26 @@ defmodule Fathom.Shard.ReplicationLagTest do
     refute Enum.any?(report.worst, &(&1.shard_id == id))
   end
 
+  # The precondition the test above depends on, pinned (flake at full-suite seed 883557, 2026-11-07:
+  # `catching_up?: true, catchup_fails: 1` right after an `:ok` commit). With N=3, Q=2 the commit
+  # acks at the second ack, and a follower whose shipper has not connected YET answers the round
+  # `:disconnected`: a real reject, which counts a catch-up failure and arms the loud catch-up. So
+  # `lag_info/1` right after an acked commit is only "current" when every shipper is connected,
+  # which is what `connected: :all` gives the tests that read it. The seed-883557 run itself was not
+  # reproduced (20/20 green alone under 10 busy-loop processes); this test shows what the late
+  # connection looks like, with a follower that NEVER connects.
+  test "an acked commit with a follower that is not connected reads as catching up", ctx do
+    %{id: id, root: root} = ctx
+    followers = start_followers!(root, 2, "rl")
+    enable_replication!(followers ++ [{:unreachable, 1}], connected: 2)
+    {coordinator, path} = open_shard!(id)
+    for {n, _} <- followers, do: Follower.seed(n, id, 0, 0, 0, 0)
+
+    assert :ok = Session.commit(id, path <> "-wal", coordinator)
+
+    assert %{catching_up?: true, catchup_fails: 1} = Session.lag_info(id)
+  end
+
   # Expert review 2026-10-19 #9 (measure only): the commit_stage events carry a bounded
   # `reset: true | false` tag, so the first commit after a checkpoint (a planned `:reset`, which waits
   # on the follower's absorb) can be separated from a plain append commit in the rig's histogram.
@@ -138,7 +158,7 @@ defmodule Fathom.Shard.ReplicationLagTest do
        ctx do
     %{id: id, root: root} = ctx
     followers = start_followers!(root, 3, "rl")
-    enable_replication!(followers)
+    enable_replication!(followers, connected: :all)
     {coordinator, path} = open_shard!(id)
     {:ok, conn} = Connection.open(path)
     on_exit(fn -> Connection.close(conn) end)
@@ -171,7 +191,7 @@ defmodule Fathom.Shard.ReplicationLagTest do
   test "commit and commit_stage events carry the cycle's mode; stages carry skipped", ctx do
     %{id: id, root: root} = ctx
     followers = start_followers!(root, 3, "rl")
-    enable_replication!(followers)
+    enable_replication!(followers, connected: :all)
     {coordinator, path} = open_shard!(id)
     for {n, _} <- followers, do: Follower.seed(n, id, 0, 0, 0, 0)
 
