@@ -1187,6 +1187,7 @@ defmodule Fathom.Shard.Replication.Follower do
           discard_seeds(seeds)
           await_tasks(inflight)
         else
+          sweep_held_fds_if_due()
           {seeds, inflight} = run_frame(sock, name, reader, seeds, inflight, frame, size)
           worker_loop(sock, name, reader, closed, seeds, inflight)
         end
@@ -1211,6 +1212,10 @@ defmodule Fathom.Shard.Replication.Follower do
       :stop ->
         discard_seeds(seeds)
         await_tasks(inflight)
+    after
+      held_sweep_wait() ->
+        sweep_held_fds()
+        worker_loop(sock, name, reader, closed, seeds, inflight)
     end
   end
 
@@ -1223,6 +1228,8 @@ defmodule Fathom.Shard.Replication.Follower do
         {seeds, %{inflight | shard_id => {task, [{frame, size} | queued]}}}
 
       _ ->
+        drop_held_for_frame(name, shard_id, frame)
+
         case frame do
           # NOT while this connection has a seed in flight for the shard: that seed holds the shard
           # lock as THIS process, and a push "during its own seed" must run here, reentrant on it
@@ -4190,6 +4197,101 @@ defmodule Fathom.Shard.Replication.Follower do
   defp evict_lru(held) do
     {path, _} = Enum.min_by(held, fn {_path, {_fd, _inode, used}} -> used end)
     drop_held(held, path)
+  end
+
+  # WHAT A HELD FD MUST NOT OUTLIVE (expert review 2026-11-07 #71). The inode check above makes a
+  # held fd SAFE (a replaced or deleted WAL is reopened on the next append), but it only runs on the
+  # next append for that path. Until then the fd pins whatever inode it was opened on: a reset's
+  # absorb closes SQLite's connection, which unlinks the old `-wal`; a `forget/2` (tenant erase,
+  # promotion) unlinks the replica; a seed install renames a new one in. The unlinked inode stays
+  # allocated and `df` counts bytes `du` cannot find, and for a deleted tenant its WAL bytes stay
+  # reachable through the BEAM's fd for as long as the connection lives (weeks).
+  #
+  # So two things close it, both in the WORKER (the process that owns the fd; a raw file belongs to
+  # the process that opened it, and no other process can close it):
+  #
+  #   * the frames that REPLACE the file drop its held fd as the worker runs them — an offset-0 push
+  #     (the reset; its task writes a new inode) and a seed's begin and end. Dropping is safe
+  #     because the next append re-stats and reopens by inode anyway;
+  #   * an fd unused for `:replication_held_wal_fd_idle_ms` (60 s) is closed: lazily on the frame
+  #     that finds the sweep due, and by the `after` of the worker's receive when it is idle.
+  #     `forget/2` cannot reach another process's descriptor table, so this is what bounds an
+  #     erase's pinned bytes — to the idle window, not to zero. A registry of every worker's held
+  #     paths so `forget/2` could message them was rejected: a per-open ETS write and a message per
+  #     held worker to close a window this size.
+  #
+  # One active shard per worker keeps its fd for as long as it keeps writing (a hit refreshes `used`),
+  # so the hit rate of a live shard is unchanged; a shard idle past the window pays one miss (~45 us
+  # instead of ~18 us) on its next push.
+  @default_held_idle_ms 60_000
+  @held_swept_key {__MODULE__, :held_swept}
+
+  defp held_idle_ms,
+    do: Application.get_env(:fathom, :replication_held_wal_fd_idle_ms, @default_held_idle_ms)
+
+  defp drop_held_for_frame(name, shard_id, %Protocol.Push{offset: 0}),
+    do: drop_held_wal(name, shard_id)
+
+  defp drop_held_for_frame(name, shard_id, %Protocol.SeedBegin{}),
+    do: drop_held_wal(name, shard_id)
+
+  defp drop_held_for_frame(name, shard_id, {:seed_end, _shard}),
+    do: drop_held_wal(name, shard_id)
+
+  defp drop_held_for_frame(_name, _shard_id, _frame), do: :ok
+
+  defp drop_held_wal(name, shard_id) do
+    key = {__MODULE__, :held_fds}
+
+    case Process.get(key) do
+      held when is_map(held) and map_size(held) > 0 ->
+        Process.put(key, drop_held(held, wal_path(name, shard_id)))
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  # How long the worker's receive may block before it sweeps: forever when it holds no fd, so an
+  # idle worker with nothing held costs no timer.
+  defp held_sweep_wait do
+    held = Process.get({__MODULE__, :held_fds})
+
+    if is_map(held) and map_size(held) > 0 and held_idle_ms() > 0,
+      do: held_idle_ms(),
+      else: :infinity
+  end
+
+  defp sweep_held_fds_if_due do
+    idle = held_idle_ms()
+    last = Process.get(@held_swept_key)
+
+    if idle > 0 and
+         (is_nil(last) or
+            System.monotonic_time() - last >=
+              System.convert_time_unit(idle, :millisecond, :native)),
+       do: sweep_held_fds()
+
+    :ok
+  end
+
+  defp sweep_held_fds do
+    key = {__MODULE__, :held_fds}
+    now = System.monotonic_time()
+
+    case Process.get(key) do
+      held when is_map(held) and map_size(held) > 0 ->
+        cutoff = now - System.convert_time_unit(held_idle_ms(), :millisecond, :native)
+        stale = for {path, {_fd, _inode, used}} <- held, used < cutoff, do: path
+        Process.put(key, Enum.reduce(stale, held, &drop_held(&2, &1)))
+
+      _ ->
+        :ok
+    end
+
+    Process.put(@held_swept_key, now)
+    :ok
   end
 
   # SEED INSTALL AND THE STATE FILES HONOUR `:replication_fsync` (expert review 2026-10-15 #21,
