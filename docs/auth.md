@@ -132,6 +132,29 @@ revocation **floor**. That floor is the lever for two distinct operations:
   gets the grace.) The verifier's per-node cache holds `{floor, bumped_at}`, so all of this stays off
   the Postgres hot path.
 
+**A tenant delete revokes too (expert review 2026-11-07 #1).** `Tenants.delete/1` calls `revoke/1`
+after the tombstone upsert, so a deleted id's tokens die with it — even once the directory row is
+hard-deleted for id reuse. The durable `tokenfloors/<id>` mirror is what remains, and
+`Tenants.provision/2` / `fork/3` seed a NEW row at `max(1, stored_floor + 1)` so the previous
+holder's tokens stay dead while the new tenant's work (a fresh row at version 1 would be *below*
+the floor — a locked-out tenant — and without the revoke the old holder's v1 tokens would verify
+against the reused database). Never purge `tokenfloors/<id>` to "clean up" a deleted id: it is the
+Postgres-PITR backstop. See [tenant-lifecycle.md](tenant-lifecycle.md) for the reuse recipe.
+
+**The mirror is a monotonic compare-and-set, and it is backfilled (expert review 2026-11-07 #30).**
+`Storage.put_token_floor/2` stores `max(stored, version)` (S3: GET, then `If-Match` the etag it read /
+`If-None-Match: *`, re-read on a lost race; `Local`: the same under the node-local mutex), so two
+racing bumps arriving out of order cannot lower the floor. The mirror write stays best-effort for
+`revoke/rotate` (a storage blip never fails them), but a failed write is not left stale:
+`Tenants.purge/1` re-drives it under the `DeleteJob`'s retries, and `mix fathom.directory reconcile
+--fix` writes `directory → storage` where the directory is ahead (`token_backfill` findings),
+including for `deleted` rows.
+
+**A mint never guesses the version (expert review 2026-11-07 #35).** `token_for/2` returns
+`{:error, :version_unavailable}` when the directory read fails (the API answers 503; `provision`/`fork`
+return `{:token_mint_failed, _}`), instead of silently embedding version 1 — a token that reads as
+revoked on any shard above floor 1. `rotate/2` mints at the version its own bump returned.
+
 - **Read-only scope.** `token_for(id, scope: :ro)` mints a token carrying an `"sc": "ro"` claim (a full
   token carries none — absence reads as read-write, so every already-issued token stays full-access).
   On a `ro` stream, `Fathom.ShardExecutor` refuses any write (DML or DDL) with a distinct **403

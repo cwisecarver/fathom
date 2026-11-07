@@ -63,9 +63,13 @@ defmodule Fathom.Tenants do
 
   @doc """
   Deletes a tenant: tombstones the directory row and broadcasts the tombstone fleet-wide
-  (both synchronous, so re-mint is blocked immediately), then enqueues `DeleteJob` for the
-  physical erase. Returns `{:ok, :scheduled}`, `{:error, :invalid_shard_id}`, or the
-  directory changeset error.
+  (both synchronous, so re-mint is blocked immediately), revokes every outstanding token
+  (`HranaAuth.revoke/1`: directory bump + durable `tokenfloors/<id>` mirror + fleet push), then
+  enqueues `DeleteJob` for the physical erase. Returns `{:ok, :scheduled}`,
+  `{:error, :invalid_shard_id}`, the directory changeset error, or `{:error, {:revoke_failed, reason}}`
+  when the revoke could not complete — the tombstone, broadcast and job are then ALREADY in place, and
+  re-running `delete/1` (idempotent; each run bumps the floor once more, harmless) finishes it.
+  `purge/1` additionally re-drives the durable floor mirror under the job's retries.
   """
   @spec delete(String.t()) :: {:ok, :scheduled} | {:error, term()}
   def delete(shard_id) do
@@ -73,8 +77,19 @@ defmodule Fathom.Tenants do
          {:ok, _row} <- Directory.tombstone(id) do
       broadcast_deleted(id)
       write_early_marker(id)
+
+      # Tokens die with the tenant (expert review 2026-11-07 #1). Delete ended the DATA but not the
+      # credentials: every token stayed valid, and a later reuse of the id (the DR runbook's
+      # recipe) inherited the old holder's tokens against the new tenant's database. After the
+      # tombstone upsert, so the row exists for the bump; before the enqueue, which is
+      # fire-and-forget either way.
+      revoked = revoke_tokens(id)
       enqueue_delete(id)
-      {:ok, :scheduled}
+
+      case revoked do
+        :ok -> {:ok, :scheduled}
+        {:error, _} = error -> error
+      end
     end
   end
 
@@ -97,6 +112,13 @@ defmodule Fathom.Tenants do
   `{:error, {:fork_failed, reason}}` and rolls the directory row back — provision never reports
   success for a tenant that has no schema (expert review 2026-08-31 #10). A concurrent forker
   winning the race is success, not a failure.
+
+  A NEW row is seeded at `max(1, stored_floor + 1)` (`seed_token_floor/1`): a reused id — one that
+  was deleted, then freed per `docs/tenant-lifecycle.md` — must not inherit the old holder's tokens
+  (expert review 2026-11-07 #1). An unreadable store refuses the birth
+  (`{:error, {:token_floor_unreadable, reason}}`, row rolled back), and a token that cannot embed
+  its version is `{:error, {:token_mint_failed, reason}}` (the tenant exists; mint with
+  `POST /api/tenants/:id/token`) rather than an `auth_token: nil` success (#35).
   """
   @spec provision(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def provision(shard_id, opts \\ []) do
@@ -106,8 +128,9 @@ defmodule Fathom.Tenants do
          {:ok, warnings} <- dns_safety(id),
          {:ok, row} <- Directory.resolve(id),
          :ok <- require_registered_active(row),
+         :ok <- seed_floor_or_rollback(id),
          :ok <- fork_or_rollback(id) do
-      {:ok, tenant_result(id, warnings, opts)}
+      tenant_result(id, warnings, opts)
     end
   end
 
@@ -124,7 +147,9 @@ defmodule Fathom.Tenants do
   home node first. Refuses `{:error, :already_exists}`/`{:error, :tombstoned}` (dst taken in the
   directory), `{:error, :dst_exists}` (dst already has a stored object), `{:error, :dst_busy}` (dst is
   being opened/forked concurrently — its lease is held), `{:error, :no_source}` (src has no stored
-  object / directory row), the flush error if `flush_source` fails, or `{:error, :invalid_shard_id}`.
+  object / directory row), the flush error if `flush_source` fails, `{:error, :invalid_shard_id}`, or
+  `{:error, {:token_mint_failed, reason}}` (the fork succeeded but no token could be minted — mint
+  one with `POST /api/tenants/:id/token`).
   """
   @spec fork(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def fork(src_id, dst_id, opts \\ []) do
@@ -136,8 +161,8 @@ defmodule Fathom.Tenants do
          {:ok, src_row} <- fetch_src(src),
          :ok <- maybe_flush_source(src, opts),
          :ok <- fork_into_leased_dst(src, dst),
-         :ok <- register_fork(dst) do
-      result = tenant_result(dst, warnings, opts)
+         :ok <- register_fork(dst),
+         {:ok, result} <- tenant_result(dst, warnings, opts) do
       {:ok, Map.put(result, :source_flushed_at, source_flushed_at(src_row, opts))}
     end
   end
@@ -294,6 +319,7 @@ defmodule Fathom.Tenants do
           # sweep's LIST and its DELETEs; the migrator refuses to retain for a tombstoned id, and
           # this second pass collects the one that raced that check. Idempotent, like the first.
           with :ok <- Storage.put_tombstone(id),
+               :ok <- mirror_token_floor(id),
                :ok <- Storage.purge_shard(id),
                :ok <- rm_local(id) do
             :telemetry.execute([:fathom, :tenants, :deleted], %{count: 1}, %{shard_id: id})
@@ -629,11 +655,82 @@ defmodule Fathom.Tenants do
 
   # `opts[:actor]` is the caller's identity for the issuance ledger (expert review 2026-10-10 #W3);
   # without it every API-minted token read as the anonymous "Tenants.provision".
+  #
+  # A mint that cannot embed the shard's revocation version is an ERROR, not a `nil` token (expert
+  # review 2026-11-07 #35): this used to swallow every non-`{:ok, _}` into `auth_token: nil`.
   defp mint_token(id, opts) do
     case HranaAuth.token_for(id, actor: Keyword.get(opts, :actor) || "Tenants.provision") do
-      {:ok, token} -> token
-      _ -> nil
+      {:ok, token} -> {:ok, token}
+      {:error, reason} -> {:error, {:token_mint_failed, reason}}
     end
+  end
+
+  # A REUSED ID MUST NOT INHERIT ITS PREVIOUS HOLDER'S TOKENS (expert review 2026-11-07 #1).
+  # `delete/1` revokes, so the durable `tokenfloors/<id>` mirror holds the dead tenant's floor. A
+  # fresh directory row starts at version 1, which is BELOW that floor: tokens minted at 1 (the new
+  # tenant's) read as revoked, while — had delete not raised the floor — the old holder's v1 tokens
+  # would verify against the new tenant's database. So a new row is seeded at `max(1, floor + 1)`:
+  # the `+ 1` also covers a final mirror write that never landed (the floor then trails the last
+  # version the old holder's tokens carried by up to one bump).
+  #
+  # Read from STORAGE, not the old directory row: the reuse recipe hard-deletes that row. Never
+  # purge `tokenfloors/<id>` instead — it is the Postgres-PITR backstop, and removing it would make
+  # the reuse unprotected whenever the row is not the one that was just deleted.
+  # `raise_token_version/2` never lowers, so a re-run (or a row already ahead) is a no-op.
+  #
+  # An unreadable store REFUSES the birth: provisioning blind is the cross-tenant hole itself.
+  defp seed_token_floor(id) do
+    case Storage.read_token_floor(id) do
+      {:ok, nil} ->
+        :ok
+
+      {:ok, floor} ->
+        Directory.raise_token_version(id, max(1, floor + 1))
+        :ok
+
+      {:error, reason} ->
+        {:error, {:token_floor_unreadable, reason}}
+    end
+  rescue
+    e -> {:error, {:token_floor_unreadable, e}}
+  catch
+    :exit, reason -> {:error, {:token_floor_unreadable, {:exit, reason}}}
+  end
+
+  defp seed_floor_or_rollback(id) do
+    case seed_token_floor(id) do
+      :ok ->
+        :ok
+
+      {:error, _} = err ->
+        _ = Directory.rollback_provisioned(id)
+        err
+    end
+  end
+
+  # Revokes every outstanding token of a deleted tenant (expert review 2026-11-07 #1): bumps the
+  # directory floor, mirrors it to storage and pushes it fleet-wide. A failure is returned, not
+  # swallowed, but only AFTER the tombstone, broadcast and job are in place (`delete/1`): the data
+  # is already protected, and the operator re-runs the idempotent delete to finish the revoke.
+  defp revoke_tokens(id) do
+    case HranaAuth.revoke(id) do
+      {:ok, _version} -> :ok
+      {:error, reason} -> {:error, {:revoke_failed, reason}}
+    end
+  rescue
+    e -> {:error, {:revoke_failed, e}}
+  catch
+    :exit, reason -> {:error, {:revoke_failed, {:exit, reason}}}
+  end
+
+  # The retryable durable half of the revoke (see `HranaAuth.mirror_floor/1`): re-driven by every
+  # `purge/1` attempt so a mirror write that failed at delete time is not left to a DR sweep.
+  defp mirror_token_floor(id) do
+    HranaAuth.mirror_floor(id)
+  rescue
+    e -> {:error, {:token_floor_mirror, e}}
+  catch
+    :exit, reason -> {:error, {:token_floor_mirror, {:exit, reason}}}
   end
 
   # Flush src's live coordinator before a fork when `flush_source: true`, so the copy reflects the
@@ -683,6 +780,7 @@ defmodule Fathom.Tenants do
   def register_fork(dst) do
     with {:ok, version} <- copied_version(dst),
          {:ok, _row} <- Directory.resolve(dst),
+         :ok <- seed_token_floor(dst),
          {:ok, _row} <- stamp_fork(dst, version) do
       :ok
     else
@@ -736,13 +834,16 @@ defmodule Fathom.Tenants do
   # The provision/fork response shape. `warnings` is always present (empty when the id is fine) so
   # the API surface is consistent (expert review #35).
   defp tenant_result(id, warnings, opts) do
-    %{
-      shard_id: id,
-      url: tenant_url(id),
-      auth_token: mint_token(id, opts),
-      auth_required: auth_required?(),
-      warnings: warnings
-    }
+    with {:ok, token} <- mint_token(id, opts) do
+      {:ok,
+       %{
+         shard_id: id,
+         url: tenant_url(id),
+         auth_token: token,
+         auth_required: auth_required?(),
+         warnings: warnings
+       }}
+    end
   end
 
   # Wildcard-TLS servability gate (expert review #35). `provision`/`fork` is the one place that KNOWS

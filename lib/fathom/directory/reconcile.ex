@@ -14,7 +14,10 @@ defmodule Fathom.Directory.Reconcile do
     * **`schema_version`** ← the shard file's `PRAGMA user_version`. The file lives in storage (not
       Postgres), so its version survives a directory restore and is the source of truth.
     * **`token_version`** ← the durable revocation floor (`Storage.read_token_floor/1`, #6b). Raised,
-      never lowered, so a restore can't un-revoke.
+      never lowered, so a restore can't un-revoke. The OTHER direction too (expert review 2026-11-07
+      #30): a directory that is ahead of its storage mirror (the revoke-time mirror write is
+      best-effort) is written back to storage, monotonically — including for `deleted` rows, whose
+      floor is what keeps a reused id from inheriting the old holder's tokens.
     * **deleted status** ← the durable tombstones (`Storage.tombstoned_ids/0`, #6a). A storage
       tombstone with no `deleted` directory row is re-tombstoned.
     * **`retained_version`** ← the retained `<shard>@<version>` copy. A pointer to a copy storage no
@@ -105,10 +108,19 @@ defmodule Fathom.Directory.Reconcile do
   defp apply_limit(stream, _), do: stream
 
   # A deleted row's object is purged — nothing to read; it's covered by the tombstone check instead.
+  # Its token floor is NOT covered by anything else, though: `Tenants.delete/1` raises the floor so a
+  # reused id cannot inherit the old holder's tokens, and the mirror in storage is what a hard-deleted
+  # row leaves behind (expert review 2026-11-07 #1/#30). Backfill that one direction (never raise the
+  # directory from storage on a row nothing mints from); a row never raised has nothing to mirror.
+  defp reconcile_row(%{status: "deleted", token_version: v} = row, fix?)
+       when is_integer(v) and v > 1,
+       do: reconcile_token(row, fix?, false)
+
   defp reconcile_row(%{status: "deleted"}, _fix?), do: []
 
   defp reconcile_row(row, fix?) do
-    reconcile_schema(row, fix?) ++ reconcile_token(row, fix?) ++ reconcile_retained(row, fix?)
+    reconcile_schema(row, fix?) ++
+      reconcile_token(row, fix?, true) ++ reconcile_retained(row, fix?)
   end
 
   # `retained_version` names the retained `<shard>@<version>` copy that a revert restores from. A
@@ -162,13 +174,36 @@ defmodule Fathom.Directory.Reconcile do
     end
   end
 
-  defp reconcile_token(row, fix?) do
+  # Both directions of the floor, each one-sided (expert review 2026-11-07 #30):
+  #
+  #   * storage > directory → raise the directory (a PITR rewound it; never lowers).
+  #   * storage < directory (or absent) while the directory has been raised → backfill storage. The
+  #     mirror is written best-effort at revoke/rotate time, so a store blip leaves it stale — and a
+  #     stale mirror is exactly what a later PITR would faithfully restore the directory to, un-revoking
+  #     tokens. This direction did not exist; the comment in `HranaAuth` claiming "the reconcile sweep
+  #     backfills it" was false. `put_token_floor/2` is monotonic, so a racing revoke can't be lowered.
+  #
+  # A directory at the default 1 has nothing to mirror (the floor is only ever written on a bump).
+  defp reconcile_token(row, fix?, directory_may_rise?) do
     current = row.token_version || 0
 
     case Storage.read_token_floor(row.shard_id) do
-      {:ok, floor} when is_integer(floor) and floor > current ->
+      {:ok, floor} when directory_may_rise? and is_integer(floor) and floor > current ->
         fixed? = fix? and Directory.raise_token_version(row.shard_id, floor) == 1
         [%{shard_id: row.shard_id, kind: :token_drift, from: current, to: floor, fixed: fixed?}]
+
+      {:ok, floor} when current > 1 and (is_nil(floor) or floor < current) ->
+        fixed? = fix? and Storage.put_token_floor(row.shard_id, current) == :ok
+
+        [
+          %{
+            shard_id: row.shard_id,
+            kind: :token_backfill,
+            from: floor,
+            to: current,
+            fixed: fixed?
+          }
+        ]
 
       {:error, reason} ->
         [%{shard_id: row.shard_id, kind: :unreadable, fact: :token, reason: reason}]

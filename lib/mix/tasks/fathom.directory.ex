@@ -13,7 +13,9 @@ defmodule Mix.Tasks.Fathom.Directory do
   applies corrections. `--limit N` bounds how many rows it inspects (each pulls the shard's object).
 
   Reconciles: `schema_version` ← the file's `PRAGMA user_version`; `token_version` ← the durable
-  storage revocation floor; and re-tombstones any `deleted`-in-storage id the directory forgot.
+  storage revocation floor (raised, never lowered) AND the floor mirror ← the directory's
+  `token_version` (a revoke-time mirror write that failed is backfilled, monotonically); and
+  re-tombstones any `deleted`-in-storage id the directory forgot.
   """
   use Mix.Task
 
@@ -68,6 +70,13 @@ defmodule Mix.Tasks.Fathom.Directory do
     do:
       Mix.shell().info(
         "  #{f.shard_id}: token_version #{f.from} -> #{f.to} (storage floor)#{fixed(f)}"
+      )
+
+  defp print_finding(%{kind: :token_backfill} = f),
+    do:
+      Mix.shell().info(
+        "  #{f.shard_id}: storage token floor #{inspect(f.from)} -> #{f.to} (directory version; " <>
+          "the revoke-time mirror write had not landed)#{fixed(f)}"
       )
 
   defp print_finding(%{kind: :orphan_tombstone} = f),

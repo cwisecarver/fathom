@@ -31,8 +31,11 @@ defmodule Fathom.HranaAuthTest do
 
   defp require_auth!, do: Application.put_env(:fathom, :hrana_auth, :required)
 
+  # These tests run with no Ecto sandbox owner, so `token_for/2` cannot read the directory (it answers
+  # `{:error, :version_unavailable}` rather than guessing — expert review 2026-11-07 #35). Pin the
+  # version the directory holds for a never-recorded shard, which is what the old rescue guessed.
   defp token!(shard, opts \\ []) do
-    {:ok, token} = HranaAuth.token_for(shard, opts)
+    {:ok, token} = HranaAuth.token_for(shard, Keyword.put_new(opts, :version, 1))
     token
   end
 
@@ -418,7 +421,7 @@ defmodule Fathom.HranaAuthTest do
     end
 
     test "reads and writes are refused after a revoke, on the SAME handle", %{shard: shard} do
-      {:ok, token} = HranaAuth.token_for(shard)
+      {:ok, token} = HranaAuth.token_for(shard, version: 1)
       {:ok, {scope, version}} = HranaAuth.authorize(shard, token)
       assert is_integer(version), "the token carried no version; the re-check cannot run"
 

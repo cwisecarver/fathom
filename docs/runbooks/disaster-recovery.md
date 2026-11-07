@@ -24,7 +24,7 @@ incident, not just lost control-plane state.
 | Directory fact rolled back | Unmitigated consequence | Backstop |
 |---|---|---|
 | a tenant's `deleted` status | the erased subdomain re-mints an **empty shard** on next request (a GDPR erasure failure) | **Storage tombstone** (`tombstones/<id>`, audit #6a): written on delete, never swept by `purge_shard`, and **unioned into the admission ETS at each node's boot**. A node already running keeps its append-only tombstone set; a node booting after the restore re-reads storage. |
-| `token_version` (revocation floor) | a **revoked/leaked token verifies again** | **Storage token floor** (`tokenfloors/<id>`, audit #6b): written on revoke/rotate. `HranaAuth.Revocations` is monotonic in memory (a running node never lowers its floor) and unions the storage floor on a cold cache read (a node booting after the restore). |
+| `token_version` (revocation floor) | a **revoked/leaked token verifies again** | **Storage token floor** (`tokenfloors/<id>`, audit #6b): written on revoke/rotate/**delete** (a monotonic conditional write: it never lowers the floor; a failed write is re-driven by the `DeleteJob` and backfilled by `reconcile --fix`). `HranaAuth.Revocations` is monotonic in memory (a running node never lowers its floor) and unions the storage floor on a cold cache read (a node booting after the restore). |
 | `schema_version` | the laggard sweep sees `schema_version < head`, **replays a migration onto an already-migrated file**, hits "already exists", and **quarantines** the tenant | **The shard file's `PRAGMA user_version`** lives in storage, not Postgres, so it is *not* rolled back and is the source of truth. `mix fathom.directory reconcile` realigns the directory to it. |
 
 The through-line, same as everywhere in fathom: **tenant data is never at risk** (it lives in
@@ -54,7 +54,8 @@ Run this after any Postgres restore that moved the directory backward in time.
 
    `--fix` realigns three facts to their durable-storage truth: `schema_version` ← the file's
    `user_version` (this is what prevents the laggard-quarantine), `token_version` ← the storage
-   revocation floor (raised, never lowered), and re-tombstones any storage-`deleted` id the directory
+   revocation floor (raised, never lowered; and the storage floor is itself backfilled from the
+   directory where it trails, also for `deleted` rows), and re-tombstones any storage-`deleted` id the directory
    forgot. It also reports **dangling rows** (a directory row with no stored object) for you to
    triage. It pulls each shard's object, so on a large fleet scope it with `--limit N` and sweep in
    batches, or run it against the recently-active set first.
@@ -74,7 +75,17 @@ Run this after any Postgres restore that moved the directory backward in time.
   transient (default 1h) and directory-sourced; after a restore, treat any in-flight rotations as
   needing a fresh rotate. The hard revocation floor is what the storage backstop guarantees.
 - **Forward restores are fine.** If Postgres is restored *forward* (to a later point than storage),
-  the monotonic/`max` logic means the directory simply leads storage; reconcile is a no-op for
-  token/schema (storage never exceeds it) and the next flush/revoke re-syncs storage.
-- **To truly reuse a deleted id** (the documented escape hatch): hard-delete the directory row, delete
-  the `tombstones/<id>` storage object, and restart — otherwise the storage backstop re-tombstones it.
+  the monotonic/`max` logic means the directory simply leads storage; reconcile raises nothing in
+  the directory, and `mix fathom.directory reconcile --fix` **backfills** a storage floor that trails
+  the directory (`token_backfill` findings — the revoke-time mirror write is best-effort, and the
+  storage write is a monotonic compare-and-set, so a backfill can never lower a floor).
+- **To truly reuse a deleted id** (the documented escape hatch; full recipe and the reasoning in
+  [tenant-lifecycle.md](../tenant-lifecycle.md) § Operator runbook): (1) wait for the `DeleteJob`
+  to finish, (2) hard-delete the directory row, (3) delete the `tombstones/<id>` storage object —
+  otherwise the storage backstop re-tombstones it at every boot — but **NOT `tokenfloors/<id>`**,
+  (4) restart every node, (5) `Fathom.Tenants.provision("<id>")` before any traffic. `delete/1`
+  revoked the old holder's tokens and `provision/2` seeds the new row's `token_version` from the
+  stored floor as `max(1, floor + 1)`, so the previous holder's tokens stay dead and the new
+  tenant's work. Purging the floor instead would hand the old holder's tokens to the new tenant
+  after the next Postgres PITR. A reused row born at version 1 some other way is repaired by
+  `mix fathom.directory reconcile --fix`.

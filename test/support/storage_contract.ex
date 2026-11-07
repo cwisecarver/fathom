@@ -378,6 +378,41 @@ defmodule Fathom.Test.StorageContract do
         end
       end
 
+      # Expert review 2026-11-07 #30. The durable revocation floor is a HIGH-WATER MARK: two bumps
+      # reach storage in either order (a revoke racing a RevokeJob), and a blind overwrite let the
+      # lower one land last — a Postgres PITR then restored the directory to the lowered floor and a
+      # revoked token verified again. Both backends must keep the higher value.
+      describe "#{inspect(unquote(backend))} — the token floor is monotonic (expert review 2026-11-07 #30)" do
+        test "a lower floor written after a higher one does not lower it" do
+          id = sid("floor")
+
+          assert {:ok, nil} = @backend.read_token_floor(id)
+          assert :ok = @backend.put_token_floor(id, 6)
+          assert {:ok, 6} = @backend.read_token_floor(id)
+
+          assert :ok = @backend.put_token_floor(id, 5)
+          assert {:ok, 6} = @backend.read_token_floor(id), "a late, lower write lowered the floor"
+
+          assert :ok = @backend.put_token_floor(id, 6)
+          assert {:ok, 6} = @backend.read_token_floor(id)
+
+          assert :ok = @backend.put_token_floor(id, 7)
+          assert {:ok, 7} = @backend.read_token_floor(id)
+        end
+
+        test "a floor is per shard: raising `acme` never moves `acme2` (shard-isolation gate)" do
+          base = sid("acme")
+          neighbour = base <> "2"
+
+          assert :ok = @backend.put_token_floor(base, 9)
+          assert {:ok, nil} = @backend.read_token_floor(neighbour)
+
+          assert :ok = @backend.put_token_floor(neighbour, 3)
+          assert {:ok, 9} = @backend.read_token_floor(base)
+          assert {:ok, 3} = @backend.read_token_floor(neighbour)
+        end
+      end
+
       # Read the stored object's bytes through the API alone (pull to a scratch path), so the
       # contract stays backend-agnostic.
       defp stored_body(shard_id) do

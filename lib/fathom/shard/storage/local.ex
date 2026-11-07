@@ -577,9 +577,25 @@ defmodule Fathom.Shard.Storage.Local do
   def put_token_floor(shard_id, version) do
     path = Path.join([dir(), "tokenfloors", shard_id])
     File.mkdir_p!(Path.dirname(path))
-    # fsync + rename (expert review 2026-10-12 #25): a truncating `File.write` can read back empty
-    # (floor nil, i.e. no revocation floor) after a crash; atomic_write is whole-old or whole-new.
-    Storage.atomic_write(path, Integer.to_string(version))
+
+    # MONOTONIC (expert review 2026-11-07 #30): stores `max(stored, version)`. Read-compare-write
+    # under the same node-local mutex the lock mutations use — Local is one machine, so the mutex is
+    # the whole conditional-write story (S3 uses If-Match on the etag it read).
+    with_lock_mutex({:token_floor, shard_id}, fn ->
+      case read_token_floor(shard_id) do
+        {:ok, stored} when is_integer(stored) and stored >= version ->
+          :ok
+
+        {:ok, _lower_or_unparseable} ->
+          # fsync + rename (expert review 2026-10-12 #25): a truncating `File.write` can read back
+          # empty (floor nil, i.e. no revocation floor) after a crash; atomic_write is whole-old or
+          # whole-new.
+          Storage.atomic_write(path, Integer.to_string(version))
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end)
   end
 
   @impl true

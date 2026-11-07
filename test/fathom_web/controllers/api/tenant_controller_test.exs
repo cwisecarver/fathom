@@ -202,6 +202,24 @@ defmodule FathomWeb.Api.TenantControllerTest do
       assert is_binary(body["auth_token"])
     end
 
+    # Expert review 2026-11-07 #35: with the directory unreadable the mint used to answer 200 with a
+    # version-1 token that verified as revoked. It is a retryable 503 now, and nothing is issued.
+    test "mint answers 503, not a dead token, when the directory cannot be read", %{conn: conn} do
+      put_shard("api_tok_down")
+      conn = auth(conn)
+
+      Ecto.Adapters.SQL.Sandbox.mode(Repo, :manual)
+
+      on_exit(fn ->
+        owner = Ecto.Adapters.SQL.Sandbox.start_owner!(Repo, shared: true)
+        Ecto.Adapters.SQL.Sandbox.stop_owner(owner)
+      end)
+
+      body = conn |> post("/api/tenants/api_tok_down/token") |> json_response(503)
+      assert body["error"] =~ "token version unavailable"
+      refute Map.has_key?(body, "auth_token")
+    end
+
     # Expert review 2026-10-10 #W3: mint/rotate recorded the route string "api:/api/tenants/:id/token"
     # (and create/fork "Tenants.provision") as the ledger actor, so the fleet-wide time-scoped
     # revoke could not tell WHICH API key minted what. Every API mint now names the caller.

@@ -379,6 +379,7 @@ defmodule FathomWeb.Api.TenantController do
     case HranaAuth.token_for(id, scope: scope, actor: token_actor(conn)) do
       {:ok, token} -> json(conn, %{shard_id: id, auth_token: token, scope: to_string(scope)})
       {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
+      {:error, :version_unavailable} -> version_unavailable(conn)
     end
   end
 
@@ -391,6 +392,17 @@ defmodule FathomWeb.Api.TenantController do
       {:error, :invalid_shard_id} -> error(conn, :bad_request, "invalid shard id")
     end
   end
+
+  # The directory could not be read for the shard's revocation version (expert review 2026-11-07
+  # #35). A token minted blind would embed version 1 and read as revoked, so the mint is refused and
+  # the caller retries; nothing was issued.
+  defp version_unavailable(conn),
+    do:
+      error(
+        conn,
+        :service_unavailable,
+        "token version unavailable (directory unreachable); retry"
+      )
 
   # DELETE /api/tenants/:id/token   — revoke every outstanding token immediately (#24)
   def revoke_token(conn, %{"id" => id}) do

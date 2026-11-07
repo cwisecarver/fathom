@@ -121,8 +121,10 @@ defmodule Fathom.FailureTelemetryTest do
       :ok
     end
 
+    # No sandbox owner here, so `token_for/2` cannot read the directory and would refuse (expert review
+    # 2026-11-07 #35); pin the version the directory holds for a never-recorded shard.
     defp token!(shard, opts \\ []) do
-      {:ok, t} = HranaAuth.token_for(shard, opts)
+      {:ok, t} = HranaAuth.token_for(shard, Keyword.put_new(opts, :version, 1))
       t
     end
 

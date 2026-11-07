@@ -601,6 +601,14 @@ defmodule Fathom.Shard.Storage do
   # back and revoked tokens verify again. This mirrors the floor (a monotonic high-water mark) to
   # storage under a `tokenfloors/<shard_id>` key so `HranaAuth.Revocations` can union it on a cold
   # read and never drop below it — keeping a revocation durable across a directory restore.
+  #
+  # `put_token_floor/2` is a MONOTONIC write (expert review 2026-11-07 #30): it stores
+  # `max(stored, version)`, never lowers, and answers `:ok` when the stored value is already
+  # at/above `version`. Two bumps (a revoke racing a RevokeJob, an operator rotate racing either)
+  # reach storage in either order, so a blind overwrite let v3 land after v4 and LOWER the floor —
+  # the revoked v3 token then verified again after a directory restore. A backend that can only
+  # overwrite must read-compare-write under a real conditional write (S3: `If-Match` the etag it
+  # read, `If-None-Match: *` when absent).
   @callback put_token_floor(shard_id :: String.t(), version :: non_neg_integer()) ::
               :ok | {:error, term()}
   @callback read_token_floor(shard_id :: String.t()) ::
@@ -1407,7 +1415,11 @@ defmodule Fathom.Shard.Storage do
   @spec tombstone_present?(String.t()) :: {:ok, boolean()} | {:error, term()}
   def tombstone_present?(shard_id), do: backend().tombstone_present?(shard_id)
 
-  @doc "Mirrors `shard_id`'s token-revocation floor to durable storage (the DR backstop, #6). Idempotent."
+  @doc """
+  Mirrors `shard_id`'s token-revocation floor to durable storage (the DR backstop, #6) as a
+  MONOTONIC high-water mark: stores `max(stored, version)` and answers `:ok` without writing when
+  the stored floor is already at/above `version` (expert review 2026-11-07 #30). Idempotent.
+  """
   @spec put_token_floor(String.t(), non_neg_integer()) :: :ok | {:error, term()}
   def put_token_floor(shard_id, version), do: backend().put_token_floor(shard_id, version)
 

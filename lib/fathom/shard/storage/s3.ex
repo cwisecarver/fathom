@@ -2486,15 +2486,71 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # MONOTONIC and conditional (expert review 2026-11-07 #30). The old body was one blind PUT, so two
+  # bumps reaching the store out of order (a revoke racing a RevokeJob; v3's PUT landing after v4's)
+  # LOWERED the durable floor, and a later Postgres PITR then restored the directory to the lowered
+  # value — a revoked token verifying again, the exact scenario this mirror exists for.
+  #
+  # GET the stored floor: already at/above `version` ⇒ `:ok` with no write; otherwise PUT
+  # `If-Match` the etag just read (`If-None-Match: *` when the key is absent). A 412 means a
+  # concurrent writer got in between, so re-read and decide again (their value may already cover
+  # ours). Per-call headers only: `build_req/1` is shared with the lease/flush traffic and untouched.
+  @token_floor_cas_attempts 4
+
   @impl true
-  def put_token_floor(shard_id, version) do
+  def put_token_floor(shard_id, version),
+    do: put_token_floor(shard_id, version, @token_floor_cas_attempts)
+
+  defp put_token_floor(_shard_id, _version, 0), do: {:error, :token_floor_contended}
+
+  defp put_token_floor(shard_id, version, attempts) do
+    case Req.get(req(), url: url_path(token_floor_key(shard_id))) do
+      {:ok, %{status: 200, body: body, headers: headers}} ->
+        case {parse_token_floor(body), etag(headers)} do
+          {stored, _} when is_integer(stored) and stored >= version ->
+            :ok
+
+          # A 200 with no ETag cannot be conditionally replaced; an unfenced overwrite is exactly
+          # the defect this loop exists to remove.
+          {_, nil} ->
+            {:error, :token_floor_no_etag}
+
+          # Lower, or unparseable (which reads as no floor at all): replace the exact version read.
+          {_, etag} ->
+            put_token_floor_cas(shard_id, version, attempts, [{"if-match", etag}])
+        end
+
+      {:ok, %{status: 404}} ->
+        put_token_floor_cas(shard_id, version, attempts, [{"if-none-match", "*"}])
+
+      {:ok, %{status: status}} ->
+        {:error, {:s3_get_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp put_token_floor_cas(shard_id, version, attempts, headers) do
     case Req.put(req(),
            url: url_path(token_floor_key(shard_id)),
+           headers: headers,
            body: Integer.to_string(version)
          ) do
-      {:ok, %{status: status}} when status in 200..299 -> :ok
-      {:ok, %{status: status}} -> {:error, {:s3_put_status, status}}
-      {:error, reason} -> {:error, reason}
+      {:ok, %{status: status}} when status in 200..299 ->
+        :ok
+
+      # 412: the precondition failed; 404 on `If-Match`: the object was deleted between the GET and
+      # the PUT (AWS answers 404 NoSuchKey where MinIO answers 412); 409: ConditionalRequestConflict.
+      # All three mean a concurrent writer moved the key — re-read and decide again.
+      {:ok, %{status: status}} when status in [404, 409, 412] ->
+        put_token_floor(shard_id, version, attempts - 1)
+
+      {:ok, %{status: status}} ->
+        {:error, {:s3_put_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

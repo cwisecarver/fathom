@@ -22,7 +22,10 @@ physical erase to a durable, retryable job.
 delete(id):
   Directory.tombstone(id)          # 1. durable: status -> "deleted" (upsert; never resurrected)
   broadcast_deleted(id)            # 2. fleet-wide: ETS re-mint gate + A2 replica erase, now
-  enqueue DeleteJob(id)            # 3. the physical erase, off the request path
+  HranaAuth.revoke(id)             # 3. every outstanding token dies: directory bump + durable
+                                   #    tokenfloors/<id> mirror + fleet push (reuse of the id can
+                                   #    never inherit the old holder's tokens)
+  enqueue DeleteJob(id)            # 4. the physical erase, off the request path
 ```
 
 By the time `delete/1` returns, **no new stream can open the shard** anywhere in the fleet — the
@@ -62,6 +65,7 @@ purge(id):
   cancel_pending_jobs(id)   # scheduled/available/retryable migration/revert/retirement/handoff jobs
   Shards.stop(id)           # FORCE-stop the home coordinator (see below)
   Storage.purge_shard(id)   # delete every stored object of the shard
+  HranaAuth.mirror_floor(id) # re-drive the durable token-floor mirror (a delete-time PUT may have failed)
   rm_local(id)              # sweep the local working file + any quarantine copies
 ```
 
@@ -280,8 +284,31 @@ from a release remote console.
   delete is immediate and irreversible by design.
 - **A delete looks stuck.** Check the `:tenants` Oban queue for a retrying/failed `DeleteJob`; a
   storage error retries. Re-running `Tenants.delete/1` is safe (idempotent) and re-enqueues.
-- **Re-use a deleted id.** The tombstone is permanent. To make the subdomain mintable again, hard-
-  delete the directory row and let the tombstone set refresh (or restart the node).
+- **Re-use a deleted id.** The tombstone is permanent and a deleted id's credentials are revoked, so
+  freeing an id is a deliberate, multi-step operator action. (The step this bullet used to give —
+  "hard-delete the directory row and let the tombstone set refresh" — never worked: the
+  `tombstones/<id>` storage marker is unioned back into the in-memory set at every boot, and the set
+  is append-only, so the id stayed refused. Expert review 2026-11-07 #1.)
+
+  1. Let the `DeleteJob` finish (the `:tenants` queue is empty for the id) — a reuse over a live
+     erase would race the purge.
+  2. Hard-delete the directory row: `Fathom.Directory.hard_delete("acme")`.
+  3. Delete the storage marker `tombstones/acme` (S3: delete that key; `Local`:
+     `<dir>/tombstones/acme`). **Do NOT delete `tokenfloors/acme`**: it is the durable revocation
+     floor, the Postgres-PITR backstop, and the only record of the old holder's tokens once the row is
+     gone.
+  4. Restart every node (the tombstone set is append-only in memory; a restart re-reads storage,
+     which no longer lists the id). Same step as the DR runbook's reuse recipe.
+  5. `Fathom.Tenants.provision("acme")` — **before** routing any traffic or minting a token for the
+     id. `provision/2` seeds the new row's `token_version` from storage as `max(1, floor + 1)`, so the
+     previous holder's tokens (all below the floor) are dead and the new tenant's token (at the seeded
+     version) works. It reads the stored floor, so a re-run of `delete/1` (each run bumps once more)
+     is harmless. `fork/3` into the id seeds the same way. An unreadable store refuses the
+     provision rather than birthing the tenant blind.
+
+  A row born any other way (a stray request recorded it at version 1) is repaired by
+  `mix fathom.directory reconcile --fix`, which raises the directory to the storage floor — but only
+  `provision/2` and `fork/3` add the `+ 1` margin that covers a final mirror write that never landed.
 
 **Export a tenant.** In **Directory**, click **Export** on the row (downloads `<id>.db`), or
 `Fathom.Tenants.export/1` for a temp-file path. Open the file with any SQLite client.

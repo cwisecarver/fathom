@@ -102,6 +102,94 @@ defmodule Fathom.Directory.ReconcileTest do
     assert {:ok, %{status: "deleted"}} = Directory.get(shard)
   end
 
+  # Expert review 2026-11-07 #30: the revoke-time mirror write is best-effort, and the comment that
+  # promised "the reconcile sweep backfills it" was false — reconcile only ever read storage ->
+  # directory. A stale mirror is what a later Postgres PITR restores the directory to, so a revoked
+  # token verified again. The other direction now exists.
+  describe "the storage token floor is backfilled from the directory (expert review 2026-11-07 #30)" do
+    test "a directory ahead of its mirror is reported, and --fix writes the mirror" do
+      shard = uniq()
+      on_exit(fn -> cleanup(shard) end)
+      {:ok, _} = Directory.resolve(shard)
+      seed_object(shard, 0)
+
+      # The directory was bumped but the mirror write never landed (an S3 blip at revoke time).
+      {:ok, 2} = Directory.bump_token_version(shard)
+      {:ok, 3} = Directory.bump_token_version(shard)
+      assert {:ok, nil} = Storage.read_token_floor(shard), "fixture: no mirror was written"
+
+      findings = Reconcile.run()
+
+      assert Enum.any?(
+               findings,
+               &match?(
+                 %{shard_id: ^shard, kind: :token_backfill, from: nil, to: 3, fixed: false},
+                 &1
+               )
+             )
+
+      assert {:ok, nil} = Storage.read_token_floor(shard), "a dry run must not write storage"
+
+      fixed = Reconcile.run(fix: true)
+
+      assert Enum.any?(
+               fixed,
+               &match?(%{shard_id: ^shard, kind: :token_backfill, to: 3, fixed: true}, &1)
+             )
+
+      assert {:ok, 3} = Storage.read_token_floor(shard)
+
+      refute Enum.any?(Reconcile.run(), &(&1[:shard_id] == shard and &1.kind == :token_backfill)),
+             "once mirrored the shard is coherent"
+    end
+
+    test "a mirror that is only STALE (lower, not absent) is raised, never lowered" do
+      shard = uniq()
+      on_exit(fn -> cleanup(shard) end)
+      {:ok, _} = Directory.resolve(shard)
+      seed_object(shard, 0)
+      {:ok, 2} = Directory.bump_token_version(shard)
+      {:ok, 3} = Directory.bump_token_version(shard)
+      :ok = Storage.put_token_floor(shard, 2)
+
+      assert Enum.any?(
+               Reconcile.run(fix: true),
+               &match?(
+                 %{shard_id: ^shard, kind: :token_backfill, from: 2, to: 3, fixed: true},
+                 &1
+               )
+             )
+
+      assert {:ok, 3} = Storage.read_token_floor(shard)
+    end
+
+    test "a DELETED row's mirror is backfilled too: it is all a hard-deleted, reused id leaves behind" do
+      shard = uniq()
+      on_exit(fn -> cleanup(shard) end)
+      {:ok, _} = Directory.resolve(shard)
+      {:ok, 2} = Directory.bump_token_version(shard)
+      {:ok, _} = Directory.tombstone(shard)
+      assert {:ok, nil} = Storage.read_token_floor(shard), "fixture: no mirror was written"
+
+      assert Enum.any?(
+               Reconcile.run(fix: true),
+               &match?(%{shard_id: ^shard, kind: :token_backfill, to: 2, fixed: true}, &1)
+             )
+
+      assert {:ok, 2} = Storage.read_token_floor(shard)
+    end
+
+    test "a shard whose floor was never raised has nothing to mirror" do
+      shard = uniq()
+      on_exit(fn -> cleanup(shard) end)
+      {:ok, _} = Directory.resolve(shard)
+      seed_object(shard, 0)
+
+      refute Enum.any?(Reconcile.run(fix: true), &(&1[:shard_id] == shard))
+      assert {:ok, nil} = Storage.read_token_floor(shard)
+    end
+  end
+
   # Expert review 2026-10-15 #24: a PITR can roll `retained_version` back to a value whose
   # `<shard>@<version>` copy RetirementJob has since dropped. A revert would then aim at nothing.
   # Reconcile clears such a pointer, but only on proof of absence: a store error is never a clear.

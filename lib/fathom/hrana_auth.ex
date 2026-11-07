@@ -280,9 +280,19 @@ defmodule Fathom.HranaAuth do
   @doc """
   Mints a bearer token granting access to `shard_id` (canonicalized).
 
-  `opts` pass through to `Phoenix.Token.sign/4` (e.g. `:signed_at`, for tests).
+  `opts` pass through to `Phoenix.Token.sign/4` (e.g. `:signed_at`, for tests). `:version` pins the
+  embedded revocation version (`rotate/2` passes the version its own bump returned); without it the
+  shard's current version is read from the directory.
+
+  `{:error, :version_unavailable}` when that read fails (expert review 2026-11-07 #35). It used to
+  default to version 1 on a Postgres failure, so a shard at floor 5 got a token that every
+  `authorize/2` then refused as revoked — a "successful" mint (or rotate: the old token also dies at
+  the end of its grace) that left the tenant locked out. Refusing is the only safe answer: the floor
+  is the one fact a mint must not guess. A shard with NO directory row legitimately sits at the
+  default version 1 and mints at it.
   """
-  @spec token_for(term(), keyword()) :: {:ok, String.t()} | {:error, :invalid_shard_id}
+  @spec token_for(term(), keyword()) ::
+          {:ok, String.t()} | {:error, :invalid_shard_id | :version_unavailable}
   def token_for(shard_id, opts \\ []) do
     # `:scope` (`:rw` default | `:ro`, #24) is consumed here; the rest pass to Phoenix.Token.sign.
     {scope, opts} = Keyword.pop(opts, :scope, :rw)
@@ -290,6 +300,7 @@ defmodule Fathom.HranaAuth do
     # Provenance for the ledger (#37) — who asked for this credential. Never authenticated and never
     # consulted for authorization; a breadcrumb for whoever reads the audit later.
     {actor, sign_opts} = Keyword.pop(opts, :actor)
+    {pinned_version, sign_opts} = Keyword.pop(sign_opts, :version)
 
     # A PER-TOKEN LIFETIME, for callers that mint a credential to use immediately (expert review
     # 2026-08-20 #32 — the admin query console). `Phoenix.Token` has no per-token expiry: `max_age`
@@ -302,30 +313,29 @@ defmodule Fathom.HranaAuth do
     {ttl, sign_opts} = Keyword.pop(sign_opts, :ttl)
     sign_opts = backdate(sign_opts, ttl)
 
+    with {:ok, canonical} <- cast_shard_id(shard_id),
+         # Embed the shard's current revocation version (expert review #31); a later
+         # revoke/1 bumps the floor above this, so this token stops verifying.
+         {:ok, version} <- mint_version(canonical, pinned_version) do
+      payload =
+        %{"s" => canonical, "v" => version}
+        |> put_scope(scope)
+        |> put_expiry(sign_opts)
+
+      # Issuance ledger (#37). Best-effort and AFTER the claims are settled: the mint is the
+      # authoritative act and a ledger outage must never fail it. An incomplete ledger
+      # under-reports what is outstanding, which is the safe direction for
+      # `revoke_issued_before/2` — it revokes less than it might, never more.
+      Ledger.record(shard_id: canonical, token_version: version, scope: scope, actor: actor)
+
+      {:ok, Phoenix.Token.sign(secret!(), @salt, payload, sign_opts)}
+    end
+  end
+
+  defp cast_shard_id(shard_id) do
     case ShardId.cast(shard_id) do
-      {:ok, canonical} ->
-        # Embed the shard's current revocation version (expert review #31); a later
-        # revoke/1 bumps the floor above this, so this token stops verifying. A
-        # directory-unreachable mint (the `mix fathom.token` task runs with config
-        # only, no Repo) defaults to version 1 — the floor is also read fail-open, so
-        # a v1 token works until a revoke actually bumps the floor above 1.
-        version = current_token_version(canonical)
-
-        payload =
-          %{"s" => canonical, "v" => version}
-          |> put_scope(scope)
-          |> put_expiry(sign_opts)
-
-        # Issuance ledger (#37). Best-effort and AFTER the claims are settled: the mint is the
-        # authoritative act and a ledger outage must never fail it (`mix fathom.token` runs with no
-        # Repo at all). An incomplete ledger under-reports what is outstanding, which is the safe
-        # direction for `revoke_issued_before/2` — it revokes less than it might, never more.
-        Ledger.record(shard_id: canonical, token_version: version, scope: scope, actor: actor)
-
-        {:ok, Phoenix.Token.sign(secret!(), @salt, payload, sign_opts)}
-
-      :error ->
-        {:error, :invalid_shard_id}
+      {:ok, canonical} -> {:ok, canonical}
+      :error -> {:error, :invalid_shard_id}
     end
   end
 
@@ -412,7 +422,7 @@ defmodule Fathom.HranaAuth do
           {:ok, version} ->
             # No bump instant ⇒ no grace: a revoke kills the previous version immediately.
             Revocations.put(canonical, version, nil)
-            back_token_floor(canonical, version)
+            _ = back_token_floor(canonical, version)
             notify_revocation(canonical, version, nil)
             {:ok, version}
 
@@ -514,6 +524,10 @@ defmodule Fathom.HranaAuth do
   the grace window and the old auto-hardens out with no per-tenant outage — unlike `revoke/1`,
   which is immediate. `opts` pass through to the mint. Returns `{:ok, token}` or
   `{:error, :invalid_shard_id}`.
+
+  The token is minted at the version the bump itself returned (`:version`), not at a second
+  directory read: a read failing between the bump and the mint used to embed version 1 — a token dead
+  on arrival, with the old one dying too at the end of its grace (expert review 2026-11-07 #35).
   """
   @spec rotate(term(), keyword()) :: {:ok, String.t()} | {:error, :invalid_shard_id}
   def rotate(shard_id, opts \\ []) do
@@ -523,10 +537,9 @@ defmodule Fathom.HranaAuth do
           {:ok, version} ->
             bumped_at = DateTime.utc_now()
             Revocations.put(canonical, version, bumped_at)
-            back_token_floor(canonical, version)
+            _ = back_token_floor(canonical, version)
             notify_revocation(canonical, version, bumped_at)
-            # token_for reads the now-raised directory version, so it mints at the new version.
-            token_for(canonical, opts)
+            token_for(canonical, Keyword.put(opts, :version, version))
 
           {:error, _changeset} ->
             {:error, :invalid_shard_id}
@@ -537,32 +550,52 @@ defmodule Fathom.HranaAuth do
     end
   end
 
-  # Best-effort fleet push (round-2 #24): a notify failure must never fail the revoke/rotate — the
-  # directory bump is the durable truth and the TTL converges. `bumped_at` (ISO or nil) carries the
-  # rotation grace instant so other nodes honor it too.
   # Mirror the revocation floor to durable storage (the DR backstop, #6) so a Postgres directory
-  # point-in-time restore can't un-revoke tokens. Best-effort: the directory bump is the primary,
-  # already-committed truth, so a storage blip only leaves the backstop stale (the reconcile sweep
-  # backfills it) — never fail a revoke/rotate for it.
+  # point-in-time restore can't un-revoke tokens. The write is monotonic (`Storage.put_token_floor/2`
+  # stores max(stored, version)). Best-effort FOR revoke/rotate: the directory bump is the primary,
+  # already-committed truth, so a storage blip must not fail them. It is NOT left to chance, though
+  # (expert review 2026-11-07 #30): a stale mirror is what a later PITR faithfully restores the
+  # directory to, and the comment that used to sit here ("the reconcile sweep backfills it") was false —
+  # reconcile only ever read storage → directory. It now also writes directory → storage
+  # (`Directory.Reconcile`, `:token_backfill`), and `Tenants.purge/1` re-drives `mirror_floor/1` under
+  # the DeleteJob's retries, because a deleted id's mirror is the only thing left once its row is
+  # hard-deleted for reuse. Returns the write's outcome for those callers; revoke/rotate ignore it.
   defp back_token_floor(shard_id, version) do
     case Fathom.Shard.Storage.put_token_floor(shard_id, version) do
       :ok ->
         :ok
 
-      {:error, reason} ->
+      {:error, reason} = error ->
         Logger.warning("token floor backstop write failed for #{shard_id}: #{inspect(reason)}")
-        :ok
+        error
     end
   rescue
     e ->
       Logger.warning("token floor backstop write failed for #{shard_id}: #{Exception.message(e)}")
-      :ok
+      {:error, e}
   catch
     :exit, reason ->
       Logger.warning("token floor backstop write failed for #{shard_id}: #{inspect(reason)}")
-      :ok
+      {:error, {:exit, reason}}
   end
 
+  @doc """
+  Writes `shard_id`'s CURRENT directory revocation version to the durable storage floor (monotonic),
+  returning the storage outcome — the retryable form of the best-effort mirror `revoke/1` writes
+  (expert review 2026-11-07 #30). `:ok` when there is nothing to mirror (no directory row, or never
+  raised past the default 1). Raises on a directory read failure, so an Oban job retries it.
+  """
+  @spec mirror_floor(String.t()) :: :ok | {:error, term()}
+  def mirror_floor(shard_id) do
+    case Directory.token_version(shard_id) do
+      version when is_integer(version) and version > 1 -> back_token_floor(shard_id, version)
+      _ -> :ok
+    end
+  end
+
+  # Best-effort fleet push (round-2 #24): a notify failure must never fail the revoke/rotate — the
+  # directory bump is the durable truth and the TTL converges. `bumped_at` (ISO or nil) carries the
+  # rotation grace instant so other nodes honor it too.
   defp notify_revocation(shard_id, version, bumped_at) do
     Oban.Notifier.notify(Oban, :fathom_revocations, %{
       shard_id: shard_id,
@@ -669,13 +702,29 @@ defmodule Fathom.HranaAuth do
 
   defp max_age, do: Application.get_env(:fathom, :hrana_token_max_age, :infinity)
 
-  # Read the shard's mint-time version, defaulting to 1 when the directory can't be
-  # reached (the mix-task path has no Repo; the floor is read fail-open to match).
-  defp current_token_version(canonical) do
-    Directory.token_version(canonical) || 1
+  # The version a mint embeds: the caller's pinned one, else the directory's current one. A shard with
+  # no directory row sits at the default 1. A read FAILURE is `{:error, :version_unavailable}`, never
+  # 1 (expert review 2026-11-07 #35): 1 is below every raised floor, so a guessed mint is a token that
+  # verifies as revoked — and the `mix fathom.token` task, the one caller that used to run without a
+  # Repo, now starts it and probes this exact read before minting.
+  defp mint_version(_canonical, version) when is_integer(version) and version > 0,
+    do: {:ok, version}
+
+  defp mint_version(canonical, nil) do
+    case Directory.token_version(canonical) do
+      nil -> {:ok, 1}
+      version -> {:ok, version}
+    end
   rescue
-    _ -> 1
+    e ->
+      Logger.warning(
+        "token mint for #{canonical}: directory read failed: #{Exception.message(e)}"
+      )
+
+      {:error, :version_unavailable}
   catch
-    :exit, _ -> 1
+    :exit, reason ->
+      Logger.warning("token mint for #{canonical}: directory read failed: #{inspect(reason)}")
+      {:error, :version_unavailable}
   end
 end
