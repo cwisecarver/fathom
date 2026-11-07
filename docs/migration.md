@@ -150,7 +150,9 @@ both are now caught instead of silently forking the fleet:
 
 - **`ShardMigrationJob`** (unique per shard) migrates one shard.
 - **`ReconcileJob`** (hourly cron) is the key to *millions*: it asks the directory for laggards
-  (`schema_version < HEAD`) and enqueues them. You never push to millions of shards — a tenant that
+  (`schema_version < HEAD`, `active`, and having **flushed at least once** — a row minted by a
+  read-only request has no stored object to migrate, so it is not a laggard and cannot wedge
+  `converged`) and enqueues them. You never push to millions of shards — a tenant that
   was asleep during the rollout gets migrated the next time reconcile sweeps (or when it next
   wakes). The tail **converges**.
 - **`RetirementJob`** drops retained old versions past their `retain_until`.

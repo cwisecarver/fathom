@@ -219,18 +219,18 @@ defmodule Fathom.DirectoryTest do
 
   describe "laggards/2 and count_laggards/1" do
     test "returns active shards behind HEAD, most-recently-used first" do
-      {:ok, _} = Directory.resolve("old")
-      {:ok, _} = Directory.resolve("new")
+      {:ok, _} = resolve_flushed("old")
+      {:ok, _} = resolve_flushed("new")
 
       assert Enum.map(Directory.laggards(1, 10), & &1.shard_id) == ["new", "old"]
       assert Directory.count_laggards(1) == 2
     end
 
     test "excludes up-to-date and non-active shards" do
-      {:ok, _} = Directory.resolve("behind")
-      {:ok, _} = Directory.resolve("current")
+      {:ok, _} = resolve_flushed("behind")
+      {:ok, _} = resolve_flushed("current")
       {:ok, _} = Directory.cutover("current", 2)
-      {:ok, _} = Directory.resolve("retired")
+      {:ok, _} = resolve_flushed("retired")
       {:ok, _} = Directory.retire("retired", DateTime.utc_now())
 
       assert Enum.map(Directory.laggards(2, 10), & &1.shard_id) == ["behind"]
@@ -238,8 +238,64 @@ defmodule Fathom.DirectoryTest do
     end
 
     test "respects the limit" do
-      for id <- ~w(a b c), do: Directory.resolve(id)
+      for id <- ~w(a b c), do: resolve_flushed(id)
       assert length(Directory.laggards(1, 2)) == 2
+    end
+
+    # Expert review 2026-11-07 #51. A read-only request for a novel id mints an `active v0` row and
+    # never dirties the shard, so NO stored object exists and a migration for it can only cancel
+    # `:no_live_object`. Left in the laggard definition those phantoms (a) kept `converged` false
+    # forever and (b) — touched more recently than the real cold tail — filled every `laggards/2`
+    # chunk so the real laggards behind them were never selected. Pre-fix `laggards(2, 100)` is
+    # 100 phantoms and `status().converged` is false after the real shard migrates.
+    test "never-flushed v0 phantoms are not laggards: the real tail is selected and converged turns true (#51)" do
+      {:ok, _} = Fathom.Migrator.release(2, "v2", ["SELECT 1"])
+
+      {:ok, real} = resolve_flushed("real_tail")
+      {:ok, _} = Directory.cutover("real_tail", 1)
+
+      # OLDER than every phantom below, so a limit-100 chunk of "most recently active" is all phantoms.
+      old = DateTime.add(DateTime.utc_now(), -3_600, :second)
+
+      Fathom.Repo.update_all(from(s in Shard, where: s.shard_id == ^real.shard_id),
+        set: [last_active_at: old]
+      )
+
+      for n <- 1..101, do: {:ok, _} = Directory.resolve("phantom_#{n}")
+
+      assert %{rows: [[101]]} =
+               Fathom.Repo.query!(
+                 "SELECT count(*) FROM shards WHERE shard_id LIKE 'phantom_%' AND " <>
+                   "schema_version = 0 AND status = 'active' AND last_flushed_at IS NULL " <>
+                   "AND cutover_at IS NULL"
+               ),
+             "fixture: the phantoms must be never-flushed active v0 rows"
+
+      assert Enum.map(Directory.laggards(2, 100), & &1.shard_id) == ["real_tail"],
+             "the sweep chunk must reach the real laggard, not 100 phantoms"
+
+      assert Directory.count_laggards(2) == 1
+
+      {:ok, _} = Directory.cutover("real_tail", 2)
+
+      assert Directory.count_laggards(2) == 0
+
+      assert %{converged: true, laggards: 0} = Fathom.Migrator.status(),
+             "a phantom must not wedge the deploy gate"
+
+      # The first real flush makes a phantom an ordinary laggard (it now has an object to migrate).
+      assert 1 = Directory.record_flush_batch([{"phantom_1", DateTime.utc_now()}])
+      assert Enum.map(Directory.laggards(2, 100), & &1.shard_id) == ["phantom_1"]
+      assert Directory.count_laggards(2) == 1
+    end
+
+    # The other discriminator: a shard born by fork-from-template is stamped by `cutover/2` (no flush
+    # recorded yet) and must keep its place in the sweep once HEAD moves on.
+    test "a v0-stamped row with a cutover_at is a laggard even before its first flush (#51)" do
+      {:ok, _} = Directory.resolve("forked")
+      {:ok, _} = Directory.cutover("forked", 0)
+      assert {:ok, %{last_flushed_at: nil, cutover_at: %DateTime{}}} = Directory.get("forked")
+      assert Enum.map(Directory.laggards(1, 10), & &1.shard_id) == ["forked"]
     end
 
     # Expert review 2026-09-18 #27: a node crash between the restore drill's fork and its drop leaves
@@ -247,12 +303,13 @@ defmodule Fathom.DirectoryTest do
     # false, gets a migration enqueued for a throwaway, and (never-verified) sorts FIRST in drill
     # sampling. The reserved prefix must be excluded from the rollout + drill sweeps.
     test "a leaked restore-drill scratch fork is excluded from laggards + drill sampling (#27)" do
-      {:ok, _} = Directory.resolve("real-laggard")
+      {:ok, _} = resolve_flushed("real-laggard")
       # The reserved prefix literal (see Directory.scratch_prefix/0) — kept literal here so this
       # discriminates the exclusion itself, not the constant's presence. Marked at birth, exactly as
       # the drill's own fork (`Tenants.register_fork/2`) does.
       scratch = "restoredrill999"
-      {:ok, _} = Directory.resolve(scratch, scratch: true)
+      # FLUSHED, so it is the `scratch` exclusion under test and not the never-flushed one (#51).
+      {:ok, _} = resolve_flushed(scratch, scratch: true)
 
       # Only the real laggard counts / is swept — not the scratch fork.
       assert Directory.count_laggards(5) == 1,
@@ -275,8 +332,8 @@ defmodule Fathom.DirectoryTest do
     # merely LOOKS like a scratch fork is migrated and drilled like any other.
     test "a real tenant that merely looks like a drill scratch fork is still a laggard (#34, 2026-11-07 #15)" do
       real = ["restoredrill-eu", "restoredrills", "restoredrill1a", "restoredrill42"]
-      for id <- real, do: {:ok, _} = Directory.resolve(id)
-      {:ok, _} = Directory.resolve("restoredrill999", scratch: true)
+      for id <- real, do: {:ok, _} = resolve_flushed(id)
+      {:ok, _} = resolve_flushed("restoredrill999", scratch: true)
 
       assert Directory.count_laggards(5) == length(real)
       assert Enum.sort(Enum.map(Directory.laggards(5, 10), & &1.shard_id)) == Enum.sort(real)
@@ -897,7 +954,8 @@ defmodule Fathom.DirectoryTest do
              "s.last_verified_at IS NOT NULL"},
           {"reclaim_stale_migrating", "shards_migrating_since_index",
            "SELECT s.shard_id FROM shards s WHERE s.status = 'migrating' AND " <>
-             "s.migrating_since IS NOT NULL AND s.migrating_since < now()"}
+             "((s.migrating_since IS NOT NULL AND s.migrating_since < now()) OR " <>
+             "(s.migrating_since IS NULL AND s.updated_at < now()))"}
         ] do
       test "#{label} is served by its partial index" do
         # A REALISTIC TABLE, or the plan is a coin toss (flaked in precommit 2026-10-03, seed

@@ -55,4 +55,19 @@ defmodule Fathom.DataCase do
       end)
     end)
   end
+
+  @doc """
+  `Directory.resolve/2` plus a recorded first flush: a row that has really been uploaded.
+
+  The rollout sweep deliberately skips a NEVER-FLUSHED `schema_version: 0` row (expert review
+  2026-11-07 #51 — a read-only request mints one and no stored object exists, so a migration for
+  it can only cancel `:no_live_object`). A test that models a real cold-tail shard behind HEAD must
+  therefore say it flushed; a bare `resolve/2` models the phantom.
+  """
+  @spec resolve_flushed(String.t(), keyword()) :: {:ok, Fathom.Directory.Shard.t()} | :error
+  def resolve_flushed(shard_id, opts \\ []) do
+    {:ok, _} = Fathom.Directory.resolve(shard_id, opts)
+    1 = Fathom.Directory.record_flush_batch([{shard_id, DateTime.utc_now()}])
+    Fathom.Directory.get(shard_id)
+  end
 end

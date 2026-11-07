@@ -199,4 +199,57 @@ defmodule Fathom.DirectoryAdminTest do
       assert %{total: 2} = Directory.list_page(status: "active")
     end
   end
+
+  # Expert review 2026-11-07 #63 (b). `migrating` was hand-settable, but `admin_update/2` never
+  # stamps `migrating_since`, `reclaim_stale_migrating/1` skipped a NULL stamp, no sweep selects
+  # anything but `active`, and the row counted in `in_flight`: `converged` stayed false until
+  # someone flipped it back by hand. `migrating` is engine-owned now; a stuck one (hand-set before
+  # this, or a pre-column in-flight row) is reclaimed by age.
+  describe "migrating is engine-owned (expert review 2026-11-07 #63)" do
+    test "an admin edit cannot SET migrating" do
+      put_shard(%{shard_id: "dir_mig", status: "active"})
+
+      assert {:error, %Ecto.Changeset{} = cs} =
+               Directory.admin_update("dir_mig", %{"status" => "migrating"})
+
+      assert %{status: ["is invalid"]} = errors_on(cs)
+      assert {:ok, %{status: "active"}} = Directory.get("dir_mig")
+      refute "migrating" in Shard.admin_editable_statuses()
+    end
+
+    test "an admin edit can still flip a STUCK migrating row back to active" do
+      put_shard(%{shard_id: "dir_stuck", status: "migrating"})
+      assert {:ok, %{status: "active"}} = Directory.admin_update("dir_stuck", %{status: "active"})
+    end
+
+    test "a migrating row with NO migrating_since is reclaimed by its age" do
+      put_shard(%{shard_id: "dir_nil_since", status: "migrating"})
+      assert {:ok, %{migrating_since: nil, status: "migrating"}} = Directory.get("dir_nil_since")
+
+      # A fresh one is left alone: the age is the evidence, not the nil.
+      assert Directory.reclaim_stale_migrating(3_600) == []
+
+      old = DateTime.add(DateTime.utc_now(), -7_200, :second)
+
+      Repo.update_all(from(s in Shard, where: s.shard_id == "dir_nil_since"),
+        set: [updated_at: old]
+      )
+
+      assert Directory.reclaim_stale_migrating(3_600) == ["dir_nil_since"]
+      assert {:ok, %{status: "active", migrating_since: nil}} = Directory.get("dir_nil_since")
+    end
+  end
+
+  # The attach refusal's crossed-count must see a SUSPENDED tenant: it applied the step without the
+  # transform exactly like an active one, and `Tenants.resume` returns it to the fleet.
+  describe "count_at_or_above_version/1 (expert review 2026-11-07 #63)" do
+    test "counts a suspended tenant that crossed the version, not a deleted one" do
+      put_shard(%{shard_id: "cr_act", status: "active", schema_version: 3})
+      put_shard(%{shard_id: "cr_susp", status: "suspended", schema_version: 3})
+      put_shard(%{shard_id: "cr_del", status: "deleted", schema_version: 3})
+      put_shard(%{shard_id: "cr_low", status: "suspended", schema_version: 2})
+
+      assert Directory.count_at_or_above_version(3) == 2
+    end
+  end
 end

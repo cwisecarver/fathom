@@ -158,7 +158,7 @@ defmodule Fathom.Admin.FleetJobsTest do
 
     test "histogram counts active shards per version; ETA = laggards / hourly rate" do
       for id <- ~w(a b c d) do
-        {:ok, _} = Directory.resolve(id)
+        {:ok, _} = resolve_flushed(id)
       end
 
       # Three at head (v2, cut over just now), one laggard at v1.
@@ -172,7 +172,7 @@ defmodule Fathom.Admin.FleetJobsTest do
     end
 
     test "laggards but no recent cutovers has no ETA" do
-      {:ok, _} = Directory.resolve("a")
+      {:ok, _} = resolve_flushed("a")
       assert %{eta_seconds: nil} = Fleet.rollout(5)
     end
   end

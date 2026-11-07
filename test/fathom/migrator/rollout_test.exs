@@ -27,9 +27,9 @@ defmodule Fathom.Migrator.RolloutTest do
   describe "rollout/1" do
     test "enqueues a migration job for each active shard behind HEAD" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("a")
-      {:ok, _} = Directory.resolve("b")
-      {:ok, _} = Directory.resolve("c")
+      {:ok, _} = resolve_flushed("a")
+      {:ok, _} = resolve_flushed("b")
+      {:ok, _} = resolve_flushed("c")
       {:ok, _} = Directory.cutover("c", 2)
 
       assert {:ok, 2} = Migrator.rollout()
@@ -54,8 +54,8 @@ defmodule Fathom.Migrator.RolloutTest do
       end)
 
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("tmpl_ex")
-      {:ok, _} = Directory.resolve("tenant_x")
+      {:ok, _} = resolve_flushed("tmpl_ex")
+      {:ok, _} = resolve_flushed("tenant_x")
 
       assert {:ok, 1} = Migrator.rollout()
       assert_enqueued(migration_job_args("tenant_x"))
@@ -64,7 +64,7 @@ defmodule Fathom.Migrator.RolloutTest do
     end
 
     test "is a no-op when no version is released (HEAD 0)" do
-      {:ok, _} = Directory.resolve("a")
+      {:ok, _} = resolve_flushed("a")
       assert {:ok, 0} = Migrator.rollout()
       refute_enqueued(worker: Fathom.Migrator.ShardMigrationJob)
     end
@@ -78,7 +78,7 @@ defmodule Fathom.Migrator.RolloutTest do
       put_env!(:reconcile_watermark, 2)
 
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      for id <- ~w(rb_a rb_b rb_c rb_d), do: Directory.resolve(id)
+      for id <- ~w(rb_a rb_b rb_c rb_d), do: resolve_flushed(id)
 
       assert :ok = perform_job(ReconcileJob, %{})
 
@@ -94,7 +94,7 @@ defmodule Fathom.Migrator.RolloutTest do
       put_env!(:reconcile_watermark, 5)
 
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      for n <- 1..10, do: Directory.resolve("wm_#{n}")
+      for n <- 1..10, do: resolve_flushed("wm_#{n}")
 
       assert :ok = perform_job(ReconcileJob, %{})
 
@@ -111,12 +111,12 @@ defmodule Fathom.Migrator.RolloutTest do
       put_env!(:reconcile_batch_size, 2)
       put_env!(:reconcile_watermark, 1_000)
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      for n <- 1..5, do: Directory.resolve("ex_#{n}")
+      for n <- 1..5, do: resolve_flushed("ex_#{n}")
 
       assert :ok = perform_job(ReconcileJob, %{})
       assert length(all_enqueued(worker: ShardMigrationJob)) == 5
 
-      for n <- 1..5, do: Directory.resolve("tb_#{n}")
+      for n <- 1..5, do: resolve_flushed("tb_#{n}")
       put_env!(:reconcile_rollout_budget_ms, 0)
       assert :ok = perform_job(ReconcileJob, %{})
       # Budget 0: the first chunk still goes (no starvation), the second is cut.
@@ -128,8 +128,8 @@ defmodule Fathom.Migrator.RolloutTest do
     # reconcile would re-enqueue already-queued shards and pile up jobs. Pin idempotency.
     test "is idempotent: a second sweep re-enqueues nothing while jobs are in flight" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("a")
-      {:ok, _} = Directory.resolve("b")
+      {:ok, _} = resolve_flushed("a")
+      {:ok, _} = resolve_flushed("b")
 
       assert {:ok, 2} = Migrator.rollout()
       assert {:ok, 0} = Migrator.rollout()
@@ -153,6 +153,8 @@ defmodule Fathom.Migrator.RolloutTest do
           schema_version: 0,
           status: "active",
           last_active_at: now,
+          # Flushed once, as a real cold-tail shard is: a never-flushed v0 row is skipped (#51).
+          last_flushed_at: now,
           inserted_at: now,
           updated_at: now
         },
@@ -161,6 +163,7 @@ defmodule Fathom.Migrator.RolloutTest do
           schema_version: 0,
           status: "active",
           last_active_at: DateTime.add(now, -3600, :second),
+          last_flushed_at: now,
           inserted_at: now,
           updated_at: now
         }
@@ -199,6 +202,7 @@ defmodule Fathom.Migrator.RolloutTest do
             schema_version: 0,
             status: "active",
             last_active_at: now,
+            last_flushed_at: now,
             inserted_at: now,
             updated_at: now
           }
@@ -214,7 +218,7 @@ defmodule Fathom.Migrator.RolloutTest do
   describe "reconcile" do
     test "re-runs the rollout sweep" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("a")
+      {:ok, _} = resolve_flushed("a")
 
       assert :ok = perform_job(ReconcileJob, %{})
       assert_enqueued(migration_job_args("a"))
@@ -234,7 +238,7 @@ defmodule Fathom.Migrator.RolloutTest do
       {:ok, _} = Migrator.release(2, "bad", ["SELECT 1"])
 
       for id <- ~w(a b) do
-        {:ok, _} = Directory.resolve(id)
+        {:ok, _} = resolve_flushed(id)
         {:ok, _} = Directory.cutover(id, 2)
       end
 
@@ -254,7 +258,7 @@ defmodule Fathom.Migrator.RolloutTest do
 
     test "yank cancels pending forward jobs targeting the version" do
       {:ok, _} = Migrator.release(2, "bad", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("c")
+      {:ok, _} = resolve_flushed("c")
       assert {:ok, 1} = Migrator.rollout()
       assert_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "c", "target" => 2})
 
@@ -266,7 +270,7 @@ defmodule Fathom.Migrator.RolloutTest do
 
     test "revert with yank: false keeps the release live" do
       {:ok, _} = Migrator.release(2, "canary", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("d")
+      {:ok, _} = resolve_flushed("d")
       {:ok, _} = Directory.cutover("d", 2)
 
       assert {:ok, 1} = Migrator.revert(2, 1, yank: false)
@@ -284,8 +288,8 @@ defmodule Fathom.Migrator.RolloutTest do
     # kill it claimed was safe.
     test "yank does NOT cancel an executing forward job (it completes cleanly), only pending ones" do
       {:ok, _} = Migrator.release(2, "bad", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("e")
-      {:ok, _} = Directory.resolve("p")
+      {:ok, _} = resolve_flushed("e")
+      {:ok, _} = resolve_flushed("p")
       assert {:ok, 2} = Migrator.rollout()
 
       # 'e' is mid-copy (executing) just before the yank; 'p' is still pending.
@@ -332,7 +336,7 @@ defmodule Fathom.Migrator.RolloutTest do
       # The fleet reverted 2 → 1 (yanking 2) while this shard's migration was
       # completing: it lands on v2 AFTER the revert's shard-set read.
       assert :ok = Migrator.yank(2)
-      {:ok, _} = Directory.resolve("stranded")
+      {:ok, _} = resolve_flushed("stranded")
       {:ok, _} = Directory.cutover("stranded", 2)
       assert Migrator.head() == 1
 
@@ -439,11 +443,11 @@ defmodule Fathom.Migrator.RolloutTest do
   describe "quarantined shards and the deploy gate" do
     test "converged is false while a migration_failed shard sits below head" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("cg")
+      {:ok, _} = resolve_flushed("cg")
       {:ok, _} = Directory.cutover("cg", 2)
       assert %{converged: true, failed: 0} = Migrator.status()
 
-      {:ok, _} = Directory.resolve("cg_bad")
+      {:ok, _} = resolve_flushed("cg_bad")
       {:ok, _} = Directory.mark_failed("cg_bad")
 
       assert %{converged: false, failed: 1, laggards: 0} = Migrator.status(),
@@ -455,7 +459,7 @@ defmodule Fathom.Migrator.RolloutTest do
     test "converged is false while a migration_failed shard sits ABOVE head" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = Migrator.release(3, "v3", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("cg_hi")
+      {:ok, _} = resolve_flushed("cg_hi")
       {:ok, _} = Directory.cutover("cg_hi", 3)
       assert :ok = Migrator.yank(3)
       assert Migrator.head() == 2
@@ -469,7 +473,7 @@ defmodule Fathom.Migrator.RolloutTest do
 
     test "ReconcileJob requeues a migration_failed shard only after the cool-off" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("cf")
+      {:ok, _} = resolve_flushed("cf")
       {:ok, _} = Directory.mark_failed("cf")
 
       assert :ok = perform_job(ReconcileJob, %{})
@@ -500,7 +504,7 @@ defmodule Fathom.Migrator.RolloutTest do
 
     test "a quarantined shard that is still being touched cools off on quarantined_at" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("hot")
+      {:ok, _} = resolve_flushed("hot")
       {:ok, _} = Directory.mark_failed("hot")
 
       long_ago = DateTime.add(DateTime.utc_now(), -3_600, :second)
@@ -513,7 +517,7 @@ defmodule Fathom.Migrator.RolloutTest do
 
     test "a shard quarantined just now is not requeued even if its updated_at is old" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("fresh")
+      {:ok, _} = resolve_flushed("fresh")
       {:ok, _} = Directory.mark_failed("fresh")
       backdate!("fresh", updated_at: DateTime.add(DateTime.utc_now(), -3_600, :second))
 
@@ -523,7 +527,7 @@ defmodule Fathom.Migrator.RolloutTest do
 
     test "automatic requeues are capped; retry_failed/0 resets the cap; a cutover resets it" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("flap")
+      {:ok, _} = resolve_flushed("flap")
 
       for round <- 1..3 do
         {:ok, _} = Directory.mark_failed("flap")
@@ -547,7 +551,7 @@ defmodule Fathom.Migrator.RolloutTest do
 
     test "ReconcileJob survives a failing cool-off requeue and still runs the rollout" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("lag")
+      {:ok, _} = resolve_flushed("lag")
 
       # A non-integer cool-off makes the requeue raise (stands in for a Postgres error).
       Application.put_env(:fathom, :migration_failed_cool_off_ms, :boom)
@@ -561,7 +565,7 @@ defmodule Fathom.Migrator.RolloutTest do
   describe "retry_failed/0" do
     test "un-quarantines failed shards and re-enqueues their migration to HEAD" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
-      {:ok, _} = Directory.resolve("fq")
+      {:ok, _} = resolve_flushed("fq")
       {:ok, _} = Directory.mark_failed("fq")
 
       # Quarantined: invisible to the sweep.
@@ -594,7 +598,7 @@ defmodule Fathom.Migrator.RolloutTest do
       ids = for i <- 1..25, do: "fqs_#{i}"
 
       for id <- ids do
-        {:ok, _} = Directory.resolve(id)
+        {:ok, _} = resolve_flushed(id)
         {:ok, _} = Directory.mark_failed(id)
       end
 
@@ -615,7 +619,7 @@ defmodule Fathom.Migrator.RolloutTest do
     # no released version there is no target to enqueue, but un-quarantining is the OTHER half of
     # what this API does and must still happen.
     test "un-quarantines even when no version is released" do
-      {:ok, _} = Directory.resolve("fq_nohead")
+      {:ok, _} = resolve_flushed("fq_nohead")
       {:ok, _} = Directory.mark_failed("fq_nohead")
 
       assert Migrator.head() == 0, "fixture: a release exists, so this tests nothing"
@@ -629,11 +633,11 @@ defmodule Fathom.Migrator.RolloutTest do
   describe "revert/2" do
     test "enqueues a revert job for each active shard at the from-version" do
       for id <- ~w(a b) do
-        {:ok, _} = Directory.resolve(id)
+        {:ok, _} = resolve_flushed(id)
         {:ok, _} = Directory.cutover(id, 2)
       end
 
-      {:ok, _} = Directory.resolve("c")
+      {:ok, _} = resolve_flushed("c")
 
       assert {:ok, 2} = Migrator.revert(2, 1)
       assert_enqueued(worker: RevertJob, args: %{"shard_id" => "a", "to_version" => 1})
@@ -641,11 +645,32 @@ defmodule Fathom.Migrator.RolloutTest do
       refute_enqueued(worker: RevertJob, args: %{"shard_id" => "c"})
     end
 
+    # Expert review 2026-11-07 #63 (a). `stream_ids_at_version/2` selected `status == "active"`, so a
+    # tenant SUSPENDED at the bad version was skipped by a fleet revert; `Tenants.resume` then put it
+    # back at a yanked version above HEAD, with the write-age guard refusing every unforced revert.
+    # `ShardMigration.revert/4` supports a suspended tenant (`keep_suspended`), so the page must
+    # select it. A quarantined `migration_failed` row stays out: `cutover/4` refuses it, so its
+    # revert would roll back after the destructive restore.
+    test "a SUSPENDED tenant at the from-version is reverted too; a quarantined one is not (#63)" do
+      for id <- ~w(act susp quar) do
+        {:ok, _} = resolve_flushed(id)
+        {:ok, _} = Directory.cutover(id, 2)
+      end
+
+      {:ok, %{status: "suspended", schema_version: 2}} = Directory.suspend("susp")
+      {:ok, %{status: "migration_failed", schema_version: 2}} = Directory.mark_failed("quar")
+
+      assert {:ok, 2} = Migrator.revert(2, 1)
+      assert_enqueued(worker: RevertJob, args: %{"shard_id" => "act", "to_version" => 1})
+      assert_enqueued(worker: RevertJob, args: %{"shard_id" => "susp", "to_version" => 1})
+      refute_enqueued(worker: RevertJob, args: %{"shard_id" => "quar"})
+    end
+
     # Finding #21: same insert_all uniqueness caveat as rollout — a re-issued revert must not
     # duplicate in-flight revert jobs.
     test "is idempotent: a second revert re-enqueues nothing while jobs are in flight" do
       for id <- ~w(a b) do
-        {:ok, _} = Directory.resolve(id)
+        {:ok, _} = resolve_flushed(id)
         {:ok, _} = Directory.cutover(id, 2)
       end
 
@@ -664,7 +689,7 @@ defmodule Fathom.Migrator.RolloutTest do
     # shard, upgrading in-flight jobs' args instead of skipping them.
     test "a forced re-issue upgrades in-flight revert jobs instead of skipping them" do
       for id <- ~w(a b) do
-        {:ok, _} = Directory.resolve(id)
+        {:ok, _} = resolve_flushed(id)
         {:ok, _} = Directory.cutover(id, 2)
       end
 
@@ -688,7 +713,7 @@ defmodule Fathom.Migrator.RolloutTest do
     # post-cutover writes) to v4, never reaching v3, with the →3 job deduped away.
     # The invariant: a force sweep retargets the WHOLE operation — last command wins.
     test "a forced re-issue retargets in-flight revert jobs to its own to_version" do
-      {:ok, _} = Directory.resolve("retarget")
+      {:ok, _} = resolve_flushed("retarget")
       {:ok, _} = Directory.cutover("retarget", 5)
 
       # A non-forced revert 5→4 is in flight (never executed — manual testing mode).
@@ -734,7 +759,7 @@ defmodule Fathom.Migrator.RolloutTest do
     Connection.close(conn)
     :ok = Storage.flush(shard, seed)
     for s <- ["", "-wal", "-shm"], do: File.rm(seed <> s)
-    {:ok, _} = Directory.resolve(shard)
+    {:ok, _} = resolve_flushed(shard)
     {:ok, _} = Directory.cutover(shard, 1)
     :ok
   end

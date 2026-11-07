@@ -20,7 +20,16 @@ defmodule Fathom.Directory.Shard do
   # + coordinator drain), never a hand-flip that would move the directory status while
   # leaving the in-memory gate unset on this and every other node. They go through the
   # dedicated delete / suspend / resume actions.
-  @admin_editable_statuses ~w(active migrating retired migration_failed)
+  #
+  # `migrating` is EXCLUDED as a TARGET too (expert review 2026-11-07 #63): it is engine-owned —
+  # only `Directory.mark_migrating/2` sets it, together with `migrating_since`, the liveness stamp
+  # the stale-reclaim and the migration renewer key on. A hand-set `migrating` row had no
+  # `migrating_since`, so `reclaim_stale_migrating/1` skipped it, no sweep selects anything but
+  # `active`, and it counted in `in_flight` — `Migrator.status().converged` stayed false until
+  # someone flipped it back by hand. It stays a legal SOURCE (`@admin_updatable_from`) so an
+  # operator can still flip a stuck `migrating` row back to `active`.
+  @admin_editable_statuses ~w(active retired migration_failed)
+  @admin_updatable_from ~w(active migrating retired migration_failed)
 
   @type t :: %__MODULE__{}
 
@@ -121,6 +130,13 @@ defmodule Fathom.Directory.Shard do
   @doc "Statuses an operator may hand-set from the admin edit UI (excludes `deleted`, #15)."
   @spec admin_editable_statuses() :: [String.t()]
   def admin_editable_statuses, do: @admin_editable_statuses
+
+  @doc """
+  Statuses a row may CURRENTLY be in for an admin edit to apply (a superset of the editable
+  targets: a stuck `migrating` row can be flipped back, expert review 2026-11-07 #63).
+  """
+  @spec admin_updatable_from() :: [String.t()]
+  def admin_updatable_from, do: @admin_updatable_from
 
   @doc """
   Restricted changeset for operator hand-edits from the admin directory UI

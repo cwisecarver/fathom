@@ -27,7 +27,7 @@ defmodule Fathom.Migrator.RolloutRateTest do
   import Ecto.Query
 
   defp shard_at_head!(id, version) do
-    {:ok, _} = Directory.resolve(id)
+    {:ok, _} = resolve_flushed(id)
     {:ok, _} = Directory.cutover(id, version)
     id
   end
@@ -80,7 +80,7 @@ defmodule Fathom.Migrator.RolloutRateTest do
     end
 
     test "is zero before any release" do
-      {:ok, _} = Directory.resolve("rate_norelease")
+      {:ok, _} = resolve_flushed("rate_norelease")
       assert Migrator.head() == 0
       assert Migrator.rollout_rate() == 0
     end
@@ -92,7 +92,7 @@ defmodule Fathom.Migrator.RolloutRateTest do
       # Two shards migrated in the last hour; four still behind.
       shard_at_head!("eta_done_1", 1)
       shard_at_head!("eta_done_2", 1)
-      for i <- 1..4, do: {:ok, _} = Directory.resolve("eta_behind_#{i}")
+      for i <- 1..4, do: {:ok, _} = resolve_flushed("eta_behind_#{i}")
 
       status = Migrator.status()
 
@@ -112,7 +112,7 @@ defmodule Fathom.Migrator.RolloutRateTest do
       shard_at_head!("ah_ok", 1)
 
       # Stranded above head: schema_version 2 > head 1, still active.
-      {:ok, _} = Directory.resolve("ah_stranded")
+      {:ok, _} = resolve_flushed("ah_stranded")
       {:ok, _} = Directory.cutover("ah_stranded", 2)
 
       status = Migrator.status()
@@ -133,7 +133,7 @@ defmodule Fathom.Migrator.RolloutRateTest do
     test "status/0 does not read converged while a shard below head is mid-migration" do
       {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       shard_at_head!("inflight_done", 1)
-      {:ok, _} = Directory.resolve("inflight_running")
+      {:ok, _} = resolve_flushed("inflight_running")
       {:ok, _} = Directory.mark_migrating("inflight_running", 0)
 
       status = Migrator.status()
@@ -203,7 +203,7 @@ defmodule Fathom.Migrator.RolloutRateTest do
     # (or :infinity) puts a number on a dashboard that reads as progress.
     test "ETA is nil, not a large number, when the rollout is stalled" do
       {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
-      for i <- 1..3, do: {:ok, _} = Directory.resolve("stall_behind_#{i}")
+      for i <- 1..3, do: {:ok, _} = resolve_flushed("stall_behind_#{i}")
 
       status = Migrator.status()
 
@@ -228,7 +228,7 @@ defmodule Fathom.Migrator.RolloutRateTest do
       {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       shard_at_head!("ceil_done_1", 1)
       shard_at_head!("ceil_done_2", 1)
-      for i <- 1..3, do: {:ok, _} = Directory.resolve("ceil_behind_#{i}")
+      for i <- 1..3, do: {:ok, _} = resolve_flushed("ceil_behind_#{i}")
 
       assert Migrator.status().eta_seconds == 5400
     end
@@ -276,7 +276,7 @@ defmodule Fathom.Migrator.RolloutRateTest do
       {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       # One shard migrated recently (so the rate is non-zero) and one still behind.
       shard_at_head!("stall_done", 1)
-      {:ok, _} = Directory.resolve("stall_behind")
+      {:ok, _} = resolve_flushed("stall_behind")
 
       insert_migration_job!(
         "stall_behind",

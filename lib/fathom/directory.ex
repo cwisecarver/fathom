@@ -1174,8 +1174,11 @@ defmodule Fathom.Directory do
   laggard/reconcile query filters `status == "active"`, so without this it is invisible to
   every sweep forever — its data never converges to HEAD. Flipping it back to `active` makes
   the next rollout re-enqueue and retry it (the migration copy is idempotent). Called from
-  the hourly reconcile; a nil `migrating_since` (a pre-`migrating_since`-migration in-flight
-  row) is left alone and self-corrects on the next mark_migrating.
+  the hourly reconcile. A row with a nil `migrating_since` is aged by `updated_at` instead (expert
+  review 2026-11-07 #63): the engine's own `mark_migrating/2` always stamps `migrating_since`, so
+  a nil can only be a pre-column in-flight row or a hand-set status, and the old "left alone,
+  self-corrects on the next mark_migrating" never happened — `laggards/2` selects only `active`
+  rows, so nothing re-marked it, it counted in `count_in_flight/1`, and `converged` stayed false.
   """
   @spec reclaim_stale_migrating(pos_integer() | nil) :: [String.t()]
   def reclaim_stale_migrating(stale_after_seconds \\ nil) do
@@ -1194,8 +1197,9 @@ defmodule Fathom.Directory do
       Repo.update_all(
         from(s in Shard,
           where:
-            s.status == "migrating" and not is_nil(s.migrating_since) and
-              s.migrating_since < ^cutoff,
+            s.status == "migrating" and
+              ((not is_nil(s.migrating_since) and s.migrating_since < ^cutoff) or
+                 (is_nil(s.migrating_since) and s.updated_at < ^cutoff)),
           select: s.shard_id
         ),
         set: [status: "active", migrating_since: nil, updated_at: now]
@@ -1559,7 +1563,12 @@ defmodule Fathom.Directory do
   """
   @spec count_at_or_above_version(non_neg_integer()) :: non_neg_integer()
   def count_at_or_above_version(version) do
-    base = from(s in Shard, where: s.schema_version >= ^version and s.status == "active")
+    # EVERY NON-DELETED STATUS, not just `active` (expert review 2026-11-07 #63): a SUSPENDED tenant
+    # that already crossed `version` has applied that step without the transform exactly like an
+    # active one, and `Tenants.resume` returns it to the fleet — so attaching a transform after it
+    # crossed was accepted, and the fleet split the refusal exists to prevent went in unseen.
+    # (`migrating` rows below `version` are `count_migrating_below_version/1`'s.)
+    base = from(s in Shard, where: s.schema_version >= ^version and s.status != "deleted")
 
     case template_shard_id() do
       nil -> base
@@ -1598,12 +1607,22 @@ defmodule Fathom.Directory do
   end
 
   @doc """
-  Lazily streams the active shard_ids at `version` in keyset-paginated pages of `page_size` (#12),
+  Lazily streams the shard_ids at `version` — `active` AND `suspended` — in keyset-paginated pages
+  of `page_size` (#12),
   so a fleet-wide set (millions) never materializes at once and never holds one long transaction:
   each page is an independent short query ordered by `shard_id`, so the revert engine can enqueue +
   commit per chunk (a job starts after the first page, not after a full scan). Returns a `Stream` of
   shard_id strings. Robust to shards flipping out of the set mid-scan (a concurrently-reverted shard
   is simply skipped — its revert is already in flight, and enqueue is idempotent).
+
+  `suspended` is included (expert review 2026-11-07 #63): a tenant suspended at the bad version was
+  skipped by a fleet revert, and `Tenants.resume` then returned it to `active` at a yanked version
+  above HEAD, serving on the bad schema with the write-age guard (it has been used) refusing every
+  unforced revert — only `force: true`, which discards writes, could move it. `ShardMigration.revert/4`
+  already supports a suspended tenant (`keep_suspended`: the cutover keeps it suspended, a revert is
+  not a resume), so selecting it changes no tenant's availability. `migration_failed` is NOT
+  included: `cutover/4` refuses it (only active/migrating/suspended), so its revert would roll back
+  AFTER the destructive restore had landed — and a quarantine is the operator's `retry_failed/0`.
   """
   @spec stream_ids_at_version(non_neg_integer(), pos_integer()) :: Enumerable.t()
   def stream_ids_at_version(version, page_size \\ 5_000) do
@@ -1613,7 +1632,9 @@ defmodule Fathom.Directory do
         ids =
           Repo.all(
             from(s in Shard,
-              where: s.schema_version == ^version and s.status == "active" and s.shard_id > ^last,
+              where:
+                s.schema_version == ^version and s.status in ["active", "suspended"] and
+                  s.shard_id > ^last,
               order_by: [asc: s.shard_id],
               limit: ^page_size,
               select: s.shard_id
@@ -2346,14 +2367,42 @@ defmodule Fathom.Directory do
         changeset = Shard.admin_changeset(shard, attrs)
 
         if changeset.valid? do
-          guarded_update_shard(shard_id, changeset.changes, Shard.admin_editable_statuses())
+          guarded_update_shard(shard_id, changeset.changes, Shard.admin_updatable_from())
         else
           {:error, changeset}
         end
     end
   end
 
-  defp laggard_query(head_version), do: behind_query(head_version, "active")
+  # NEVER-FLUSHED v0 ROWS ARE NOT LAGGARDS (expert review 2026-11-07 #51). A read-only request for a
+  # novel id mints an `active, schema_version: 0` row (`insert_new`) but never dirties the shard, so
+  # no stored object exists; a migration job for it fails `{:error, :no_live_object}` and cancels,
+  # the row stays `active v0`, and `cancelled` is not a live state, so every hourly sweep re-selected
+  # it. Those phantoms (a) kept `laggards` above 0 so `Migrator.status().converged` was false
+  # forever, (b) cost an S3 lock PUT + Oban insert/cancel each per hour, and (c) with >= batch_size
+  # of them touched more recently than the real cold tail, filled every `laggards/2` chunk so the
+  # real laggards behind them were never selected while `rollout_loop` spun to its time budget.
+  # `last_flushed_at` is the discriminator the restore drill already uses for "brand new vs lost"
+  # (`record_flush`/`record_flush_batch` set it on the first upload); `cutover_at` covers a row born
+  # by a fork-from-template (stamped by `cutover/2`, no flush recorded yet). Residual: the Recorder
+  # is best-effort, so a shard that flushed once and lost its `record_flush` (a node crash inside
+  # the buffer window) with no later flush is hidden from sweeps until its next flush — and such a
+  # v0 shard has no `django_migrations` ledger to replay onto anyway.
+  #
+  # Applied to the ACTIVE query only. `count_in_flight/1` reads `migrating` rows, and a row only
+  # becomes `migrating` after the job pulled a stored object — it is real work in flight whatever
+  # its `last_flushed_at` says, so hiding it would make `converged` lie in the OTHER direction.
+  defp laggard_query(head_version) do
+    head_version
+    |> behind_query("active")
+    |> exclude_never_flushed()
+  end
+
+  defp exclude_never_flushed(query) do
+    from(s in query,
+      where: s.schema_version != 0 or not is_nil(s.last_flushed_at) or not is_nil(s.cutover_at)
+    )
+  end
 
   # Shards stamped below `head_version` in `status`, minus the scratch forks and the template.
   defp behind_query(head_version, status) do

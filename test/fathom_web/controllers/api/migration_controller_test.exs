@@ -17,6 +17,8 @@ defmodule FathomWeb.Api.MigrationControllerTest do
     |> Plug.Conn.put_req_header("accept", "application/json")
   end
 
+  # A real cold-tail shard has uploaded at least once. A never-flushed v0 row is a phantom the
+  # sweep deliberately skips (expert review 2026-11-07 #51), so the fixture says it flushed.
   defp put_shard(id, version, status \\ "active") do
     %Shard{}
     |> Shard.changeset(%{
@@ -25,6 +27,7 @@ defmodule FathomWeb.Api.MigrationControllerTest do
       status: status,
       last_active_at: DateTime.utc_now()
     })
+    |> Ecto.Changeset.put_change(:last_flushed_at, DateTime.utc_now())
     |> Repo.insert!()
   end
 
