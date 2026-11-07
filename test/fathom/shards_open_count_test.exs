@@ -133,7 +133,7 @@ defmodule Fathom.ShardsOpenCountTest do
       # drain_all/1 marks the node draining (a node-global persistent_term). Left set, every later
       # test that reads HealthPlug.draining?/0 sees a draining node (it broke reporter_test's
       # health-snapshot assertion under CI seed 609064).
-      Fathom.HealthPlug.end_draining()
+      Fathom.Shards.undrain()
     end
 
     assert_receive {:DOWN, ^ref, :process, ^pid, _}, 5_000

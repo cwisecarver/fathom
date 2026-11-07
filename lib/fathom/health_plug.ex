@@ -36,7 +36,7 @@ defmodule Fathom.HealthPlug do
   @spec begin_draining() :: :ok
   def begin_draining, do: :persistent_term.put(@draining_key, true)
 
-  @doc "Clear the draining flag (a cancelled drain / tests)."
+  @doc "Clear the draining flag (tests, and `Fathom.Shards.undrain/0`, the operator's rpc-callable clear)."
   @spec end_draining() :: :ok
   def end_draining, do: :persistent_term.put(@draining_key, false)
 

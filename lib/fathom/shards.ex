@@ -823,13 +823,16 @@ defmodule Fathom.Shards do
   fan-out, so one busy shard cannot consume the whole window and strand the rest (expert review
   2026-08-26 #5; before it, this sentence described a property the code did not have). Wire it as a release **pre-stop** (`bin/fathom rpc
   "Fathom.Shards.drain_all()"`) ahead of SIGTERM — see `docs/runbooks/cluster.md`. It never
-  `end_draining`s: the node is on its way down, and a cancelled drain resets the flag explicitly.
+  clears the flag itself: the node is on its way down. If the stop does NOT follow (the
+  orchestrator aborted, a rollout was paused), run `Fathom.Shards.undrain/0` — there is no
+  auto-expiry (see `undrain/0`), so the node otherwise stays out of the LB and refuses every cold
+  open until it is restarted. `drain_all` logs a warning on completion saying exactly that.
 
   While the flag is set a request-path checkout that would start a coordinator is refused with the
   retryable `{:error, :draining}` (expert review 2026-11-07 #46), so a drained shard is not
   re-opened — and its lease re-taken — by the next request; coordinators that still registered after
   the first snapshot are drained by a final sweep with the budget that is left. A cancelled drain
-  MUST `HealthPlug.end_draining/0`, or this node refuses every cold open.
+  MUST call `undrain/0`, or this node refuses every cold open.
   """
   @spec drain_all(pos_integer()) :: %{
           drained: non_neg_integer(),
@@ -855,10 +858,51 @@ defmodule Fathom.Shards do
     # budget; the tally is the sum of both batches.
     seen = MapSet.new(pids, fn {_id, pid} -> pid end)
 
-    case Enum.reject(registered_coordinators(), fn {_id, pid} -> MapSet.member?(seen, pid) end) do
-      [] -> first
-      late -> Map.merge(first, drain_batch(late, deadline, budget_ms), fn _k, a, b -> a + b end)
+    outcome =
+      case Enum.reject(registered_coordinators(), fn {_id, pid} -> MapSet.member?(seen, pid) end) do
+        [] -> first
+        late -> Map.merge(first, drain_batch(late, deadline, budget_ms), fn _k, a, b -> a + b end)
+      end
+
+    # LOUD, because the flag outlives this call (expert review 2026-11-07 follow-up to #46): when the
+    # stop that should follow never comes, the node is out of the LB and refusing cold opens, and the
+    # only trace of why is this line.
+    Logger.warning(
+      "drain_all finished #{inspect(outcome)}: this node stays DRAINING — /health is 503 and every " <>
+        "request-path cold open is refused — until it stops. If it is NOT about to stop (aborted " <>
+        "deploy, paused rollout), run Fathom.Shards.undrain() to put it back in service."
+    )
+
+    outcome
+  end
+
+  @doc """
+  Take this node out of the draining state: `/health` returns 200 again (the LB re-admits it) and
+  request-path cold opens are accepted again. The operator's undo for `drain_all/1` when the stop it
+  was the pre-stop of never arrives — `bin/fathom rpc 'Fathom.Shards.undrain()'`. Idempotent: a node
+  that is not draining is left alone (and logs nothing).
+
+  It does NOT reopen what the drain closed: shards `drain_all` flushed and released stay closed until
+  their next request (a cold open, which re-acquires the lease). A shard the drain reported `busy` or
+  `timed_out` already resumed serving on its own when its window lapsed.
+
+  **Why there is no auto-expiry.** A timer (the flag's start time plus `drain_all`'s budget and a
+  grace) would also fire on a node that IS stopping: the gap between the pre-stop rpc and the
+  orchestrator's SIGTERM is the orchestrator's, unbounded from here, and the supervisor teardown
+  after `prep_stop` runs for `SHARD_SHUTDOWN_MS` more. A stopping node that re-opens shards re-takes
+  leases it has just released, which is the bug #46 fixed. Nothing in the code can tell "stop is
+  coming" from "stop was abandoned", so the clear is an explicit operator decision, made visible by
+  the warning `drain_all/1` logs.
+  """
+  @spec undrain() :: :ok
+  def undrain do
+    if Fathom.HealthPlug.draining?() do
+      Logger.warning(
+        "undrain: this node is back in service — /health is 200 and cold opens are accepted again"
+      )
     end
+
+    Fathom.HealthPlug.end_draining()
   end
 
   # One bounded, wave-sliced drain of `pids` against `deadline` (see the slice note below).

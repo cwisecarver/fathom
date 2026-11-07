@@ -15,7 +15,7 @@ defmodule Fathom.ShardsDrainAllTest do
     ids = for i <- 1..3, do: "drainall_#{System.unique_integer([:positive])}_#{i}"
 
     on_exit(fn ->
-      HealthPlug.end_draining()
+      Shards.undrain()
       restore(:shard_idle_ms, prev_idle)
 
       for id <- ids, do: Shards.drain(id, 2_000)
@@ -223,28 +223,7 @@ defmodule Fathom.ShardsDrainAllTest do
     test "a draining node refuses cold opens: a drained shard is not re-taken (#{mode})", %{
       ids: [id | _]
     } do
-      case unquote(mode) do
-        :legacy ->
-          refute Fathom.Shard.Heartbeat.running?(), "legacy mode needs the heartbeat OFF"
-
-        :heartbeat ->
-          hb = start_supervised!({Fathom.Shard.Heartbeat, ttl_ms: 30_000})
-          _ = :sys.get_state(hb)
-          assert Fathom.Shard.Heartbeat.running?()
-      end
-
-      pid = open_idle!(id)
-
-      case unquote(mode) do
-        :legacy -> assert is_nil(Fathom.Shard.acquire_gen(pid)), "expected LEGACY liveness"
-        :heartbeat -> refute is_nil(Fathom.Shard.acquire_gen(pid)), "expected HEARTBEAT liveness"
-      end
-
-      ref = Process.monitor(pid)
-      result = Shards.drain_all(3_000)
-      assert result.drained >= 1, "fixture: the shard must have drained (#{inspect(result)})"
-      assert_receive {:DOWN, ^ref, :process, ^pid, _}, 3_000
-      assert HealthPlug.draining?()
+      drained_node!(unquote(mode), id)
 
       # The request path: refused with the retryable error, and nothing was started.
       assert {:error, :draining} = Shards.checkout(id),
@@ -257,6 +236,71 @@ defmodule Fathom.ShardsDrainAllTest do
       # A bare `ensure/1` (flush_kept_local, admin, bench) is not a request and still opens.
       assert {:ok, _pid} = Shards.ensure(id)
     end
+
+    # Follow-up to #46: `drain_all/1` as the pre-stop rpc, with the stop never arriving, left the
+    # flag set forever — nothing in the code cleared it — so the node refused every cold open and
+    # answered /health 503 until restarted. `undrain/0` is the operator's explicit clear.
+    test "undrain restores cold opens and the health 200 after a drain_all (#{mode})", %{
+      ids: [id | _]
+    } do
+      drained_node!(unquote(mode), id)
+      assert {:error, :draining} = Shards.checkout(id)
+      assert probe() == {503, "draining"}
+
+      assert :ok = Shards.undrain()
+
+      refute HealthPlug.draining?()
+      assert probe() == {200, "ok"}
+
+      assert {:ok, pid, ref, _path} = Shards.checkout(id),
+             "undrain did not restore request-path cold opens"
+
+      # The re-opened coordinator is in the mode under test (it re-took the lease the drain released).
+      case unquote(mode) do
+        :legacy -> assert is_nil(Fathom.Shard.acquire_gen(pid)), "expected LEGACY liveness"
+        :heartbeat -> refute is_nil(Fathom.Shard.acquire_gen(pid)), "expected HEARTBEAT liveness"
+      end
+
+      Fathom.Shard.checkin(pid, ref)
+    end
+  end
+
+  test "undrain is idempotent on a node that is not draining" do
+    HealthPlug.end_draining()
+    refute HealthPlug.draining?()
+
+    assert :ok = Shards.undrain()
+    assert :ok = Shards.undrain()
+    refute HealthPlug.draining?()
+    assert probe() == {200, "ok"}
+  end
+
+  # Opens `id` in liveness `mode` (asserting the mode took), runs a real `drain_all/1`, and returns
+  # the DOWN'd coordinator pid with the node left draining.
+  defp drained_node!(mode, id) do
+    case mode do
+      :legacy ->
+        refute Fathom.Shard.Heartbeat.running?(), "legacy mode needs the heartbeat OFF"
+
+      :heartbeat ->
+        hb = start_supervised!({Fathom.Shard.Heartbeat, ttl_ms: 30_000})
+        _ = :sys.get_state(hb)
+        assert Fathom.Shard.Heartbeat.running?()
+    end
+
+    pid = open_idle!(id)
+
+    case mode do
+      :legacy -> assert is_nil(Fathom.Shard.acquire_gen(pid)), "expected LEGACY liveness"
+      :heartbeat -> refute is_nil(Fathom.Shard.acquire_gen(pid)), "expected HEARTBEAT liveness"
+    end
+
+    ref = Process.monitor(pid)
+    result = Shards.drain_all(3_000)
+    assert result.drained >= 1, "fixture: the shard must have drained (#{inspect(result)})"
+    assert_receive {:DOWN, ^ref, :process, ^pid, _}, 3_000
+    assert HealthPlug.draining?()
+    pid
   end
 
   test "a coordinator that registered after the first snapshot is drained by the final sweep", %{

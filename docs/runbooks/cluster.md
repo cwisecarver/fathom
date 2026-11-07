@@ -165,8 +165,21 @@ request that would start a coordinator is refused with the retryable `FILO_DRAIN
 re-opening the shard the drain just released and re-taking its lease. This matters because the shipped
 OSS nginx has no active health check and keeps pooled keepalives, so it keeps sending to a node whose
 `/health` already says 503; `proxy_next_upstream … http_503` retries the request on the next upstream.
-Shards that are already open keep serving until their drain. If you cancel a drain you started with the
-rpc, `Fathom.HealthPlug.end_draining()` it, or this node refuses every cold open.
+Shards that are already open keep serving until their drain. **Nothing clears the flag except a restart
+or `undrain`** (there is no auto-expiry, by design: see `Fathom.Shards.undrain/0` — a timer would also
+fire on a node that is genuinely about to stop, and a stopping node that re-opens shards re-takes the
+leases it just released). So if you ran the `drain_all` rpc and the stop never follows (the orchestrator
+aborted, a rollout was paused), put the node back in service yourself:
+
+```sh
+bin/fathom rpc 'Fathom.Shards.undrain()'
+```
+
+It is idempotent (a node that is not draining is left alone), clears the flag so `/health` returns 200
+and cold opens are accepted again, and does not reopen what the drain already closed (those shards
+cold-open on their next request). The symptom of a forgotten undrain is a live node with `/health` 503,
+`FILO_DRAINING` on every first touch of a shard, and `draining: true` on the admin overview; `drain_all`
+logs a warning on completion naming the command.
 
 **Open connections are asked to close (expert review 2026-10-10 panel2 H4).** When a coordinator
 starts draining it tells each connection holder to let go: a WebSocket closes with code 1001 once
@@ -184,6 +197,8 @@ long-lived django-libsql WebSocket held every drain open until its window ran ou
 bin/fathom rpc 'IO.inspect(Fathom.Shards.drain_all())'
 # 2. THEN send SIGTERM / stop the release.
 bin/fathom stop
+# If the stop is ABORTED after step 1 (rollout paused, orchestrator gave up), undo step 1 instead:
+#   bin/fathom rpc 'Fathom.Shards.undrain()'
 ```
 
 These knobs are environment variables read at boot (a release cannot edit `config/*.exs`); each

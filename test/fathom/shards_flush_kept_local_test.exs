@@ -147,7 +147,7 @@ defmodule Fathom.ShardsFlushKeptLocalTest do
 
   test "drain_all counts a kept local copy as kept_local, not drained", %{id: id} do
     {pid, ref} = kept_local_fixture(id)
-    on_exit(fn -> Fathom.HealthPlug.end_draining() end)
+    on_exit(fn -> Fathom.Shards.undrain() end)
 
     result = Shards.drain_all(5_000)
     assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000

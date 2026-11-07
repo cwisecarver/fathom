@@ -148,7 +148,15 @@ defmodule Fathom.Shard.ReplicationLagTest do
 
     assert :ok = Session.commit(id, path <> "-wal", coordinator)
 
-    assert %{catching_up?: true, catchup_fails: 1} = Session.lag_info(id)
+    # The commit acks at the second ack (Q=2); the never-connected follower's `:disconnected`
+    # reject is a THIRD, asynchronous round. Reading `lag_info/1` immediately raced it: flake at
+    # full-suite seed 392626, 2026-11-07 — `catchup_fails: 0, inflight_pushes: 1, catching_up?:
+    # false`, i.e. the ack had returned with the unreachable follower's push still in flight. The
+    # state is reached; it just is not announced, so wait for it.
+    Fathom.Test.Await.until(
+      fn -> match?(%{catching_up?: true, catchup_fails: 1}, Session.lag_info(id)) end,
+      "the unreachable follower's reject never registered as a catch-up failure"
+    )
   end
 
   # Expert review 2026-10-19 #9 (measure only): the commit_stage events carry a bounded
