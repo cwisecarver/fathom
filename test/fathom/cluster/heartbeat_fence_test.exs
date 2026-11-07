@@ -245,25 +245,43 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
   # flush disabled). The invariant: the lapse broadcast alone makes a stolen shard's
   # coordinator revalidate and self-fence, no flush needed.
   #
-  # :flaky (CI 2-core runners + back-to-back local runs, 2026-09-02). The self-fence is prompt but
-  # not instantaneous — the broadcast has to reach the coordinator, which revalidates (a storage
-  # check) and stops — and on a starved runner that exceeds the 2000 ms `assert_receive` window even
-  # though the mechanism works (it passes at a 20 s deadline). AGENTS.md explicitly forbids widening
-  # THIS timeout, and the assertion is a genuine latency bound, not a synchronous read of an async
-  # result (contrast replication_commit_test's `await_catchup_fails`, which WAS made deterministic).
-  # So this is the project's `:flaky` case — real behaviour, unreliable repro. To un-tag it, the
-  # fence would have to be observable without a wall-clock bound (e.g. a deterministic signal that
-  # the lapse broadcast was applied, separate from the coordinator's stop latency). Run with
-  # `mix test --include flaky`.
-  @tag :flaky
+  # Un-`:flaky`ed (expert review 2026-11-07 #84). It was excluded for a 2000 ms `assert_receive`
+  # that a starved runner could exceed, which left the invariant with no default-suite coverage
+  # (neither CI nor `mix test` runs `:flaky`). The wait was never a race: pre-fix the coordinator
+  # NEVER stops, so a 30 s bound discriminates exactly like 2 s and only costs time on failure. The
+  # lapse revalidation's jitter is pinned to 1 ms so the scheduled check fires at once instead of
+  # drawing from `Shard.lapse_spread_ms/1`. The thief arrives BEFORE the lapse, so the
+  # revalidation can only find the lock stolen.
+  #
+  # Mutation proof (run when this was written): `apply_lapse_verdict(:superseded, state)` returning
+  # `{:noreply, state}` makes this test time out in the default run.
   test "a lapse broadcast proactively self-fences a stolen shard without waiting for a flush",
        %{shard: shard, hb: hb} do
+    prev_jitter = Application.get_env(:fathom, :lapse_revalidate_jitter_ms)
+    Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 1)
+
+    on_exit(fn ->
+      if prev_jitter,
+        do: Application.put_env(:fathom, :lapse_revalidate_jitter_ms, prev_jitter),
+        else: Application.delete_env(:fathom, :lapse_revalidate_jitter_ms)
+    end)
+
     capture_log(fn ->
       {:ok, conn} = ShardExecutor.open(shard)
-      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
 
       {:ok, coordinator} = Shards.ensure(shard)
       ref = Process.monitor(coordinator)
+
+      # CLEAN on purpose: no write has been issued. A dirty stolen shard also self-fences at its
+      # next durability flush (`:fence_superseded`, ~5 s), which stops it with the same reason and
+      # made an earlier version of this test pass with the lapse verdict mutated to a no-op.
+      pre = :sys.get_state(coordinator)
+      refute pre.counter_gen != Fathom.Shard.WriteCounter.generation()
+      assert Fathom.Shard.WriteCounter.count(shard) <= pre.flushed_through
+
+      # Heartbeat mode took: the coordinator recorded the acquire generation the lapse will move.
+      assert Heartbeat.running?()
+      assert is_integer(:sys.get_state(coordinator).acquire_gen)
 
       # A thief takes the lock during the lapse.
       put_raw_lock(shard, "thief@node", 999, now_ms() + 60_000)
@@ -277,8 +295,8 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       _ = :sys.get_state(hb)
 
       # The broadcast alone must fence the coordinator — the connection stays open,
-      # no idle flush runs. Pre-fix nothing subscribed and this timed out.
-      assert_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 2_000
+      # no idle flush runs. Pre-fix nothing subscribed and the coordinator never stopped.
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 30_000
 
       :ok = ShardExecutor.close(conn)
     end)
@@ -348,13 +366,13 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       put_raw_lock(shard, "thief@node", 999, now_ms() + 60_000)
 
       :ok = ShardExecutor.close(conn)
-      # Two terminal paths now reach "self-fenced, never flushed": the close-time flush fence
-      # (`:normal`) and — since expert review 2026-10-10 #12, which delivers a lapse that landed
-      # before the open's lapse subscription — the proactive revalidation, which can win the race
-      # against the thief and stop `{:shutdown, :lease_lost}`. This previously asserted `:normal`
-      # only, which pinned the missed-lapse defect; the invariant is the refute below.
-      assert_receive {:DOWN, ^ref, :process, ^coordinator, reason}, 2_000
-      assert reason in [:normal, {:shutdown, :lease_lost}]
+      # The jitter is pinned to 60 s above, so the proactive revalidation (#12, which delivers a
+      # lapse that landed before the open's subscription) cannot fire: the only terminal path is
+      # the close-time flush fence, which stops `:normal` without writing. Observed `:normal` in
+      # every run (2026-11-07); an exact match, so a `{:shutdown, :lease_lost}` here would mean the
+      # pin stopped holding rather than being silently accepted.
+      assert_receive {:DOWN, ^ref, :process, ^coordinator, reason}, 30_000
+      assert reason == :normal, "exit reason: #{inspect(reason)}"
     end)
 
     refute File.exists?(remote_db(shard)),
