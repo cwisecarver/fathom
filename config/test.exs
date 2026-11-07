@@ -96,6 +96,15 @@ config :fathom, Fathom.Shard.Storage.Local,
 # the path — that duplication is what let the two drift.
 config :fathom, :shard_data_dir, Path.join(System.tmp_dir!(), "fathom_shards_test")
 
+# The scratch dir (`TempReaper.scratch_dir/0`: tenant exports, restore-drill and snapshot temps) is
+# the same kind of per-run state, and it was the one dir left in the shared system tmp. It
+# accumulated across runs (49 entries, hours old, on a dev box) and `TempReaper.sweep/0` returns the
+# stale ones it reaps, so an exact-count assertion (`sweep() == 0` in `temp_reaper_listing_test`)
+# failed whenever an entry left by an earlier run crossed the 1 h age gate between two sweeps of one
+# test (full-suite seed 32223; reproduced by planting entries 1-3 s short of the gate). Test-owned
+# and cleared by `test_helper.exs` like the shard dir; reach it via `TempReaper.scratch_dir/0`.
+config :fathom, :fathom_scratch_dir, Path.join(System.tmp_dir!(), "fathom_scratch_test")
+
 # Don't touch the Postgres directory from the shard data path by default in test
 # (the shard/storage/lease tests aren't sandbox-checked-out). The directory
 # wiring test flips this on explicitly.

@@ -57,6 +57,10 @@ for f <- Path.wildcard(Path.join(remote_dir, "*.db")), do: File.rm(f)
 # sweep that enumerates kinds is one new kind away from leaking again.
 File.rm_rf(Fathom.Shard.data_dir())
 
+# The scratch dir is per-run state too (`config/test.exs` :fathom_scratch_dir): entries left by an
+# earlier run age across the reaper's 1 h gate DURING a later run's exact-count sweep assertions.
+File.rm_rf(Fathom.Shard.TempReaper.scratch_dir())
+
 try do
   :ets.delete_all_objects(Fathom.Tenants.Tombstones)
 rescue
