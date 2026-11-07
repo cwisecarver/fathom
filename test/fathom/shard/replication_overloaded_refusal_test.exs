@@ -89,6 +89,15 @@ defmodule Fathom.Shard.ReplicationOverloadedRefusalTest do
         for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
         assert :ok = Session.commit(id, wal, coordinator)
 
+        # The FIRST commit of a fresh lineage seeds every follower directly (`Session.seed_first/4`)
+        # and returns at the QUORUM, so the third follower's seed can still be in flight here under
+        # load. That seed's follower is then `seeding` (not pushed to, and `inflight` is not idle)
+        # while the overload commit below runs, and the assertion that follows read a Session that
+        # was still settling the first commit: seen twice in full-suite runs as `[overloaded: 0,
+        # seeding: 0]` (the log line of a seed in flight) and `inflight != %{}`, never in isolation.
+        # Wait for it, so the test measures the overload and not the first commit's stragglers.
+        await_no_seeds!(id)
+
         assert :sys.get_state(session!(id)).inflight == %{},
                "fixture: not idle after a good commit"
 
