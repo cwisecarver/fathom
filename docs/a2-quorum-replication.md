@@ -209,6 +209,11 @@ Refinements (expert review 2026-10-13 #5, #14, #15, #40):
   (it may lack the acked tail). A refusal by this node's own sink ends the attempt at once. Ties
   between equal peers are spread per shard by `phash2({shard_id, node_key})`, so a failover wave
   does not send every pull to the highest `node_key`.
+- A **torn local replica never wins `choose/4`** (expert review 2026-11-07 #2): ranking reads only
+  `{lineage, ordinal, offset}`, so a torn copy (an OS-reboot hold, a failed promotion's fence) that
+  tied or out-ranked a peer returned `:local`, the caller refused it as not fresher, and the stale
+  object was served with no pull and no refusal. The local copy must itself be fresher than the
+  object; otherwise the better peer is pulled and replaces it.
 
 N and Q are this node's peer set and `REPLICATION_QUORUM`, which assumes a symmetric fleet with one
 quorum. The floor applies only against a rankable object stamp, so a brand-new shard is never

@@ -170,6 +170,27 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
                Recovery.choose(nil, stamp(9, 3, 4_120), [{peer("n2"), torn}, {peer("n3"), whole}])
     end
 
+    # Expert review 2026-11-07 #2. `rank/1` reads `{lineage, ordinal, offset}` and never `torn`, so a
+    # torn local copy that tied or out-ranked a peer returned `:local`, which the caller then refused
+    # (`fresher?(%{torn: true}, _) == false`): no pull, no refusal, the stale object served while the
+    # peer held the acked tail. The old comment argued this away by transitivity, which is false
+    # where `fresher?/2` has non-order clauses.
+    test "a TORN local replica never wins a tie or a ranking against a whole peer ahead of the object" do
+      stamp = stamp(9, 3, 4_120)
+      peer_offer = [{peer("n2"), at(9, 3, 8_240)}]
+
+      for local <- [at(9, 3, 8_240), at(9, 3, 9_000), at(10, 3, 99_999)] do
+        torn = Map.put(local, :torn, true)
+
+        assert {:pull, {"n2", _, _}, _} = Recovery.choose(torn, stamp, peer_offer),
+               "a torn local (#{inspect(local)}) was chosen over a peer that is provably ahead"
+      end
+
+      # Controls: the same positions WHOLE still win, so the guard is `torn`, not the ranking.
+      assert :local = Recovery.choose(at(9, 3, 8_240), stamp, peer_offer)
+      assert :local = Recovery.choose(at(9, 3, 9_000), stamp, peer_offer)
+    end
+
     test "ties between peers break deterministically, so two survivors choose alike" do
       offers = [{peer("n2"), at(9, 3, 8_240)}, {peer("n3"), at(9, 3, 8_240)}]
       assert {:pull, {"n3", _, _}, _} = Recovery.choose(nil, stamp(9, 3, 0), offers)
@@ -418,6 +439,37 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     assert File.read!(Follower.db_path(survivor, id)) == db
     assert File.read!(Follower.wal_path(survivor, id)) == wal
     assert installed == Follower.state_of(survivor, id)
+  end
+
+  # Expert review 2026-11-07 #2, end to end: the survivor's own replica is TORN (as a reboot hold or a
+  # failed promotion's fence leaves it) at the same position a whole peer holds. It used to come back
+  # as `{:ok, torn_local}`, which `decide_from_fleet` refused, serving the stale object.
+  test "a torn local replica is replaced by the peer's whole copy, not returned", %{id: id} do
+    {source, source_port} = start_follower("recov_src")
+    {survivor, _} = start_follower("recov_surv")
+
+    db = :crypto.strong_rand_bytes(12_288)
+    wal = wal_bytes(5, 0xDEADBEEF, :crypto.strong_rand_bytes(8_192))
+    plant_replica(source, id, 9, 5, 0xDEADBEEF, db, wal)
+
+    # Same claimed position, different bytes, then torn.
+    local_db = :crypto.strong_rand_bytes(12_288)
+    plant_replica(survivor, id, 9, 5, 0xDEADBEEF, local_db, wal)
+    Follower.fence_for_promotion(survivor, id, [])
+
+    assert %{torn: true, lineage: 9, next_offset: offset} = Follower.state_of(survivor, id)
+    assert offset == byte_size(wal), "fixture: the torn local must TIE the peer, not trail it"
+
+    assert {:ok, installed} =
+             Recovery.best_replica(id, stamp(9, 5, 0),
+               follower: survivor,
+               peers: [{"src", "127.0.0.1", source_port}]
+             )
+
+    assert %{torn: false, next_offset: ^offset} = installed,
+           "the torn local replica was returned instead of the peer's whole copy"
+
+    assert File.read!(Follower.db_path(survivor, id)) == db
   end
 
   test "a survivor already holding the freshest copy asks nobody", %{id: id} do

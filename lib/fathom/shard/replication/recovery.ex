@@ -171,10 +171,19 @@ defmodule Fathom.Shard.Replication.Recovery do
         if Promote.fresher?(local, object_stamp), do: :local, else: :none
 
       [{endpoint, pos} | _] ->
-        # `>=`, so an equal peer does not cost a database transfer. Transitivity does the rest: the
-        # winner is already strictly ahead of the object, so a local copy at least equal to it is
-        # too, and `:local` is safe without re-testing.
-        if local && rank(local) >= rank(pos), do: :local, else: {:pull, endpoint, pos}
+        # `>=`, so an equal peer does not cost a database transfer. The local copy must ITSELF be
+        # `fresher?` than the object (expert review 2026-11-07 #2). This used to rest on
+        # transitivity ("the winner is already strictly ahead of the object, so a local copy at
+        # least equal to it is too, and `:local` is safe without re-testing"), which is false exactly
+        # where `fresher?/2` has non-order clauses: `rank/1` reads only `{lineage, ordinal,
+        # offset}`, so a TORN replica (a reboot hold, a failed promotion's fence) that out-ranked or
+        # tied the peer returned `:local`; `decide_from_fleet` then refused it
+        # (`fresher?(%{torn: true}, _) == false`) and fell through to the stale object with no pull
+        # and no refusal, while the peer held the acked tail. A torn local never wins: the peer is
+        # pulled, and the pull replaces the unusable copy.
+        if Promote.fresher?(local, object_stamp) and rank(local) >= rank(pos),
+          do: :local,
+          else: {:pull, endpoint, pos}
     end
   end
 
