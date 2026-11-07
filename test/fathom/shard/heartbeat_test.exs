@@ -898,15 +898,23 @@ defmodule Fathom.Shard.HeartbeatTest do
   # inside its own critical path, at the moment it is already behind. Every millisecond there
   # extends the lapse, and the lapse is what triggers #13's revalidation fan-out.
   describe "the lapse fan-out does not run in the heartbeat process (#18)" do
-    setup do
+    setup %{pid: hb} do
       test_pid = self()
       handler = "lapsefan-#{System.unique_integer([:positive])}"
 
+      # Scoped to THIS test's heartbeat. Telemetry is node-global, so an unscoped handler also
+      # counted a lapse from any other heartbeat still alive on the node, and the asserts below
+      # match one literal `inline` value: a stray event with the right value made them pass for a
+      # lapse this test never caused. The emitter is the heartbeat itself (inline) or the task it
+      # started, whose `$callers` names it.
       :ok =
         :telemetry.attach(
           handler,
           [:fathom, :shard, :heartbeat, :lapse_broadcast],
-          fn _e, _m, meta, _c -> send(test_pid, {:lapse_broadcast, meta.inline}) end,
+          fn _e, _m, meta, _c ->
+            if hb in [self() | Process.get(:"$callers", [])],
+              do: send(test_pid, {:lapse_broadcast, meta.inline})
+          end,
           nil
         )
 
@@ -941,6 +949,24 @@ defmodule Fathom.Shard.HeartbeatTest do
                      "the lapse fan-out ran INLINE in the heartbeat process. Measured at p50 " <>
                        "35 ms against 30 000 subscribers, inside the critical path that ends " <>
                        "the lapse."
+    end
+
+    test "a lapse event from a different heartbeat is not counted as this one's" do
+      # Pins the scoping above: an emitter that is neither this test's heartbeat nor a task it
+      # started is dropped, whatever `inline` it carries.
+      for inline <- [false, true] do
+        task =
+          Task.async(fn ->
+            :telemetry.execute([:fathom, :shard, :heartbeat, :lapse_broadcast], %{count: 1}, %{
+              generation: 0,
+              inline: inline
+            })
+          end)
+
+        Task.await(task)
+      end
+
+      refute_received {:lapse_broadcast, _}
     end
 
     test "the generation bump and publish stay INLINE, so the fence sees the lapse immediately",
