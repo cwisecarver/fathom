@@ -98,6 +98,53 @@ defmodule Fathom.Migrator.CheckMigrationsTest do
       path = write(dir, "0005_indent.py", "class Migration:\n        atomic = False\n")
       assert [%{rule: "atomic_false"}] = CheckMigrations.scan(path)
     end
+
+    # Expert review 2026-11-07 #65. The idiom is nearly always commented, and the old pattern
+    # required nothing but whitespace after `False`, so every one of these returned [] (CI green,
+    # `manage.py migrate` ran in autocommit, capture never saw it).
+    for {label, line} <- [
+          {"trailing comment", "atomic = False  # CREATE INDEX CONCURRENTLY"},
+          {"trailing semicolon", "atomic = False;"},
+          {"annotated", "atomic: bool = False"},
+          {"annotated with a comment", "atomic: bool = False  # needs CONCURRENTLY"},
+          {"tight comment", "atomic = False# x"}
+        ] do
+      test "fires on #{label}", %{dir: dir} do
+        path = write(dir, "0006_spelling.py", "class Migration:\n    #{unquote(line)}\n")
+        assert [%{rule: "atomic_false"}] = CheckMigrations.scan(path)
+      end
+    end
+
+    test "a longer identifier or a different value does not fire", %{dir: dir} do
+      for line <- [
+            "atomic = Falsey",
+            "atomic = False_ish",
+            "atomic = True  # atomic = False",
+            "# atomic = False  # no"
+          ] do
+        path =
+          write(
+            dir,
+            "0007_#{System.unique_integer([:positive])}.py",
+            "class Migration:\n    #{line}\n"
+          )
+
+        assert CheckMigrations.scan(path) == [], "must stay clean: #{line}"
+      end
+    end
+
+    test "the import form of RunPython is a warning too", %{dir: dir} do
+      path =
+        write(dir, "0008_import_form.py", """
+        from django.db.migrations import Migration, RunPython
+
+
+        class Migration(Migration):
+            operations = [RunPython(lambda apps, schema_editor: None)]
+        """)
+
+      assert [%{rule: "run_python", severity: "warning"}] = CheckMigrations.scan(path)
+    end
   end
 
   describe "data migrations" do

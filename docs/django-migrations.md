@@ -249,7 +249,8 @@ needs to roll carefully, so check for it before anything touches the template:
 mix fathom.check_migrations path/to/django/project
 ```
 
-Exits non-zero on `atomic = False` (error) and warns on `RunPython` / `RunSQL` so you learn a
+Exits non-zero on `atomic = False` (error; bare, annotated `atomic: bool = False`, or with a trailing
+`# comment` or `;`) and warns on `RunPython` / `RunSQL` (dotted or imported) so you learn a
 version will need a transform *before* the fleet freezes. Wire it into CI ahead of the
 `manage.py migrate` that runs against the template.
 

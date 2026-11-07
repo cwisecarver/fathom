@@ -42,9 +42,19 @@ defmodule Mix.Tasks.Fathom.CheckMigrations do
 
   use Mix.Task
 
-  @atomic_false ~r/^\s*atomic\s*=\s*False\s*$/m
-  @run_python ~r/\bmigrations\.RunPython\b/
-  @run_sql ~r/\bmigrations\.RunSQL\b/
+  # `atomic = False` as a class attribute, in any of the spellings Django projects use: bare,
+  # annotated (`atomic: bool = False`), with a trailing `;`, and — the overwhelmingly common form,
+  # because the idiom exists for `CREATE INDEX CONCURRENTLY`-style migrations people explain —
+  # with a trailing `# reason` comment (expert review 2026-11-07 #65: the old pattern required
+  # nothing after `False` and so passed the commonest spelling, leaving the gate green). The
+  # anchor is the start of the LINE, so a `# atomic = False` comment line still does not match;
+  # `[ \t]` rather than `\s` so the anchor cannot slide across newlines. A docstring line that is
+  # exactly `atomic = False` remains a documented false positive.
+  @atomic_false ~r/^[ \t]*atomic[ \t]*(?::[ \t]*bool[ \t]*)?=[ \t]*False\b[ \t]*;?[ \t]*(?:#[^\n]*)?$/m
+  # `migrations.RunPython(…)` AND the import form (`from django.db.migrations import RunPython`,
+  # then a bare `RunPython(…)` in `operations`), which the dotted pattern alone cannot see.
+  @run_python ~r/\bmigrations\.RunPython\b|^[ \t]*from[ \t]+django\.db\.migrations(?:\.\w+)*[ \t]+import\b[^\n]*\bRunPython\b/m
+  @run_sql ~r/\bmigrations\.RunSQL\b|^[ \t]*from[ \t]+django\.db\.migrations(?:\.\w+)*[ \t]+import\b[^\n]*\bRunSQL\b/m
 
   @impl Mix.Task
   def run(argv) do
