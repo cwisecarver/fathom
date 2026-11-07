@@ -572,6 +572,22 @@ defmodule Fathom.ShardExecutor do
       {:error, {:too_many_rows, cap}} ->
         query_error(:too_large)
 
+        # THE ERROR RETURN IS NOT "NOTHING COMMITTED" (expert review 2026-11-07 #5). The cap trips
+        # AFTER SQLite performed an `INSERT/UPDATE/DELETE … RETURNING` in full on the first step,
+        # and `Connection`'s `reset_if_abandoned` then `sqlite3_reset`s the statement, which in
+        # autocommit COMMITS it (probe: capped 10-row `INSERT … RETURNING`, reset, `changes` = 10,
+        # `count(*)` = 10). The client is told FILO_RESULT_TOO_LARGE for a write that is locally
+        # committed and visible; without the success-branch bookkeeping the shard stayed "clean" and
+        # the idle drop deleted it. Inside an open transaction the rows are pending in that
+        # transaction and `account_failed_write/7` marks the transaction as having written.
+        #
+        # Why this is accounting and not a SAVEPOINT rollback: the ROLLBACK TO alternative IS legal
+        # (probed 2026-11-07: `ROLLBACK TO` over an un-reset RETURNING step succeeds and the rows
+        # vanish), but it would wrap every capped DML in two extra statements and move the commit
+        # from the step to the RELEASE, so it is a semantic change to the hot path that this fix does
+        # not need. Not `read?` (select/values/explain) because those cannot have mutated anything.
+        unless read?, do: account_failed_write(pid, conn, shard_id, sql, head, repl_on?, opts)
+
         {:error,
          %Error{
            message: "result exceeded the #{cap}-row cap",
@@ -589,6 +605,22 @@ defmodule Fathom.ShardExecutor do
   # added to the success path.
   defp query_error(class),
     do: :telemetry.execute([:fathom, :shard, :query, :error], %{count: 1}, %{class: class})
+
+  # The error-return counterpart of the success branch's bookkeeping, for a statement that MAY have
+  # written although it reports an error (expert review 2026-11-07 #5): bump the WriteCounter (the
+  # idle drop deletes a "clean" shard's local copy), tell the coordinator, SHIP what committed
+  # (under A2 `QuorumFence.mark` alone only makes the NEXT statement run a round, and a failed
+  # statement may be the last one; a failed round still fences via `mark_if_unconfirmed/2`), and
+  # record the write against the open transaction. Over-counting is the documented safe direction.
+  #
+  # The shipping result is dropped: the client is already being told about the primary error, and a
+  # failed round has fenced the shard for the next statement.
+  defp account_failed_write(pid, conn, shard_id, sql, head, repl_on?, opts) do
+    Fathom.Shard.WriteCounter.bump(shard_id)
+    signal_dirty_once(pid, conn)
+    _ = maybe_replicate(shard_id, pid, conn, head, true, repl_on?, nil, deferred_sync?(opts))
+    track_txn_write(conn, sql, head, true)
+  end
 
   # Did this statement change the shard file? Check `num_changes` FIRST: an
   # `INSERT/UPDATE/DELETE ... RETURNING` returns columns *and* mutates rows, so the old
@@ -1279,6 +1311,45 @@ defmodule Fathom.ShardExecutor do
         end
 
       {:error, reason} ->
+        # A FAILED SCRIPT MAY HAVE COMMITTED (expert review 2026-11-07 #5). `sqlite3_exec` runs the
+        # statements in order and stops at the first error, but in autocommit each statement before
+        # it has already COMMITTED: `CREATE TABLE t…; INSERT …; INSERT <bad>` returns an error with
+        # a table and a row on disk. Every bookkeeping step above lived in the `:ok` branch, so such
+        # a shard stayed "clean" and the idle drop deleted the committed statements without an
+        # upload (and, under A2, without shipping them). Inside an open transaction the statements
+        # before the error are pending in it; `mark_txn_write` makes the COMMIT that closes it
+        # re-bump.
+        #
+        # Which statement failed is not known, so this is over-dirty by design (the safe
+        # direction): a script with at least two statements, one of them not provably read-shaped.
+        # A single statement is atomic, so a lone failing statement committed nothing and costs no
+        # flush. Probing `total_changes()` before and after was rejected: it does not move for DDL,
+        # a header pragma or `VACUUM`, which are exactly what a migration script holds.
+        #
+        # The frames that did commit are shipped here too (`maybe_replicate`, as on success): under
+        # A2 `QuorumFence.mark` only makes the NEXT statement run a round, and this may be the last.
+        # A failed round fences the shard through `mark_if_unconfirmed/2`; the client still gets the
+        # script's own error.
+        if script_may_have_committed?(sql) do
+          Fathom.Shard.WriteCounter.bump(shard_id)
+          signal_dirty_once(pid, conn)
+          mark_txn_write(conn)
+          # Partial DDL is possible, so the cached column lists are as suspect as after success.
+          Connection.purge_statements(conn)
+
+          _ =
+            maybe_replicate(
+              shard_id,
+              pid,
+              conn,
+              sql,
+              true,
+              Session.enabled?(),
+              true,
+              deferred_sync?(opts)
+            )
+        end
+
         {:error, %Error{message: reason_to_string(reason), code: sqlite_code(reason)}}
     end
   end
@@ -1398,6 +1469,57 @@ defmodule Fathom.ShardExecutor do
     case String.trim(acc) do
       "" -> out
       stmt -> [stmt | out]
+    end
+  end
+
+  # The statements of `sql` as SQLite would run them, for the two questions "how many" and "could an
+  # earlier one have committed". `split_statements/1` over-splits on purpose (it is a gate), which is
+  # wrong for COUNTING in two ways, both handled here:
+  #
+  #   * a fragment that is only a comment or an empty statement is not a statement
+  #     (`Fathom.SqlLead.strip/1 == ""`, the head classifiers' own definition of "nothing there");
+  #   * a `CREATE TRIGGER` body is ONE statement that contains `;`, so its tail fragments (everything
+  #     up to and including the closing `END`) are folded into it. SQLite's grammar has no other
+  #     statement with a top-level `;` inside it. A trigger with no closing `END` swallows the rest,
+  #     which is the right answer: SQLite refuses it as incomplete input.
+  defp statement_fragments(sql) do
+    sql
+    |> split_statements()
+    |> Enum.reject(&(Fathom.SqlLead.strip(&1) == ""))
+    |> merge_trigger_bodies()
+  end
+
+  defp merge_trigger_bodies([]), do: []
+
+  defp merge_trigger_bodies([first | rest]) do
+    if trigger_create?(first) do
+      [
+        first
+        | rest
+          |> Enum.drop_while(&(not trigger_end?(&1)))
+          |> Enum.drop(1)
+          |> merge_trigger_bodies()
+      ]
+    else
+      [first | merge_trigger_bodies(rest)]
+    end
+  end
+
+  defp trigger_create?(fragment) do
+    code = fragment |> strip_lead_noise() |> this_statement_code("") |> String.downcase()
+    Regex.match?(~r/\Acreate\s+(?:temp\s+|temporary\s+)?trigger\b/, code)
+  end
+
+  defp trigger_end?(fragment),
+    do: Regex.match?(~r/\Aend\b/i, strip_lead_noise(fragment))
+
+  # Could a statement of this script, other than the one that failed, have committed? Which one
+  # failed is unknown, so: two or more statements and at least one that is not provably read-shaped.
+  # See `run_script/5`'s error branch.
+  defp script_may_have_committed?(sql) do
+    case statement_fragments(sql) do
+      [_, _ | _] = fragments -> Enum.any?(fragments, &(not read_shaped?(head(&1))))
+      _ -> false
     end
   end
 
