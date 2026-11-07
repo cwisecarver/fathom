@@ -195,7 +195,7 @@ running the reference implementation rather than by hand-writing what it is beli
 | Suite | Compares | Cases |
 |---|---|---|
 | `native/fathom_udf/tests/oracle.rs` | each `_sqlite_*` function's return value | 12,501 |
-| `native/fathom_udf/tests/re_oracle.rs` | `regexp` against CPython's `re.search` | 3,444 |
+| `native/fathom_udf/tests/re_oracle.rs` | `regexp` against CPython's `re.search` | 18,839 |
 | `test/fathom/django_sql_parity_test.exs` | **whole queries** against Django's backend | 119 |
 
 The third is the strongest: it opens a real Python `sqlite3` connection, registers Django's UDFs on
@@ -221,8 +221,26 @@ and the second is the dangerous one:
   same subject, no error. Any text arriving from a form or a file carries that newline.
 
 `native/fathom_udf/src/pyre.rs` closes both: `fancy-regex` for the backtracking constructs, plus a
-small translation layer for the tokens Python spells differently (`$` → `(?=\n?\z)`, `\Z` → `\z`,
-`(?P=name)` → `\k<name>`). Verified against 3,444 CPython-generated cases.
+translation layer for the tokens the two engines read differently (`$` → `(?=\n?\z)`, or the
+lookaround-free `(?:\n?\z)` when nothing can follow it; `\Z` → `\z`; `(?P=name)` → `\k<name>`;
+`\w`/`\W` → Python's letters-plus-numbers; `\<`/`\>` → literals; and the class members `[`, `&&`,
+`~~`, `--` that Python takes literally). Verified against 18,839 CPython-generated cases, including a
+seeded random-pattern family that must agree on every case.
+
+**Where `regexp` still differs from Python** (each is a pinned entry in
+`generate_re_cases.py`'s `KNOWN_DIVERGENCES`; the replay fails if one stops differing):
+
+- *Django raises, fathom answers* — syntax CPython rejects that the engine accepts: `(?<name>…)`,
+  variable-width lookbehind, `\e \G \h \K \R \p{…} \x{41} \z`, `a{2}{3}`, a global flag in the middle
+  of a pattern. A query that works on Django works here.
+- *`\b` uses the engine's idea of a word character.* A pattern with no `\b`/`\B` gets Python's `\w`
+  (letters + numbers: a combining mark is not a word character, `²` and `①` are). A pattern that uses
+  `\b` keeps the engine's `\w` too, so the two agree with each other, but they differ from Python on
+  combining marks and `No`-category digits.
+- `\s` does not match U+001C–U+001F; `(?i)` does not equate `i`/`ı`/`İ`; octal escapes (`\0`,
+  `\101`), `\N{NAME}` and the `(?a)` flag are not supported.
+- Not pinned in the oracle (the random-pattern grammar avoids it): a quantified group that holds only
+  an anchor (`(?:$){,2}`) is refused by the engine.
 
 **Size limits.** A match cannot be interrupted once it starts, so `regexp` refuses a subject over
 **1 MiB** with an error for every pattern, and over **64 KiB** for a pattern that uses lookaround or a

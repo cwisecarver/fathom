@@ -20,14 +20,20 @@
 //! subject, opposite answer, no error anywhere. Text coming out of a form or a file very often has
 //! a trailing newline, so this is not a corner case.
 //!
-//! The fix is to rewrite a bare `$` as `(?=\n?\z)`, which is exactly Python's rule. Doing that
-//! needs to know whether a given `$` is a real anchor — not escaped, not inside a character class
-//! — and whether `(?m)` is in effect, which is why [`translate`] is a small scanner rather than a
+//! The fix is to rewrite a bare `$` as `(?=\n?\z)` (or, where nothing can follow it, the consuming
+//! `(?:\n?\z)`: see [`translate`]), which is exactly Python's rule. Doing that needs to know whether
+//! a given `$` is a real anchor — not escaped, not inside a character class — and whether `(?m)` is
+//! in effect in ITS scope, which is why [`translate`] is a small scanner rather than a
 //! `String::replace`. A naive replace corrupts `[a$b]` and `\$`.
 //!
+//! The same scanner rewrites the other tokens the two engines read differently: `\w`/`\W` (Python's
+//! are letters + numbers, not marks), `\<`/`\>`, and the class members `[`, `&&`, `~~`, `--` that
+//! Python takes literally.
+//!
 //! **Not a general regex parser**, and deliberately not: it only classifies enough of the syntax to
-//! find real `$`, `\Z` and `(?P=name)` tokens, and passes everything else through untouched. Every
-//! rule here is pinned by a differential test against CPython (`tests/oracle/generate_re_cases.py`).
+//! find the tokens above and passes everything else through untouched. Every rule here is pinned by
+//! a differential test against CPython (`tests/oracle/generate_re_cases.py`), and what still differs
+//! is enumerated there as `KNOWN_DIVERGENCES` and in `docs/component-notes.md`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -36,95 +42,364 @@ use fancy_regex::Regex;
 
 /// Rewrites a Python `re` pattern into the equivalent `fancy-regex` pattern.
 ///
-/// Three substitutions, all of them tokens `fancy-regex` either spells differently or does not
-/// have:
+/// The substitutions, all of them tokens `fancy-regex` either spells differently, does not have, or
+/// reads differently from CPython:
 ///
-/// | Python        | here            | why |
-/// |---------------|-----------------|-----|
-/// | `$` (no `(?m)`) | `(?=\n?\z)`   | Python's `$` also matches before ONE trailing newline |
-/// | `\Z`          | `\z`            | same meaning, different spelling |
-/// | `(?P=name)`   | `\k<name>`      | same meaning, different spelling |
+/// | Python          | here              | why |
+/// |-----------------|-------------------|-----|
+/// | `$` (no `(?m)`) | `(?:\n?\z)` when nothing can follow it, else `(?=\n?\z)` | Python's `$` also matches before ONE trailing newline; the consuming form keeps the pattern lookaround-free (see below) |
+/// | `\Z`            | `\z`              | same meaning, different spelling |
+/// | `(?P=name)`     | `\k<name>`        | same meaning, different spelling |
+/// | `\w`, `\W`      | `[\p{L}\p{N}_]`, `[^\p{L}\p{N}_]` (only in a pattern with no `\b` / `\B`) | Python's `\w` is `str.isalnum()` or `_` (letters and every number, NOT combining marks); Rust's adds marks and drops `No` numbers (`²`, `①`). `\b` cannot follow without a lookaround, so a pattern that has one keeps the engine's `\w` and the two agree with each other |
+/// | `\<`, `\>`      | `<`, `>`          | literals in Python; word-boundary assertions in `regex` |
+/// | `(?#…)`         | (removed)         | Python skips it as if absent |
+/// | `[` `&&` `~~` `-` inside a class | escaped, `-` range handling as Python's | Python takes them as literals / range operators; `regex` reads set operations and nested classes (expert review 2026-11-07 #88) |
 ///
-/// `^`, `\A`, `\b`, `\d`, `\w`, `(?P<name>…)`, `(?i)`, `(?s)`, `(?m)` and the rest already agree.
+/// `^`, `\A`, `\b`, `\d`, `(?P<name>…)`, `(?i)`, `(?s)`, `(?m)` and the rest already agree.
+///
+/// ## A terminal `$` is rewritten to a consuming form (expert review 2026-11-07 #74)
+///
+/// `(?=\n?\z)` is a lookaround, and any lookaround makes `fancy-regex` run the pattern on its
+/// backtracking VM: ~O(n) per start position against shared 1M-step / 1M-entry limits, so
+/// `^[a-z0-9-]+$|^x$` over a ~1 MB subject raised `Max limit for backtracking count exceeded` where
+/// Python answers (measured: 1.5 MB, 1 MB and 120 KB subjects for three alternation shapes).
+/// `fancy-regex` 0.19 already moves a lookahead that is the LAST element of the whole pattern into
+/// pure `regex` syntax (`optimize_trailing_lookahead`), which is why `^abc$` and `\w+$` were fine;
+/// it does not do it for a `$` that ends one alternative, a group, or anything but the root's last
+/// atom. A `$` after which NOTHING can follow on any path — the end of the pattern, a `|`, or a `)`
+/// whose group is itself followed only by those, and not under a quantifier or inside a lookaround —
+/// only has to ASSERT, and consuming the optional `\n` is equivalent for an existence check, so it
+/// becomes `(?:\n?\z)` and the pattern stays plain. Anything that follows (`a$\n`, `a$\b`, `(a$)b`)
+/// keeps the lookahead, where consuming the `\n` would change what the rest can match.
+///
+/// ## Scoped flags
+///
+/// `(?m:…)` / `(?-m:…)` apply to their group only (and a global `(?m)` to the whole pattern), so
+/// whether a `$` is multiline is tracked per group, and a `[`, `(?m)` or `$` inside a character
+/// class is a class member, not syntax.
+///
+/// **Not a general regex parser**, and deliberately not: it only classifies enough of the syntax to
+/// find real `$`, `\Z`, `\w`, class and group tokens, and passes everything else through untouched.
+/// Every rule here is pinned by a differential test against CPython
+/// (`tests/oracle/generate_re_cases.py`), and the differences that are left are listed in its
+/// `KNOWN_DIVERGENCES`.
 pub fn translate(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    // Position of the last `)`: an unclosed `(?P=` / `(?#` is then rejected in O(1) instead of
+    // rescanning to the end of the pattern each time.
+    let last_close = chars.iter().rposition(|&c| c == ')');
     // Python applies inline global flags wherever they appear (and since 3.11 requires them at the
     // start). `(?m)` changes what `$` means, so find it before rewriting any anchor.
-    let multiline = has_multiline_flag(pattern);
+    let Prescan {
+        global_multiline,
+        word_boundary,
+    } = prescan(&chars, last_close);
+    // Python's `\w` (letters + numbers) differs from `regex`'s (alphabetic + marks + `Nd`), and
+    // `regex`'s `\b` is defined by ITS `\w`. `\b` cannot be given Python's definition without a
+    // lookaround (the backtracking VM, capped at 64 KiB: the most common construct, `\bword\b`,
+    // would pay it), so a pattern that uses `\b` / `\B` keeps `regex`'s `\w` as well and the two at
+    // least agree with each other; without one, `\w` / `\W` are Python's (expert review 2026-11-07 #88).
+    let python_word = !word_boundary;
 
+    // The output is `segments[0] $0 segments[1] $1 … tail`: each real `$` ends a segment and is
+    // spelled when its terminal-ness is known, at the end.
+    let mut segments: Vec<String> = Vec::new();
+    let mut terminal: Vec<bool> = Vec::new();
     let mut out = String::with_capacity(pattern.len() + 8);
-    let chars: Vec<char> = pattern.chars().collect();
+    let mut frames: Vec<Frame> = Vec::new();
     let mut i = 0;
-    // Position of the last `)`: an unclosed `(?P=` is then rejected in O(1) instead of rescanning
-    // to the end of the pattern each time.
-    let last_close = chars.iter().rposition(|&c| c == ')');
-    // Depth is not enough: `[` inside a class is a literal, so this is a flag, not a counter.
-    let mut in_class = false;
-    // A `]` in the FIRST position of a class is a literal `]`, not the terminator — `[]]` is a
-    // class matching one `]`. Kept as a BYTE offset into `out` (`out.len()` is O(1); the old
-    // `out.chars().count()` was O(n) per bracket, so N bracket pairs cost O(N^2) — expert review
-    // 2026-10-12 #1). Only relative position matters, and the `[` / `^` it is compared against
-    // are ASCII.
-    let mut class_start = 0usize;
 
     while i < chars.len() {
         let c = chars[i];
 
         match c {
             '\\' if i + 1 < chars.len() => {
-                let next = chars[i + 1];
-                if !in_class && next == 'Z' {
-                    // Python `\Z` == absolute end of string == Rust `\z`. (Rust has no `\Z`, which
-                    // is why this was a hard error rather than a wrong answer.)
-                    out.push_str("\\z");
-                } else {
-                    out.push(c);
-                    out.push(next);
-                }
+                push_escape(chars[i + 1], false, python_word, &mut out);
                 i += 2;
-                continue;
             }
 
-            '[' if !in_class => {
-                in_class = true;
-                class_start = out.len();
-                out.push(c);
+            '[' => i = translate_class(&chars, i, python_word, &mut out),
+
+            '$' if !frames.last().map_or(global_multiline, |f| f.multiline) => {
+                // The whole reason this module exists.
+                let id = terminal.len();
+                terminal.push(false);
+                segments.push(std::mem::take(&mut out));
+                if only_a_branch_end_follows(&chars, i) {
+                    match frames.last_mut() {
+                        Some(f) => f.pending.push(id),
+                        None => terminal[id] = true,
+                    }
+                }
+                i += 1;
             }
 
-            ']' if in_class => {
-                // Only closes the class if it is not the first character (`[]abc]`) and not first
-                // after a leading negation (`[^]abc]`).
-                let pos = out.len();
-                let first =
-                    pos == class_start + 1 || (pos == class_start + 2 && out.ends_with('^'));
-                if !first {
-                    in_class = false;
+            '(' => {
+                if let Some(close) = named_backref_close(&chars, i, last_close) {
+                    // `(?P=name)` -> `\k<name>`
+                    let name: String = chars[i + 4..close].iter().collect();
+                    out.push_str("\\k<");
+                    out.push_str(&name);
+                    out.push('>');
+                    i = close + 1;
+                    continue;
+                }
+                let open = classify_group(&chars, i, last_close);
+                match open.kind {
+                    GroupKind::Comment => {}
+                    GroupKind::GlobalFlags => out.extend(&chars[i..i + open.len]),
+                    GroupKind::Group {
+                        multiline,
+                        lookaround,
+                    } => {
+                        let inherited = frames.last().map_or(global_multiline, |f| f.multiline);
+                        frames.push(Frame {
+                            multiline: multiline.unwrap_or(inherited),
+                            lookaround,
+                            pending: Vec::new(),
+                        });
+                        out.extend(&chars[i..i + open.len]);
+                    }
+                }
+                i += open.len;
+            }
+
+            ')' => {
+                if let Some(f) = frames.pop() {
+                    // The group's pending `$`s are terminal only if the group itself ends a
+                    // branch: its parent decides (the root says yes).
+                    if !f.lookaround && only_a_branch_end_follows(&chars, i) {
+                        match frames.last_mut() {
+                            Some(parent) => parent.pending.extend(f.pending),
+                            None => f.pending.iter().for_each(|&id| terminal[id] = true),
+                        }
+                    }
                 }
                 out.push(c);
+                i += 1;
             }
 
-            '$' if !in_class && !multiline => {
-                // The whole reason this module exists.
-                out.push_str("(?=\\n?\\z)");
+            _ => {
+                out.push(c);
+                i += 1;
             }
-
-            '(' if !in_class && named_backref_close(&chars, i, last_close).is_some() => {
-                // `(?P=name)` -> `\k<name>`
-                let close = named_backref_close(&chars, i, last_close).unwrap();
-                let name: String = chars[i + 4..close].iter().collect();
-                out.push_str("\\k<");
-                out.push_str(&name);
-                out.push('>');
-                i = close + 1;
-                continue;
-            }
-
-            _ => out.push(c),
         }
-
-        i += 1;
     }
 
-    out
+    let mut result = String::with_capacity(pattern.len() + 8 + 10 * segments.len());
+    for (segment, &is_terminal) in segments.iter().zip(&terminal) {
+        result.push_str(segment);
+        result.push_str(if is_terminal {
+            "(?:\\n?\\z)"
+        } else {
+            "(?=\\n?\\z)"
+        });
+    }
+    result.push_str(&out);
+    result
+}
+
+/// An open group during [`translate`]'s scan.
+struct Frame {
+    /// Whether `$` is multiline here (an enclosing scope's flag unless this group sets its own).
+    multiline: bool,
+    /// A lookaround, atomic or conditional group: a `$` inside is never rewritten to the consuming
+    /// form (a lookbehind needs a fixed width; a conditional's branches are not branch ends).
+    lookaround: bool,
+    /// `$`s directly in this group (or in groups that ended a branch of it) that are terminal iff
+    /// this group ends a branch of ITS parent.
+    pending: Vec<usize>,
+}
+
+/// Whether, after the `$` or `)` at `i`, the pattern ends, or an alternative does (`|`), or an
+/// enclosing group does (`)`) — i.e. nothing can match after it on this path. A quantifier, a
+/// literal, an escape or anything else means something can.
+fn only_a_branch_end_follows(chars: &[char], i: usize) -> bool {
+    matches!(chars.get(i + 1), None | Some('|') | Some(')'))
+}
+
+/// How a `(` at some index opens a group; `len` is how many chars the opener takes.
+struct GroupOpen {
+    len: usize,
+    kind: GroupKind,
+}
+
+enum GroupKind {
+    /// `(?#…)`: skipped entirely.
+    Comment,
+    /// `(?i)`, `(?im)`: a global flag group, no scope of its own.
+    GlobalFlags,
+    /// Everything that is closed by a `)`.
+    Group {
+        /// `Some` when the opener is `(?m:` / `(?-m:` (and so on): this scope's `$` mode.
+        multiline: Option<bool>,
+        lookaround: bool,
+    },
+}
+
+fn classify_group(chars: &[char], i: usize, last_close: Option<usize>) -> GroupOpen {
+    let group = |len, multiline, lookaround| GroupOpen {
+        len,
+        kind: GroupKind::Group {
+            multiline,
+            lookaround,
+        },
+    };
+    if chars.get(i + 1) != Some(&'?') {
+        return group(1, None, false);
+    }
+    match chars.get(i + 2) {
+        Some(':') => group(3, None, false),
+        Some('#') => {
+            // The first `)` at or after `i`; the caller jumps past it, so total work is linear.
+            let close = if last_close.is_some_and(|l| l > i) {
+                chars[i..].iter().position(|&c| c == ')').map(|p| p + i)
+            } else {
+                None
+            };
+            match close {
+                Some(close) => GroupOpen {
+                    len: close + 1 - i,
+                    kind: GroupKind::Comment,
+                },
+                None => group(3, None, false),
+            }
+        }
+        Some('P') if chars.get(i + 3) == Some(&'<') => group(4, None, false),
+        Some('=') | Some('!') | Some('>') | Some('(') => group(3, None, true),
+        Some('<') => match chars.get(i + 3) {
+            Some('=') | Some('!') => group(4, None, true),
+            _ => group(3, None, false),
+        },
+        Some(c) if c.is_ascii_alphabetic() || *c == '-' => {
+            let mut j = i + 2;
+            let mut on_m = false;
+            let mut off_m = false;
+            while chars.get(j).is_some_and(|c| c.is_ascii_alphabetic()) {
+                on_m |= chars[j] == 'm';
+                j += 1;
+            }
+            if chars.get(j) == Some(&'-') {
+                j += 1;
+                while chars.get(j).is_some_and(|c| c.is_ascii_alphabetic()) {
+                    off_m |= chars[j] == 'm';
+                    j += 1;
+                }
+            }
+            match chars.get(j) {
+                Some(')') => GroupOpen {
+                    len: j + 1 - i,
+                    kind: GroupKind::GlobalFlags,
+                },
+                Some(':') => group(
+                    j + 1 - i,
+                    if on_m {
+                        Some(true)
+                    } else if off_m {
+                        Some(false)
+                    } else {
+                        None
+                    },
+                    false,
+                ),
+                _ => group(2, None, false),
+            }
+        }
+        _ => group(2, None, false),
+    }
+}
+
+/// The text a backslash escape becomes. `in_class` selects the spelling of `\w` / `\W`, which sit
+/// inside a bracket expression as members; `python_word` says whether to write them at all (see
+/// [`translate`]'s `\b` rule).
+fn push_escape(next: char, in_class: bool, python_word: bool, out: &mut String) {
+    match next {
+        // Python `\Z` == absolute end of string == Rust `\z`. (Rust has no `\Z`, which is why this
+        // was a hard error rather than a wrong answer.) Inside a class both are an escaped letter.
+        'Z' if !in_class => out.push_str("\\z"),
+        // Python's `\w`: `str.isalnum()` or `_`, i.e. every letter and every number.
+        'w' if python_word => out.push_str(if in_class { WORD_MEMBERS } else { WORD }),
+        'W' if python_word => out.push_str(NOT_WORD),
+        // Literals in Python; `regex` reads them as word-start / word-end assertions.
+        '<' | '>' => out.push(next),
+        _ => {
+            out.push('\\');
+            out.push(next);
+        }
+    }
+}
+
+/// Python's `\w` as `regex` syntax: Unicode letters, Unicode numbers (`Nd`, `Nl`, `No`), `_`.
+const WORD_MEMBERS: &str = "\\p{L}\\p{N}_";
+const WORD: &str = "[\\p{L}\\p{N}_]";
+const NOT_WORD: &str = "[^\\p{L}\\p{N}_]";
+
+/// Rewrites the character class starting at `start` (a `[`) into `out` and returns the index after
+/// its closing `]` (or the end of the pattern when it is unterminated, which `regex` then reports).
+///
+/// CPython's rules (`sre_parse`): a `]` first after `[` / `[^` is a member; `[`, `&&`, `~~` and `||`
+/// are plain members (a FutureWarning at most); `-` between two members is a range, a `-` that
+/// STARTS an item or ENDS the class is a literal, and so `[a--b]` is the range `a`..`-` (an error)
+/// and `[a-c--b]` is `a-c` plus `-`..`b`. `regex` reads `[` as a nested class and `&&`, `--`, `~~` as
+/// set operations, so every member that is not syntax in Python is escaped, and only a real range
+/// operator is written as `-`.
+fn translate_class(chars: &[char], start: usize, python_word: bool, out: &mut String) -> usize {
+    out.push('[');
+    let mut i = start + 1;
+    if chars.get(i) == Some(&'^') {
+        out.push('^');
+        i += 1;
+    }
+    let first = i;
+    // True when the next char begins an item; false right after one, where a `-` is a range
+    // operator.
+    let mut at_item = true;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == ']' && i != first {
+            out.push(']');
+            return i + 1;
+        }
+        if !at_item && c == '-' {
+            if chars.get(i + 1) == Some(&']') {
+                // `[a-]`: a trailing literal `-`.
+                out.push_str("\\-");
+                i += 1;
+                at_item = true;
+                continue;
+            }
+            out.push('-');
+            // The range END is one item.
+            i = push_class_item(chars, i + 1, python_word, out);
+            at_item = true;
+            continue;
+        }
+        i = push_class_item(chars, i, python_word, out);
+        at_item = false;
+    }
+    chars.len()
+}
+
+/// One class member (an escape or a single char) at `i`; returns the next index.
+fn push_class_item(chars: &[char], i: usize, python_word: bool, out: &mut String) -> usize {
+    let Some(&c) = chars.get(i) else {
+        return i;
+    };
+    match c {
+        '\\' if i + 1 < chars.len() => {
+            push_escape(chars[i + 1], true, python_word, out);
+            i + 2
+        }
+        '[' | '&' | '~' | '-' | ']' => {
+            out.push('\\');
+            out.push(c);
+            i + 1
+        }
+        _ => {
+            out.push(c);
+            i + 1
+        }
+    }
 }
 
 /// Index of the `)` closing a `(?P=name` that starts at `i`, if it is one.
@@ -140,39 +415,79 @@ fn named_backref_close(chars: &[char], i: usize, last_close: Option<usize>) -> O
     chars[i..].iter().position(|&c| c == ')').map(|p| p + i)
 }
 
-/// Whether an inline `(?m)`-style flag group enables multiline.
-///
-/// Scans for `(?<letters>)` and `(?<letters>:` groups rather than searching for the literal
-/// `"(?m)"`, so `(?im)` and `(?ms:...)` are recognized too — both of which a Django app can send
-/// and either of which would otherwise leave `$` rewritten the wrong way.
-fn has_multiline_flag(pattern: &str) -> bool {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut i = 0;
-
-    while i + 2 < chars.len() {
-        if chars[i] == '\\' {
-            i += 2;
-            continue;
-        }
-        if chars[i] == '(' && chars[i + 1] == '?' {
-            let mut j = i + 2;
-            let mut seen_m = false;
-            while j < chars.len() && chars[j].is_ascii_alphabetic() {
-                if chars[j] == 'm' {
-                    seen_m = true;
-                }
-                j += 1;
-            }
-            // Only a flag group if the letters are followed by `)` or `:`; `(?=`, `(?!`, `(?P<`
-            // and friends are not.
-            if seen_m && j < chars.len() && (chars[j] == ')' || chars[j] == ':') {
-                return true;
-            }
-        }
+/// Index just past the character class starting at `start` (a `[`), or the pattern's end.
+fn class_end(chars: &[char], start: usize) -> usize {
+    let mut i = start + 1;
+    if chars.get(i) == Some(&'^') {
         i += 1;
     }
+    let first = i;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => i += 2,
+            ']' if i != first => return i + 1,
+            _ => i += 1,
+        }
+    }
+    chars.len()
+}
 
-    false
+/// What one pass over a pattern's top level (outside character classes and `(?#…)` comments) finds
+/// before any token is rewritten.
+struct Prescan {
+    /// A GLOBAL inline flag group — `(?m)`, `(?im)` — enables multiline.
+    global_multiline: bool,
+    /// The pattern uses `\b` or `\B`.
+    word_boundary: bool,
+}
+
+/// Scans for `(?<letters>)` groups rather than searching for the literal `"(?m)"`, so `(?im)` is
+/// recognized too. A scoped `(?m:` is NOT global: [`translate`] tracks it per group (expert review
+/// 2026-11-07 #88: this scan used to count it, and `[(?m)]$`, whose `(?m)` is class members, as
+/// global, so `(?m:a$)b$` left both `$` un-rewritten).
+fn prescan(chars: &[char], last_close: Option<usize>) -> Prescan {
+    let mut found = Prescan {
+        global_multiline: false,
+        word_boundary: false,
+    };
+    let mut i = 0;
+
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                found.word_boundary |= matches!(chars.get(i + 1), Some('b') | Some('B'));
+                i += 2;
+            }
+            '[' => i = class_end(chars, i),
+            '(' if chars.get(i + 1) == Some(&'?') => {
+                if chars.get(i + 2) == Some(&'#') {
+                    // Skip a comment (to its first `)`, linear overall as in `classify_group`).
+                    i = if last_close.is_some_and(|l| l > i) {
+                        chars[i..]
+                            .iter()
+                            .position(|&c| c == ')')
+                            .map_or(i + 1, |p| p + i + 1)
+                    } else {
+                        i + 1
+                    };
+                    continue;
+                }
+                let mut j = i + 2;
+                let mut seen_m = false;
+                while chars.get(j).is_some_and(|c| c.is_ascii_alphabetic()) {
+                    seen_m |= chars[j] == 'm';
+                    j += 1;
+                }
+                // Only a global flag group if the letters are followed by `)`; `(?=`, `(?P<`,
+                // `(?m:` and friends are not.
+                found.global_multiline |= seen_m && chars.get(j) == Some(&')');
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    found
 }
 
 const CACHE_CAP: usize = 256;
@@ -550,11 +865,133 @@ mod tests {
 
     #[test]
     fn translate_rewrites_only_real_anchors() {
-        assert_eq!(translate("a$"), "a(?=\\n?\\z)");
+        assert_eq!(translate("a$"), "a(?:\\n?\\z)");
         assert_eq!(translate("\\$"), "\\$");
         assert_eq!(translate("[a$]"), "[a$]");
         assert_eq!(translate("(?m)a$"), "(?m)a$");
         assert_eq!(translate("a\\Z"), "a\\z");
+    }
+
+    // expert review 2026-11-07 #74: a `$` after which nothing can match is spelled consuming
+    // (`(?:\n?\z)`, no lookaround, so the pattern stays on the linear engine); one that something
+    // can follow keeps the lookahead, where consuming the `\n` would change what the rest matches.
+    #[test]
+    fn a_terminal_dollar_is_consuming_and_the_rest_keep_the_lookahead() {
+        const C: &str = "(?:\\n?\\z)";
+        const L: &str = "(?=\\n?\\z)";
+        // End of pattern, end of an alternative, end of a (nested) group that ends one.
+        assert_eq!(translate("a$|b$"), format!("a{C}|b{C}"));
+        assert_eq!(translate("^a$|^b$"), format!("^a{C}|^b{C}"));
+        assert_eq!(translate("(a$)"), format!("(a{C})"));
+        assert_eq!(translate("(?:x(a$))|y"), format!("(?:x(a{C}))|y"));
+        assert_eq!(translate("^(?:[a-z]+$)"), format!("^(?:[a-z]+{C})"));
+        assert_eq!(translate("(a|b$)"), format!("(a|b{C})"));
+        assert_eq!(translate("a$|"), format!("a{C}|"));
+        // Something can follow: a literal, an escape, a quantifier, a group that is followed.
+        assert_eq!(translate("a$\\n"), format!("a{L}\\n"));
+        assert_eq!(translate("a$\\b"), format!("a{L}\\b"));
+        assert_eq!(translate("a$*"), format!("a{L}*"));
+        assert_eq!(translate("(a$)b"), format!("(a{L})b"));
+        assert_eq!(translate("(a$|b)c"), format!("(a{L}|b)c"));
+        assert_eq!(translate("(a$)+"), format!("(a{L})+"));
+        assert_eq!(translate("(a$)?"), format!("(a{L})?"));
+        // Inside a lookaround, atomic or conditional group: never consuming.
+        assert_eq!(translate("(?=a$)"), format!("(?=a{L})"));
+        assert_eq!(translate("(?<=a$)"), format!("(?<=a{L})"));
+        assert_eq!(translate("(?>a$)"), format!("(?>a{L})"));
+    }
+
+    // The measured failure (fancy-regex 0.19.2): a `$` that is not the root's last atom made the
+    // pattern a lookaround pattern, ran it on the backtracking VM, and a ~1 MB subject raised
+    // "Max limit for backtracking count exceeded" / "Max stack size exceeded" where Python answers.
+    #[test]
+    fn terminal_dollars_in_alternatives_and_groups_answer_on_big_subjects() {
+        let slug = "a".repeat(1_000_000);
+        assert_eq!(search("^[a-z0-9-]+$|^x$", &slug).unwrap(), true);
+        assert_eq!(search("^(?:[a-z0-9-]+$)", &slug).unwrap(), true);
+        let words = "ab ".repeat(333_333);
+        assert_eq!(search("[a-z]+$|[0-9]+$", &words).unwrap(), false);
+        assert_eq!(search("\\w+$|zz", &words).unwrap(), false);
+        // And the trailing-newline rule is intact on every spelling.
+        assert!(m("^a$|^b$", "b\n"));
+        assert!(!m("^a$|^b$", "b\n\n"));
+        assert!(m("(a$)", "a\n"));
+        assert!(!m("(a$)", "a\nb"));
+        assert!(m("(?:^|,)a$", ",a\n"));
+    }
+
+    // expert review 2026-11-07 #88: `(?m:…)` is scoped, `(?m)` inside a class is not a flag.
+    #[test]
+    fn multiline_is_tracked_per_scope() {
+        const C: &str = "(?:\\n?\\z)";
+        assert_eq!(translate("(?m:a$)|b$"), format!("(?m:a$)|b{C}"));
+        assert_eq!(translate("(?m:a$)(?-m:$)"), format!("(?m:a$)(?-m:{C})"));
+        assert_eq!(translate("(?m:(?-m:a$))"), format!("(?m:(?-m:a{C}))"));
+        assert_eq!(translate("[(?m)]$"), format!("[(?m)]{C}"));
+        assert_eq!(translate("(?i)(?m)a$"), "(?i)(?m)a$");
+        // The first `$` is end-of-line (matches before the `\n` that `\n` then consumes); the
+        // second is the ordinary end-of-text-or-before-one-newline `$`.
+        assert!(m("(?m:a$)\\nb$", "a\nb\n"));
+        assert!(!m("(?m:a$)\\nb$", "a\nb\n\n"));
+        // Pre-fix the global scan counted the scoped flag, so the trailing `$` was Rust's strict one.
+        assert!(m("(?m:a$)|b$", "b\n"));
+    }
+
+    // expert review 2026-11-07 #88: Python reads these as members of a class; `regex` reads them
+    // as nested classes and set operations.
+    #[test]
+    fn class_members_that_regex_reads_as_syntax_are_escaped() {
+        assert_eq!(translate("[[]"), "[\\[]");
+        assert_eq!(translate("[a&&b]"), "[a\\&\\&b]");
+        assert_eq!(translate("[a~~b]"), "[a\\~\\~b]");
+        assert_eq!(translate("[[:alpha:]]"), "[\\[:alpha:]]");
+        assert_eq!(translate("[]a]"), "[\\]a]");
+        assert_eq!(translate("[^]a]"), "[^\\]a]");
+        assert_eq!(translate("[a-]"), "[a\\-]");
+        assert_eq!(translate("[-a]"), "[\\-a]");
+        // `-` between members stays a range; `--` is a range STARTING at `-` (`[a-c--b]` is `a-c`
+        // plus `-`..`b`), and `a--` is the bad range `a`..`-`.
+        assert_eq!(translate("[a-z0-9]"), "[a-z0-9]");
+        assert_eq!(translate("[a-c--b]"), "[a-c\\--b]");
+        assert!(search("[a--b]", "a").is_err());
+        assert!(m("[a-c--b]", "5"));
+        assert!(m("[[]", "["));
+        assert!(m("[a&&b]", "&"));
+        assert!(!m("[a&&b]", "c"));
+        assert!(m("[[:alpha:]]", "a]"));
+        assert!(!m("[[:alpha:]]", "a"));
+        assert!(m("[\\w-]", "-"));
+    }
+
+    // expert review 2026-11-07 #88: Python's `\w` is letters + numbers (`isalnum() or "_"`), not
+    // `regex`'s alphabetic + marks + `Nd`.
+    #[test]
+    fn word_class_is_pythons_unless_the_pattern_uses_a_word_boundary() {
+        assert_eq!(translate("\\w+"), "[\\p{L}\\p{N}_]+");
+        assert_eq!(translate("\\W"), "[^\\p{L}\\p{N}_]");
+        assert_eq!(translate("[\\w.-]"), "[\\p{L}\\p{N}_.\\-]");
+        assert_eq!(translate("[^\\W\\d]"), "[^[^\\p{L}\\p{N}_]\\d]");
+        // A combining mark is not a word character in Python; `²` (category No) is.
+        assert!(!m("^\\w+$", "e\u{301}"));
+        assert!(m("^\\w+$", "caf\u{e9}"));
+        assert!(m("^\\w$", "\u{b2}"));
+        assert!(!m("^[\\w ]+$", "Jose\u{301} Garcia"));
+        assert!(m("^\\W+$", "\u{301}"));
+        // With `\b` the engine's own word definition rules both, so they agree with each other.
+        assert_eq!(translate("\\b\\w+\\b"), "\\b\\w+\\b");
+        assert_eq!(translate("[\\w]\\B"), "[\\w]\\B");
+        assert!(m("\\b\\w+\\b", "e\u{301}"));
+        // `\b` inside a class is a backspace, not a boundary.
+        assert_eq!(translate("[\\b]\\w"), "[\\b][\\p{L}\\p{N}_]");
+    }
+
+    #[test]
+    fn angle_escapes_are_literals_and_comments_vanish() {
+        assert_eq!(translate("\\<a\\>"), "<a>");
+        assert!(m("\\<a\\>", "<a>"));
+        assert!(!m("\\<a\\>", "a"));
+        assert_eq!(translate("a(?#note)b"), "ab");
+        assert!(m("a(?#note)b", "ab"));
     }
 
     #[test]

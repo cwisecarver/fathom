@@ -11,8 +11,13 @@
 //!     that breaks or silently returns fewer rows;
 //!   * a pattern Python REFUSES that we accept — rarer, but it means an app that fails fast on
 //!     Django fails late here.
+//!
+//! Zero disagreements, except the ones the generator lists in `known_divergences` (a documented,
+//! deliberate choice each: `tests/oracle/generate_re_cases.py`). Those are replayed too, and the
+//! test fails if a listed divergence has STOPPED diverging, so a fix forces its entry to be
+//! deleted and the list cannot go stale (expert review 2026-11-07 #88).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use fathom_udf::pyre;
@@ -32,6 +37,23 @@ fn matches_cpython_re_on_every_generated_case() {
     let meta: J = serde_json::from_str(lines.next().expect("meta line")).unwrap();
     assert_eq!(meta["_meta"], J::Bool(true));
     let declared = meta["count"].as_u64().unwrap() as usize;
+
+    // pattern -> the subjects it is allowed to differ on (`None`: every subject).
+    let known: BTreeMap<String, Option<BTreeSet<String>>> = meta["known_divergences"]
+        .as_array()
+        .expect("known_divergences")
+        .iter()
+        .map(|d| {
+            let subjects = d["subjects"].as_array().map(|a| {
+                a.iter()
+                    .map(|s| s.as_str().unwrap().to_string())
+                    .collect::<BTreeSet<_>>()
+            });
+            (d["pattern"].as_str().unwrap().to_string(), subjects)
+        })
+        .collect();
+    // (pattern, subject) cases of a known divergence that did diverge.
+    let mut diverged: BTreeSet<(String, String)> = BTreeSet::new();
 
     let mut failures: Vec<String> = Vec::new();
     let mut diverging: BTreeMap<String, usize> = BTreeMap::new();
@@ -59,7 +81,13 @@ fn matches_cpython_re_on_every_generated_case() {
             matched += 1;
         }
 
-        if got != want {
+        let allowed = known
+            .get(pattern)
+            .is_some_and(|subjects| subjects.as_ref().is_none_or(|s| s.contains(subject)));
+
+        if got != want && allowed {
+            diverged.insert((pattern.to_string(), subject.to_string()));
+        } else if got != want {
             *diverging.entry(pattern.to_string()).or_default() += 1;
             if failures.len() < 40 {
                 let mut s = String::new();
@@ -88,8 +116,33 @@ fn matches_cpython_re_on_every_generated_case() {
         panic!("{summary}");
     }
 
+    // A known divergence that no longer diverges is a stale entry: the difference was fixed (or the
+    // listed subject never differed), so the entry would now excuse a future regression.
+    let mut stale: Vec<String> = Vec::new();
+    for (pattern, subjects) in &known {
+        match subjects {
+            None => {
+                if !diverged.iter().any(|(p, _)| p == pattern) {
+                    stale.push(format!("{pattern:?} (all subjects)"));
+                }
+            }
+            Some(subjects) => {
+                for subject in subjects {
+                    if !diverged.contains(&(pattern.clone(), subject.clone())) {
+                        stale.push(format!("{pattern:?} on {subject:?}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "known_divergences entries that no longer diverge (delete them from \
+         generate_re_cases.py): {stale:?}"
+    );
+
     // Guard on the guard: a corpus where nothing matches would pass trivially.
-    assert!(total > 3_000, "only {total} cases ran");
+    assert!(total > 9_000, "only {total} cases ran");
     assert!(
         matched > 500,
         "only {matched} cases were expected to match — the corpus is not exercising much"
