@@ -201,6 +201,21 @@ defmodule Fathom.Application do
               "look dead and unpins the whole fleet each tick (review 2026-07-09 #1). Set NODE_KEY " <>
               "to this node's lb_backends key."
     end
+
+    # Expert review 2026-11-07 #57: a rebalancer that cannot write the LB map cannot move anything.
+    # `HandoffJob` refuses its handoffs on such a node (they would drain a shard the LB still routes
+    # here), and the `rebalance` Oban queue runs on EVERY node, so one node without LB_MAP_PATH
+    # picks up jobs it can only refuse. A warning, not a refusal to boot: decision-plane-only
+    # operation (the override table and the decision log without any LB wiring) is documented.
+    if Application.get_env(:fathom, :env) == :prod and
+         Application.get_env(:fathom, :rebalancer_enabled, false) == true and
+         not Fathom.Rebalancer.LbApply.map_configured?() do
+      Logger.warning(
+        "config warning: REBALANCER_ENABLED is on but LB_MAP_PATH is unset on this node. Its " <>
+          "handoff jobs will be refused (a flip that writes no map would only drain the shard " <>
+          "the LB still routes here); set LB_MAP_PATH on every node that runs the rebalance queue."
+      )
+    end
   end
 
   # Expert review #9: template-shard capture replays a shard's SQL fleet-wide, and

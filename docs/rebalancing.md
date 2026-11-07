@@ -60,6 +60,13 @@ Then the anti-thrash guards:
   within `band × q` of the least-loaded (`:rebalance_locality_band`, default 0.5), prefer one that
   already holds the shard **warm** (`Rebalancer.WarmLocations` / `shard_warm_locations`) — a cheap
   304 handoff instead of a full S3 pull, while balance still improves.
+- **Draining and recently-stopped nodes are not targets** (expert review 2026-11-07 #56). A node in
+  `drain_all` publishes `draining: true` on its beat and sheds every shard, so it reads as the least
+  loaded node — the policy's favourite — and is about to stop. Targets must be beating within two
+  reporter intervals (`:rebalance_target_fresh_ms`, never more than the 60 s reconciler window — a node
+  that exited keeps its row `alive` that long) and must not be publishing `draining`. The dead-pin
+  reconciler keeps the wide window and ignores `draining`: unpinning a shard a draining node is still
+  serving cooperatively would be the harm.
 
 If it decides, it enqueues a unique-per-shard `HandoffJob`.
 
@@ -84,6 +91,13 @@ gap, a request landing on the target finds the source still holds the lease (`ac
 and briefly retries. **Failure handling is careful:** if the flip can't apply, the drain is
 **skipped** (don't strand the source); if it still fails on the last attempt, the pin is
 **reverted** so traffic returns to the source — the shard is never left pinned-and-unavailable.
+
+**No `LB_MAP_PATH`, no handoff** (expert review 2026-11-07 #57). With `LB_MAP_PATH` unset the flip would write
+nothing, and the drain would flush, release and stop a shard the LB still routes to that node — which
+cold-reopens it on the next request — every cooldown, on the hottest shard, reported as complete.
+`HandoffJob` now refuses before writing the pin (`{:error, :lb_map_path_unset}`, retried, then cancelled with no
+cooldown row), and a prod boot with `REBALANCER_ENABLED` and no `LB_MAP_PATH` warns. The `rebalance` queue runs
+on every node, so set `LB_MAP_PATH` on all of them.
 
 ## Reaching a node the orchestrator can't call
 

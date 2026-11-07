@@ -82,6 +82,26 @@ defmodule Fathom.Rebalancer.Nodes do
   end
 
   @doc """
+  The node_keys seen within `within_ms` ago whose published health says they are DRAINING
+  (`health->>'draining'`, written by `Fathom.Rebalancer.NodeHealth.snapshot/0` from
+  `Fathom.HealthPlug.draining?/0`). A node on an older release (NULL health) is not in the set.
+
+  The rebalancer must not hand a shard TO such a node (expert review 2026-11-07 #56): it sheds its
+  shards, so it reads as the least loaded — the policy's favourite target — and is about to stop.
+  """
+  @spec draining(non_neg_integer()) :: MapSet.t()
+  def draining(within_ms) do
+    cutoff = DateTime.add(DateTime.utc_now(), -within_ms, :millisecond)
+
+    from(n in NodeBeat,
+      where: n.last_seen_at >= ^cutoff and fragment("?->>'draining' = 'true'", n.health),
+      select: n.node_key
+    )
+    |> Repo.all()
+    |> MapSet.new()
+  end
+
+  @doc """
   The fleet hot bar (findings #2/#4): the **true pooled-distribution p99** of the fleet's
   per-shard q/s, computed by summing live nodes' published `q_hist` histograms element-wise and
   reading the p99 of the merged histogram (`Fathom.Rebalancer.Stats`). Returns `nil` when the

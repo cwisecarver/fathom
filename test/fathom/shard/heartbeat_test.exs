@@ -1113,5 +1113,48 @@ defmodule Fathom.Shard.HeartbeatTest do
                      "with no task supervisor the lapse was not broadcast at all — silence is " <>
                        "worse than a slow heartbeat here"
     end
+
+    # Expert review 2026-11-07 #80. `Phoenix.PubSub.broadcast/3` also reaches every node joined by
+    # distributed Erlang (the phx.new `DNSCluster` child is wired; `DNS_CLUSTER_QUERY` is
+    # documented). A coordinator compares the message's generation with its OWN node's `acquire_gen`
+    # and another node's generation almost always differs, so one node's store trouble armed a
+    # `check_lease` GET on every coordinator of every node. The generation is node-local state, so
+    # the lapse goes to this node's coordinators only.
+    #
+    # The review's regression sketch is two `:peer` nodes; the test VM is not distributed, so this
+    # pins the same property at the one place it is decided: the cluster-wide path is
+    # `Phoenix.PubSub.PG2.broadcast/4` (the adapter's call that forwards to remote nodes), which
+    # `local_broadcast/4` never reaches. The call is traced for processes spawned after this point
+    # (the fan-out runs in a fresh task), filtered to the lapse topic.
+    test "the lapse is delivered to this node's subscribers and is never broadcast cluster-wide",
+         %{pid: pid} do
+      topic = Heartbeat.topic()
+
+      :erlang.trace_pattern(
+        {Phoenix.PubSub.PG2, :broadcast, 4},
+        [{[:_, topic, :_, :_], [], []}],
+        [:local]
+      )
+
+      :erlang.trace(:new, true, [:call, {:tracer, self()}])
+
+      on_exit(fn ->
+        :erlang.trace(:new, false, [:call])
+        :erlang.trace_pattern({Phoenix.PubSub.PG2, :broadcast, 4}, false, [:local])
+      end)
+
+      :ok = Phoenix.PubSub.subscribe(Fathom.PubSub, topic)
+      force_lapse(pid)
+
+      # The local subscriber (standing in for a coordinator on this node) is still notified...
+      assert_receive {:heartbeat_lapsed, _gen}, 5_000
+
+      # ...and the fan-out's own event arrives only after its dispatch returned, so any traced call
+      # it made is already in this mailbox.
+      assert_receive {:lapse_broadcast, false}, 5_000
+
+      refute_received {:trace, _pid, :call, {Phoenix.PubSub.PG2, :broadcast, _args}},
+                      "the lapse was broadcast to every node of the cluster"
+    end
   end
 end

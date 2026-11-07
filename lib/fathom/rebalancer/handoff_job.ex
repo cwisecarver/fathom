@@ -181,9 +181,30 @@ defmodule Fathom.Rebalancer.HandoffJob do
   # A rejected pin (e.g. an invalid shard_id — finding #14) returns {:error, _} instead of
   # MatchError-crashing the job; the with-chain reverts it rather than retrying forever.
   defp pin_and_flip(shard, to, from, q) do
-    case Overrides.pin(shard, to, reason: "rebalance", q_per_s_at_pin: q, from_node: from) do
-      {:ok, _} -> LbApply.apply!()
-      {:error, changeset} -> {:error, {:invalid_pin, changeset.errors}}
+    # NO MAP, NO HANDOFF (expert review 2026-11-07 #57). With `:lb_map_path` unset `LbApply.apply!/0`
+    # answers `:ok` ("decision-plane only"), so this used to pin, "flip" nothing, and drain: the
+    # source flushed, released and stopped a shard the LB still routed to it, which cold-reopened it
+    # on the next request — a drain blip (flush + S3 cold pull + 503s) on the fleet's HOTTEST shard
+    # every cooldown, reported as `:completed`. The `rebalance` queue runs on every node, so any node
+    # lacking `LB_MAP_PATH` can pick the job up. Refused BEFORE the pin is written: a pin row with
+    # no flip would be rendered by another node's re-render and move traffic with no drain. The job
+    # retries (a later attempt may land on a node that has the map) and, if it never does, reverts
+    # through the same path a failed flip takes.
+    #
+    # WHY NOT `LbApply.apply!(require_map: true)` AFTER the pin (the review's wording): the pin is
+    # already committed by then, which is the state this refusal exists to avoid.
+    if LbApply.map_configured?() do
+      case Overrides.pin(shard, to, reason: "rebalance", q_per_s_at_pin: q, from_node: from) do
+        {:ok, _} -> LbApply.apply!()
+        {:error, changeset} -> {:error, {:invalid_pin, changeset.errors}}
+      end
+    else
+      Logger.warning(
+        "rebalance: handoff #{shard} #{from} -> #{to} refused: this node has no :lb_map_path " <>
+          "(LB_MAP_PATH), so the LB flip would be a no-op and the drain would only churn the shard"
+      )
+
+      {:error, :lb_map_path_unset}
     end
   end
 

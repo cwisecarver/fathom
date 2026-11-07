@@ -46,6 +46,9 @@ defmodule Fathom.Rebalancer.Policy do
     have a `ShardMigrationJob`/`RevertJob` in flight — handing off a tenant that is being erased,
     suspended or migrated pins an LB override for it and drains a shard that must not serve
     (expert review 2026-10-10 #27).
+  - **Draining nodes are not targets:** `:draining_nodes` (a `MapSet` of node keys publishing
+    `draining: true`) are excluded from the target set only (expert review 2026-11-07 #56) — a node
+    in `drain_all` sheds its shards, so it reads as the least loaded and the policy would favour it.
 
   Config (all overridable via `opts`): `:floor` (absolute q/s, default from
   `:rebalance_hot_qps_floor`, nil ⇒ p99-relative), `:p99_multiple` (20), `:confirm_windows`
@@ -118,6 +121,8 @@ defmodule Fathom.Rebalancer.Policy do
     warm_locations = Keyword.get(opts, :warm_locations, %{})
     band = Keyword.get(opts, :locality_band, cfg(:rebalance_locality_band, 0.5)) / 1.0
     alive_nodes = Keyword.get(opts, :alive_nodes)
+    # Nodes that publish `draining: true` (expert review 2026-11-07 #56): never a handoff TARGET.
+    draining_nodes = Keyword.get(opts, :draining_nodes, MapSet.new())
     # Shards the orchestrator found ineligible to move (not `active`, or a migration/revert in
     # flight) — expert review 2026-10-10 #27. Pure here: the DB lookups live in `RebalanceJob`.
     ineligible = Keyword.get(opts, :ineligible, MapSet.new())
@@ -133,7 +138,7 @@ defmodule Fathom.Rebalancer.Policy do
     # a silent/dead backend reads as load 0.0 (the most attractive target) but pinning to it
     # would be unavailable + immediately reconciled. The SOURCE filter stays `backend_keys`
     # (a hot shard's current node is inherently reporting).
-    target_keys = target_keys(backend_keys, alive_nodes)
+    target_keys = target_keys(backend_keys, alive_nodes, draining_nodes)
 
     hot =
       latest
@@ -166,14 +171,27 @@ defmodule Fathom.Rebalancer.Policy do
   defp decline_entry({guard, s}),
     do: %{shard_id: s.shard_id, node_key: s.node_key, q_per_s: s.q_per_s, guard: guard}
 
-  # The viable target set: reporting nodes only. nil / empty alive ⇒ don't filter (fail-open —
-  # the beat mechanism may be nascent, and the reconciler also fails open on an empty alive set).
-  defp target_keys(backend_keys, nil), do: backend_keys
+  # The viable target set: reporting nodes only, minus the draining ones. nil / empty alive ⇒ don't
+  # filter (fail-open — the beat mechanism may be nascent, and the reconciler also fails open on an
+  # empty alive set).
+  #
+  # A DRAINING NODE IS NOT A TARGET (expert review 2026-11-07 #56). `drain_all` publishes
+  # `draining: true` on the node's beat and then sheds every shard, so a draining node is the LEAST
+  # loaded node in the fleet — exactly what `best_target/5` prefers — and it is about to stop. The
+  # handoff pinned the hottest shard to it, flipped the LB, and the source's drain left that shard
+  # effectively unserved until the pin was reverted. Applied to the TARGET set only: the SOURCE
+  # filter stays `backend_keys` and the orchestrator's dead-pin reconciler keeps its own `alive`
+  # (excluding draining nodes there would unpin shards a draining node is still serving
+  # cooperatively).
+  defp target_keys(backend_keys, alive, draining) do
+    reporting =
+      cond do
+        is_nil(alive) -> backend_keys
+        MapSet.size(alive) == 0 -> backend_keys
+        true -> Enum.filter(backend_keys, &MapSet.member?(alive, &1))
+      end
 
-  defp target_keys(backend_keys, alive) do
-    if MapSet.size(alive) == 0,
-      do: backend_keys,
-      else: Enum.filter(backend_keys, &MapSet.member?(alive, &1))
+    Enum.reject(reporting, &MapSet.member?(draining, &1))
   end
 
   # max_moves ≤ 0 means "make no moves" — short-circuit before the reduce, which otherwise

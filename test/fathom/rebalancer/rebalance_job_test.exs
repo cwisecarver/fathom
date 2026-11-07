@@ -101,6 +101,61 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
     assert job.args["to_node"] == "n3", "least-loaded target"
   end
 
+  # Expert review 2026-11-07 #56, integration: the published `draining` flag and the target
+  # freshness cut both reach the policy.
+  test "a draining node, and a node that stopped beating a while ago, are not handoff targets (#56)" do
+    Application.put_env(:fathom, :rebalancer_enabled, true)
+    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+    Application.put_env(:fathom, :rebalance_confirm_windows, 2)
+
+    sample("n1", "hot_1", 900, 10_000)
+    sample("n1", "hot_1", 900, 0)
+    sample("n1", "filler", 300, 0)
+    sample("n2", "warm", 100, 0)
+    sample("n3", "cool", 10, 0)
+
+    :ok = Nodes.beat("n1")
+    :ok = Nodes.beat("n2")
+    # n3 is the coldest and would be the target, but it is draining (published on its beat).
+    :ok = Nodes.beat("n3", health: %{"draining" => true})
+
+    assert :ok = perform_job(RebalanceJob, %{})
+    [job] = all_enqueued(worker: HandoffJob)
+    assert job.args["to_node"] == "n2", "a draining node was chosen as the handoff target"
+  end
+
+  test "a node whose last beat is older than the target freshness window is not a target (#56)" do
+    Application.put_env(:fathom, :rebalancer_enabled, true)
+    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+    Application.put_env(:fathom, :rebalance_confirm_windows, 2)
+
+    sample("n1", "hot_1", 900, 10_000)
+    sample("n1", "hot_1", 900, 0)
+    sample("n1", "filler", 300, 0)
+    sample("n2", "warm", 100, 0)
+    sample("n3", "cool", 10, 0)
+
+    :ok = Nodes.beat("n1")
+    :ok = Nodes.beat("n2")
+    :ok = Nodes.beat("n3")
+
+    # n3 exited 40 s ago: still `alive` for the reconciler (60 s), but past two reporter intervals.
+    stale = DateTime.add(DateTime.utc_now(), -40_000, :millisecond)
+
+    Repo.update_all(from(n in Fathom.Rebalancer.NodeBeat, where: n.node_key == "n3"),
+      set: [last_seen_at: stale]
+    )
+
+    assert MapSet.member?(Nodes.alive(60_000), "n3"),
+           "fixture: n3 is still alive to the reconciler"
+
+    assert :ok = perform_job(RebalanceJob, %{})
+    [job] = all_enqueued(worker: HandoffJob)
+
+    assert job.args["to_node"] == "n2",
+           "a node that already stopped beating was chosen as a target"
+  end
+
   test "an enabled tick re-renders the LB map from the override table (#10)" do
     Application.put_env(:fathom, :rebalancer_enabled, true)
     Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)

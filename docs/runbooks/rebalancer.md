@@ -41,6 +41,8 @@ known-good full config to copy from.
    nginx on mtime). The file must be reachable by both the fathom node (write) and the LB (read)
    — a shared volume / synced path. See `deploy/chaos/nginx.conf` for the `map $host
    $fathom_target` + pin-upstream shape.
+   Every node that runs the `rebalance` Oban queue needs `LB_MAP_PATH` — a node without it **refuses** the
+   handoff jobs it picks up (they would drain a shard the LB still routes there) and warns at boot.
 4. **Single-writer safety is independent of all of this.** A mis-flip is an availability/thrash
    problem, never corruption: the lease + epoch fence blocks a double-write across every
    interleaving. If in doubt, a shard is at worst briefly unavailable, then re-homes.

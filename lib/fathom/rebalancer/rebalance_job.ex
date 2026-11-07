@@ -70,8 +70,18 @@ defmodule Fathom.Rebalancer.RebalanceJob do
 
   defp run do
     # The live fleet (nodes beating within the staleness window) — the reconciler prefilter
-    # AND the policy's viable-target set. Computed once (review 2026-07-09 #1).
+    # (review 2026-07-09 #1). The policy's TARGET set is narrower: see `target_alive` below.
     alive = Nodes.alive(node_stale_ms())
+
+    # THE TARGET SET IS TIGHTER THAN THE RECONCILER'S (expert review 2026-11-07 #56). `alive` is
+    # "beat within 60 s", right for deciding a pin is dead (a briefly slow node keeps its pins) and
+    # wrong for choosing where to MOVE a hot shard: a node that exited keeps its row `alive` for up to
+    # a minute, and a node in `drain_all` keeps beating while it sheds every shard — so the least
+    # loaded node, the policy's favourite, is one that is leaving. Targets must have beaten within a
+    # couple of reporter intervals and not be publishing `draining`. `alive` itself is NOT narrowed:
+    # excluding draining nodes from the reconciler would unpin shards a draining node still serves.
+    target_alive = Nodes.alive(target_fresh_ms())
+    draining = Nodes.draining(node_stale_ms())
 
     # Unpin any shard pinned to a dead node (finding #1b) BEFORE the re-render, so the shard
     # returns to the hash pool (re-homes to a survivor — #1a already routes it there) instead
@@ -100,7 +110,8 @@ defmodule Fathom.Rebalancer.RebalanceJob do
         ineligible: ineligible_shards(samples),
         fleet_p99: fleet_p99,
         warm_locations: warm_locations,
-        alive_nodes: alive
+        alive_nodes: target_alive,
+        draining_nodes: draining
       )
 
     # Observability only (expert review 2026-10-15 #13): the decision above is already made, and
@@ -310,6 +321,13 @@ defmodule Fathom.Rebalancer.RebalanceJob do
 
   defp min_p99_samples,
     do: Application.get_env(:fathom, :rebalance_min_p99_samples, @min_p99_samples)
+
+  # How recently a node must have beaten to be a handoff TARGET: two reporter intervals (one missed
+  # beat is tolerated), never more than the reconciler's own staleness window.
+  defp target_fresh_ms do
+    default = 2 * Application.get_env(:fathom, :load_report_interval_ms, 10_000)
+    min(Application.get_env(:fathom, :rebalance_target_fresh_ms, default), node_stale_ms())
+  end
 
   # A generous upper bound on a single HandoffJob's wall-clock life (warm await + drain await
   # across its 3 attempts, plus retry backoff): the reconciler keeps any pin touched more

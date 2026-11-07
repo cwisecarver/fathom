@@ -58,6 +58,30 @@ defmodule Fathom.Rebalancer.NodesTest do
     end
   end
 
+  # Expert review 2026-11-07 #56: the rebalancer must not hand a shard to a node that is leaving.
+  describe "draining/1 (#56)" do
+    test "names the fresh nodes whose published health says draining, and only those" do
+      :ok = Nodes.beat("drain_yes", health: %{"draining" => true})
+      :ok = Nodes.beat("drain_no", health: %{"draining" => false})
+      :ok = Nodes.beat("drain_unknown")
+      :ok = Nodes.beat("drain_other_health", health: %{"dirty_shards" => 3})
+
+      assert Nodes.draining(60_000) == MapSet.new(["drain_yes"])
+    end
+
+    test "a draining node not seen within the window is not reported" do
+      :ok = Nodes.beat("drain_old", health: %{"draining" => true})
+      old = DateTime.add(DateTime.utc_now(), -120_000, :millisecond)
+
+      Repo.get!(NodeBeat, "drain_old")
+      |> Ecto.Changeset.change(last_seen_at: old)
+      |> Repo.update!()
+
+      assert Nodes.draining(60_000) == MapSet.new()
+      assert "drain_old" in Nodes.draining(300_000)
+    end
+  end
+
   test "beat upserts one row per node_key; alive reflects the window (#1b)" do
     assert :ok = Nodes.beat("n1")
     assert :ok = Nodes.beat("n1")

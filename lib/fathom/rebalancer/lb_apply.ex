@@ -91,6 +91,15 @@ defmodule Fathom.Rebalancer.LbApply do
     end
   end
 
+  @doc """
+  Whether this node can write the LB map at all (`:lb_map_path` set). `apply!/0` answers `:ok` when
+  it is not — right for the decision-plane-only mode and for the periodic re-render, wrong for a
+  handoff, whose drain is gated on the flip being live (expert review 2026-11-07 #57): a handoff
+  asks this first (`HandoffJob`) and refuses, rather than drain a shard the LB still routes here.
+  """
+  @spec map_configured?() :: boolean()
+  def map_configured?, do: is_binary(Application.get_env(:fathom, :lb_map_path))
+
   # Produce the authoritative file UNDER the advisory lock (render + config-test + atomic
   # rename — the part that must serialize fleet-wide, #10), then reload OUTSIDE the lock so a
   # slow/hung reload can't hold the pooled connection + the fleet lock indefinitely and freeze

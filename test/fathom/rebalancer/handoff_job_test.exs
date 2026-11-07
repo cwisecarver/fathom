@@ -311,4 +311,57 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
       assert o.failed_at != nil, "a handoff nobody can confirm must revert, not keep the pin"
     end
   end
+
+  # Expert review 2026-11-07 #57. With `:lb_map_path` unset `LbApply.apply!/0` answers `:ok`
+  # ("decision-plane only"), so a handoff pinned, "flipped" nothing, and DRAINED: the source flushed,
+  # released and stopped a shard the LB still routed to it, which cold-reopened it on the next
+  # request, and the job reported `:completed` — a drain blip on the hottest shard every cooldown.
+  # (`handoff_job_test` always set `:lb_map_path`, so nothing exercised the unset case.)
+  describe "with :lb_map_path unset (#57)" do
+    test "the handoff is refused: no pin, no drain command, the source keeps its shard",
+         %{shard: shard, node: node} do
+      Application.delete_env(:fathom, :lb_map_path)
+      refute Fathom.Rebalancer.LbApply.map_configured?(), "fixture: no LB map on this node"
+
+      {:ok, pid, ref, _path} = Shards.checkout(shard)
+      Fathom.Shard.checkin(pid, ref)
+      down = Process.monitor(pid)
+      start_supervised!(CommandPoller)
+
+      # The poller is running, so the unfixed job's drain DOES run and the job completes; a drain
+      # timeout this short only bounds the pre-fix wait if the poller were slow.
+      prev_drain = Application.get_env(:fathom, :handoff_drain_timeout_ms)
+      Application.put_env(:fathom, :handoff_drain_timeout_ms, 2_000)
+      on_exit(fn -> restore(:handoff_drain_timeout_ms, prev_drain) end)
+
+      args = %{"shard_id" => shard, "from_node" => node, "to_node" => node, "q_per_s" => 500.0}
+      assert {:error, :lb_map_path_unset} = perform_job(HandoffJob, args)
+
+      assert Overrides.for_shard(shard) == nil,
+             "a pin was written for a flip that cannot happen (another node's re-render would " <>
+               "route traffic to the target with no drain)"
+
+      import Ecto.Query, only: [from: 2]
+
+      assert Repo.aggregate(
+               from(c in Fathom.Rebalancer.Command, where: c.shard_id == ^shard),
+               :count
+             ) ==
+               0,
+             "a drain command was issued for a flip that was a no-op"
+
+      refute_receive {:DOWN, ^down, :process, ^pid, _}, 300
+    end
+
+    test "the last attempt cancels cleanly: nothing to revert, no cooldown row", %{
+      shard: shard,
+      node: node
+    } do
+      Application.delete_env(:fathom, :lb_map_path)
+      args = %{"shard_id" => shard, "from_node" => node, "to_node" => node, "q_per_s" => 500.0}
+
+      assert {:cancel, _} = perform_job(HandoffJob, args, attempt: 3)
+      assert Overrides.for_shard(shard) == nil
+    end
+  end
 end

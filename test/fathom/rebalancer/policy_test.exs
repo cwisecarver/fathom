@@ -211,6 +211,44 @@ defmodule Fathom.Rebalancer.PolicyTest do
     assert move.to_node == "n3", "non-reporting n2 excluded; move goes to the live n3"
   end
 
+  # Expert review 2026-11-07 #56. A node in `drain_all` publishes `draining: true` and sheds every
+  # shard, so it is the LEAST loaded node in the fleet — the policy's favourite target — and is about
+  # to stop. The handoff pinned the hottest shard to it.
+  test "a draining node is never a handoff target, however attractive its load (#56)" do
+    samples = [
+      s("n1", "hot_1", 900, 10),
+      s("n1", "hot_1", 900, 0),
+      s("n1", "filler", 300, 0),
+      s("n2", "x", 200, 0),
+      # n3 has shed everything it was serving: load 0, the coldest.
+      s("n3", "y", 0, 0)
+    ]
+
+    assert [pre] = propose(samples, floor: 500.0, confirm_windows: 2)
+    assert pre.to_node == "n3", "fixture: without the exclusion the draining n3 is the favourite"
+
+    assert [move] =
+             propose(samples,
+               floor: 500.0,
+               confirm_windows: 2,
+               draining_nodes: MapSet.new(["n3"])
+             )
+
+    assert move.to_node == "n2"
+
+    # Every other candidate draining: no target at all, declined rather than proposed.
+    {moves, declined} =
+      Policy.propose_traced(samples, [], @backends,
+        floor: 500.0,
+        confirm_windows: 2,
+        draining_nodes: MapSet.new(["n2", "n3"]),
+        now: @now
+      )
+
+    assert moves == []
+    assert [%{guard: :no_improving_target}] = declined
+  end
+
   test "affinity: prefers a warm target within the load band over the cold least-loaded (#C)" do
     # n1 overloaded (hot_1 900 + filler 300 = 1200). Viable targets: n2 @ 10 (coldest) and
     # n3 @ 100 (warm for hot_1, well within the band). Affinity sends it to the warm n3.

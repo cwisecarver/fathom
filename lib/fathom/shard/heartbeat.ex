@@ -944,8 +944,17 @@ defmodule Fathom.Shard.Heartbeat do
   # Best-effort: the lapse broadcast is observability/proactive-revalidation only, so
   # a missing PubSub (e.g. the scale/bench harness runs without it) must not crash
   # the heartbeat.
+  #
+  # LOCAL ONLY (expert review 2026-11-07 #80). `Phoenix.PubSub.broadcast/3` also reaches every node
+  # joined by distributed Erlang (the phx.new `DNSCluster` child is wired and `DNS_CLUSTER_QUERY` is
+  # documented). A coordinator compares the message's generation with its OWN node's `acquire_gen`,
+  # and another node's generation almost always differs, so one node's store trouble armed a jittered
+  # `:revalidate_lapse` — a `check_lease` GET — on EVERY coordinator of EVERY node: O(open shards
+  # fleet-wide) GETs aimed at the store that is already struggling. The generation is node-local
+  # state and the subscribers are this node's coordinators; `local_broadcast/4` is identical for
+  # them. (The collectors' admin topics are a different question and are not touched here.)
   defp broadcast_lapse(gen) do
-    Phoenix.PubSub.broadcast(Fathom.PubSub, @topic, {:heartbeat_lapsed, gen})
+    Phoenix.PubSub.local_broadcast(Fathom.PubSub, @topic, {:heartbeat_lapsed, gen})
   rescue
     _ -> :ok
   catch
