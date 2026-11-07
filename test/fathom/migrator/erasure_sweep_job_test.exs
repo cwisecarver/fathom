@@ -332,29 +332,30 @@ defmodule Fathom.Migrator.ErasureSweepJobTest do
   # Expert review 2026-10-15 #19. A drill killed between fork and drop leaks a full tenant copy
   # (objects + an active scratch row) that no tenant delete reaches. The sweep purges stale ones.
   describe "restore-drill scratch fork GC" do
-    defp insert_row!(id, age_s) do
+    defp insert_row!(id, age_s, opts \\ []) do
       at = DateTime.add(DateTime.utc_now(), -age_s, :second)
 
       Fathom.Repo.insert_all(Directory.Shard, [
         %{
           shard_id: id,
           schema_version: 0,
-          status: "active",
-          last_active_at: at,
+          status: Keyword.get(opts, :status, "active"),
+          scratch: Keyword.get(opts, :scratch, false),
+          last_active_at: Keyword.get(opts, :last_active_at, at),
           updated_at: at,
           inserted_at: at
         }
       ])
     end
 
-    test "purges objects and row of a scratch fork older than 24h, and nothing else" do
+    test "purges objects and row of a MARKED scratch fork older than 24h, and nothing else" do
       stale = "restoredrill1#{System.unique_integer([:positive])}"
       fresh = "restoredrill2#{System.unique_integer([:positive])}"
       real_old = "restoredrill-eu-#{System.unique_integer([:positive])}"
 
       for id <- [stale, fresh, real_old], do: put_object!(id)
-      insert_row!(stale, 25 * 3600)
-      insert_row!(fresh, 3600)
+      insert_row!(stale, 25 * 3600, scratch: true)
+      insert_row!(fresh, 3600, scratch: true)
       insert_row!(real_old, 25 * 3600)
 
       assert ErasureSweepJob.sweep_scratch_forks() == 1
@@ -369,6 +370,34 @@ defmodule Fathom.Migrator.ErasureSweepJobTest do
       assert {:ok, true} = Storage.any_shard_object?(real_old)
 
       for id <- [fresh, real_old], do: Storage.purge_shard(id)
+    end
+
+    # Expert review 2026-11-07 #15 (tenant-lifecycle#2). The reservation of the `restoredrill<digits>`
+    # shape is enforced only at `Tenants.provision/2` and `fork/3`; a Host subdomain or the token mint
+    # births a row with it. The sweep used to select `inserted_at < cutoff AND shard_id ~ pattern`, so
+    # this LIVE tenant — created a day ago, active a minute ago — had its objects and row destroyed.
+    test "a LIVE tenant whose id merely has the scratch shape is never purged" do
+      live = "restoredrill3#{System.unique_integer([:positive])}"
+      put_object!(live)
+      insert_row!(live, 25 * 3600, last_active_at: DateTime.utc_now())
+
+      assert Fathom.Repo.get_by(Directory.Shard, shard_id: live).scratch == false,
+             "fixture: an organic row is not marked"
+
+      assert ErasureSweepJob.sweep_scratch_forks() == 0
+
+      assert Fathom.Repo.get_by(Directory.Shard, shard_id: live)
+      assert {:ok, true} = Storage.any_shard_object?(live), "a live tenant's object was purged"
+
+      Storage.purge_shard(live)
+    end
+
+    test "a marked row that has been TOMBSTONED keeps its row: it is the directory half of the guard" do
+      gone = "restoredrill4#{System.unique_integer([:positive])}"
+      insert_row!(gone, 25 * 3600, scratch: true, status: "deleted")
+
+      assert ErasureSweepJob.sweep_scratch_forks() == 0
+      assert %{status: "deleted"} = Fathom.Repo.get_by(Directory.Shard, shard_id: gone)
     end
   end
 end

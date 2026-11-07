@@ -1099,6 +1099,11 @@ defmodule Fathom.TenantsTest do
 
       assert {:error, :reserved_shard_id} = Tenants.fork(id, dst)
       assert {:ok, %{shard_id: ^dst}} = Tenants.fork(id, dst, scratch: true)
+
+      # The drill's own fork is what writes the provenance marker the scratch sweeps key on (expert
+      # review 2026-11-07 #15) — and a plain fork/provision of any id never does.
+      assert Fathom.Repo.get_by(Fathom.Directory.Shard, shard_id: dst).scratch
+      refute Fathom.Repo.get_by(Fathom.Directory.Shard, shard_id: id).scratch
     end
   end
 

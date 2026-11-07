@@ -104,6 +104,13 @@ defmodule Fathom.Directory.Shard do
     field :quarantined_at, :utc_datetime_usec
     field :requeue_count, :integer, default: 0
 
+    # PROVENANCE of a restore-drill scratch fork (expert review 2026-11-07 #15). The sweeps that
+    # exclude scratch rows from rollout/drill sampling and that PURGE leaked ones act on THIS column,
+    # never on the shape of the id: `restoredrill<digits>` is a reservation enforced only at
+    # `Tenants.provision/2` and `fork/3`, so an organic tenant can carry it, and a name-keyed sweep
+    # destroyed such a live tenant (objects, snapshots, row) 24 h after creation.
+    field :scratch, :boolean, default: false
+
     timestamps(type: :utc_datetime_usec)
   end
 
@@ -149,7 +156,11 @@ defmodule Fathom.Directory.Shard do
       # Castable here but deliberately NOT in `admin_changeset/2` above: it is a
       # migration-state-machine field like `schema_version`, and a hand-edit that names a version
       # with no object behind it points a revert at nothing.
-      :retained_version
+      :retained_version,
+      # Written ONLY by the restore drill's own fork at birth (`Directory.resolve/2`,
+      # `scratch: true`). Not in `admin_changeset/2`: an operator hand-edit must not mark a live
+      # tenant a purge target.
+      :scratch
     ])
     |> validate_required([:shard_id, :schema_version, :status, :last_active_at])
     # Shard ids become SQLite file names and registry keys elsewhere; defer to the single

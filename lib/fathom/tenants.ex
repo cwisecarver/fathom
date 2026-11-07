@@ -161,7 +161,7 @@ defmodule Fathom.Tenants do
          {:ok, src_row} <- fetch_src(src),
          :ok <- maybe_flush_source(src, opts),
          :ok <- fork_into_leased_dst(src, dst),
-         :ok <- register_fork(dst),
+         :ok <- register_fork(dst, Keyword.get(opts, :scratch, false)),
          {:ok, result} <- tenant_result(dst, warnings, opts) do
       {:ok, Map.put(result, :source_flushed_at, source_flushed_at(src_row, opts))}
     end
@@ -776,10 +776,12 @@ defmodule Fathom.Tenants do
   # swallowed. The copy has already happened, so a failure here leaves a dst object with no good
   # row; the caller sees the error and `mix fathom.directory` reconciles the stamp from the file.
   @doc false
-  @spec register_fork(String.t()) :: :ok | {:error, term()}
-  def register_fork(dst) do
+  @spec register_fork(String.t(), boolean()) :: :ok | {:error, term()}
+  def register_fork(dst, scratch? \\ false) do
     with {:ok, version} <- copied_version(dst),
-         {:ok, _row} <- Directory.resolve(dst),
+         # `scratch: true` ONLY for the restore drill's own fork (expert review 2026-11-07 #15): the
+         # row's provenance marker, which the scratch sweeps key on instead of the id's shape.
+         {:ok, _row} <- Directory.resolve(dst, scratch: scratch?),
          :ok <- seed_token_floor(dst),
          {:ok, _row} <- stamp_fork(dst, version) do
       :ok

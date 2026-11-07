@@ -249,9 +249,10 @@ defmodule Fathom.DirectoryTest do
     test "a leaked restore-drill scratch fork is excluded from laggards + drill sampling (#27)" do
       {:ok, _} = Directory.resolve("real-laggard")
       # The reserved prefix literal (see Directory.scratch_prefix/0) — kept literal here so this
-      # discriminates the exclusion itself, not the constant's presence.
+      # discriminates the exclusion itself, not the constant's presence. Marked at birth, exactly as
+      # the drill's own fork (`Tenants.register_fork/2`) does.
       scratch = "restoredrill999"
-      {:ok, _} = Directory.resolve(scratch)
+      {:ok, _} = Directory.resolve(scratch, scratch: true)
 
       # Only the real laggard counts / is swept — not the scratch fork.
       assert Directory.count_laggards(5) == 1,
@@ -265,20 +266,38 @@ defmodule Fathom.DirectoryTest do
       refute scratch in drill_ids, "a scratch fork must not be re-sampled by the drill"
     end
 
-    # Expert review 2026-09-29 #34. The exclusion was `LIKE 'restoredrill%'`, and nothing refused
-    # that prefix for a real tenant — so `restoredrill-eu` was silently never migrated while
-    # `converged` read true. Only the drill's own shape, `restoredrill<digits>`, is excluded now.
-    test "a real tenant that merely starts with the drill prefix is still a laggard (#34)" do
-      real = ["restoredrill-eu", "restoredrills", "restoredrill1a"]
+    # Expert review 2026-09-29 #34 + 2026-11-07 #15. The exclusion was `LIKE 'restoredrill%'`, and
+    # nothing refused that prefix for a real tenant — so `restoredrill-eu` was silently never migrated
+    # while `converged` read true. It was then keyed on the exact drill SHAPE, but the shape is only a
+    # reservation (`Tenants.provision/fork` refuse it; a stray request or the token mint do not), so
+    # an organic `restoredrill42` was excluded from every rollout AND purged by the scratch sweep. The
+    # exclusion now follows the `scratch` marker the drill's own fork writes at birth: a tenant that
+    # merely LOOKS like a scratch fork is migrated and drilled like any other.
+    test "a real tenant that merely looks like a drill scratch fork is still a laggard (#34, 2026-11-07 #15)" do
+      real = ["restoredrill-eu", "restoredrills", "restoredrill1a", "restoredrill42"]
       for id <- real, do: {:ok, _} = Directory.resolve(id)
-      {:ok, _} = Directory.resolve("restoredrill42")
+      {:ok, _} = Directory.resolve("restoredrill999", scratch: true)
 
       assert Directory.count_laggards(5) == length(real)
       assert Enum.sort(Enum.map(Directory.laggards(5, 10), & &1.shard_id)) == Enum.sort(real)
 
       drill_ids = Directory.sample_for_drill(10) |> Enum.map(& &1.shard_id)
       for id <- real, do: assert(id in drill_ids, "#{id} was excluded from the drill sample")
-      refute "restoredrill42" in drill_ids
+      refute "restoredrill999" in drill_ids
+    end
+
+    test "only the INSERT carries the marker: a re-resolve never marks or unmarks a row" do
+      {:ok, organic} = Directory.resolve("restoredrill77")
+      refute organic.scratch
+      {:ok, again} = Directory.resolve("restoredrill77", scratch: true)
+
+      refute again.scratch,
+             "a drill that names a live tenant must not turn it into a purge target"
+
+      {:ok, marked} = Directory.resolve("restoredrill78", scratch: true)
+      assert marked.scratch
+      {:ok, again} = Directory.resolve("restoredrill78")
+      assert again.scratch
     end
 
     test "scratch_id?/1 is exactly the drill's <prefix><digits> shape (#34)" do

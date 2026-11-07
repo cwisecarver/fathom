@@ -93,6 +93,12 @@ defmodule Fathom.Migrator.ErasureSweepJob do
   # kill/deploy/OOM mid-drill skips: the fork (a full tenant copy, plus snapshots) and its directory
   # row then leak, and no tenant delete ever reaches them. Purge objects first, then the row, so a
   # failed purge leaves the row to be retried next sweep. Public so tests drive it directly.
+  #
+  # WHICH rows (expert review 2026-11-07 #15): the ones the drill's own fork MARKED `scratch` at
+  # birth (`Directory.stale_scratch_ids/2`), never "an id that looks like the scratch shape". The
+  # shape is only reserved at `Tenants.provision/2` / `fork/3`, so a live tenant with such an id was
+  # purged — objects, snapshots and row — 24 h after creation. A leaked drill row from before the
+  # marker existed is deliberately NOT swept: it cannot be told from an organic tenant.
   @scratch_max_age_s 24 * 3600
   @scratch_max 50
 

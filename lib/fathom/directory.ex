@@ -53,21 +53,23 @@ defmodule Fathom.Directory do
   # exclusion that row is an eternal laggard: `count_laggards/1` counts it so `converged` never turns
   # true, `laggards/2` keeps enqueuing a migration for a throwaway, and later drills re-sample it.
   # Excluded from the rollout + drill sweeps exactly like the capture template. `RestoreDrillJob` owns
-  # the naming via `scratch_prefix/0`; the reserved shape is `scratch_id?/1`, enforced by `Tenants`.
+  # the naming via `scratch_prefix/0`.
+  #
+  # THE NAME IS A RESERVATION, NOT PROOF (expert review 2026-11-07 #15). `scratch_id?/1` is enforced
+  # only at `Tenants.provision/2` and `fork/3`; every other birth path (a Host subdomain, the token
+  # mint, `bump_token_version/1`'s register-if-unknown) accepts the shape, so a name can never say a
+  # row is a throwaway. What the sweeps act on is the `scratch` column, written only by the drill's
+  # own fork (`resolve/2`, `scratch: true`).
   @scratch_prefix "restoredrill"
 
   @doc "The reserved prefix for restore-drill scratch forks — see `@scratch_prefix` (#27)."
   @spec scratch_prefix() :: String.t()
   def scratch_prefix, do: @scratch_prefix
 
-  # The drill names a scratch fork `<prefix><positive integer>` and nothing else. Only THIS shape is
-  # reserved (expert review 2026-09-29 #34) — the prefix alone would also reserve `restoredrill-eu`.
-  @scratch_id_pattern "^" <> @scratch_prefix <> "[0-9]+$"
-
   @doc """
   True for an id of the restore drill's scratch shape, `#{@scratch_prefix}<digits>` — reserved:
-  excluded from rollout and drill sweeps, so a real tenant with such an id would never migrate.
-  `Fathom.Tenants` refuses it at provision and fork (#34).
+  `Fathom.Tenants` refuses it at provision and fork (#34). A shape check only: whether a ROW is a
+  scratch fork is the `scratch` column's fact, not the name's (expert review 2026-11-07 #15).
   """
   @spec scratch_id?(String.t()) :: boolean()
   def scratch_id?(@scratch_prefix <> rest) when rest != "",
@@ -80,9 +82,13 @@ defmodule Fathom.Directory do
   `{:ok, entry}` with the shard's current `schema_version`/`status` (or
   `{:error, changeset}` for an invalid id). This is the hook the lazy migration
   path will use to spot and enqueue laggards.
+
+  `scratch: true` marks a row BORN here as a restore-drill scratch fork (expert review 2026-11-07
+  #15). Only the insert carries it — a re-resolve never marks (or unmarks) an existing row, so an
+  organic tenant can never be turned into a purge target by a drill that happens to name it.
   """
-  @spec resolve(String.t()) :: {:ok, Shard.t()} | {:error, Ecto.Changeset.t()}
-  def resolve(shard_id) do
+  @spec resolve(String.t(), keyword()) :: {:ok, Shard.t()} | {:error, Ecto.Changeset.t()}
+  def resolve(shard_id, opts \\ []) do
     now = DateTime.utc_now()
 
     %Shard{}
@@ -90,7 +96,8 @@ defmodule Fathom.Directory do
       shard_id: shard_id,
       schema_version: 0,
       status: "active",
-      last_active_at: now
+      last_active_at: now,
+      scratch: Keyword.get(opts, :scratch, false)
     })
     |> Repo.insert(
       # On re-resolve, only bump recency — never reset version/status. The recency stamp is the
@@ -548,15 +555,22 @@ defmodule Fathom.Directory do
   end
 
   @doc """
-  Scratch-fork ids (see `scratch_id?/1`) whose directory row is older than `cutoff`, oldest first,
-  at most `limit`. The drill drops its own scratch in an `after`, so a row this old is a LEAK from a
-  kill/deploy/OOM mid-drill: a full tenant copy that no tenant delete will ever reach (expert
-  review 2026-10-15 #19). `ErasureSweepJob` purges them.
+  Scratch-fork ids whose directory row is older than `cutoff`, oldest first, at most `limit`. The
+  drill drops its own scratch in an `after`, so a row this old is a LEAK from a kill/deploy/OOM
+  mid-drill: a full tenant copy that no tenant delete will ever reach (expert review 2026-10-15 #19).
+  `ErasureSweepJob` purges them.
+
+  Selected by PROVENANCE, not by name (expert review 2026-11-07 #15): only rows the drill's own fork
+  marked `scratch` at birth (`resolve/2`). This used to be `inserted_at < cutoff AND shard_id ~
+  '^restoredrill[0-9]+$'` with no status filter, so a LIVE tenant whose id happened to have that shape
+  (the reservation is enforced only by `Tenants.provision/2` and `fork/3`) had its objects, snapshots
+  and directory row destroyed 24 h after creation. `status != 'deleted'` keeps the sweep off a
+  tombstone: hard-deleting one drops the directory half of the re-mint guard.
   """
   @spec stale_scratch_ids(DateTime.t(), pos_integer()) :: [String.t()]
   def stale_scratch_ids(%DateTime{} = cutoff, limit) when is_integer(limit) and limit > 0 do
     from(s in Shard,
-      where: s.inserted_at < ^cutoff and fragment("? ~ ?", s.shard_id, ^@scratch_id_pattern),
+      where: s.scratch and s.status != "deleted" and s.inserted_at < ^cutoff,
       order_by: [asc: s.inserted_at],
       limit: ^limit,
       select: s.shard_id
@@ -2359,13 +2373,15 @@ defmodule Fathom.Directory do
   end
 
   # Exclude the restore drill's scratch forks (#27) so a leaked one is not an eternal laggard /
-  # re-sampled drill target. EXACTLY the drill's own shape, `<prefix><digits>` (expert review
-  # 2026-09-29 #34): this was `LIKE 'restoredrill%'`, but nothing refused that prefix for a real
-  # tenant, so `restoredrill-eu` provisioned fine and was then silently never migrated while
-  # `converged` read true. The exact shape is also refused at every tenant-facing birth path (see
-  # `scratch_id?/1`), so the two sets cannot overlap.
+  # re-sampled drill target. KEYED ON THE `scratch` MARKER the drill's own fork writes at birth
+  # (`resolve/2`, `scratch: true`), NOT on the id's shape (expert review 2026-11-07 #15). The shape
+  # `restoredrill<digits>` is only REFUSED at `Tenants.provision/2` and `fork/3`; a stray request
+  # (a Host subdomain, `POST /api/tenants/:id/token`) can still birth a row with it, and a name
+  # pattern then treats that live tenant as a throwaway — excluded from every rollout while
+  # `converged` reads true, and (the original #15) purged with its row 24 h later. A tenant that
+  # merely LOOKS like a scratch fork is migrated and drilled like any other.
   defp exclude_scratch(query) do
-    from(s in query, where: fragment("? !~ ?", s.shard_id, ^@scratch_id_pattern))
+    from(s in query, where: not s.scratch)
   end
 
   defp template_shard_id do
