@@ -90,7 +90,11 @@ defmodule FathomWeb.AdminQueryLiveTest do
     view |> form("#query-form", q: %{shard: id, sql: sql}) |> render_submit()
     render_async(view, 5_000)
 
-    assert [ev] = Fathom.Audit.list(shard_id: id)
+    # Two rows per run since 2026-11-07 #38: `started` (before the statement leaves) and the
+    # outcome. This asserted exactly one row, which is the audit gap that finding closed.
+    assert [ev, started] = Fathom.Audit.list(shard_id: id)
+    assert started.outcome == "started"
+    assert started.detail["sql_sha256"] == ev.detail["sql_sha256"]
     assert ev.action == "console_query"
     assert ev.outcome == "ok"
     assert ev.actor == "console:admin"
@@ -103,8 +107,114 @@ defmodule FathomWeb.AdminQueryLiveTest do
     view |> form("#query-form", q: %{shard: id, sql: "SELECT * FROM nope"}) |> render_submit()
     render_async(view, 5_000)
 
-    assert [ev] = Fathom.Audit.list(shard_id: id)
+    assert [ev, %{outcome: "started"}] = Fathom.Audit.list(shard_id: id)
     assert ev.outcome == "error"
+  end
+
+  # Expert review 2026-11-07 #38. The only audit write was in `handle_async/3`, after the statement
+  # finished and only if the LiveView still held that task's ref. A second `run` (the button's
+  # `disabled` is client-side only) `start_async`ed a SECOND task over the first's key: the first
+  # statement kept running server-side, its result was dropped with NO audit row, and `pending`
+  # named the second statement; a LiveView that died mid-flight left no row at all. The intent is
+  # now recorded BEFORE the call, and the server refuses a second statement while one is in flight.
+  #
+  # The "tenant" here is a socket that accepts and never answers, so the first statement is
+  # genuinely in flight for as long as the test wants.
+  describe "intent is audited before the call; one statement in flight (#38)" do
+    setup do
+      {:ok, listen} =
+        :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}, reuseaddr: true])
+
+      {:ok, port} = :inet.port(listen)
+      parent = self()
+
+      acceptor =
+        spawn_link(fn ->
+          accept_forever(listen, parent)
+        end)
+
+      Application.put_env(:fathom, :query_console_endpoint, "http://127.0.0.1:#{port}")
+
+      on_exit(fn ->
+        Process.unlink(acceptor)
+        Process.exit(acceptor, :kill)
+        :gen_tcp.close(listen)
+      end)
+
+      :ok
+    end
+
+    defp accept_forever(listen, parent) do
+      case :gen_tcp.accept(listen, 10_000) do
+        {:ok, sock} ->
+          send(parent, {:statement_left, sock})
+          accept_forever(listen, parent)
+
+        _ ->
+          :ok
+      end
+    end
+
+    test "a `started` row exists while the statement is still running", %{conn: conn, id: id} do
+      {:ok, view, _html} = conn |> auth() |> live("/admin/query")
+      sql = "DELETE FROM t WHERE 1 = 1"
+      view |> form("#query-form", q: %{shard: id, sql: sql}) |> render_submit()
+
+      assert_receive {:statement_left, _sock}, 5_000
+
+      # No outcome yet — the request never returns — but the intent is on record.
+      assert [row] = Fathom.Audit.list(shard_id: id)
+      assert row.action == "console_query"
+      assert row.outcome == "started"
+      assert row.actor == "console:admin"
+      assert row.detail["sql_sha256"] == Base.encode16(:crypto.hash(:sha256, sql), case: :lower)
+    end
+
+    test "a second run while one is in flight is refused: it never leaves, no row names it", %{
+      conn: conn,
+      id: id
+    } do
+      {:ok, view, _html} = conn |> auth() |> live("/admin/query")
+
+      view
+      |> form("#query-form", q: %{shard: id, sql: "UPDATE t SET v = 'first'"})
+      |> render_submit()
+
+      assert_receive {:statement_left, _}, 5_000
+
+      html =
+        view
+        |> form("#query-form", q: %{shard: id, sql: "DROP TABLE t -- the second statement"})
+        |> render_submit()
+
+      assert html =~ "already running"
+      refute_receive {:statement_left, _}, 500, "the superseding statement was sent"
+
+      assert [row] = Fathom.Audit.list(shard_id: id)
+      assert row.detail["sql_head"] == "UPDATE t SET v = 'first'"
+    end
+
+    test "a LiveView that dies mid-flight has already left its `started` row", %{
+      conn: conn,
+      id: id
+    } do
+      {:ok, view, _html} = conn |> auth() |> live("/admin/query")
+
+      view
+      |> form("#query-form", q: %{shard: id, sql: "INSERT INTO t VALUES ('x')"})
+      |> render_submit()
+
+      assert_receive {:statement_left, _}, 5_000
+
+      # The test process is LINKED to the view (`live/2`), so killing it would take the test down
+      # with it unless exits are trapped.
+      Process.flag(:trap_exit, true)
+      ref = Process.monitor(view.pid)
+      Process.exit(view.pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, _, _}, 2_000
+
+      assert [%{outcome: "started"}] = Fathom.Audit.list(shard_id: id)
+    end
   end
 
   test "the template shard is blocked in the console and nothing reaches it", %{conn: conn} do

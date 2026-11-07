@@ -45,16 +45,24 @@ defmodule FathomWeb.AdminQueryLive do
     sql = String.trim(sql)
 
     cond do
+      # One statement in flight per console (expert review 2026-11-07 #38). The submit button's
+      # `disabled={@running}` is client-side only: a direct websocket event (or a double submit that
+      # beats the re-render) used to `start_async` a SECOND task under the same key, whose
+      # `{ref, pid, kind}` replaced the first's — the first statement kept running server-side (its
+      # Hrana request had already left), its result was dropped by LiveView with no audit row, and
+      # `pending` named the SECOND statement. The server refuses instead.
+      socket.assigns.running ->
+        {:noreply,
+         assign(socket,
+           error: input_error("a statement is already running — wait for it to finish")
+         )}
+
       shard == "" ->
         {:noreply, assign(socket, error: input_error("enter a shard id"), result: nil)}
 
       sql == "" ->
         {:noreply, assign(socket, error: input_error("enter a SQL statement"), result: nil)}
 
-      # Validate the shard id before it reaches QueryConsole.host_for/1, which interpolates it into
-      # the Host (expert review 2026-07-18 #16). Unvalidated, a dotted id like "acme.other" is
-      # reinterpreted by Host-subdomain routing as its FIRST label ("acme") — an admin would run SQL
-      # against the WRONG tenant. ShardId.valid? enforces the DNS-label-safe format (no dots/slashes).
       # Validate the shard id before it reaches QueryConsole.host_for/1, which interpolates it into
       # the Host (expert review 2026-07-18 #16). Unvalidated, a dotted id like "acme.other" is
       # reinterpreted by Host-subdomain routing as its FIRST label ("acme") — an admin would run SQL
@@ -73,6 +81,23 @@ defmodule FathomWeb.AdminQueryLive do
         # Bound OUTSIDE the closure: `start_async/3` runs in a separate process and referencing
         # `socket` there captures the whole struct.
         actor = socket.assigns.admin_actor
+
+        # RECORD THE INTENT BEFORE THE CALL (expert review 2026-11-07 #38). The only audit write
+        # used to be in `handle_async/3`, after the statement finished and only if this LiveView
+        # still held that task's ref — so a statement whose LiveView died mid-flight (an operator
+        # navigating away during a slow write; the task is `start_link`ed, but the loopback request
+        # may already be committing) executed with no `console_query` row at all. The `started`
+        # row cannot be skipped by anything that happens after it; the outcome row below is kept.
+        # (Not moved into the Task alone: a killed task would skip it.) `Audit.record/6` is
+        # best-effort, so it cannot fail the run.
+        Fathom.Audit.record(
+          actor,
+          "console_query",
+          shard,
+          socket.assigns.admin_ip,
+          "started",
+          sql_detail(sql, %{})
+        )
 
         {:noreply,
          socket
@@ -113,28 +138,30 @@ defmodule FathomWeb.AdminQueryLive do
   # Every console run is audited (expert review 2026-10-10 #W1): the console executes arbitrary
   # SQL — writes and DDL included — against any tenant, and used to leave no trail. Detail holds
   # the statement's sha256 plus its first 200 chars (not the whole text, to keep rows small).
-  # Best-effort like every audit write.
+  # Best-effort like every audit write. Two rows per run (2026-11-07 #38): `started`, written
+  # BEFORE the statement leaves (see `handle_event("run")`), and this outcome row.
   defp audit_run(socket, outcome, extra) do
     case socket.assigns.pending do
       {shard, sql} ->
-        detail =
-          Map.merge(extra, %{
-            sql_sha256: Base.encode16(:crypto.hash(:sha256, sql), case: :lower),
-            sql_head: String.slice(sql, 0, 200)
-          })
-
         Fathom.Audit.record(
           socket.assigns.admin_actor,
           "console_query",
           shard,
           socket.assigns.admin_ip,
           outcome,
-          detail
+          sql_detail(sql, extra)
         )
 
       _ ->
         :ok
     end
+  end
+
+  defp sql_detail(sql, extra) do
+    Map.merge(extra, %{
+      sql_sha256: Base.encode16(:crypto.hash(:sha256, sql), case: :lower),
+      sql_head: String.slice(sql, 0, 200)
+    })
   end
 
   defp input_error(message), do: %{code: "INPUT", message: message}
