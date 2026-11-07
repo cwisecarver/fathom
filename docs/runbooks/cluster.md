@@ -178,12 +178,18 @@ bin/fathom rpc 'IO.inspect(Fathom.Shards.drain_all())'
 bin/fathom stop
 ```
 
-Set `:drain_lb_settle_ms` to your LB's health-probe interval so `drain_all` waits for the LB to
-notice the 503 before it drains (otherwise a request can still land mid-drain). Tune
-`:drain_all_budget_ms` (default 55s, keep under your orchestrator's SIGTERM grace),
-`:drain_all_concurrency` (default 64 — the fan-out width, so the drain doesn't fire every shard's
-flush at once), and `:drain_all_flush_grace_ms` (default 5s — the tail a busy shard needs to finish
-its final flush before the deadline). A clean drain reports `busy: 0, timed_out: 0`; a `timed_out`
+These knobs are environment variables read at boot (a release cannot edit `config/*.exs`); each
+has a row in [`../configuration.md`](../configuration.md). Set `DRAIN_LB_SETTLE_MS` to your LB's
+health-probe interval so `drain_all` waits for the LB to notice the 503 before it drains (otherwise a
+request can still land mid-drain). Tune `DRAIN_ALL_BUDGET_MS` (default 55 s), `DRAIN_ALL_CONCURRENCY`
+(default 64 — the fan-out width, so the drain doesn't fire every shard's flush at once), and
+`DRAIN_ALL_FLUSH_GRACE_MS` (default 5 s — the tail a busy shard needs to finish its final flush
+before the deadline). `DRAIN_ALL_BUDGET_MS` is **not** the number to compare with your orchestrator's
+SIGTERM grace: the supervisor teardown (`SHARD_SHUTDOWN_MS`, Edge listeners, Recorder, Oban) runs
+*after* the drain, so the stop grace must be at least
+`DRAIN_LB_SETTLE_MS + DRAIN_ALL_BUDGET_MS + SHARD_SHUTDOWN_MS + 90 s` (205 s with the defaults) — the
+derivation is in [`deploy.md`](deploy.md#stop-grace-arithmetic). `DRAIN_ON_SHUTDOWN=false` turns the
+`prep_stop` drain off (the rpc above still works). A clean drain reports `busy: 0, timed_out: 0`; a `timed_out`
 shard is left to the supervisor shutdown (raise the budget or lower per-node density). This is the
 structural companion to the busy-terminate flush fix (audit #2): together, a clean shutdown's
 deploy-time loss window is zero. Validating it against the chaos rig's rolling-deploy scenario and

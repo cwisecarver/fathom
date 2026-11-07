@@ -195,4 +195,43 @@ defmodule Fathom.EnvReachabilityTest do
            ~98 exemptions. See this module's moduledoc.
            """
   end
+
+  # Expert review 2026-11-07 #58: the third place an unreachable knob gets ADVERTISED. The runbooks
+  # told operators to "Set `:drain_lb_settle_ms`", "Tune `:drain_all_budget_ms`" and size
+  # `:shard_shutdown_ms` — app-env keys named in PROSE, with no `` `ENV_VAR` `` table row — so neither
+  # half above (a doc ROW is read; a lib/ "set X" message is read) could see that no
+  # `System.get_env` mapped to any of them, and a release cannot edit `config/*.exs`.
+  #
+  # Deliberately the same narrow shape as the rest of this file (no exemption list): only a key that a
+  # runbook is the SUBJECT of an instruction for — an imperative verb immediately followed by the
+  # backticked `:key` — must be reachable. A key merely mentioned ("`:max_open_shards` bounds ...")
+  # is not a promise. The key's env name is its upcased form, the convention every wired knob follows.
+  @runbook_tells ~r/\b(?:[Ss]et|[Tt]une|[Rr]aise|[Ll]ower)\s+`:([a-z][a-z0-9_]+)`/
+
+  test "every app-env key a runbook tells an operator to set is reachable from the environment" do
+    # The pattern must match what it was written for, or this test checks nothing.
+    assert [["drain_lb_settle_ms"]] =
+             Regex.scan(@runbook_tells, "Set `:drain_lb_settle_ms` to your LB's probe",
+               capture: :all_but_first
+             )
+
+    files = Path.wildcard("docs/runbooks/*.md") ++ ["docs/deploy-cluster.md"]
+    assert length(files) > 3, "the runbook scan found #{length(files)} files — wrong cwd/layout?"
+
+    wired = read_names()
+
+    unwired =
+      files
+      |> Enum.flat_map(fn path ->
+        @runbook_tells
+        |> Regex.scan(File.read!(path), capture: :all_but_first)
+        |> Enum.map(fn [key] -> {path, key} end)
+      end)
+      |> Enum.reject(fn {_path, key} -> MapSet.member?(wired, String.upcase(key)) end)
+
+    assert unwired == [],
+           "a runbook tells an operator to set these app-env keys, but no env var of that name is " <>
+             "read by config/ or lib/, so on a release the instruction cannot be followed: " <>
+             Enum.map_join(unwired, ", ", fn {path, key} -> "`:#{key}` (#{path})" end)
+  end
 end

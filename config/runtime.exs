@@ -457,6 +457,44 @@ if ttl = System.get_env("SHARD_LEASE_TTL_MS") do
   config :fathom, :shard_lease_ttl_ms, parse_int!.("SHARD_LEASE_TTL_MS", ttl)
 end
 
+# --- Node shutdown / drain (expert review 2026-11-07 #58) -------------------------------------
+#
+# All six were read only through `Application.get_env` and the runbooks told operators to set them,
+# but a release cannot edit `config/*.exs`, so on a deployed node none of them could be set. The
+# stop-grace arithmetic they feed (`docs/runbooks/deploy.md` § Stop-grace arithmetic):
+#
+#   stop grace >= DRAIN_LB_SETTLE_MS + DRAIN_ALL_BUDGET_MS + SHARD_SHUTDOWN_MS + 90 s
+#
+# Unset leaves each key unwritten, so `Fathom.Shards` / `Fathom.Shard` keep their own defaults
+# (0 / 55 s / 64 / 5 s / 60 s / drain on). `env_int` (positive) for the budgets and the width, since
+# a zero there is not a setting; `env_nonneg_int` where 0 is a real value (no LB settle sleep, no
+# per-shard flush tail).
+if ms = env_nonneg_int.("DRAIN_LB_SETTLE_MS") do
+  config :fathom, :drain_lb_settle_ms, ms
+end
+
+if ms = env_int.("DRAIN_ALL_BUDGET_MS") do
+  config :fathom, :drain_all_budget_ms, ms
+end
+
+if n = env_int.("DRAIN_ALL_CONCURRENCY") do
+  config :fathom, :drain_all_concurrency, n
+end
+
+if ms = env_nonneg_int.("DRAIN_ALL_FLUSH_GRACE_MS") do
+  config :fathom, :drain_all_flush_grace_ms, ms
+end
+
+if ms = env_int.("SHARD_SHUTDOWN_MS") do
+  config :fathom, :shard_shutdown_ms, ms
+end
+
+# Default ON (`Fathom.Application.prep_stop/1`), so the off switch has to be reachable.
+case env_bool.("DRAIN_ON_SHUTDOWN") do
+  nil -> :ok
+  v -> config :fathom, :drain_on_shutdown, v
+end
+
 # Periodic durability-flush cadence, ms (SHARD_FLUSH_INTERVAL_MS). The idle (flush+drop+stop)
 # threshold, SHARD_IDLE_MS, is read separately further down and keeps its own default.
 #

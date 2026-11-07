@@ -11,12 +11,20 @@ therefore node-by-node graceful restarts; the S3 lease makes the reroute safe.
 
 ## The clean-shutdown guarantee (measured)
 
-On `SIGTERM` (what `docker stop`, `kill`, systemd, and an orchestrator drain all send), the BEAM runs
-a graceful `init:stop`: the supervision tree terminates in reverse start order, each shard
-coordinator's `terminate` **flushes its shard to S3** (within its `:shard_shutdown_ms` budget,
-default 60 s) and **releases its lease**, and the node heartbeat is cleaned up last. Coordinators
-flush **concurrently** (bounded by the S3 client pool), so shutdown time is dominated by flush
-throughput, not per-shard cost.
+On `SIGTERM` (what `docker stop`, `kill`, systemd, and an orchestrator drain all send) the node shuts
+down in two phases, and the stop grace has to cover **both** (see [Stop-grace arithmetic](#stop-grace-arithmetic)):
+
+1. **`prep_stop` drain** (`Fathom.Shards.drain_all/0`, on by default; `DRAIN_ON_SHUTDOWN=false` skips
+   it). `/health` goes `draining`, the node sleeps `DRAIN_LB_SETTLE_MS` (default 0), then drains
+   every open coordinator — let streams finish, flush, **release the lease**, stop — with
+   `DRAIN_ALL_CONCURRENCY`-wide fan-out inside a `DRAIN_ALL_BUDGET_MS` budget (default 55 s). A
+   coordinator the drain could not finish (`busy`, `timed_out`, `kept_local`) is left alive.
+2. **Supervisor teardown** (`init:stop`): the tree terminates in reverse start order — Edge
+   listeners, then the data plane, then the control plane, then infra. Each coordinator still alive
+   gets `terminate`, which **flushes its shard to S3** within its `SHARD_SHUTDOWN_MS` budget (default
+   60 s) and **releases its lease**; the node heartbeat is cleaned up last. Coordinators flush
+   **concurrently** (bounded by the S3 client pool), so shutdown time is dominated by flush
+   throughput, not per-shard cost.
 
 Verified on the chaos rig (`deploy/chaos/chaos.sh deploy <N>`) — N shards held **open and dirty**
 (idle-drop + periodic flush disabled, so *only* the terminate path can persist them), then SIGTERM,
@@ -35,24 +43,53 @@ path, not the deploy path.
 > These are loopback-MinIO numbers (relative, not prod-absolute). On real S3 the concurrent flush
 > scales with `open_shards / pool_size × RTT`: ~10k shards through the default 200-connection pool is
 > ~50 waves; at a 30 ms region RTT that's a few seconds of S3 time — still far inside the 60 s
-> `:shard_shutdown_ms`. Size the pool (`Fathom.Shard.Storage.S3` `pool_size`) and the budget together
+> `SHARD_SHUTDOWN_MS`. Size the pool (`Fathom.Shard.Storage.S3` `pool_size`) and the budget together
 > for your densest node.
 
-## Sizing `:shard_shutdown_ms`
+## Sizing `SHARD_SHUTDOWN_MS`
 
-`:shard_shutdown_ms` (default 60 s) is each coordinator's budget to **settle + drop-flush** on
-shutdown; `settle_yield_ms` is capped at a third of it. It must cover the worst-case flush of a
-node's open shards. Rule of thumb:
+`SHARD_SHUTDOWN_MS` (default 60 s; env var, read at boot) is each coordinator's budget to **settle +
+drop-flush** when the supervisor tears it down; the settle step is capped at a third of it. It must
+cover the worst-case flush of the shards the drain left behind. Rule of thumb:
 
 ```
-shard_shutdown_ms >= (max_open_shards / s3_pool_size) × p99_flush_ms × safety_factor(2–3)
+SHARD_SHUTDOWN_MS >= (max_open_shards / s3_pool_size) × p99_flush_ms × safety_factor(2–3)
 ```
 
 With the default 60 s and a 200-connection pool, that covers ~10k open shards at a p99 flush well
 into the hundreds of ms. Raise it if you run very dense nodes or slow storage; lower it only if you
-accept SIGKILL-ing stragglers (which lose their unflushed writes). **Also raise the orchestrator's
-kill grace** (`docker stop -t`, `terminationGracePeriodSeconds`, systemd `TimeoutStopSec`) above
-`:shard_shutdown_ms`, or the platform SIGKILLs the node mid-flush and defeats the guarantee.
+accept SIGKILL-ing stragglers (which lose their unflushed writes).
+
+## Stop-grace arithmetic
+
+The orchestrator's kill grace (`docker stop -t`, `terminationGracePeriodSeconds`, systemd
+`TimeoutStopSec`) starts at SIGTERM and ends in a SIGKILL that cuts off whatever is still flushing.
+Setting it to `SHARD_SHUTDOWN_MS` alone (what this runbook used to say) is wrong: since `prep_stop`
+the drain runs **first**, and the supervisor teardown only starts after it. The worst case from
+SIGTERM, phase by phase (every bound read from the code):
+
+| Phase | Worst case | Where it comes from |
+|---|---|---|
+| LB settle | `DRAIN_LB_SETTLE_MS` (default 0) | `Shards.drain_all/1` sleeps it before the fan-out |
+| `drain_all` | `DRAIN_ALL_BUDGET_MS` (default 55 s) | every coordinator's wait is bounded by the budget's deadline |
+| Edge teardown | up to 15 s **per** Bandit listener, ×3 = 45 s (Endpoint, Hrana, health) | ThousandIsland `shutdown_timeout` default 15 s; the three listeners stop one after another |
+| Data plane | `SHARD_SHUTDOWN_MS` (default 60 s) | every straggler coordinator's child `shutdown`, terminated concurrently |
+| Control plane | 30 s | `Directory.Recorder` child `shutdown: 30_000` (its own budget gives up at 25 s) |
+| Infra | 15 s | Oban `shutdown_grace_period` default |
+
+So:
+
+```
+stop grace  >=  DRAIN_LB_SETTLE_MS + DRAIN_ALL_BUDGET_MS + SHARD_SHUTDOWN_MS + 90 s
+```
+
+With the defaults that is 0 + 55 + 60 + 90 = **205 s**. It is a ceiling, not a typical stop: a node
+that drains cleanly (`busy: 0, timed_out: 0`) with idle listeners stops in `DRAIN_LB_SETTLE_MS` plus
+seconds. Size to the ceiling anyway — the failure mode of undershooting is a SIGKILL in the middle
+of a straggler's flush, which loses exactly the unflushed writes this procedure exists to
+protect. With `DRAIN_ON_SHUTDOWN=false` drop the first two terms. If you also run the `rpc
+drain_all` pre-stop step of [`cluster.md`](cluster.md#graceful-drain-rolling-deploy-pre-stop--audit-28),
+note that the `prep_stop` drain after it sleeps `DRAIN_LB_SETTLE_MS` again, so count that term twice.
 
 ## Rolling upgrade — node by node
 
@@ -66,7 +103,7 @@ Do one node at a time; never restart a quorum at once (the survivors absorb each
    also reroute on the restart itself (`proxy_next_upstream`), so this step reduces client-visible
    blips but isn't strictly required — the clean-shutdown flush protects data regardless.
 3. **Restart the node** with the new image (graceful SIGTERM → the flush+release above → start the
-   new version). Give the platform a stop grace ≥ `:shard_shutdown_ms`.
+   new version). Give the platform the stop grace from [Stop-grace arithmetic](#stop-grace-arithmetic) (205 s with the defaults), not just `SHARD_SHUTDOWN_MS`.
 4. **What tenants on that node experience:** their subdomains reroute to a survivor, which
    cold-opens the shard from S3 and acquires the (already-released) lease **immediately** — no TTL
    wait, because the graceful shutdown released it (contrast a crash, which waits out the lease TTL).

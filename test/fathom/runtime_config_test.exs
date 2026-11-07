@@ -431,4 +431,56 @@ defmodule Fathom.RuntimeConfigTest do
     assert Keyword.fetch!(fathom_config(%{"ALLOW_LOCAL_STORAGE" => "true"}), :allow_local_storage)
     refute Keyword.has_key?(fathom_config(%{"ALLOW_LOCAL_STORAGE" => nil}), :allow_local_storage)
   end
+
+  # Expert review 2026-11-07 #58. Symptom: the runbooks told operators to set `:drain_lb_settle_ms`,
+  # `:shard_shutdown_ms`, `:drain_all_budget_ms` ..., but each was read only through
+  # `Application.get_env` — no env var mapped to any, and a release cannot edit `config/*.exs`, so on
+  # a deployed node none could be set (and #46's `:drain_lb_settle_ms` mitigation was unreachable).
+  # Invariant: each is reachable from the environment; unset leaves the key unwritten so the reading
+  # module's own default stands.
+  describe "node shutdown / drain knobs (#58)" do
+    for {var, key, value} <- [
+          {"DRAIN_LB_SETTLE_MS", :drain_lb_settle_ms, 1500},
+          {"DRAIN_ALL_BUDGET_MS", :drain_all_budget_ms, 120_000},
+          {"DRAIN_ALL_CONCURRENCY", :drain_all_concurrency, 32},
+          {"DRAIN_ALL_FLUSH_GRACE_MS", :drain_all_flush_grace_ms, 8000},
+          {"SHARD_SHUTDOWN_MS", :shard_shutdown_ms, 90_000}
+        ] do
+      test "#{var} sets #{inspect(key)}; unset leaves it unwritten" do
+        assert Keyword.fetch!(fathom_config(%{unquote(var) => "#{unquote(value)}"}), unquote(key)) ==
+                 unquote(value)
+
+        refute Keyword.has_key?(fathom_config(%{unquote(var) => nil}), unquote(key))
+      end
+
+      test "#{var}: a non-integer value refuses to boot, naming the variable" do
+        assert_raise RuntimeError, ~r/#{unquote(var)} must be an integer/, fn ->
+          fathom_config(%{unquote(var) => "30s"})
+        end
+      end
+    end
+
+    test "0 is a VALUE for the settle sleep and the flush grace (env_nonneg_int, not env_int)" do
+      for {var, key} <- [
+            {"DRAIN_LB_SETTLE_MS", :drain_lb_settle_ms},
+            {"DRAIN_ALL_FLUSH_GRACE_MS", :drain_all_flush_grace_ms}
+          ] do
+        assert Keyword.fetch!(fathom_config(%{var => "0"}), key) == 0
+      end
+    end
+
+    test "DRAIN_ON_SHUTDOWN is tri-state: false|0 turns the prep_stop drain off, true on, unset says nothing" do
+      for v <- ["false", "0"],
+          do:
+            assert(
+              Keyword.fetch!(fathom_config(%{"DRAIN_ON_SHUTDOWN" => v}), :drain_on_shutdown) ==
+                false
+            )
+
+      assert Keyword.fetch!(fathom_config(%{"DRAIN_ON_SHUTDOWN" => "true"}), :drain_on_shutdown) ==
+               true
+
+      refute Keyword.has_key?(fathom_config(%{"DRAIN_ON_SHUTDOWN" => nil}), :drain_on_shutdown)
+    end
+  end
 end
