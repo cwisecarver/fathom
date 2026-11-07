@@ -41,6 +41,20 @@ defmodule Fathom.Test.FaultyStorage do
     end
   end
 
+  # `:faulty_after_flush` — a 1-arity fun handed the shard id once a (6-arity) flush has COMPLETED,
+  # still inside the caller's process and before its result is returned (the sibling of
+  # `:faulty_after_pull`). It models an event landing DURING the real request, e.g. a heartbeat lapse
+  # while a PUT is on the wire, which `:faulty_before {:flush, _}` cannot: the coordinator's own
+  # pre-PUT `recheck_before_put/1` runs inside the backend call, so a lapse injected BEFORE the call
+  # is caught by it and aborts the flush instead of being merged (expert review 2026-11-07 #12 — the
+  # mid-flush lapse that survives is the one that lands after that recheck).
+  defp run_after_flush(shard_id) do
+    case Application.get_env(:fathom, :faulty_after_flush) do
+      fun when is_function(fun, 1) -> fun.(shard_id)
+      _ -> :ok
+    end
+  end
+
   # --- lock-etag semantics (expert review 2026-08-01 #9) -------------------------------------
   #
   # `Local` identifies a lock by `{owner, epoch}` only. The S3 backend also carries
@@ -349,7 +363,9 @@ defmodule Fathom.Test.FaultyStorage do
         Process.sleep(:infinity)
 
       true ->
-        Local.flush(shard_id, local_path, expected_etag, position, lineage, opts)
+        result = Local.flush(shard_id, local_path, expected_etag, position, lineage, opts)
+        run_after_flush(shard_id)
+        result
     end
   end
 

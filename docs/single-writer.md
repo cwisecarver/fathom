@@ -192,6 +192,14 @@ avoids). Before a flush it calls `Heartbeat.valid_for_write?(acquire_gen)`:
   remapped shard never double-writes.
 - If the **heartbeat process is down** entirely, the coordinator degrades to the **legacy per-shard
   renew fence** (renew the lease on a timer, self-fence on `:superseded`).
+- **A lapse that lands while a flush is in flight is re-armed when that flush ends.** The proactive
+  lapse revalidation (`:revalidate_lapse`) never runs concurrently with a flush — it would race the
+  flush task's lease merge (a stale lock etag merged over a fresh one reads as a steal) — so it skips
+  while `flush_task != nil`. A lapse that landed after the flush's own fence ran leaves the flush
+  merging its start-of-flush `acquire_gen`, so the flush's completion (success, failure or crash)
+  re-arms the revalidation when `Heartbeat.valid_for_write?(acquire_gen)` still reads `:revalidate`
+  (expert review 2026-11-07 #12). Without it every commit answered `:ownership_unconfirmed` until the
+  next flush's fence — up to a whole flush interval — on a shard that never lost ownership.
 
 The idle flush also re-checks the lease first and self-fences on a lost lease — so a lease lost
 between the last check and idle never produces a clobbering write.

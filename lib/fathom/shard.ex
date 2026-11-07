@@ -2114,63 +2114,14 @@ defmodule Fathom.Shard do
     # 412-reconcile) all ran off-process (expert review 2026-07-18 #18), so this handler does ZERO
     # Storage S3 I/O and never blocks the coordinator mailbox: the exact stall #27 removed, now
     # covering the legacy-mode renew PUT too. Only local state moves here.
-    case result do
-      # Fence confirmed ownership off-process (#18): merge the refreshed lease/gen, then apply the
-      # flush verdict below. All its Storage S3 I/O ran in the task; only local state moves here
-      # (write_etag_sidecar is local disk, FlushWatermark.record a local ETS insert).
-      {:fenced, flush_result, updates} ->
-        # Ownership was confirmed off-process — lift any write-fence and reset the not-valid clock
-        # (expert review #3). A dirty shard keeps flushing each interval, so a healed partition
-        # clears the fence here on its next flush.
-        state = clear_write_fence(Map.merge(state, updates))
-
-        # The verdict fold is SHARED with the terminate path's settle_flush_task/1
-        # (expert review 2026-08-01 #3): the two used to be separate `case`s and drifted —
-        # settle matched a reply shape this task stopped producing at f8ecf63, so every
-        # graceful stop silently discarded the flush result. One function, two callers.
-        case apply_flush_verdict(state, flush_result) do
-          {:flushed, state} ->
-            {:noreply, settle_flushed_and_reschedule(state)}
-
-          # Still dirty — re-kick for any flush_now waiter (else it waits a whole flush interval).
-          {:dirty, state} ->
-            {:noreply, settle_flushed_and_reschedule(state)}
-
-          # 412 AND the task's lock re-check found the lock SUPERSEDED — a real steal. Never
-          # clobber the new owner: self-fence (stop without flushing). Fail any flush_now waiters.
-          {:superseded, state} ->
-            {:stop, {:shutdown, :lease_lost},
-             settle_waiters(%{state | lease_lost: true}, {:error, :lease_lost})}
-
-          {{:error, reason}, state} ->
-            {:noreply,
-             schedule_flush_after_failure(settle_waiters(state, {:error, reason}), reason)}
-        end
-
-      # The pre-flush fence found a real steal (lock superseded) — self-fence, never clobber the new
-      # owner (a distinct cause from the 412-reconcile's :superseded above).
-      :fence_superseded ->
-        Logger.error("shard #{state.id}: lease superseded during durability flush; self-fencing")
-
-        {:stop, {:shutdown, :lease_lost},
-         settle_waiters(%{state | lease_lost: true}, {:error, :lease_lost})}
-
-      # Ownership unconfirmed (transient store error / heartbeat not valid): keep dirty, retry next
-      # interval, feeding the RPO-alerting counter (#8) — the loss window grows like a PUT failure.
-      # Ownership unconfirmed (a transient store error, or the heartbeat not valid). Settle any
-      # flush_now waiter with an explicit error (expert review 2026-08-01 #32): this branch
-      # never called settle_waiters at all, so during a storage partition a caller blocked the
-      # full 60s @flush_now_timeout instead of getting a retryable answer immediately.
-      :fence_skip ->
-        {:noreply,
-         schedule_flush_after_failure(
-           settle_waiters(
-             record_flush_failure(note_not_valid(state), :ownership_unconfirmed),
-             {:error, :ownership_unconfirmed}
-           ),
-           :ownership_unconfirmed
-         )}
-    end
+    # A LAPSE THAT LANDED MID-FLUSH IS RE-ARMED HERE (expert review 2026-11-07 #12). The
+    # `:revalidate_lapse` clause skips while a flush is in flight (mutual exclusion — see there) and
+    # its old justification, "the flush runs its OWN `Fence.check`", is only true when the lapse
+    # preceded that check; one that landed after it leaves this reply merging the flush-start
+    # `acquire_gen` over a heartbeat that has moved on, so every commit read `:revalidate` →
+    # `:ownership_unconfirmed` until the NEXT flush's fence (up to a whole flush interval). Every
+    # reply shape re-arms, including failures: a failed flush must not be what keeps the gate stale.
+    result |> apply_flush_reply(state) |> rearm_lapse_after_flush()
   end
 
   # A flush attempt handed the backend this md5 (the task's `:pre_put` hook, see
@@ -2266,7 +2217,7 @@ defmodule Fathom.Shard do
       release_flush_slot(record_flush_failure(%{state | flush_task: nil}, {:task_crash, reason}))
 
     # Dirty (the task never landed) — re-kick so a flush_now waiter retries rather than hangs.
-    {:noreply, settle_flushed_and_reschedule(state)}
+    rearm_lapse_after_flush({:noreply, settle_flushed_and_reschedule(state)})
   end
 
   # THE FLUSH DEADLINE (expert review 2026-11-04 #3, carried 2026-10-29 #25). A PUT whose body
@@ -2544,8 +2495,12 @@ defmodule Fathom.Shard do
   # local WITHOUT flushing. That is exactly the failure expert review 2026-08-24 #8 paid for once
   # already, and the reason `:renew_lease` grew the same guard.
   #
-  # Skipping loses nothing: an in-flight flush is running its OWN `Fence.check` right now and
-  # applies the same three verdicts. `lapse_revalidate_pending` is cleared so a later lapse re-arms.
+  # Skipping is correct only when the lapse PRECEDED the flush's `Fence.check`. A lapse that lands
+  # after that check leaves the flush merging its flush-start `acquire_gen` over a heartbeat that has
+  # moved on, so the flush's completion RE-ARMS (`rearm_lapse_after_flush/1`, expert review
+  # 2026-11-07 #12) — the skip is mutual exclusion, not "the flush covers it". The check itself must
+  # NOT run concurrently with the flush (see above). `lapse_revalidate_pending` is cleared so the
+  # completion's re-arm (or a later lapse) can arm a new episode.
   #
   # `renew_task` is in the guard for locality, not because it can co-occur: `schedule_renew/1` is
   # armed only at open when `acquire_gen == nil`, and this handler is reachable only from the
@@ -2873,6 +2828,68 @@ defmodule Fathom.Shard do
                  flush_pending_gen: pending_gen
              }}
         end
+    end
+  end
+
+  # The flush task's resolved verdict, applied to the coordinator (the body of the reply handler
+  # above, split out so every shape funnels through one re-arm).
+  defp apply_flush_reply(result, state) do
+    case result do
+      # Fence confirmed ownership off-process (#18): merge the refreshed lease/gen, then apply the
+      # flush verdict below. All its Storage S3 I/O ran in the task; only local state moves here
+      # (write_etag_sidecar is local disk, FlushWatermark.record a local ETS insert).
+      {:fenced, flush_result, updates} ->
+        # Ownership was confirmed off-process — lift any write-fence and reset the not-valid clock
+        # (expert review #3). A dirty shard keeps flushing each interval, so a healed partition
+        # clears the fence here on its next flush.
+        state = clear_write_fence(Map.merge(state, updates))
+
+        # The verdict fold is SHARED with the terminate path's settle_flush_task/1
+        # (expert review 2026-08-01 #3): the two used to be separate `case`s and drifted —
+        # settle matched a reply shape this task stopped producing at f8ecf63, so every
+        # graceful stop silently discarded the flush result. One function, two callers.
+        case apply_flush_verdict(state, flush_result) do
+          {:flushed, state} ->
+            {:noreply, settle_flushed_and_reschedule(state)}
+
+          # Still dirty — re-kick for any flush_now waiter (else it waits a whole flush interval).
+          {:dirty, state} ->
+            {:noreply, settle_flushed_and_reschedule(state)}
+
+          # 412 AND the task's lock re-check found the lock SUPERSEDED — a real steal. Never
+          # clobber the new owner: self-fence (stop without flushing). Fail any flush_now waiters.
+          {:superseded, state} ->
+            {:stop, {:shutdown, :lease_lost},
+             settle_waiters(%{state | lease_lost: true}, {:error, :lease_lost})}
+
+          {{:error, reason}, state} ->
+            {:noreply,
+             schedule_flush_after_failure(settle_waiters(state, {:error, reason}), reason)}
+        end
+
+      # The pre-flush fence found a real steal (lock superseded) — self-fence, never clobber the new
+      # owner (a distinct cause from the 412-reconcile's :superseded above).
+      :fence_superseded ->
+        Logger.error("shard #{state.id}: lease superseded during durability flush; self-fencing")
+
+        {:stop, {:shutdown, :lease_lost},
+         settle_waiters(%{state | lease_lost: true}, {:error, :lease_lost})}
+
+      # Ownership unconfirmed (transient store error / heartbeat not valid): keep dirty, retry next
+      # interval, feeding the RPO-alerting counter (#8) — the loss window grows like a PUT failure.
+      # Ownership unconfirmed (a transient store error, or the heartbeat not valid). Settle any
+      # flush_now waiter with an explicit error (expert review 2026-08-01 #32): this branch
+      # never called settle_waiters at all, so during a storage partition a caller blocked the
+      # full 60s @flush_now_timeout instead of getting a retryable answer immediately.
+      :fence_skip ->
+        {:noreply,
+         schedule_flush_after_failure(
+           settle_waiters(
+             record_flush_failure(note_not_valid(state), :ownership_unconfirmed),
+             {:error, :ownership_unconfirmed}
+           ),
+           :ownership_unconfirmed
+         )}
     end
   end
 
@@ -5532,7 +5549,7 @@ defmodule Fathom.Shard do
         do: settled,
         else: schedule_flush_after_failure(settled, {:flush_deadline, flush_deadline_ms()})
 
-    {:noreply, settled}
+    rearm_lapse_after_flush({:noreply, settled})
   end
 
   defp gate_full(%{flush_waiters: []} = state, backoff), do: backoff.(state)
@@ -7013,6 +7030,12 @@ defmodule Fathom.Shard do
   end
 
   defp rearm_lapse_if_stale(state), do: state
+
+  # The flush task ended (any shape): a lapse that arrived while it ran was skipped by
+  # `:revalidate_lapse` and nothing else re-arms it on a shard whose flush fence already ran. Only
+  # `{:noreply, _}` re-arms; a `:stop` has no later episode to close.
+  defp rearm_lapse_after_flush({:noreply, state}), do: {:noreply, rearm_lapse_if_stale(state)}
+  defp rearm_lapse_after_flush(stop), do: stop
 
   # Renew well inside the TTL (every third) so a couple of transient failures
   # don't lapse the lease.
