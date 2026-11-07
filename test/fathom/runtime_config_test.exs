@@ -573,4 +573,33 @@ defmodule Fathom.RuntimeConfigTest do
       refute Keyword.has_key?(fathom_config(%{"DRAIN_ON_SHUTDOWN" => nil}), :drain_on_shutdown)
     end
   end
+
+  # Expert review 2026-11-07 #41: the console's connect target was settable only by compile-time
+  # config surgery, so a release could not point it anywhere.
+  describe "QUERY_CONSOLE_ENDPOINT (#41)" do
+    test "unset or blank says nothing (the default follows the Hrana bind); a URL sets it" do
+      refute Keyword.has_key?(
+               prod_config(%{"QUERY_CONSOLE_ENDPOINT" => nil}),
+               :query_console_endpoint
+             )
+
+      refute Keyword.has_key?(
+               prod_config(%{"QUERY_CONSOLE_ENDPOINT" => ""}),
+               :query_console_endpoint
+             )
+
+      assert Keyword.fetch!(
+               prod_config(%{"QUERY_CONSOLE_ENDPOINT" => "http://10.0.0.7:8080/"}),
+               :query_console_endpoint
+             ) == "http://10.0.0.7:8080"
+    end
+
+    test "a value that is not an http(s) URL with a host fails the boot" do
+      for bad <- ["10.0.0.7:8080", "ftp://10.0.0.7", "http://", "not a url"] do
+        assert_raise RuntimeError, ~r/QUERY_CONSOLE_ENDPOINT/, fn ->
+          prod_config(%{"QUERY_CONSOLE_ENDPOINT" => bad})
+        end
+      end
+    end
+  end
 end

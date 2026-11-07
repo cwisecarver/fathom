@@ -1632,6 +1632,27 @@ if config_env() == :prod do
     end
   end
 
+  # Where the admin query console connects (expert review 2026-11-07 #41). Unset (the default) it
+  # follows the Hrana listener's bound interface — `Fathom.QueryConsole.default_endpoint/0` — which
+  # is right for a pinned `HRANA_BIND_IP`; set this only when the console must reach the listener
+  # some other way (a different local address, a TLS terminator in front). Only the CONNECT target
+  # changes: the console still sends the real `Host`, so routing, auth and admission still apply.
+  # A blank value is unset (compose passes `X: "${X:-}"`).
+  case System.get_env("QUERY_CONSOLE_ENDPOINT") do
+    blank when blank in [nil, ""] ->
+      :ok
+
+    url ->
+      case URI.parse(url) do
+        %URI{scheme: scheme, host: host}
+        when scheme in ["http", "https"] and is_binary(host) and host != "" ->
+          config :fathom, :query_console_endpoint, String.trim_trailing(url, "/")
+
+        _ ->
+          raise "QUERY_CONSOLE_ENDPOINT must be an http(s) URL with a host: #{inspect(url)}"
+      end
+  end
+
   # In-app bearer-token auth on the Hrana data path (Fathom.HranaAuth). Off by default —
   # the network trust boundary above stands alone; set HRANA_AUTH=required to make every
   # stream open present a per-shard token (needed if 8080 is ever reachable beyond the LB,

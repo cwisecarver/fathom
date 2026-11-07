@@ -214,12 +214,35 @@ defmodule Fathom.QueryConsole do
 
   # --- addressing ----------------------------------------------------------
 
-  defp default_endpoint do
+  # `@doc false` public so a test can pin it (the suite always passes `endpoint:` explicitly, which
+  # is why it never saw this). The console deliberately goes through the Hrana listener over the
+  # network stack — Host routing, auth, admission, as its moduledoc requires — so only the CONNECT
+  # target is chosen here; the `Host` header is unchanged.
+  #
+  # The connect target follows the interface the listener is BOUND to (expert review 2026-11-07
+  # #41). It was hard-coded to `127.0.0.1`, but `HRANA_BIND_IP=10.0.0.7` — the documented hardening
+  # (docs/deploy-cluster.md, the boot warning) — binds ONLY that address, so nothing listens on
+  # loopback and every console run was `{:error, %{code: "TRANSPORT"}}`: the per-node smoke test
+  # and the operator's tenant-SQL tool failed silently in the recommended posture. A wildcard bind
+  # (the default) is reachable on loopback, so that stays; `:query_console_endpoint`
+  # (`QUERY_CONSOLE_ENDPOINT`) overrides the whole URL.
+  @doc false
+  @spec default_endpoint() :: String.t()
+  def default_endpoint do
     case Application.get_env(:fathom, :query_console_endpoint) do
       url when is_binary(url) -> url
-      _ -> "http://127.0.0.1:#{Application.get_env(:fathom, :hrana_port, 8080)}"
+      _ -> "http://#{connect_host(Fathom.Application.hrana_bind_ip())}:#{hrana_port()}"
     end
   end
+
+  defp hrana_port, do: Application.get_env(:fathom, :hrana_port, 8080)
+
+  defp connect_host({0, 0, 0, 0}), do: "127.0.0.1"
+  defp connect_host({0, 0, 0, 0, 0, 0, 0, 0}), do: "[::1]"
+  defp connect_host(ip) when tuple_size(ip) == 4, do: ip |> :inet.ntoa() |> to_string()
+
+  defp connect_host(ip) when tuple_size(ip) == 8,
+    do: "[" <> (ip |> :inet.ntoa() |> to_string()) <> "]"
 
   defp host_for(shard_id) do
     base =
