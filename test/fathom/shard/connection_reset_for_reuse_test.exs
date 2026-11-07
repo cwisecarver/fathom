@@ -5,7 +5,9 @@ defmodule Fathom.Shard.ConnectionResetForReuseTest do
   never crosses shards — but an open transaction or a toggled pragma left by the previous stream
   must not carry into the next one. The transaction rollback is the load-bearing guard.
   """
-  use ExUnit.Case, async: true
+  # Not async: this module sets node-global Application env (:tenant_pragma_allow (the tenant-pragma allow-list)), which every concurrently
+  # running module would observe (expert review 2026-11-07 #87; `Fathom.TestHygieneTest` enforces it).
+  use ExUnit.Case, async: false
 
   alias Exqlite.Sqlite3
   alias Fathom.Shard.Connection

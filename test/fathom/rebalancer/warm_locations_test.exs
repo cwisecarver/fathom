@@ -1,6 +1,8 @@
 defmodule Fathom.Rebalancer.WarmLocationsTest do
   @moduledoc "The warm-location signal (affinity-aware target input, Phase 2 C)."
-  use Fathom.DataCase, async: true
+  # Not async: this module sets node-global Application env (:rebalancer_fleet_sweep_odds), which every concurrently
+  # running module would observe (expert review 2026-11-07 #87; `Fathom.TestHygieneTest` enforces it).
+  use Fathom.DataCase, async: false
 
   alias Fathom.Rebalancer.{WarmLocation, WarmLocations}
 

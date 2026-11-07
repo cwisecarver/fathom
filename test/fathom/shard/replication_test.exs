@@ -11,7 +11,9 @@ defmodule Fathom.Shard.ReplicationTest do
   wrong bytes does not raise, it produces a SQLite file that looks fine until it is promoted and the
   primary that could have corrected it is gone.
   """
-  use ExUnit.Case, async: true
+  # Not async: this module sets node-global Application env (:replication_ordinal_wire), which every concurrently
+  # running module would observe (expert review 2026-11-07 #87; `Fathom.TestHygieneTest` enforces it).
+  use ExUnit.Case, async: false
 
   alias Fathom.Shard.Replication.FollowerLog
   alias Fathom.Shard.Replication.Protocol

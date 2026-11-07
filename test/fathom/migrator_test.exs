@@ -1,5 +1,7 @@
 defmodule Fathom.MigratorTest do
-  use Fathom.DataCase, async: true
+  # Not async: this module sets node-global Application env (:fork_from_template and :template_shard_id), which every concurrently
+  # running module would observe (expert review 2026-11-07 #87; `Fathom.TestHygieneTest` enforces it).
+  use Fathom.DataCase, async: false
 
   # These build fixtures by releasing versions with a capture template configured, which is
   # exactly the configuration `Migrator.release/6` warns about (novel tenants born empty).
