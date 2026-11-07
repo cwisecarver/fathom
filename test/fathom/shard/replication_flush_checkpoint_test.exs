@@ -105,6 +105,36 @@ defmodule Fathom.Shard.ReplicationFlushCheckpointTest do
     end
   end
 
+  # A commit replies at the QUORUM's ack (Q=2 of 3), so right after `write!/2` the third follower can
+  # still be owed the last frames, and `covers` then answers false (the laggard rule: a connected
+  # follower still owed frames defers the checkpoint, `:skipped_not_covered`). That is the design —
+  # "on a steadily written shard this checkpoint rarely runs" — but a test that expects the PASSIVE
+  # to RUN must first wait for the real condition: every follower holds the newest extent. A
+  # straggler a skipped push left short is brought current by the catch-up timer, well inside the
+  # wait. Without this the "gate at 0" test failed 3 of 60 copies (seed 21493 in a full gate).
+  defp await_all_current!(%{id: id}) do
+    [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
+
+    Fathom.Test.Await.until(
+      fn ->
+        st = :sys.get_state(session)
+
+        case st.seen do
+          [{g, s, e} | _] ->
+            st.inflight == %{} and map_size(st.followers) == 3 and
+              Enum.all?(
+                Map.values(st.followers),
+                &match?(%{wal_gen: ^g, salt1: ^s, offset: o} when o >= e, &1)
+              )
+
+          _ ->
+            false
+        end
+      end,
+      "every follower current after the writes"
+    )
+  end
+
   defp backfilled(s) do
     {:ok, %{rows: [[_busy, log, ckpt]]}} =
       Connection.query(s.flush, "PRAGMA wal_checkpoint(PASSIVE)", [])
@@ -127,6 +157,7 @@ defmodule Fathom.Shard.ReplicationFlushCheckpointTest do
     write!(s, 15)
     {:ok, %{commit_extent: e}} = Wal.read(s.wal)
     assert e >= 20 * @frame, "precondition: past the size gate"
+    await_all_current!(s)
 
     assert {:ok, _} = Session.checkpoint_after_snapshot(s.flush, ctx.id)
     assert_receive {:flush_checkpoint, %{result: :ran, replicated: true}}
@@ -138,6 +169,7 @@ defmodule Fathom.Shard.ReplicationFlushCheckpointTest do
     Application.put_env(:fathom, :replication_flush_checkpoint_min_bytes, 0)
     s = replicated_shard!(ctx)
     write!(s, 4)
+    await_all_current!(s)
 
     assert {:ok, _} = Session.checkpoint_after_snapshot(s.flush, ctx.id)
     assert_receive {:flush_checkpoint, %{result: :ran, replicated: true}}
