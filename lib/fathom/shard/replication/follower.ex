@@ -483,6 +483,7 @@ defmodule Fathom.Shard.Replication.Follower do
   defp do_forget(name, shard_id) do
     :ets.delete(table(name), shard_id)
     :ets.delete(touches(name), shard_id)
+    :ets.delete(locks(name), {:seed_refused, shard_id})
     Fathom.FS.rm(db_path(name, shard_id))
     Fathom.FS.rm(wal_path(name, shard_id))
     # And the torn marker (expert review 2026-08-20 #11b), or a promoted-then-re-followed shard
@@ -821,6 +822,7 @@ defmodule Fathom.Shard.Replication.Follower do
   def handle_info(:reap_seed_temps, state) do
     reap_seed_temp_dir(state.name)
     schedule_seed_temp_reap()
+    prune_seed_refusals(state.name)
     {:noreply, state}
   end
 
@@ -1814,20 +1816,129 @@ defmodule Fathom.Shard.Replication.Follower do
     incoming = (b.db_size || 0) + (b.wal_size || 0)
     reserve(name, b.shard_id, incoming)
 
-    ok? =
-      case disk_free(name) do
-        # Cannot read the volume — fail OPEN (as the removed WarmFollower did). Refusing to
-        # replicate because a stat failed would turn an observability gap into a durability one.
-        :error ->
-          true
-
-        {:ok, free, free_inodes} ->
-          free - reserved_bytes(name) >= disk_free_floor_bytes() and inodes_ok?(free_inodes)
-      end
+    ok? = headroom?(name)
 
     unless ok?, do: release_reservation(name, b.shard_id)
     ok?
   end
+
+  # Whether a seed of `incoming` bytes would clear the floor right now, from the cached reading and
+  # every live reservation (see `reserve_headroom?/2`).
+  defp headroom?(name) do
+    case disk_free(name) do
+      # Cannot read the volume — fail OPEN (as the removed WarmFollower did). Refusing to
+      # replicate because a stat failed would turn an observability gap into a durability one.
+      :error ->
+        true
+
+      {:ok, free, free_inodes} ->
+        free - reserved_bytes(name) >= disk_free_floor_bytes() and inodes_ok?(free_inodes)
+    end
+  end
+
+  # A FOLLOWER UNDER ITS FLOOR REFUSES THE SEED REQUEST, NOT THE SEED (expert review 2026-11-07 #43).
+  #
+  # The refusal used to surface only at `seed_end`: every push for a torn or unknown replica was
+  # answered `:unknown_shard` (the seed request, see `request_seed/4`), the primary's
+  # `Session.start_seeds/3` pinned a snapshot and streamed `seed_begin` + EVERY chunk + `seed_end`,
+  # this module dropped the begin (`refuse_seed/4`) so each chunk was discarded, and only `seed_end`
+  # answered `:internal`. The next commit asked again. "A refused seed is simply re-seeded later" was
+  # the documented cost of back-pressure, but the cost was a whole database per COMMIT per shard per
+  # follower, on the node that is short of disk (the 2026-10-03 seed-storm shape).
+  #
+  # So the answer to "I hold nothing you can build on" depends on whether a seed would be taken:
+  #
+  #   * the volume is below the floor (bytes or inodes, the cached reading `disk_free/1` serves —
+  #     live reservations are NOT subtracted here: that fold is O(lock table) and this runs once per
+  #     push of a shard we hold nothing of): `:internal`, a settled reject that starts no seed
+  #     (`Session`'s `@settled_rejects` has it, its seed `needs` filter does not);
+  #   * a seed of THIS shard was refused moments ago (`refuse_seed/4`, remembered for
+  #     `:replication_seed_refusal_ms`): the same `:internal`. This is the half the floor alone cannot
+  #     catch: a seed refused for its SIZE (headroom for a small one, not this one) passes the check
+  #     above on every push and would be streamed once per commit. Now it is streamed at most once per
+  #     window;
+  #   * otherwise `:unknown_shard`, as before.
+  #
+  # WHY IT IS HERE AND NOT IN `Session` (the review's optional "per-follower seed backoff"): this is
+  # the side that knows WHY it refused. The primary only ever sees `:internal`, which it also gets
+  # for causes that should be retried at once (`replica_busy`, a failed install), so a backoff on
+  # `:internal` would turn a transient refusal into seconds of lost quorum for a shard that needs
+  # this follower. A follower under its floor still ACCEPTS appends to replicas it holds: this
+  # changes only the answer to a request for a seed it would refuse.
+  defp seed_request_reject(name, shard_id, expected) do
+    if seed_refusal_remembered?(name, shard_id) or below_floor?(name) do
+      :telemetry.execute([:fathom, :replication, :disk_pressure], %{count: 1}, %{
+        shard_id: shard_id
+      })
+
+      case Fathom.LogLimiter.check(:follower_seed_refused, 1, 30_000) do
+        :suppress ->
+          :ok
+
+        _log ->
+          Logger.warning(
+            "replication follower REFUSING seeds of #{shard_id} and every other shard it holds " <>
+              "nothing of: the replica volume (#{dir(name)}) is below its free-space floor, or a " <>
+              "seed of this shard was just refused for its size. Primaries are answered a settled " <>
+              "`:internal`, not a seed request. Free space on the replica volume, or give " <>
+              "REPLICATION_DIR its own volume. (Logged once per 30 s.)"
+          )
+      end
+
+      Protocol.encode_reject(shard_id, :internal, expected)
+    else
+      Protocol.encode_reject(shard_id, :unknown_shard, expected)
+    end
+  end
+
+  defp below_floor?(name) do
+    case disk_free(name) do
+      :error -> false
+      {:ok, free, free_inodes} -> free < disk_free_floor_bytes() or not inodes_ok?(free_inodes)
+    end
+  end
+
+  @default_seed_refusal_ms 30_000
+
+  defp remember_seed_refusal(name, shard_id) do
+    until = System.monotonic_time(:millisecond) + seed_refusal_ms()
+    :ets.insert(locks(name), {{:seed_refused, shard_id}, until})
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp seed_refusal_remembered?(name, shard_id) do
+    tab = locks(name)
+
+    case :ets.lookup(tab, {:seed_refused, shard_id}) do
+      [{key, until}] ->
+        if until > System.monotonic_time(:millisecond) do
+          true
+        else
+          :ets.delete_object(tab, {key, until})
+          false
+        end
+
+      [] ->
+        false
+    end
+  rescue
+    ArgumentError -> false
+  end
+
+  # Expired memories of shards that never pushed again (a lookup deletes only what it reads).
+  defp prune_seed_refusals(name) do
+    now = System.monotonic_time(:millisecond)
+
+    :ets.select_delete(locks(name), [
+      {{{:seed_refused, :_}, :"$1"}, [{:"=<", :"$1", now}], [true]}
+    ])
+  rescue
+    ArgumentError -> 0
+  end
+
+  defp seed_refusal_ms,
+    do: Application.get_env(:fathom, :replication_seed_refusal_ms, @default_seed_refusal_ms)
 
   # Reservation rows live in the lock table under `{:reserved, shard_id, owner}` keys (a tuple, so
   # they can never collide with a binary shard id's lock row); the disk-info cache under
@@ -2049,13 +2160,17 @@ defmodule Fathom.Shard.Replication.Follower do
       "replication follower REFUSING to seed #{b.shard_id}: the replica volume (#{dir(name)}) is " <>
         "below its free-space floor (bytes or inodes). That shard's RPO stays at its stored object — the pre-A2 " <>
         "behaviour — which is correct; a full volume would instead break THIS node's own tenants, " <>
-        "whose flushes and cold-open pulls all need the same disk. Raise " <>
-        "REPLICATION_DISK_FREE_FLOOR_BYTES, give REPLICATION_DIR its own volume, or add space."
+        "whose flushes and cold-open pulls all need the same disk. Free space on it, or give " <>
+        "REPLICATION_DIR its own volume (the floor is the :replication_disk_free_floor_bytes app " <>
+        "env, default 1 GiB; no env var sets it)."
     )
 
     :telemetry.execute([:fathom, :replication, :disk_pressure], %{count: 1}, %{
       shard_id: b.shard_id
     })
+
+    # A seed refused for its SIZE is not streamed again on every commit: see `seed_request_reject/3`.
+    if not pull?, do: remember_seed_refusal(name, b.shard_id)
 
     refused(seeds, name, b, :disk_floor, pull?)
   end
@@ -3432,6 +3547,9 @@ defmodule Fathom.Shard.Replication.Follower do
     prev = state_of(name, push.shard_id)
 
     case FollowerLog.decide(prev, push) do
+      {:reject, :unknown_shard, expected} ->
+        seed_request_reject(name, push.shard_id, expected)
+
       {:reject, reason, expected} ->
         Protocol.encode_reject(push.shard_id, reason, expected)
 
@@ -3526,7 +3644,7 @@ defmodule Fathom.Shard.Replication.Follower do
         lineage: decided.lineage
     })
 
-    Protocol.encode_reject(push.shard_id, :unknown_shard, 0)
+    seed_request_reject(name, push.shard_id, 0)
   end
 
   # Absorb our own WAL into our own `.db` before the reset discards it.
@@ -3978,7 +4096,7 @@ defmodule Fathom.Shard.Replication.Follower do
         do_apply_write(name, push, new_state, :append, path, stat)
 
       :not_followed ->
-        Protocol.encode_reject(push.shard_id, :unknown_shard, 0)
+        seed_request_reject(name, push.shard_id, 0)
 
       :wal_missing ->
         Logger.warning(
@@ -3991,7 +4109,7 @@ defmodule Fathom.Shard.Replication.Follower do
           prev -> put_state(name, push.shard_id, %{prev | torn: true})
         end
 
-        Protocol.encode_reject(push.shard_id, :unknown_shard, 0)
+        seed_request_reject(name, push.shard_id, 0)
     end
   end
 
