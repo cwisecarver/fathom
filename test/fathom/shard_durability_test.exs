@@ -781,14 +781,19 @@ defmodule Fathom.ShardDurabilityTest do
     test_pid = self()
 
     # Block the flush's PUT so the flush task stays in flight and the flush_now waiter stays pending.
-    blocker = fn ->
-      send(test_pid, :flush_started)
+    # Scoped to THIS shard (see the `:renew_lease` test): `:faulty_before` is global.
+    blocker = fn
+      ^shard ->
+        send(test_pid, :flush_started)
 
-      receive do
-        :release -> :ok
-      after
-        10_000 -> :ok
-      end
+        receive do
+          :release -> :ok
+        after
+          10_000 -> :ok
+        end
+
+      _other ->
+        :ok
     end
 
     Application.put_env(:fathom, :faulty_before, {:flush, blocker})
@@ -901,14 +906,23 @@ defmodule Fathom.ShardDurabilityTest do
 
     test_pid = self()
 
-    blocker = fn ->
-      send(test_pid, :flush_started)
+    # Scoped to THIS shard. `:faulty_before` is global Application env and coordinators from
+    # earlier tests are still flushing through `FaultyStorage`, so an unscoped blocker reported
+    # ANOTHER shard's flush as `:flush_started` while this shard's own flush had not begun — the
+    # tick below then found `flush_task == nil`, started a legitimate renew, and the assertion
+    # failed (seed 651515).
+    blocker = fn
+      ^shard ->
+        send(test_pid, :flush_started)
 
-      receive do
-        :release -> :ok
-      after
-        10_000 -> :ok
-      end
+        receive do
+          :release -> :ok
+        after
+          10_000 -> :ok
+        end
+
+      _other ->
+        :ok
     end
 
     Application.put_env(:fathom, :faulty_before, {:flush, blocker})
@@ -1328,7 +1342,14 @@ defmodule Fathom.ShardDurabilityTest do
   test "the first periodic flush timer is jittered within the interval and varies across coordinators" do
     prev_jitter = Application.get_env(:fathom, :shard_flush_jitter_ratio)
     prev_interval = Application.get_env(:fathom, :shard_flush_interval_ms)
-    interval = 4_000
+
+    # An HOUR, not seconds: the first arm is drawn uniform over (0, interval], so with a 4 s interval
+    # a coordinator whose draw was a few ms FIRED its first tick before this test read the timer
+    # (~0.5% of runs, seen at 20-38 s "left"). That tick found a clean, held-open shard and re-armed
+    # at the SLOW clean-poll cadence (`@clean_poll_multiplier` x interval, +/- ratio), which this
+    # test then read as a first-arm delay far above the interval. Correct behaviour, wrong sample;
+    # at an hour the draw landing inside the open+read window is ~1e-5.
+    interval = 3_600_000
     Application.put_env(:fathom, :shard_flush_jitter_ratio, 0.5)
     Application.put_env(:fathom, :shard_flush_interval_ms, interval)
 
@@ -1620,14 +1641,20 @@ defmodule Fathom.ShardDurabilityTest do
     test_pid = self()
 
     # Block the flush's PUT until released — the coordinator must stay responsive.
-    blocker = fn ->
-      send(test_pid, :flush_started)
+    # Scoped to THIS shard (see the other `:flush_started` blockers): an unscoped hook parks and
+    # reports other tests' live coordinators' flushes.
+    blocker = fn
+      ^shard ->
+        send(test_pid, :flush_started)
 
-      receive do
-        :release_flush -> :ok
-      after
-        10_000 -> :ok
-      end
+        receive do
+          :release_flush -> :ok
+        after
+          10_000 -> :ok
+        end
+
+      _other ->
+        :ok
     end
 
     Application.put_env(:fathom, :faulty_before, {:flush, blocker})
@@ -3006,14 +3033,20 @@ defmodule Fathom.ShardDurabilityTest do
     test_pid = self()
 
     # Park the flush task mid-PUT until released.
-    blocker = fn ->
-      send(test_pid, :flush_started)
+    # Scoped to THIS shard: `:faulty_before` is global and other tests' coordinators are still
+    # flushing, so an unscoped blocker reports (and parks) THEIR flush as this test's.
+    blocker = fn
+      ^shard ->
+        send(test_pid, :flush_started)
 
-      receive do
-        :release_flush -> :ok
-      after
-        10_000 -> :ok
-      end
+        receive do
+          :release_flush -> :ok
+        after
+          10_000 -> :ok
+        end
+
+      _other ->
+        :ok
     end
 
     Application.put_env(:fathom, :faulty_before, {:flush, blocker})
