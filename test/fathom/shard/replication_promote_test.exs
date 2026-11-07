@@ -382,6 +382,33 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
       Storage.release_lease(id, lease)
     end
 
+    # FS.exists? audit (batch D follow-up). `ensure_no_local_copy/1` read an indeterminate stat of the
+    # live path as "no local copy" and the rename then replaced a `.db` that may hold acked writes the
+    # replica lacks. A symlink loop at the path is a real stat failure other than ENOENT (`ELOOP`).
+    test "refuses to promote when the live path cannot be stat'ed, leaving it and the lease alone",
+         ctx do
+      %{id: id, root: root} = ctx
+      followers = start_followers!(root, 3, "promote")
+      enable_replication!(followers, quorum: 2, connected: :all)
+      :ok = replicate_then_abandon_primary(id, followers, 3)
+      [{name, _} | _] = followers
+
+      path = Fathom.Shard.db_path(id)
+      File.rm_rf!(path)
+      :ok = File.ln_s(path, path)
+      assert {:error, :eloop} = Fathom.FS.presence(path), "fixture: the path must be unstat-able"
+
+      assert {:error, {:local_stat_failed, ^path, :eloop}} = Promote.promote(id, follower: name)
+
+      assert {:ok, _target} = File.read_link(path),
+             "the promotion replaced a live path it could not stat"
+
+      # Refused BEFORE taking the lease: a foreign owner can acquire it straight away.
+      assert {:ok, lease} = Storage.acquire_lease(id, "verifier#stat", 10_000)
+      Storage.release_lease(id, lease)
+      File.rm!(path)
+    end
+
     test "removes a stale -wal/-shm left beside an absent .db before publishing", ctx do
       %{id: id, root: root} = ctx
       followers = start_followers!(root, 3, "promote")

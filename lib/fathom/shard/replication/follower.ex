@@ -458,8 +458,15 @@ defmodule Fathom.Shard.Replication.Follower do
     ArgumentError -> false
   end
 
-  defp replica_files?(name, shard_id),
-    do: Fathom.FS.exists?(db_path(name, shard_id)) or Fathom.FS.exists?(wal_path(name, shard_id))
+  # INDETERMINATE IS PRESENT (FS.exists? audit, batch D follow-up). This answer licenses SKIPPING an
+  # erase: `forget_if_present/2` is the bulk tombstone path, and `exists?/1` read a stat error
+  # (EIO, ESTALE, EACCES) as "no file" — so a deleted tenant's replica whose `.db` could not be
+  # stat'ed was left on disk, unerased, behind a "nothing here" verdict. Wrongly "present" costs one
+  # lock and six ENOENT unlinks, which is the price an unconditional `forget/2` always paid.
+  defp replica_files?(name, shard_id) do
+    Fathom.FS.presence(db_path(name, shard_id)) != :absent or
+      Fathom.FS.presence(wal_path(name, shard_id)) != :absent
+  end
 
   defp forget_lock_wait_ms,
     do: Application.get_env(:fathom, :replication_forget_lock_wait_ms, 2_000)
@@ -2928,38 +2935,68 @@ defmodule Fathom.Shard.Replication.Follower do
   # NO `.db` ⇒ nothing a recovery could build on, and a follower that never held the shard has no
   # files at all: both still answer a definite "nothing" (the documented requirement).
   defp derive(name, shard_id, log?) do
-    db? = Fathom.FS.exists?(db_path(name, shard_id))
+    # `presence/1`, not `exists?/1` (FS.exists? audit, batch D follow-up): an indeterminate stat of
+    # the `.db` (EIO, ESTALE, EACCES) read as "no `.db`", and `nil` is the definite "I hold nothing"
+    # that counts toward the recovery floor — the #18 failure again, reached through the `.db`'s stat
+    # instead of the `-wal`'s read. An unknowable `.db` is answered torn and NOT cached.
+    db = Fathom.FS.presence(db_path(name, shard_id))
 
-    case Wal.read(wal_path(name, shard_id)) do
-      {:ok, header} when db? ->
+    case {Wal.read(wal_path(name, shard_id)), db} do
+      {{:ok, header}, :present} ->
         # Carry `torn` across the restart (expert review 2026-08-20 #11b). `FollowerLog.seeded/4`
         # stamps `torn: false` because a real SEED is the one event that rebuilds both files
         # together — but this is not a seed, it is a recovery, and the marker on disk is the only
         # thing that remembers the two files were a generation apart when we went down.
-        torn? = Fathom.FS.exists?(torn_path(name, shard_id))
+        #
+        # An unreadable marker is torn too, and uncached: the safe direction, and a stat that
+        # clears must not leave the replica torn until a re-seed.
+        marker = Fathom.FS.presence(torn_path(name, shard_id))
+        kind = if match?({:error, _}, marker), do: :transient, else: :held
 
-        {:held,
-         recovered_state(name, shard_id, header, torn?, recovered_ownership(name, shard_id), log?)}
+        {kind,
+         recovered_state(
+           name,
+           shard_id,
+           header,
+           marker != :absent,
+           recovered_ownership(name, shard_id),
+           log?
+         )}
 
-      {:ok, _header} ->
+      {{:ok, _header}, :absent} ->
         nil
 
-      {:error, reason} when db? ->
-        if log? do
-          Logger.warning(
-            "replication follower: the replica of #{shard_id} exists but its WAL cannot be read " <>
-              "(#{inspect(reason)}); holding it as torn (unrankable, not counted) until it is " <>
-              "re-seeded or the failure clears"
-          )
-        end
+      {{:ok, _header}, {:error, reason}} ->
+        unreadable_replica(name, shard_id, log?, {:db_stat, reason}, :transient)
 
-        {lineage, _epoch} = recovered_ownership(name, shard_id)
-        kind = if reason == :not_a_wal, do: :held, else: :transient
-        {kind, %{FollowerLog.seeded(0, 0, 0, 0, lineage) | torn: true}}
+      {{:error, reason}, :present} ->
+        unreadable_replica(
+          name,
+          shard_id,
+          log?,
+          reason,
+          if(reason == :not_a_wal, do: :held, else: :transient)
+        )
 
-      {:error, _reason} ->
+      {{:error, _reason}, :absent} ->
         nil
+
+      {{:error, _reason}, {:error, reason}} ->
+        unreadable_replica(name, shard_id, log?, {:db_stat, reason}, :transient)
     end
+  end
+
+  defp unreadable_replica(name, shard_id, log?, reason, kind) do
+    if log? do
+      Logger.warning(
+        "replication follower: the replica of #{shard_id} exists but its files cannot be read " <>
+          "(#{inspect(reason)}); holding it as torn (unrankable, not counted) until it is " <>
+          "re-seeded or the failure clears"
+      )
+    end
+
+    {lineage, _epoch} = recovered_ownership(name, shard_id)
+    {kind, %{FollowerLog.seeded(0, 0, 0, 0, lineage) | torn: true}}
   end
 
   # SWEEPING IDLE REPLICA ROWS (expert review 2026-10-20-2027 #11). Every shard this node ever
@@ -3390,44 +3427,74 @@ defmodule Fathom.Shard.Replication.Follower do
     # it is simply new — `apply_write` is about to lay down a whole generation from offset 0. An
     # empty WAL over an existing `.db` has nothing to absorb either, but it does NOT make a torn
     # replica whole, so a sticky verdict survives this branch too.
-    if Fathom.FS.exists?(db) and wal_bytes(wal) > 0 do
-      case absorb_recording_position(name, shard_id, prev, verdict, db, wal) do
-        :ok when verdict == :already_torn ->
-          # Absorbing is still right — the pages we hold are real — but it cannot clear the flag.
-          new_state
+    #
+    # INDETERMINATE IS NOT "NOTHING" (FS.exists? audit, batch D follow-up). A stat of the `.db` or
+    # `-wal` that fails for any reason but ENOENT used to read as "no files": the absorb was skipped,
+    # `torn` was CLEARED, and `apply_write(:truncate)` then overwrote the `-wal` — a replica marked
+    # whole and promotable that had silently lost the generation it never absorbed. The fail-safe
+    # for any failure here is "stays torn" (see below), so that is what an unknowable stat gets.
+    case absorbable(db, wal) do
+      :absorb ->
+        case absorb_recording_position(name, shard_id, prev, verdict, db, wal) do
+          :ok when verdict == :already_torn ->
+            # Absorbing is still right — the pages we hold are real — but it cannot clear the flag.
+            new_state
 
-        :ok when verdict == :short ->
-          # The checkpoint SUCCEEDED and the replica is still torn, which is the whole point: the
-          # local move was fine, the INPUT to it was short. Absorbing incomplete pages produces a
-          # database that looks healthy, so the flag is the only thing standing between it and a
-          # promotion.
-          Logger.warning(
-            "shard #{shard_id}: absorbed a SHORT WAL before a reset — this replica was behind at " <>
-              "the generation boundary and stays torn; it will not be promoted until it is re-seeded"
-          )
+          :ok when verdict == :short ->
+            # The checkpoint SUCCEEDED and the replica is still torn, which is the whole point: the
+            # local move was fine, the INPUT to it was short. Absorbing incomplete pages produces a
+            # database that looks healthy, so the flag is the only thing standing between it and a
+            # promotion.
+            Logger.warning(
+              "shard #{shard_id}: absorbed a SHORT WAL before a reset — this replica was behind at " <>
+                "the generation boundary and stays torn; it will not be promoted until it is re-seeded"
+            )
 
-          new_state
+            new_state
 
-        :ok ->
-          %{new_state | torn: false}
+          :ok ->
+            %{new_state | torn: false}
 
-        {:error, reason} ->
-          Logger.warning(
-            "shard #{shard_id}: could not absorb the WAL before a reset (#{inspect(reason)}); " <>
-              "the replica stays torn and will not be promoted until it is re-seeded"
-          )
+          {:error, reason} ->
+            Logger.warning(
+              "shard #{shard_id}: could not absorb the WAL before a reset (#{inspect(reason)}); " <>
+                "the replica stays torn and will not be promoted until it is re-seeded"
+            )
 
-          new_state
-      end
-    else
-      if verdict == :already_torn, do: new_state, else: %{new_state | torn: false}
+            new_state
+        end
+
+      :nothing ->
+        if verdict == :already_torn, do: new_state, else: %{new_state | torn: false}
+
+      {:error, reason} ->
+        Logger.warning(
+          "shard #{shard_id}: could not tell whether there is a WAL to absorb before a reset " <>
+            "(#{inspect(reason)}); the replica stays torn and will not be promoted until it is " <>
+            "re-seeded"
+        )
+
+        new_state
     end
   end
 
-  defp wal_bytes(path) do
-    case Fathom.FS.stat(path) do
-      {:ok, %{size: size}} -> size
-      _ -> 0
+  # `:absorb` (a `.db` and a non-empty `-wal`), `:nothing` (DEFINITELY no `.db`, or no or an empty
+  # `-wal`) or `{:error, why}` (a stat that failed for any other reason).
+  defp absorbable(db, wal) do
+    case Fathom.FS.presence(db) do
+      :absent ->
+        :nothing
+
+      {:error, reason} ->
+        {:error, {:db_stat, reason}}
+
+      :present ->
+        case Fathom.FS.stat(wal) do
+          {:ok, %{size: size}} when size > 0 -> :absorb
+          {:ok, _empty} -> :nothing
+          {:error, :enoent} -> :nothing
+          {:error, reason} -> {:error, {:wal_stat, reason}}
+        end
     end
   end
 

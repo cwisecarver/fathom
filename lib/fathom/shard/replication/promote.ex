@@ -210,6 +210,8 @@ defmodule Fathom.Shard.Replication.Promote do
       several shards can tell "not here" from "broken".
     * `{:error, {:local_copy_exists, path}}` — a local `.db` is already on disk (a kept or
       quarantined copy that may hold writes the replica lacks); never replaced silently.
+    * `{:error, {:local_stat_failed, path, posix}}` — whether a local `.db` exists could not be
+      determined (EIO, ESTALE, EACCES); refused for the same reason.
     * `{:error, :coordinator_running}` — this node is already serving the shard, so its own
       coordinator owns those files and promotion would be writing underneath a live writer.
   """
@@ -316,7 +318,16 @@ defmodule Fathom.Shard.Replication.Promote do
   # alternative; refusing keeps the decision with the human who is mid-incident anyway.)
   defp ensure_no_local_copy(shard_id) do
     path = Shard.db_path(shard_id)
-    if Fathom.FS.exists?(path), do: {:error, {:local_copy_exists, path}}, else: :ok
+
+    # `presence/1`, not `exists?/1` (FS.exists? audit, batch D follow-up): an indeterminate stat
+    # (EIO, ESTALE, EACCES) read as "no local copy", and the rename below then replaced a kept
+    # local `.db` that may hold acked writes the replica lacks. Refuse instead — this is the
+    # operator path, and the operator resolves a stat failure deliberately.
+    case Fathom.FS.presence(path) do
+      :absent -> :ok
+      :present -> {:error, {:local_copy_exists, path}}
+      {:error, reason} -> {:error, {:local_stat_failed, path, reason}}
+    end
   end
 
   # A `-wal`/`-shm` left beside an ABSENT `.db` would be applied by SQLite to the promoted pages
