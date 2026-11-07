@@ -33,6 +33,7 @@ defmodule Fathom.Application do
     check_replication_exposure!()
     check_replication_frame_auth!()
     check_replication_disk!()
+    check_sqlite_temp_dir!()
     check_vm_dirty_background!()
     check_replication_flush_interval!()
     check_flush_interval!()
@@ -663,6 +664,85 @@ defmodule Fathom.Application do
     end
 
     nil
+  end
+
+  # SORTER / TRANSIENT-INDEX SPILL IS NOT BOUNDED BY ANYTHING FATHOM CAN SET (expert review
+  # 2026-11-07 #32; connection-executor#5). `PRAGMA temp.max_page_count` caps only the TEMP *schema*
+  # database. A statement's own sorter runs, ephemeral tables, materialised CTEs and automatic
+  # indexes are separate unlinked `etilqs_*` files outside that cap. Re-measured here with a bare
+  # exqlite connection (`temp.max_page_count=1000` set first, `WITH RECURSIVE … SELECT x … ORDER BY
+  # random()` stepped once): the process held a 412 MB unlinked temp file after 5 s, so the 30 s
+  # query deadline is the only bound (~2.4 GB per statement per dirty-IO thread). A tenant cannot
+  # bound or undo it either way: `temp_store` / `temp_store_directory` are not on the tenant allow
+  # list, and `temp_store=MEMORY` would only trade the disk for the process-global
+  # `hard_heap_limit`. SQLite has no sorter-bytes limit; a `sqlite3_progress_handler` that
+  # fstat()s the spill fd is the only in-engine bound and is unbuilt/uncosted (PARKED,
+  # docs/component-notes.md).
+  #
+  # So the bound is operational: point SQLite at a size-limited location (`SQLITE_TMPDIR`). This
+  # boot check WARNS when SQLite's resolved temp dir shares a volume with SHARD_DATA_DIR (or
+  # REPLICATION_DIR when this node follows), because then one tenant statement can fill the volume
+  # every co-resident tenant's commits, checkpoints and flushes depend on. It resolves the dir
+  # the way SQLite's unix VFS does (`SQLITE_TMPDIR`, `TMPDIR`, `/var/tmp`, `/usr/tmp`, `/tmp`) and
+  # NOT `System.tmp_dir!/0`: that one reads `TMPDIR`/`TMP`/`TEMP`, never `SQLITE_TMPDIR`, and
+  # prefers `/tmp` over `/var/tmp`, so using it would name the wrong directory.
+  # Warn-only, prod-only, like every sibling: a single-volume box is a legitimate small deployment.
+  @doc false
+  @spec check_sqlite_temp_dir!() :: nil
+  def check_sqlite_temp_dir! do
+    if Application.get_env(:fathom, :env) == :prod do
+      dirs =
+        [{"SHARD_DATA_DIR", Fathom.Shard.data_dir()}] ++
+          if Application.get_env(:fathom, :replication_listen, false) == true,
+            do: [{"REPLICATION_DIR", Fathom.Shard.Replication.Follower.default_dir()}],
+            else: []
+
+      for msg <- sqlite_temp_warnings(sqlite_temp_dir(), dirs, &same_volume?/2),
+          do: Logger.warning(msg)
+    end
+
+    nil
+  end
+
+  @doc """
+  The directory SQLite's unix VFS spills temporary files to: the first of `SQLITE_TMPDIR`,
+  `TMPDIR`, `/var/tmp`, `/usr/tmp`, `/tmp` that is a usable directory (SQLite also tries `.` last,
+  and `sqlite3_temp_directory`, which fathom never sets). `getenv` and `usable?` are injectable.
+  """
+  @spec sqlite_temp_dir((String.t() -> String.t() | nil), (String.t() -> boolean())) ::
+          String.t() | nil
+  def sqlite_temp_dir(getenv \\ &System.get_env/1, usable? \\ &usable_dir?/1) do
+    [getenv.("SQLITE_TMPDIR"), getenv.("TMPDIR"), "/var/tmp", "/usr/tmp", "/tmp"]
+    |> Enum.find(&(is_binary(&1) and &1 != "" and usable?.(&1)))
+  end
+
+  # SQLite checks `access(dir, R_OK|W_OK|X_OK)` on a directory; the closest portable check without
+  # a NIF is "is a directory we can read and write".
+  defp usable_dir?(dir) do
+    match?(
+      {:ok, %File.Stat{type: :directory, access: access}} when access == :read_write,
+      File.stat(dir)
+    )
+  end
+
+  @doc false
+  @spec sqlite_temp_warnings(
+          String.t() | nil,
+          [{String.t(), Path.t()}],
+          (Path.t(), Path.t() -> boolean())
+        ) :: [String.t()]
+  def sqlite_temp_warnings(nil, _dirs, _same_volume?), do: []
+
+  def sqlite_temp_warnings(temp, dirs, same_volume?) do
+    for {label, dir} <- dirs, same_volume?.(temp, dir) do
+      "config warning: SQLite's temp directory (#{temp}; resolved from SQLITE_TMPDIR, TMPDIR, " <>
+        "/var/tmp, /usr/tmp, /tmp) is on the SAME volume as #{label} (#{dir}). One tenant " <>
+        "statement with a large ORDER BY / GROUP BY / DISTINCT spills hundreds of MB per second " <>
+        "there and nothing bounds it but the 30 s query deadline (PRAGMA temp.max_page_count caps " <>
+        "only the TEMP schema), so it can fill the volume that every co-resident tenant's " <>
+        "commits, checkpoints and durability flushes need. Point SQLITE_TMPDIR at a size-limited " <>
+        "tmpfs or a separate volume (expert review 2026-11-07 #32)."
+    end
   end
 
   @doc false
