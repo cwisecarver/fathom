@@ -44,8 +44,14 @@ defmodule Fathom.Shard.Provenance do
   intent BEFORE its PUT: a first flush whose PUT landed but whose result was never stamped, then a
   retry that overwrites the single slot and 412s (the object is still the first one's), then a
   crash — the surviving intent matched nothing and a good copy was quarantined (expert review
-  2026-10-10 #R2-1 of the fix-review). Recording a NEW intent demotes the current one to "previous"
-  (an unresolved intent is never dropped by a retry); `Fork` adopts on a match with EITHER.
+  2026-10-10 #R2-1 of the fix-review). Recording a NEW intent demotes the current one to "previous";
+  `Fork` adopts on a match with EITHER. TWO slots are a WINDOW, not a guarantee: a third attempt
+  drops the oldest (expert review 2026-11-07 #23). A landed-but-unacked PUT followed by two attempts
+  that each record an intent and fail before reaching the store falls out of it, which `Fork` used to
+  read as a fork and quarantine. The live coordinator therefore also remembers the md5s its flush
+  attempts recorded (`Fork.put_origin/3`'s `attempted`); the sidecar stays the only thing that
+  survives a crash, and its format is unchanged (more slots would need a version byte, since every
+  existing 177-byte record would read `:corrupt`).
 
   The same record carries the PUT INTENT: the plaintext md5 of the bytes about to be PUT, recorded
   durably BEFORE the PUT. If the process dies after the object landed but before the sidecar learned

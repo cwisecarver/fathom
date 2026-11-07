@@ -235,9 +235,10 @@ defmodule Fathom.Shard.Fork do
   @doc """
   WHO WROTE THE STORED OBJECT — this node's own recorded PUT, or someone else? Side-effect free.
 
-  Compares the object's `fathom-md5` with the PUT intents `Provenance.record_intent/2` recorded
-  before this node's own uploads (EITHER slot: a retry flush demotes the first flush's intent rather
-  than erasing it, expert review 2026-10-10 R2-1, and the object may be the older one).
+  Compares the object's `fathom-md5` with the PUT intents this node recorded before its own
+  uploads: the sidecar's (`Provenance.record_intent/2`, EITHER slot — a retry flush demotes the
+  first flush's intent rather than erasing it, expert review 2026-10-10 R2-1) UNION `attempted`, the
+  md5s the coordinator itself remembers having handed to the backend since its last successful flush.
 
     * `{:own, etag}` — the object is a snapshot this node was about to PUT; `etag` is the object's
       current etag, read in the same HEAD as the md5, so the two describe one version.
@@ -245,19 +246,30 @@ defmodule Fathom.Shard.Fork do
     * `:absent` — there is no object.
     * `{:error, reason}` — the HEAD failed: unknown, never read as either answer.
 
-  Shared by the warm-open verdict (`resolve/4`) and the coordinator's 412-reconcile (expert review
-  2026-10-15 #6), which must not re-fence onto an object it did not write.
+  Shared by the warm-open verdict (`resolve/4`, which has only the sidecar: a crash loses the
+  coordinator's set) and the coordinator's 412-reconcile (expert review 2026-10-15 #6), which must
+  not re-fence onto an object it did not write.
 
-  KNOWN FALSE `:fork` — accepted (review 2026-10-15 D3: a false quarantine is recoverable, a clobber
-  is not): the sidecar keeps only TWO intents, so a landed-but-unacked PUT followed by two more
-  flush attempts that each recorded an intent and failed falls out of the window; and a durable flush
-  clears the intents, so a `Storage.retouch/2` whose response was lost (object rotated past our own
-  etag with no intent naming it) also reads as a fork.
+  WHY `attempted` EXISTS (expert review 2026-11-07 #23). The sidecar keeps only TWO intents, and an
+  attempt that records its intent and then FAILS BEFORE REACHING THE STORE still demotes an older
+  unresolved one. A PUT that landed with its reply lost, then two more failed attempts, pushed that
+  PUT's md5 out of the record: the next flush's 412 read the object as `:fork`, the coordinator
+  self-fenced and quarantined every write acked since the landed PUT's snapshot. That was documented
+  here as "KNOWN FALSE `:fork` — accepted" (review 2026-10-15 D3: a false quarantine is recoverable, a
+  clobber is not). Not any more, and not by widening the record: more slots need a version byte
+  because every existing 177-byte sidecar would read `:corrupt` on warm open, and the review's
+  "lineage-equals-ours" alternative only works with replication ON. The coordinator's set is a
+  superset kept in memory and the sidecar stays the only thing that survives a crash — which is why
+  the warm-open caller passes nothing. A clobber is still impossible: only an md5 this node itself
+  computed from its own snapshot is accepted, and identical bytes lose nothing.
+
+  STILL a known false `:fork`: a durable flush clears the intents, so a `Storage.retouch/2` whose
+  response was lost (object rotated past our own etag with no intent naming it) reads as a fork.
   """
-  @spec put_origin(String.t(), Path.t()) ::
+  @spec put_origin(String.t(), Path.t(), [String.t()]) ::
           {:own, String.t()} | :fork | :absent | {:error, term()}
-  def put_origin(shard_id, path) do
-    case Provenance.read_intents(path) do
+  def put_origin(shard_id, path, attempted \\ []) do
+    case Provenance.read_intents(path) ++ attempted do
       [] ->
         :fork
 

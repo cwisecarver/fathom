@@ -325,6 +325,19 @@ defmodule Fathom.Test.FaultyStorage do
         _ = Local.flush(shard_id, local_path, expected_etag, position, lineage, opts)
         {:error, :s3_unreachable}
 
+      # THE FAILED ATTEMPT THAT STILL RECORDED AN INTENT (expert review 2026-11-07 #23). The real S3
+      # backend calls `:pre_put` (which durably records the flush intent in the provenance sidecar)
+      # after compress+hash and immediately BEFORE the PUT, so an attempt that then fails before
+      # reaching the store (connect refused, a 5xx from a proxy) has already recorded its md5 and
+      # pushed an older unresolved intent toward the sidecar's two-slot limit. The plain `:flush`
+      # fault above returns before ever calling `:pre_put`, so no test could express it.
+      fault() == :flush_fails_after_pre_put ->
+        with pre_put when is_function(pre_put, 1) <- Keyword.get(opts, :pre_put) do
+          _ = pre_put.(local_md5_hex(local_path))
+        end
+
+        {:error, :s3_unreachable}
+
       # THE STALLED PUT (expert review 2026-11-04 #3): the body never finishes, so the call never
       # returns. `:flush_lands_then_hangs` is the worse variant: the object advances server-side,
       # then the caller waits forever for a response that never comes.
@@ -339,6 +352,9 @@ defmodule Fathom.Test.FaultyStorage do
         Local.flush(shard_id, local_path, expected_etag, position, lineage, opts)
     end
   end
+
+  defp local_md5_hex(path),
+    do: :md5 |> :crypto.hash(File.read!(path)) |> Base.encode16(case: :lower)
 
   # The position stamp must exist on the DOUBLE, not just the real backends. This suite's default
   # backend is this module, so a contract implemented only in `Local`/`S3` would be a contract no

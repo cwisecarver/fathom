@@ -151,6 +151,11 @@ defmodule Fathom.Shard do
   @flush_route_key :fathom_shard_flush_route
   @drop_route_key :fathom_shard_drop_route
 
+  # Most PUT-attempt md5s a coordinator remembers for the 412-reconcile (expert review 2026-11-07
+  # #23); see the `{:put_intent, md5}` handler. 32 bytes each, so the worst case is ~2 KB, and only on a
+  # shard whose flushes keep failing.
+  @max_put_intents 64
+
   # Overrides `use GenServer`'s generated child_spec to attach the shutdown budget
   # (config-tunable: bigger shards / slower links warrant more).
   @doc false
@@ -2112,6 +2117,25 @@ defmodule Fathom.Shard do
     end
   end
 
+  # A flush attempt handed the backend this md5 (the task's `:pre_put` hook, see
+  # `flush_intent_opts/3`). Remembered until a flush succeeds or reconciles: the sidecar keeps only
+  # TWO intents, and an attempt that records one and then fails before reaching the store pushes an
+  # older, possibly LANDED-but-unacked PUT's md5 out of it — which the next 412 then read as a fork and
+  # self-fenced over (expert review 2026-11-07 #23). Arrives in mailbox order BEFORE the same task's
+  # reply (one sender), so the reconcile and the next flush's snapshot always see it.
+  #
+  # `Map.put`, not a new init key: only a shard with an attempt in flight carries it, and an init key
+  # costs every coordinator a word (`fanout_kb_per_shard`). Bounded at `@max_put_intents`: a shard
+  # whose flushes fail for that many consecutive attempts has bigger problems than this set, and the
+  # sidecar still holds the newest two.
+  def handle_info({:put_intent, md5}, state) when is_binary(md5) do
+    intents = Map.get(state, :put_intents, [])
+
+    if md5 in intents,
+      do: {:noreply, state},
+      else: {:noreply, Map.put(state, :put_intents, Enum.take([md5 | intents], @max_put_intents))}
+  end
+
   # The flush task crashed before replying: treat like a transient flush failure.
   def handle_info({ref, result}, %{renew_task: %Task{ref: ref}} = state) do
     Process.demonitor(ref, [:flush])
@@ -2734,8 +2758,13 @@ defmodule Fathom.Shard do
             # only when the salt it reads off the WAL MATCHES the one in this snapshot, so a
             # missing key can only ever withhold an ordinal — never invent a wrong one. Withholding
             # degrades to "unknown ⇒ the stored object wins", which is the pre-A2 answer.
+            # `:put_intents` / `:coordinator` ride along for the 412-reconcile's ownership question
+            # (expert review 2026-11-07 #23): the task sends each attempt's md5 to `:coordinator` from
+            # its `:pre_put` hook, and the reconcile asks `Fork.put_origin/3` with the set so far.
+            # `Map.take` leaves `:put_intents` out when the coordinator holds none.
             snapshot_state =
-              Map.take(state, [
+              state
+              |> Map.take([
                 :id,
                 :path,
                 :etag,
@@ -2744,8 +2773,10 @@ defmodule Fathom.Shard do
                 :wal_salt,
                 :wal_ordinal,
                 :carried_lineage,
-                :touch_pre_etag
+                :touch_pre_etag,
+                :put_intents
               ])
+              |> Map.put(:coordinator, self())
 
             # THE SLOT IS RESERVED BEFORE THE STATE THAT OWNS ITS RELEASE EXISTS (expert review
             # 2026-08-20 #15) — the same class AGENTS.md records for `acquire_lease` → built state.
@@ -4295,7 +4326,7 @@ defmodule Fathom.Shard do
   # recoverable, a clobber is not). An unreadable HEAD is a transient error — keep dirty, retry —
   # never a guess in either direction. Costs one HEAD, only on a 412.
   defp reconcile_moved(state) do
-    case Fork.put_origin(state.id, state.path) do
+    case Fork.put_origin(state.id, state.path, Map.get(state, :put_intents, [])) do
       {:own, etag} -> {:reconciled, etag}
       :fork -> :forked
       :absent -> {:error, :object_vanished}
@@ -4346,7 +4377,7 @@ defmodule Fathom.Shard do
     # object that is one of our own recorded PUTs is re-fenced; a fork is quarantined and the lock
     # released keeping its claim; anything unconfirmable keeps the local copy (the old fallback).
     with {:ok, etag} when not is_nil(etag) <- Storage.object_etag(state.id),
-         {:own, etag} <- Fork.put_origin(state.id, state.path),
+         {:own, etag} <- Fork.put_origin(state.id, state.path, Map.get(state, :put_intents, [])),
          {:ok, new_etag, _carried} <- upload_for_drop(%{state | etag: etag}) do
       Logger.info(
         "shard #{state.id}: flush 412 with lock ours; re-fenced to the object and re-uploaded"
@@ -5569,7 +5600,11 @@ defmodule Fathom.Shard do
       state.etag,
       Position.snapshot_position(state, pre),
       Position.lineage_arg(state),
-      flush_intent_opts(state.path, fn -> recheck_before_put(state) end) ++ extra_opts
+      flush_intent_opts(
+        state.path,
+        fn -> recheck_before_put(state) end,
+        Map.get(state, :coordinator)
+      ) ++ extra_opts
     )
     |> guard_pre_touch(state)
   end
@@ -5882,12 +5917,21 @@ defmodule Fathom.Shard do
   # margin) that the earlier `recheck_before_put/1` cannot. A `{:error, reason}` becomes the
   # backend's `{:abort, reason}`: no PUT, the flush fails with `reason`. The default is a no-op, so
   # the drop path (which has its own fence) is unchanged.
-  defp flush_intent_opts(path, recheck \\ fn -> :ok end) do
+  #
+  # `notify` is the coordinator's pid (the periodic flush task passes it; the drop path runs against
+  # the coordinator's own state and passes nil): the attempt's md5 is sent to it BEFORE the sidecar
+  # record, so the coordinator's attempted set is a superset of what the sidecar's two slots hold
+  # (expert review 2026-11-07 #23).
+  defp flush_intent_opts(path, recheck \\ fn -> :ok end, notify \\ nil) do
     [
       pre_put: fn md5 ->
         case recheck.() do
-          :ok -> Provenance.record_intent(path, md5)
-          {:error, reason} -> {:abort, reason}
+          :ok ->
+            if is_pid(notify), do: send(notify, {:put_intent, md5})
+            Provenance.record_intent(path, md5)
+
+          {:error, reason} ->
+            {:abort, reason}
         end
       end
     ]
@@ -6372,7 +6416,10 @@ defmodule Fathom.Shard do
     FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
     # Persist the durable-flush time so it survives node death (#28) — off the hot path.
     Fathom.Directory.Recorder.record_flush(state.id)
-    {:flushed, clear_flush_failures(state)}
+    # Clear the attempted-intent set with the sidecar's intents (the stamp this verdict follows
+    # rewrote the record with none): the object is now at an etag this node holds (expert review
+    # 2026-11-07 #23).
+    {:flushed, clear_flush_failures(Map.delete(state, :put_intents))}
   end
 
   # The data PUT's If-Match failed (412) and the task's lock re-check found the lock STILL
@@ -6402,7 +6449,10 @@ defmodule Fathom.Shard do
     # object moved to an etag we did not write — our PUT 412'd — so what its metadata says is no
     # longer something we know. The next flush pays one HEAD and re-learns it, which is the whole
     # cost of being wrong here and is why the cache is safe to keep otherwise.
-    {:dirty, clear_flush_failures(%{state | etag: object_etag, carried_lineage: nil})}
+    {:dirty,
+     clear_flush_failures(
+       Map.delete(%{state | etag: object_etag, carried_lineage: nil}, :put_intents)
+     )}
   end
 
   # 412 + lock ours (checked twice) + the object is GONE and the id is not tombstoned (expert review

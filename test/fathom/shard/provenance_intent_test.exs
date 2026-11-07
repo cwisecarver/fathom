@@ -272,9 +272,17 @@ defmodule Fathom.Shard.ProvenanceIntentTest do
       refute quarantined?(shard)
     end
 
-    test "re-recording the same intent keeps the older one; a third drops the oldest", %{
-      path: path
-    } do
+    # Previously this test asserted the sidecar's two-slot limit as if it were the contract ("an
+    # unresolved intent is never dropped by a retry"), and so pinned the defect behind expert review
+    # 2026-11-07 #23: a landed-but-unacked PUT followed by two attempts that each record an intent and
+    # fail falls out of the window and the next 412 read the object as a fork. It still pins what is
+    # TRUE of the sidecar — two slots, the third drops the oldest, format unchanged — and nothing
+    # more: the live coordinator's own attempted set covers the rest (`Fork.put_origin/3`,
+    # `PutIntentAttemptsTest`). Do not "fix" the window here; a wider record needs a version byte.
+    test "re-recording the same intent keeps the older one; a third drops the oldest (the SIDECAR's window)",
+         %{
+           path: path
+         } do
       Provenance.write_durable(path, "e")
       Provenance.record_intent(path, @md5_a)
       Provenance.record_intent(path, @md5_b)
