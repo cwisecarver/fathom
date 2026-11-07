@@ -227,6 +227,150 @@ defmodule Fathom.Migrator.ForkTest do
     end
   end
 
+  # --- a template migrated by REAL Django output (expert review 2026-11-07 #52) ---------------
+  #
+  # Django's sqlite backend never writes `PRAGMA user_version`; capture records DDL + bookkeeping
+  # rows, and the only `user_version =` writer is `Copy.replay/5` on tenant copies. So the template
+  # a `manage.py migrate` leaves reads label 0 with every name present. The vet compared that file
+  # label to HEAD and refused it (`{:template_not_at_head, %{label: 0}}`), so `mix fathom.snapshot
+  # template-head` could not be used and every novel tenant was born empty. The tests above all
+  # fabricate the template with a typed `PRAGMA user_version` or with ledger-name-free releases —
+  # never the combination real capture produces, which is why this survived.
+  describe "a Django-migrated template (names present, user_version never stamped)" do
+    @capture "test/support/fixtures/django_migrate_capture.json"
+
+    # The VERBATIM capture of `manage.py migrate` (finance 0001 + 0002), released WITH the bound
+    # args exactly as `Capture.record/3` does, and the template file built by executing those same
+    # statements the way Django's own migrate did — in autocommit order, FKs off, no `user_version`.
+    defp django_template!(template) do
+      captured = @capture |> File.read!() |> Jason.decode!() |> Enum.sort_by(& &1["version"])
+
+      for v <- captured do
+        args =
+          Enum.map(v["statement_args"] || [], fn %{"args" => l} ->
+            Enum.map(l, &Filo.Value.decode/1)
+          end)
+
+        {:ok, _} =
+          Migrator.release(
+            v["version"],
+            "django #{v["version"]}",
+            v["statements"],
+            v["template_migration_count"],
+            v["requires_review"],
+            args
+          )
+      end
+
+      seed = Path.join(System.tmp_dir!(), "seedd_#{template}.db")
+      {:ok, conn} = Connection.open(seed)
+
+      # Django's recorder creates this in autocommit; it is not part of any captured migration.
+      :ok =
+        Connection.exec(
+          conn,
+          ~s|CREATE TABLE "django_migrations" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, | <>
+            ~s|"app" varchar(255) NOT NULL, "name" varchar(255) NOT NULL, "applied" datetime NOT NULL)|
+        )
+
+      :ok = Connection.exec(conn, "PRAGMA foreign_keys=OFF")
+
+      steps = Migrator.statement_steps(Enum.map(captured, & &1["version"]))
+
+      for v <- Enum.sort(Map.keys(steps)), {pairs, _transform} = Map.fetch!(steps, v) do
+        :ok = Connection.exec(conn, "BEGIN")
+
+        for {sql, bound} <- pairs do
+          {:ok, _} = Connection.query(conn, sql, bound)
+        end
+
+        :ok = Connection.exec(conn, "COMMIT")
+      end
+
+      # PRECONDITION: this is the state the bug is about. Nothing stamped the label.
+      assert {:ok, %{rows: [[0]]}} = Connection.query(conn, "PRAGMA user_version", [])
+
+      assert {:ok, %{rows: [[2]]}} =
+               Connection.query(conn, "SELECT count(*) FROM django_migrations", [])
+
+      :ok = Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+      Connection.close(conn)
+      :ok = Storage.flush(template, seed)
+      for s <- ["", "-wal", "-shm"], do: File.rm(seed <> s)
+      length(captured)
+    end
+
+    test "template-head retains it (pre-fix: :template_not_at_head, label 0)", %{
+      template: template
+    } do
+      head = django_template!(template)
+      assert Migrator.head() == head
+
+      assert {:ok, ^head} = Migrator.retain_template_head()
+      assert File.exists?(Path.join(remote_dir(), "#{template}@#{head}.db"))
+    end
+
+    test "a novel tenant is then born at HEAD from that snapshot (the fork re-vets the stamped copy)",
+         %{template: template} do
+      head = django_template!(template)
+      assert {:ok, ^head} = Migrator.retain_template_head()
+
+      tenant = new_tenant()
+      assert {:ok, %{version: ^head}} = Migrator.fork_from_template(tenant)
+      assert stored_version(tenant) == head
+    end
+
+    test "the ledger still refuses a Django template one version BEHIND: HEAD moved on", %{
+      template: template
+    } do
+      head = django_template!(template)
+
+      # A fleet release the template has not been migrated to: its ledger row is absent.
+      {:ok, _} =
+        Migrator.release(head + 1, "ahead of the template", [
+          "INSERT INTO django_migrations (app, name, applied) VALUES ('finance', '0003_x', 'now')"
+        ])
+
+      assert {:error, {:template_not_at_head, %{label: 0, head: h}}} =
+               Migrator.retain_template_head()
+
+      assert h == head + 1
+      refute File.exists?(Path.join(remote_dir(), "#{template}@#{head + 1}.db"))
+    end
+
+    test "a template carrying a LATER migration than HEAD is still refused", %{template: template} do
+      head = django_template!(template)
+
+      {:ok, _} =
+        Migrator.release(head + 1, "later", [
+          "INSERT INTO django_migrations (app, name, applied) VALUES ('finance', '0003_x', 'now')"
+        ])
+
+      # Walk HEAD back: the template still carries v3's row, which is a name of a yanked release —
+      # so it is a name of NO live release and only the absolute count can see it.
+      Migrator.yank(head + 1)
+      assert Migrator.head() == head
+
+      # Make the template carry the extra row (count 3 against the recorded 2).
+      tmp_pull = Path.join(System.tmp_dir!(), "pullx_#{template}.db")
+      {:ok, _} = Storage.pull(template, tmp_pull)
+      {:ok, conn} = Connection.open(tmp_pull)
+
+      :ok =
+        Connection.exec(
+          conn,
+          "INSERT INTO django_migrations (app, name, applied) VALUES ('finance', '0003_x', 'now')"
+        )
+
+      :ok = Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
+      Connection.close(conn)
+      :ok = Storage.flush(template, tmp_pull)
+      for s <- ["", "-wal", "-shm"], do: File.rm(tmp_pull <> s)
+
+      assert {:error, {:template_not_at_head, _}} = Migrator.retain_template_head()
+    end
+  end
+
   # --- fork_from_template/1 (the forward path) --------------------------------
 
   describe "fork_from_template/1" do

@@ -69,12 +69,19 @@ defmodule Fathom.Migrator.Ledger do
   """
   @spec check_file(Path.t(), map() | nil) :: {non_neg_integer(), verdict()}
   def check_file(path, facts \\ nil) do
+    {label, present, count} = read_file(path)
+    {label, classify(label, present, count, facts || release_facts())}
+  end
+
+  # `{PRAGMA user_version, the (app, name) set of django_migrations, its row count}`.
+  @spec read_file(Path.t()) :: {non_neg_integer(), MapSet.t(name), non_neg_integer()}
+  defp read_file(path) do
     {:ok, conn} = Connection.open(path)
 
     try do
       label = user_version(conn)
       {present, count} = shard_ledger(conn)
-      {label, classify(label, present, count, facts || release_facts())}
+      {label, present, count}
     after
       Connection.close(conn)
     end
@@ -93,10 +100,27 @@ defmodule Fathom.Migrator.Ledger do
       with a warning (default D6).
     * `{:mismatch, detail}` — the label is above `head`, or the ledger disagrees with the label, or
       names the file as something other than `head`: the caller refuses.
+
+  ## `label: :ledger_if_unstamped` (expert review 2026-11-07 #52)
+
+  The default (`label: :file`) judges the ledger against the file's own `PRAGMA user_version`. A
+  TEMPLATE is migrated by Django directly, and Django's sqlite backend never writes `user_version`
+  (capture records DDL and bookkeeping rows; the only writer is `Copy.replay/5`, on tenant
+  copies), so a Django-migrated template reads label 0 with every name present and the label
+  check refused every one: `mix fathom.snapshot template-head` could not be used by following the
+  docs, no `<template>@HEAD` was ever written and every novel tenant was born EMPTY. With
+  `:ledger_if_unstamped` a file whose label is 0 — never stamped by anything — is taken to BE at
+  `head` and the ledger alone (names and the absolute count) decides, so a template one version
+  behind (head's names absent) or ahead (a later release's names present) is still refused. A file
+  that carries a NON-zero label keeps being judged by it: someone stamped it, and a label that
+  disagrees with `head` is evidence (a template stamped 3 while HEAD is 2 is refused even when the
+  ledger alone could not tell). The file's own label is always the one reported in the detail. The
+  fork copy is re-vetted by the DEFAULT mode after `Copy.migrate` stamped `user_version`, so the
+  label is still checked where something real wrote it.
   """
-  @spec check_at_head(Path.t(), pos_integer()) ::
+  @spec check_at_head(Path.t(), pos_integer(), keyword()) ::
           :ok | {:unverified, non_neg_integer()} | {:mismatch, map()}
-  def check_at_head(path, head) do
+  def check_at_head(path, head, opts \\ []) do
     facts = release_facts()
 
     named? =
@@ -105,28 +129,36 @@ defmodule Fathom.Migrator.Ledger do
         _ -> false
       end
 
-    case check_file(path, facts) do
-      {^head, :ok} -> if named?, do: :ok, else: {:unverified, head}
+    {file_label, present, count} = read_file(path)
+
+    label =
+      case {Keyword.get(opts, :label, :file), file_label} do
+        {:ledger_if_unstamped, 0} -> head
+        _ -> file_label
+      end
+
+    case {label, classify(label, present, count, facts)} do
+      {^head, :ok} -> if named?, do: :ok, else: {:unverified, file_label}
       {label, :ok} when label < head and not named? -> {:unverified, label}
-      {label, verdict} -> {:mismatch, %{label: label, head: head, verdict: verdict}}
+      {_label, verdict} -> {:mismatch, %{label: file_label, head: head, verdict: verdict}}
     end
   end
 
   @doc """
-  `check_at_head/2` with the policy applied: `:ok` to proceed (logging a warning when the file is
+  `check_at_head/3` with the policy applied: `:ok` to proceed (logging a warning when the file is
   unverifiable, or when `:migration_ledger_check` is `:warn`), `{:error, {:template_not_at_head,
   detail}}` to refuse. `:migration_ledger_check` `:off` skips the check entirely, as it does for the
-  migrator. `what` names the artifact in the log line.
+  migrator. `what` names the artifact in the log line. `opts` is `check_at_head/3`'s.
   """
-  @spec vet_at_head(Path.t(), pos_integer(), String.t()) ::
+  @spec vet_at_head(Path.t(), pos_integer(), String.t(), keyword()) ::
           :ok | {:error, {:template_not_at_head, map()}}
-  def vet_at_head(path, head, what) do
+  def vet_at_head(path, head, what, opts \\ []) do
     mode = Application.get_env(:fathom, :migration_ledger_check, :enforce)
 
     if mode == :off do
       :ok
     else
-      case check_at_head(path, head) do
+      case check_at_head(path, head, opts) do
         :ok ->
           :ok
 

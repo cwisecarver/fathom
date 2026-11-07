@@ -1154,7 +1154,21 @@ defmodule Fathom.Migrator do
     try do
       case Fathom.Shard.Storage.pull(template, tmp) do
         {:ok, _etag} ->
-          with :ok <- Fathom.Migrator.Ledger.vet_at_head(tmp, head, "template #{template}") do
+          # AN UNSTAMPED TEMPLATE IS JUDGED BY ITS LEDGER (expert review 2026-11-07 #52). Django
+          # never writes `PRAGMA user_version`, so a template migrated the documented way reads
+          # label 0 with every name present, and the label compare refused it
+          # (`{:template_not_at_head, %{label: 0}}`) — fork-from-template could not be enabled. A
+          # label-0 file is now taken to be at HEAD and the names plus the absolute count decide, so
+          # a template one behind or ahead is still refused; a file someone DID stamp keeps being
+          # judged by its label. The label is checked where something real wrote it: on the FORK
+          # copy `stamp_fork/3` re-vets after `Copy.migrate` stamps `user_version`. The obvious
+          # alternative — stamp `user_version` on the template when `Capture.record/3` returns
+          # `{:recorded, v}` — needs a write on the template's coordinator connection, and is wrong
+          # for a template that Django migrated while capture was down.
+          with :ok <-
+                 Fathom.Migrator.Ledger.vet_at_head(tmp, head, "template #{template}",
+                   label: :ledger_if_unstamped
+                 ) do
             case Fathom.Shard.Storage.retain(template, head) do
               :ok -> {:ok, head}
               {:error, :enoent} -> {:error, :no_template_object}
