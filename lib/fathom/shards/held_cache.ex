@@ -96,6 +96,48 @@ defmodule Fathom.Shards.HeldCache do
     ArgumentError -> :ok
   end
 
+  @default_pin_ms 1_000
+
+  @doc """
+  The node-local answer to "is this node the pinned handoff target of `shard_id`?" given moments ago
+  (expert review 2026-11-07 #47), `{:ok, boolean}`, or `:miss`. Held checkouts ask this on EVERY
+  request (a `HeldCache` replay re-enters the held path too), and the answer is a Postgres read; a
+  failover makes every request for a dead node's shards a held checkout on a survivor, so the read
+  is cached for `:handoff_pin_cache_ms` (default 1 s, 0 disables). The row shares this table, keyed
+  `{:pin, shard_id}` so it can never collide with a held row, and its shape (4-tuple, expiry last)
+  is the one `sweep/1` selects.
+  """
+  @spec pin(Fathom.ShardId.t()) :: {:ok, boolean()} | :miss
+  def pin(shard_id) do
+    case :ets.lookup(@table, {:pin, shard_id}) do
+      [{_, here?, _, until}] ->
+        if System.monotonic_time(:millisecond) < until, do: {:ok, here?}, else: :miss
+
+      [] ->
+        :miss
+    end
+  rescue
+    ArgumentError -> :miss
+  end
+
+  @doc "Remembers the pin answer for `shard_id` (see `pin/1`). A no-op when the cache is off."
+  @spec put_pin(Fathom.ShardId.t(), boolean()) :: :ok
+  def put_pin(shard_id, here?) when is_boolean(here?) do
+    ttl = pin_ms()
+
+    if ttl > 0 do
+      now = System.monotonic_time(:millisecond)
+      maybe_sweep(now)
+      :ets.insert(@table, {{:pin, shard_id}, here?, nil, now + ttl})
+    end
+
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp pin_ms, do: Application.get_env(:fathom, :handoff_pin_cache_ms, @default_pin_ms)
+
   # The full-table sweep is amortized: at most once per ceiling window, and only once the table is
   # above the threshold. The old per-put sweep cost O(rows) under the table's write lock on every
   # insert of a failover herd (248 us per put at 15k unexpired rows; expert review 2026-10-21 #10).

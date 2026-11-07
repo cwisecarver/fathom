@@ -23,16 +23,23 @@ defmodule Fathom.ShardsHandoffHoldTest do
     prev_budget = Application.get_env(:fathom, :handoff_held_retry_budget_ms)
     prev_crash = Application.get_env(:fathom, :crash_failover_hold_ms)
     prev_margin = Application.get_env(:fathom, :steal_margin_ms)
+    prev_poller = Application.get_env(:fathom, :command_poller)
     Application.put_env(:fathom, :shard_idle_ms, 50)
     # Off by default here so the #20 (handoff) tests exercise only the pin path; the #21 tests
     # opt it back in.
     Application.put_env(:fathom, :crash_failover_hold_ms, 0)
+    # A handoff pin can only matter on a fleet that runs the command poller (a handoff drains its
+    # SOURCE through it), so the held path reads the pin only then (expert review 2026-11-07 #47).
+    # These tests model an in-flight handoff, which cannot exist without it; before #47 they ran with
+    # the poller off and passed because the held path read the pin unconditionally.
+    Application.put_env(:fathom, :command_poller, true)
 
     on_exit(fn ->
       restore(:shard_idle_ms, prev_idle)
       restore(:handoff_held_retry_budget_ms, prev_budget)
       restore(:crash_failover_hold_ms, prev_crash)
       restore(:steal_margin_ms, prev_margin)
+      restore(:command_poller, prev_poller)
       Storage.clear_heartbeat("dead@node#1")
       Storage.clear_heartbeat("live@node#1")
 
@@ -400,6 +407,65 @@ defmodule Fathom.ShardsHandoffHoldTest do
     assert source =~ "defp holder_stealable_at(shard_id, owner, budget, _nil) do",
            "the nil fallback is gone. Two backend paths cannot state an instant, and without " <>
              "this clause they would silently lose the crash-failover hold entirely."
+  end
+
+  # --- #47: the pin read on the held path --------------------------------------------------------
+
+  # Counts `shard_overrides` queries made BY THIS PROCESS (the held path runs in the caller).
+  defp count_override_queries! do
+    counter = :counters.new(1, [])
+    test_pid = self()
+    handler = "pinread-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:fathom, :repo, :query],
+        fn _e, _m, meta, _ ->
+          if self() == test_pid and meta[:source] == "shard_overrides",
+            do: :counters.add(counter, 1, 1)
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    counter
+  end
+
+  # Expert review 2026-11-07 #47. Every `{:shard_held, _}` checkout (a `HeldCache` replay included —
+  # it re-enters `held_retry/5`) did one synchronous Postgres read of the handoff pin, whether or not a
+  # rebalancer exists. After a hard crash every request for every tenant of the dead node is a held
+  # checkout on a survivor: thousands of queries through the pool `Revocations` needs on the
+  # stream-open path.
+  test "with the command poller off, a held checkout and its HeldCache replay read no pin (#47)",
+       %{shard: shard} do
+    Application.put_env(:fathom, :command_poller, false)
+    seed_durable(shard)
+    put_live_foreign_lock(shard, "source@node")
+    queries = count_override_queries!()
+
+    assert {:error, {:shard_held, "source@node", _}} = Shards.checkout(shard)
+    # The second is answered from `HeldCache` (zero Storage calls) and still enters the held path.
+    assert {:error, {:shard_held, "source@node", _}} = Shards.checkout(shard)
+
+    assert :counters.get(queries, 1) == 0,
+           "a held checkout queried Postgres for a handoff pin on a fleet with no command poller"
+  end
+
+  test "with the poller on, the pin read is cached: a held storm is one query per shard, not one " <>
+         "per request (#47)",
+       %{shard: shard} do
+    seed_durable(shard)
+    {:ok, _} = Overrides.pin(shard, "some_other_node", reason: "test")
+    put_live_foreign_lock(shard, "source@node")
+    queries = count_override_queries!()
+
+    for _ <- 1..5 do
+      assert {:error, {:shard_held, "source@node", _}} = Shards.checkout(shard)
+    end
+
+    assert :counters.get(queries, 1) == 1,
+           "every held checkout re-read the pin (#{:counters.get(queries, 1)} queries for 5)"
   end
 
   defp local_dir, do: Fathom.Shard.data_dir()

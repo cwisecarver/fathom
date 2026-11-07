@@ -402,8 +402,38 @@ defmodule Fathom.Shards do
   # i.e. a `{:shard_held}` here is the expected post-flip / pre-drain window, not a foreign lease.
   # Fails CLOSED (false ⇒ surface the error) on any Postgres doubt, so a directory blip never
   # converts a real held-error into a multi-second stall.
+  #
+  # THE POSTGRES READ IS NOT FREE ON THE HELD PATH (expert review 2026-11-07 #47). Every held
+  # checkout — including a `HeldCache` replay, which re-enters `held_retry/5` — used to do one
+  # synchronous `Overrides` read, whether or not a rebalancer exists, and a hard crash makes every
+  # request for every tenant of the dead node a held checkout on a survivor: thousands of queries
+  # through the pool that `Revocations` needs on the stream-open path, and a stalled Postgres turned
+  # an immediate 503 into a multi-second one. Three bounds, none of which changes a decision the old
+  # code could have made differently except in the direction it already failed (no pin ⇒ the held
+  # error):
+  #
+  #   * gated on `:command_poller`: a handoff drains its SOURCE through the command channel, so a
+  #     pin can only matter on a fleet that runs the poller (the config is fleet-uniform, the same
+  #     gate `ShardMigration.remote_drain_viable?/1` and `RemoteFlush` use). Without it the answer
+  #     is `false` with no query;
+  #   * cached per shard for ~1 s (`HeldCache.pin/1`), so a storm is one read per shard per second,
+  #     not one per request;
+  #   * the read carries a `timeout:` (`:handoff_pin_read_timeout_ms`, 500 ms).
   defp handoff_pin_here?(shard_id) do
-    case Fathom.Rebalancer.Overrides.for_shard(shard_id) do
+    Application.get_env(:fathom, :command_poller, false) == true and
+      case Fathom.Shards.HeldCache.pin(shard_id) do
+        {:ok, here?} ->
+          here?
+
+        :miss ->
+          here? = read_pin_here(shard_id)
+          Fathom.Shards.HeldCache.put_pin(shard_id, here?)
+          here?
+      end
+  end
+
+  defp read_pin_here(shard_id) do
+    case Fathom.Rebalancer.Overrides.for_shard(shard_id, timeout: pin_read_timeout_ms()) do
       %{pinned_node: node, failed_at: nil} -> node == Fathom.Rebalancer.node_key()
       _ -> false
     end
@@ -412,6 +442,8 @@ defmodule Fathom.Shards do
   catch
     :exit, _ -> false
   end
+
+  defp pin_read_timeout_ms, do: Application.get_env(:fathom, :handoff_pin_read_timeout_ms, 500)
 
   defp handoff_held_budget_ms,
     do: Application.get_env(:fathom, :handoff_held_retry_budget_ms, @default_held_budget_ms)

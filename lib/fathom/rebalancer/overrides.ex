@@ -71,9 +71,13 @@ defmodule Fathom.Rebalancer.Overrides do
   @spec all() :: [Override.t()]
   def all, do: Repo.all(from o in Override, order_by: [asc: o.shard_id])
 
-  @doc "The pin for `shard_id`, or nil."
-  @spec for_shard(String.t()) :: Override.t() | nil
-  def for_shard(shard_id), do: Repo.get_by(Override, shard_id: canon(shard_id))
+  @doc """
+  The pin for `shard_id`, or nil. `opts` go to the query (the request path passes `timeout:` so a
+  stalled Postgres cannot hold a held checkout, expert review 2026-11-07 #47).
+  """
+  @spec for_shard(String.t(), keyword()) :: Override.t() | nil
+  def for_shard(shard_id, opts \\ []),
+    do: Repo.get_by(Override, [shard_id: canon(shard_id)], opts)
 
   # Canonicalize a shard_id (downcase) so every Overrides lookup/write agrees with the stored
   # canonical key (#15). An invalid id is passed through unchanged: pin's changeset then rejects
