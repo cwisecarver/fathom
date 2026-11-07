@@ -587,20 +587,42 @@ defmodule Fathom.Shard.Storage.S3 do
           # REPORTS WHAT IT CARRIED (expert review 2026-08-26 #33). The caller caches it and hands
           # it back as `{:carried, _}` next time, so only the FIRST flush of a coordinator's life
           # pays the HEAD above.
-          s when s in 200..299 -> {:ok, etag(resp.headers), carried}
-          412 -> {:error, :superseded}
+          s when s in 200..299 ->
+            {:ok, etag(resp.headers), carried}
+
+          412 ->
+            {:error, :superseded}
+
           # A FENCED (If-Match) PUT to a key that no longer exists: AWS answers 404 NoSuchKey
           # rather than 412 (expert review 2026-10-12 #22). The fence did its job — the object we
           # fenced on is gone (purge/delete) — so it is the same self-fence verdict as 412; the
           # coordinator's `reconcile_superseded` re-checks the lock and either resyncs to an
           # absent object (lock still ours) or self-fences. Not for the create-only
           # (If-None-Match) form, where a 404 is a real error (missing bucket).
-          404 when expected_etag != nil -> {:error, :superseded}
-          s -> {:error, {:s3_put_status, s}}
+          404 when expected_etag != nil ->
+            if no_such_key?(resp.body),
+              do: {:error, :superseded},
+              else: {:error, {:s3_put_status, 404}}
+
+          s ->
+            {:error, {:s3_put_status, s}}
         end
       end
     end)
   end
+
+  # Is this the body of a 404 NoSuchKey (expert review 2026-11-07 #11)? S3 uses 404 for two different
+  # things on a conditional (`If-Match`) PUT, and only the error document tells them apart:
+  # `NoSuchKey` — the object we fenced on is gone, the same verdict as a 412 — and `NoSuchBucket`, a
+  # mis-pointed or deleted bucket. Mapping EVERY 404 to "superseded" would make a bucket outage
+  # self-fence every shard that writes and quarantine its dirty data, so the mapping requires the
+  # body to say `NoSuchKey`. Anything else stays the generic status error, which every caller
+  # treats as transient.
+  @spec no_such_key?(term()) :: boolean()
+  defp no_such_key?(body) when is_binary(body),
+    do: String.contains?(body, "<Code>NoSuchKey</Code>")
+
+  defp no_such_key?(_other), do: false
 
   # The `:pre_put` flush option. The fun is awaited (it is a durable local write); a result other
   # than `:ok` is logged and ignored, because losing the intent only re-opens the old, quarantining
@@ -3119,6 +3141,13 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, %{status: 412}} ->
         :exists
 
+      # `ConditionalRequestConflict` (AWS): a concurrent create/delete of the same key blocked this
+      # one and nothing was applied (expert review 2026-11-07 #11). A retryable shape, like the
+      # read blips that share it, not a bare status the caller cannot classify. A 404 here stays a
+      # plain error: for a create-only PUT it can only be a missing bucket.
+      {:ok, %{status: 409}} ->
+        {:error, {:transient_lookup, :conditional_conflict}}
+
       {:ok, %{status: status}} ->
         {:error, {:s3_put_status, status}}
 
@@ -3587,6 +3616,23 @@ defmodule Fathom.Shard.Storage.S3 do
           {:ok, %{owner: owner}, _etag} -> {:error, {:held, owner, nil}}
           _ -> {:error, :precondition_failed}
         end
+
+      # A CONDITIONAL PUT AGAINST A KEY THAT IS GONE (expert review 2026-11-07 #11): AWS answers
+      # 404 NoSuchKey where MinIO answers 412 — the repo's own contract (`flush/6`'s fenced-PUT
+      # clause, the boot probe accepting either). Unmapped, a deposed owner whose lock the stealer
+      # cleanly RELEASED (deleted) got `{:s3_put_status, 404}` from its renew, which every caller
+      # reads as "transient, retry": the owner never self-fenced and kept serving stale reads while
+      # it re-PUT every ~1-11 s. A deleted lock is what a 412 says — the lock is no longer the one
+      # we fenced on — so it is the same verdict. Only `NoSuchKey` says that: see `no_such_key?/1`.
+      {:ok, %{status: 404, body: body}} ->
+        if no_such_key?(body),
+          do: {:error, :precondition_failed},
+          else: {:error, {:s3_put_status, 404}}
+
+      # `ConditionalRequestConflict`: a concurrent request on the same key blocked this one, and
+      # nothing was applied. Retryable, not a verdict about who holds the lock.
+      {:ok, %{status: 409}} ->
+        {:error, {:transient_lookup, :conditional_conflict}}
 
       {:ok, %{status: status}} ->
         {:error, {:s3_put_status, status}}

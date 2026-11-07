@@ -90,6 +90,12 @@ PUT as a belt (never a delete, never back to `epoch`), and a failed touch's roll
 steal watch instead of restarting it, so the retry is not made to wait a second window
 (`component-notes.md`).
 
+**Lock PUT statuses (expert review 2026-11-07 #11).** A conditional PUT against a lock that was
+deleted is 404 `NoSuchKey` on AWS (412 on MinIO), and a conflicting concurrent request is 409. The
+first means "not the lock you fenced on" (a renew is `:superseded`, so a deposed owner self-fences);
+the second is retryable. A 404 is only the first when the error document says `NoSuchKey` — a
+`NoSuchBucket` must not mass-self-fence — and the same rule applies to the data flush's fenced PUT.
+
 **Incomplete multipart uploads.** A node killed between the touch's create and complete leaves an
 open upload holding server-side copies of up to a whole shard, invisible to ListObjectsV2. Two
 backstops (expert review 2026-10-13 #21):

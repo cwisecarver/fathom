@@ -50,13 +50,36 @@ defmodule Fathom.Shard.Storage.S3FencedPut404Test do
     )
   end
 
-  test "a fenced flush answered 404 is :superseded", %{tmp: tmp} do
-    put_s3_config(fn conn -> Plug.Conn.send_resp(conn, 404, "") end)
+  # Expert review 2026-11-07 #11 tightened this: these two used to answer a BARE 404 (empty body)
+  # and expect `:superseded`, which pinned the conflation of NoSuchKey with NoSuchBucket. A fenced
+  # PUT answered 404 is `:superseded` only when the error document says the KEY is gone; a missing
+  # bucket must not mass-self-fence every shard that writes.
+  test "a fenced flush answered 404 NoSuchKey is :superseded", %{tmp: tmp} do
+    put_s3_config(fn conn ->
+      Plug.Conn.send_resp(conn, 404, S3EtagStore.error_body("NoSuchKey"))
+    end)
+
     assert {:error, :superseded} = S3.flush("shard_x", tmp, "\"etag-1\"")
   end
 
-  test "a create-only flush answered 404 stays a plain error", %{tmp: tmp} do
+  test "a fenced flush answered 404 NoSuchBucket is a plain error, NOT a self-fence", %{tmp: tmp} do
+    put_s3_config(fn conn ->
+      Plug.Conn.send_resp(conn, 404, S3EtagStore.error_body("NoSuchBucket"))
+    end)
+
+    assert {:error, {:s3_put_status, 404}} = S3.flush("shard_x", tmp, "\"etag-1\"")
+  end
+
+  test "a fenced flush answered a bare 404 is not trusted to mean NoSuchKey", %{tmp: tmp} do
     put_s3_config(fn conn -> Plug.Conn.send_resp(conn, 404, "") end)
+    assert {:error, {:s3_put_status, 404}} = S3.flush("shard_x", tmp, "\"etag-1\"")
+  end
+
+  test "a create-only flush answered 404 stays a plain error", %{tmp: tmp} do
+    put_s3_config(fn conn ->
+      Plug.Conn.send_resp(conn, 404, S3EtagStore.error_body("NoSuchKey"))
+    end)
+
     assert {:error, {:s3_put_status, 404}} = S3.flush("shard_x", tmp, nil)
   end
 

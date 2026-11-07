@@ -240,6 +240,17 @@ defmodule Fathom.Test.StorageContract do
           assert lease.released_by == "a@node#1"
           assert Fathom.Shard.Storage.floor_owner(lease) == "a@node#1"
         end
+
+        test "a lease whose lock was DELETED is :superseded on renew, not a transient error" do
+          # A deposed owner whose lock was deleted by the stealer's clean release must self-fence:
+          # an `{:error, _}` here reads as "retry", so it would serve stale forever (#11).
+          id = sid("deleted")
+          {:ok, lease} = @backend.acquire_lease(id, "a@node#1", 30_000)
+          :ok = @backend.release_lease(id, lease)
+          assert :free = @backend.lease_holder(id), "fixture: the lock must be gone"
+
+          assert {:error, :superseded} = @backend.renew_lease(id, lease, 30_000)
+        end
       end
 
       describe "#{inspect(unquote(backend))} — the copy primitives" do
