@@ -576,6 +576,47 @@ defmodule Fathom.ConnectionWatchdogTest do
       send(freezer, :thaw)
     end
 
+    # Expert review 2026-11-07 #34. A `regexp` match is uninterruptible once started and the
+    # progress handler runs only every 1000 VDBE ops, so with the watchdog's timer unable to fire a
+    # statement calling a slow `regexp` once per ~15-op row ran ~66 calls past its deadline. The UDF
+    # now asks the connection's deadline BEFORE each call and fails with SQLITE_INTERRUPT, so the
+    # overshoot is one call. Asserted relative to the measured cost of one call on this machine.
+    test "a slow regexp per row stops at the row after the deadline, not at the next progress check" do
+      conn = backstop_conn!(100)
+
+      # `substr(.., 1 + x % 2)` makes the subject depend on the row so SQLite cannot hoist the
+      # deterministic call out of the loop; MATERIALIZED builds the random subject once. The pattern
+      # is state-explosive for the lazy DFA on random hex (a counted repetition after an unbounded
+      # one), so the regex crate runs its slow engine (a 512 KiB subject costs ~20 ms per call here; pre-fix the statement ran ~800 ms).
+      per_row = fn rows ->
+        "WITH big(s) AS MATERIALIZED (SELECT hex(randomblob(262144))), " <>
+          "r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r WHERE x < #{rows}) " <>
+          "SELECT count(*) FROM r, big " <>
+          "WHERE regexp('[0-9A-F]*A[0-9A-F]{50}[^0-9A-F]', substr(big.s, 1 + (r.x % 2)))"
+      end
+
+      # PRECONDITION: time one call (one row) — it must be slow enough that 66 of them would
+      # overshoot, and short enough to finish inside the deadline.
+      {one_us, {:ok, %{rows: [[0]]}}} = :timer.tc(fn -> query(conn, per_row.(1), []) end)
+      assert one_us > 3_000, "one regexp call took #{one_us} us; the pattern is not slow here"
+      assert one_us < 50_000, "one regexp call took #{one_us} us; too slow for a 100 ms deadline"
+
+      freezer = freeze_watchdog!(conn)
+      {us, result} = :timer.tc(fn -> query(conn, per_row.(100_000), []) end)
+
+      assert {:error, :query_timeout} = result,
+             "got #{inspect(result)} after #{div(us, 1000)} ms with the watchdog frozen"
+
+      # The deadline, the call in flight when it passed, and the next row's refusal.
+      allowed = 100_000 + 4 * one_us + 200_000
+
+      assert us < allowed,
+             "stopped after #{div(us, 1000)} ms (deadline 100 ms, one call #{div(one_us, 1000)} ms, " <>
+               "allowed #{div(allowed, 1000)} ms): regexp does not check the deadline before matching"
+
+      send(freezer, :thaw)
+    end
+
     test "a tenant cannot switch the backstop off" do
       conn = backstop_conn!(100)
 

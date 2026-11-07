@@ -336,6 +336,51 @@ pub fn install(db: &Connection) -> Result<()> {
 /// The per-connection state, opaque outside this module: what `attach` needs.
 pub type State = *mut c_void;
 
+/// A read-only handle on one connection's statement deadline, for a UDF that can run long INSIDE a
+/// single call (`regexp`, expert review 2026-11-07 #34).
+///
+/// `sqlite3_interrupt` and the progress handler are consulted only BETWEEN VDBE ops, every
+/// [`CHECK_EVERY_OPS`] of them, so a statement that calls a slow UDF once per row overshoots its
+/// deadline by (ops until the next check) / (ops per row) rows' worth of that UDF's time: ~66 calls
+/// for a 15-op row. A UDF that asks [`Deadline::expired`] BEFORE it starts turns that into at most
+/// one call. It reads exactly the atomics `on_progress` reads, so it cannot disagree with it.
+///
+/// # Lifetime
+///
+/// The pointer is the state `register` returned for the connection, which `fathom_backstop` owns
+/// and frees when the connection closes or that function is registered again. A UDF holding a
+/// `Deadline` must therefore be registered by the same `register_common` call, with the same
+/// state, as `fathom_backstop` (lib.rs): the two are replaced together, and SQLite runs no UDF on
+/// a connection once it has begun closing it.
+#[derive(Clone, Copy)]
+pub struct Deadline(State);
+
+// SAFETY: the state is only ever read through atomics, and its lifetime is the connection's (see
+// above); SQLite serializes a connection's UDF calls on one thread at a time anyway.
+unsafe impl Send for Deadline {}
+
+impl Deadline {
+    /// # Safety
+    ///
+    /// `state` must be the value [`register`] returned for the connection this handle is
+    /// registered on, and the handle must be dropped with that connection's functions.
+    pub unsafe fn new(state: State) -> Deadline {
+        Deadline(state)
+    }
+
+    /// Whether the statement that is running now is past its deadline. False when no deadline is
+    /// set or no statement has been traced yet (the same rule as the progress handler).
+    pub fn expired(&self) -> bool {
+        // SAFETY: see the type's Lifetime section.
+        let state = unsafe { &*(self.0 as *const Backstop) };
+        should_interrupt(
+            state.timeout_ns.load(Ordering::Relaxed),
+            state.start_ns.load(Ordering::Relaxed),
+            now_ns(),
+        )
+    }
+}
+
 /// Register the setters and the per-connection state, WITHOUT installing any handler.
 ///
 /// The auto-extension path (src/auto.rs, expert review 2026-10-22 r8 #14) runs inside

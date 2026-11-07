@@ -144,6 +144,10 @@ fn register_common(db: &Connection) -> Result<backstop::State> {
     // only; the handlers go in with the hook.
     let state = backstop::register(db)?;
 
+    // `regexp` takes this connection's deadline: it is registered here, after the state exists, and
+    // replaced together with `fathom_backstop` (see `backstop::Deadline`).
+    register_regexp(db, det, unsafe { backstop::Deadline::new(state) })?;
+
     // The engine half of the tenant PRAGMA gate. Registers only the set-once
     // `fathom_pragma_guard(...)` setter; the authorizer itself is installed when fathom calls it,
     // on tenant handles only (an authorizer denies ATTACH, and VACUUM INTO is an ATTACH). See
@@ -484,10 +488,10 @@ fn register_hashes(db: &Connection, flags: FunctionFlags) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// regexp, bit ops, uuids, rand
+// regexp
 // ---------------------------------------------------------------------------------------------
 
-fn register_misc(db: &Connection, det: FunctionFlags, nondet: FunctionFlags) -> Result<()> {
+fn register_regexp(db: &Connection, det: FunctionFlags, deadline: backstop::Deadline) -> Result<()> {
     // `X REGEXP Y` is SQLite syntax for `regexp(Y, X)` — pattern FIRST, which is also the order
     // Django registers. Getting these backwards produces a function that "works" on symmetric
     // test data and is wrong everywhere else.
@@ -500,7 +504,20 @@ fn register_misc(db: &Connection, det: FunctionFlags, nondet: FunctionFlags) -> 
     // Compiled patterns are cached inside `pyre` rather than via SQLite's auxdata: auxdata only
     // covers a CONSTANT argument, and a Django queryset binds the pattern as a PARAMETER
     // (`WHERE col REGEXP ?`), which would otherwise recompile per row.
-    db.create_scalar_function("regexp", 2, det, |ctx| {
+    //
+    // A match is uninterruptible once started, so the call first asks whether its statement is
+    // already past the deadline and, if so, fails with SQLITE_INTERRUPT (the code the progress
+    // handler's stop produces, which `Fathom.Shard.Connection` maps to FILO_QUERY_TIMEOUT): a
+    // statement that calls `regexp` per row stops at its next row instead of at the next progress
+    // check, which can be ~100 rows away (expert review 2026-11-07 #34). Together with
+    // `pyre::MAX_PLAIN_SUBJECT_BYTES` that bounds the overshoot to ONE bounded call.
+    db.create_scalar_function("regexp", 2, det, move |ctx| {
+        if deadline.expired() {
+            return Err(Error::SqliteFailure(
+                ffi::Error::new(ffi::SQLITE_INTERRUPT),
+                None,
+            ));
+        }
         let (Some(pattern), Some(text)) = (opt_text(ctx, 0)?, regexp_subject(ctx, 1)?) else {
             return Ok(None);
         };
@@ -510,6 +527,14 @@ fn register_misc(db: &Connection, det: FunctionFlags, nondet: FunctionFlags) -> 
             .map_err(|e| Error::UserFunctionError(Box::new(e)))
     })?;
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// bit ops, uuids, rand
+// ---------------------------------------------------------------------------------------------
+
+fn register_misc(db: &Connection, det: FunctionFlags, nondet: FunctionFlags) -> Result<()> {
     db.create_scalar_function("BITXOR", 2, det, |ctx| {
         let (Some(x), Some(y)) = (opt_i64(ctx, 0), opt_i64(ctx, 1)) else {
             return Ok(None);

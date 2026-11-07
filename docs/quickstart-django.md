@@ -224,6 +224,13 @@ and the second is the dangerous one:
 small translation layer for the tokens Python spells differently (`$` → `(?=\n?\z)`, `\Z` → `\z`,
 `(?P=name)` → `\k<name>`). Verified against 3,444 CPython-generated cases.
 
+**Size limits.** A match cannot be interrupted once it starts, so `regexp` refuses a subject over
+**1 MiB** with an error for every pattern, and over **64 KiB** for a pattern that uses lookaround or a
+backreference (those run on a backtracking engine). A `__regex` over a larger value gets
+`text is N bytes, over the … limit` where Django would answer — raise the question before relying on
+`__regex` over big text columns. A `regexp` call made after its statement's deadline has passed fails
+with the timeout instead of starting (expert review 2026-11-07 #34).
+
 ##### The two remaining differences, both deliberate
 
 Both are cases where **Django raises and fathom answers**, so every query that works on Django works

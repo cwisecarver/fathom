@@ -241,8 +241,28 @@ const FAILED_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 /// from every start position, so lookaround patterns are quadratic in subject length (measured
 /// 47/181/719 ms at 20k/40k/80k bytes; 56 s at 1 MB), bypassing the statement deadline and the
 /// backstop. `backtrack_limit` counts VM steps, not delegate rescans, so it never trips. Plain
-/// patterns run on the linear `regex` engine and are not capped.
+/// patterns run on the linear `regex` engine and have the larger [`MAX_PLAIN_SUBJECT_BYTES`] cap.
 pub const MAX_FANCY_SUBJECT_BYTES: usize = 64 * 1024;
+
+/// Every subject over this is refused, whatever the pattern (expert review 2026-11-07 #34).
+///
+/// The plain path is linear but not fast for every pattern: when the hybrid DFA cannot hold a
+/// pattern's state space (a counted repetition after an unbounded one, `[ab]*a[ab]{200}[^ab]`,
+/// `(?i)(?:\w|\s){1,100}a(?:\w|\s){100}\W`) the `regex` crate falls back to its PikeVM, and the
+/// match runs at 0.1–12 MB/s MEASURED on random a/b text (release build, Apple silicon:
+/// 12 / 6 / 3.6 / 1.9 MB/s for `{20}` / `{50}` / `{100}` / `{200}`, 0.83 for the `\w|\s` one,
+/// 0.11 for `(a|b)*a(a|b){2000}c`). SQLite's own limit lets a subject reach 64 MiB, so one call
+/// could run for minutes on a dirty-IO thread; nothing can interrupt it (the progress handler
+/// runs between VDBE ops, the regex crate has no cancellation). A bigger lazy-DFA cache does not
+/// help (4 / 32 / 256 MiB all measured identical, so it is not cache thrash that decides), and
+/// the plain subject cannot be matched in windows (a match may span any window). So the work is
+/// bounded by input size: 1 MiB bounds one call to ~0.1 s for a realistic pattern and to ~1–10 s
+/// for the slowest measured ones, and the `regexp` UDF checks the statement deadline before each
+/// call so a per-row statement stops at its next row. A `__regex` over a larger value is not a
+/// realistic workload (the fancy cap is 64 KiB for the same reason). Residual, parked: a hostile
+/// pattern can still hold one thread for up to that 1–10 s once per row until the deadline; a
+/// truly interruptible matcher would need a hand-driven lazy-DFA loop (see component-notes).
+pub const MAX_PLAIN_SUBJECT_BYTES: usize = 1024 * 1024;
 
 /// True when the pattern needs the backtracking engine. `regex-syntax` rejects exactly the
 /// constructs fancy-regex adds (lookaround, backreferences, atomic groups); any other parse failure
@@ -259,6 +279,8 @@ pub enum PyreError {
     /// A lookaround/backreference pattern was asked to scan a subject over
     /// [`MAX_FANCY_SUBJECT_BYTES`].
     SubjectTooLong(usize),
+    /// Any pattern was asked to scan a subject over [`MAX_PLAIN_SUBJECT_BYTES`].
+    PlainSubjectTooLong(usize),
     /// `fancy-regex` refused to compile or run it.
     Regex(fancy_regex::Error),
 }
@@ -274,6 +296,11 @@ impl std::fmt::Display for PyreError {
                 f,
                 "text is {n} bytes, over the {MAX_FANCY_SUBJECT_BYTES}-byte limit for \
                  regular expressions with lookaround or backreferences"
+            ),
+            PyreError::PlainSubjectTooLong(n) => write!(
+                f,
+                "text is {n} bytes, over the {MAX_PLAIN_SUBJECT_BYTES}-byte limit for regular \
+                 expressions"
             ),
             PyreError::Regex(e) => e.fmt(f),
         }
@@ -340,6 +367,9 @@ pub fn search(pattern: &str, subject: &str) -> Result<bool, PyreError> {
     };
     if fancy && subject.len() > MAX_FANCY_SUBJECT_BYTES {
         return Err(PyreError::SubjectTooLong(subject.len()));
+    }
+    if subject.len() > MAX_PLAIN_SUBJECT_BYTES {
+        return Err(PyreError::PlainSubjectTooLong(subject.len()));
     }
     Ok(re.is_match(subject)?)
 }
@@ -697,14 +727,40 @@ mod tests {
         assert!(search("(?<=a)b", &"c".repeat(MAX_FANCY_SUBJECT_BYTES)).is_ok());
     }
 
-    // The cap is for the backtracking path only: plain patterns (including `$`, which `translate`
-    // rewrites into a lookahead) stay linear and keep working on big subjects.
+    // Plain patterns (including `$`, which `translate` rewrites into a lookahead) stay linear and
+    // keep working on big subjects up to MAX_PLAIN_SUBJECT_BYTES, not the 64 KiB fancy cap.
     #[test]
-    fn plain_patterns_are_not_capped() {
+    fn plain_patterns_have_the_larger_cap() {
         let big = format!("{}b", "a".repeat(1_000_000));
         assert!(m("a*b", &big));
         assert!(m("a+b$", &big));
         assert!(!m("^c", &big));
+    }
+
+    // expert review 2026-11-07 #34: a plain pattern is not fast for every shape (the hybrid DFA
+    // gives up and the PikeVM runs at 0.1–12 MB/s), and a call cannot be interrupted, so the
+    // subject is bounded for EVERY pattern. Refused before any matching, so it is quick.
+    #[test]
+    fn plain_patterns_refuse_subjects_over_the_plain_cap_quickly() {
+        use std::time::{Duration, Instant};
+        // The measured slow shape: a counted repetition after an unbounded one, on text the lazy
+        // DFA cannot summarise. Over the cap it must not even start.
+        let slow = "[ab]*a[ab]{200}[^ab]";
+        let over = "ab".repeat(MAX_PLAIN_SUBJECT_BYTES / 2 + 1);
+        let t = Instant::now();
+        let r = search(slow, &over);
+        assert!(
+            matches!(r, Err(PyreError::PlainSubjectTooLong(n)) if n == over.len()),
+            "{r:?}"
+        );
+        assert!(t.elapsed() < Duration::from_millis(100), "{:?}", t.elapsed());
+        // Cached and uncached, trivial patterns too.
+        assert!(matches!(
+            search("^a", &over),
+            Err(PyreError::PlainSubjectTooLong(_))
+        ));
+        // Exactly at the cap still answers.
+        assert!(search("^c", &"a".repeat(MAX_PLAIN_SUBJECT_BYTES)).is_ok());
     }
 
     // expert review 2026-10-13 #32: a failing pattern re-ran every compile tier on each call.
