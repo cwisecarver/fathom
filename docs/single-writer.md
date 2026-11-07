@@ -217,6 +217,11 @@ between the last check and idle never produces a clobbering write.
   it — the same primitive in its cooperative direction (see `docs/rebalancing.md`). Because the lease
   blocks double-writes regardless, a healthy node can't be *stolen* from; a move is always a
   voluntary drain.
+  The release is a conditional DELETE (or released-marker PUT) of the lock. It is retried on a
+  50/200/800 ms ladder inside a bounded slice of the shutdown budget; if it still fails the
+  coordinator logs an error, emits `[:fathom, :shard, :release, :failed]` and `Shards.drain/2`
+  answers `{:error, {:release_failed, _}}` — the lock then still names this node, which its live
+  heartbeat keeps unstealable (expert review 2026-11-07 #13).
 
 ## Failover RTO — the recovery-time floor (audit #21)
 

@@ -697,7 +697,9 @@ defmodule Fathom.Shards do
   Returns `:ok` once the coordinator has fully stopped (data is durable in storage
   and the lease is free), or `:ok` if it wasn't running (already cold). Returns
   `{:error, :unflushed_local_copy}` if the stop kept a local copy its flush could not make
-  durable — retryable. Returns
+  durable — retryable. Returns `{:error, {:release_failed, reason}}` if the lease release failed
+  even after its retries (the lock still names this node; a handoff target or the migrator would
+  be refused behind our live heartbeat — expert review 2026-11-07 #13). Returns
   `{:error, :busy}` if connections didn't drain in time — the coordinator keeps
   serving and the caller should retry later. Blocks until the coordinator exits.
   """
@@ -745,11 +747,31 @@ defmodule Fathom.Shards do
         # safety-net timeout still reads as :busy (the coordinator normally replies via
         # DOWN or :drain_aborted well before this). Only the eviction path (evict/2) uses
         # a shorter budget and keeps the :exit_timeout as "couldn't confirm this exited".
-        case await_coordinator_exit(pid, ref, drain_timeout + @default_exit_grace_ms) do
-          {:error, :exit_timeout} -> {:error, :busy}
-          :ok -> stopped_clean(shard_id)
-          other -> other
+        result =
+          case await_coordinator_exit(pid, ref, drain_timeout + @default_exit_grace_ms) do
+            {:error, :exit_timeout} -> {:error, :busy}
+            :ok -> stopped_clean(shard_id)
+            other -> other
+          end
+
+        # A STOP WHOSE LEASE RELEASE FAILED IS NOT A DRAIN (expert review 2026-11-07 #13). The
+        # coordinator retried the release and, on giving up, told us before it exited (the message
+        # precedes its DOWN). The lock still names this node, so a handoff target or the migrator
+        # would be refused behind our live heartbeat while this answered `:ok`. Always consumed, so
+        # the message never lingers in a long-lived caller's mailbox; a kept local copy is the
+        # stronger failure and wins.
+        case {result, take_release_failure(pid)} do
+          {:ok, {:failed, reason}} -> {:error, {:release_failed, reason}}
+          {other, _} -> other
         end
+    end
+  end
+
+  defp take_release_failure(pid) do
+    receive do
+      {:drain_release_failed, ^pid, reason} -> {:failed, reason}
+    after
+      0 -> :none
     end
   end
 

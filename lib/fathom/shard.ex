@@ -840,7 +840,11 @@ defmodule Fathom.Shard do
       try do
         unmark_lease_held(shard_id)
         # A takeover lease's claim survives the failed open (expert review 2026-10-12 #3).
-        Storage.release_lease(shard_id, refusal_release_lease(lease, reason), lease[:claim])
+        # Retried like every drop-path release (expert review 2026-11-07 #13): this is the same
+        # strand-behind-a-live-heartbeat mechanism, and storage misbehaving is why we are here.
+        release_with_retry(%{id: shard_id}, :abandoned_open, fn ->
+          Storage.release_lease(shard_id, refusal_release_lease(lease, reason), lease[:claim])
+        end)
       rescue
         e -> {:error, e}
       catch
@@ -1437,7 +1441,10 @@ defmodule Fathom.Shard do
         # visit, so the steal-touch's provenance rides the marker like `release_clean/1`'s (expert
         # review 2026-10-13 #2). Without it the next stealer's touch chain restarts and the previous
         # holder's warm copy reads as a fork.
-        Storage.release_lease(shard_id, Storage.with_clean_touch(lease), lease[:claim])
+        release_with_retry(%{id: shard_id}, :open_failed, fn ->
+          Storage.release_lease(shard_id, Storage.with_clean_touch(lease), lease[:claim])
+        end)
+
         {:stop, {:shutdown, open_failure_reason(reason)}, %{id: shard_id}}
     end
   end
@@ -2058,9 +2065,13 @@ defmodule Fathom.Shard do
 
   # Begin standing down. With no connections we stop immediately (terminate
   # flushes + releases). Otherwise wait for the drain, bounded by a timer.
-  def handle_cast({:drain, _timeout, _reply_to}, %{conns: conns} = state)
+  #
+  # The immediate stop still records who asked: a lease release that fails after its retries tells
+  # the caller through `drain_reply_to` (`release_failed/3`, expert review 2026-11-07 #13), and this
+  # is the idle-shard drain every handoff and migration takes.
+  def handle_cast({:drain, _timeout, reply_to}, %{conns: conns} = state)
       when map_size(conns) == 0 do
-    {:stop, :normal, state}
+    {:stop, :normal, Map.put(state, :drain_reply_to, reply_to)}
   end
 
   # A drain is already in progress (expert review #29): refuse the second one
@@ -4184,9 +4195,15 @@ defmodule Fathom.Shard do
     if is_map(state.lease) do
       lease = Storage.with_dirty_release(state.lease)
 
-      if put_in_flight?,
-        do: Storage.release_lease_fenced(state.id, lease, state.lineage),
-        else: Storage.release_lease(state.id, lease, state.lineage)
+      if put_in_flight? do
+        release_with_retry(state, :fenced_marker, fn ->
+          Storage.release_lease_fenced(state.id, lease, state.lineage)
+        end)
+      else
+        release_with_retry(state, :keeping_claim, fn ->
+          Storage.release_lease(state.id, lease, state.lineage)
+        end)
+      end
     end
   end
 
@@ -4195,7 +4212,7 @@ defmodule Fathom.Shard do
   # flagged the guard's false branch as unreachable.
   defp release_plain(state) do
     unmark_lease_held(state.id)
-    Storage.release_lease(state.id, state.lease)
+    release_with_retry(state, :plain, fn -> Storage.release_lease(state.id, state.lease) end)
   end
 
   # The CLEAN drop's release (expert review 2026-10-12 #3). A clean coordinator shipped nothing of
@@ -4211,13 +4228,15 @@ defmodule Fathom.Shard do
     # Clean ⇒ this holder wrote nothing, so the marker may also record its steal-touch's provenance
     # (expert review 2026-10-12 #10, `Storage.with_clean_touch/1`): a previous holder reopening with
     # an older local copy then sees "only touches since your sidecar" instead of a fork.
-    if is_map(state.lease),
-      do:
+    if is_map(state.lease) do
+      release_with_retry(state, :clean, fn ->
         Storage.release_lease(
           state.id,
           Storage.with_clean_touch(state.lease),
           unstamped_claim(state)
         )
+      end)
+    end
   end
 
   defp unstamped_claim(%{lineage_stamped?: false, lease: %{claim: claim}})
@@ -4225,6 +4244,94 @@ defmodule Fathom.Shard do
        do: claim
 
   defp unstamped_claim(_state), do: nil
+
+  # THE LEASE RELEASE IS RETRIED, AND A FAILURE THAT OUTLASTS THE RETRIES IS SURFACED (expert review
+  # 2026-11-07 #13). Every drop path ends in ONE conditional DELETE (or the conditional released-
+  # marker PUT) whose `{:error, _}` the helpers above returned to callers that ignored it. `Req`
+  # retries only GET/HEAD, so a reset connection, a timeout or a 5xx on that one request left the
+  # lock naming this node's LIVE incarnation: its fresh heartbeat means `owner_live?` never lets a
+  # peer steal it, a rebalancer handoff's target is refused (`{:shard_held, source}`) and the
+  # migrator's `hold_lease` snoozes, with nothing logged — until this node happened to reopen the
+  # shard (its own incarnation reclaims silently, which is why the damage is so quiet).
+  #
+  # A RETRY CANNOT HURT A NEWER OWNER, and that is the whole safety argument: each attempt is the
+  # SAME fenced request, resolved against the lock's CURRENT state by the backend. A DELETE whose
+  # reply was lost retries into a 404 (`:ok`); a lock someone else has since written 412s into
+  # `resolve_412_release`, which re-reads it and leaves it alone; a marker PUT retries into a 412 →
+  # `resolve_412_marker` → `:not_ours`. The obvious-looking alternatives are WRONG: deleting
+  # unconditionally removes a stealer's fresh lock (finding #22), and switching the marker to a plain
+  # DELETE re-creates the epoch-1 unfenced create (AGENTS.md, "delete the lock instead of rolling
+  # it back").
+  #
+  # BOUNDED WITHIN THE DROP BUDGET. The attempts run in a task on the S3 backend's own 50/200/800 ms
+  # ladder, under `release_budget_ms/0` (a quarter of the settle budget, 5 s by default): the first
+  # upload already holds up to `settle_yield_ms/0`, the retried upload up to half of it
+  # (`bounded_retry_upload/2`), and `:shard_shutdown_ms` kills terminate outright — a hung store must
+  # cost the drop a bounded slice, not the whole shutdown (a total outage that also hangs the DELETE
+  # was the "follow-up" the `bounded_upload_for_drop/1` note left open).
+  #
+  # The failure is an ERROR log plus `[:fathom, :shard, :release, :failed]` (alertable like
+  # `flush :failed`), and a drain's caller is told (`{:drain_release_failed, pid, reason}` to
+  # `drain_reply_to`): a PERMANENT failure (a 403 from an IAM policy that withholds DeleteObject,
+  # review #36) hits the same path and was invisible.
+  @release_retry_ms [50, 200, 800]
+
+  defp release_with_retry(state, kind, release_fun) do
+    task = Task.async(fn -> retry_release(release_fun, @release_retry_ms) end)
+
+    result =
+      case Task.yield(task, release_budget_ms()) || Task.shutdown(task, :brutal_kill) do
+        {:ok, result} -> result
+        {:exit, reason} -> {:error, {:release_exit, reason}}
+        nil -> {:error, :release_timeout}
+      end
+
+    with {:error, reason} <- result do
+      release_failed(state, kind, reason)
+    end
+
+    result
+  end
+
+  defp retry_release(release_fun, ladder) do
+    case release_fun.() do
+      {:error, _} = error ->
+        case ladder do
+          [] ->
+            error
+
+          [delay | rest] ->
+            Process.sleep(delay)
+            retry_release(release_fun, rest)
+        end
+
+      done ->
+        done
+    end
+  end
+
+  defp release_budget_ms, do: div(settle_yield_ms(), 4)
+
+  defp release_failed(state, kind, reason) do
+    Logger.error(
+      "shard #{state.id}: lease release FAILED (#{kind}: #{inspect(reason)}) after retries; the " <>
+        "lock may still name this node, which blocks every peer, handoff and migration while its " <>
+        "heartbeat is live — it clears when this node reopens the shard or restarts"
+    )
+
+    :telemetry.execute([:fathom, :shard, :release, :failed], %{count: 1}, %{
+      shard_id: state.id,
+      kind: kind,
+      reason: reason
+    })
+
+    case Map.get(state, :drain_reply_to) do
+      pid when is_pid(pid) -> send(pid, {:drain_release_failed, self(), reason})
+      _ -> :ok
+    end
+
+    :ok
+  end
 
   # The registry mark `open_with_lease/8` sets (`:lease_held`) tells this node's replication follower
   # "a coordinator HERE owns this shard, refuse wire frames for it" (expert review 2026-10-10 #1). It
@@ -4449,9 +4556,14 @@ defmodule Fathom.Shard do
     # onto an object we did not write and re-uploading would clobber a peer's newer lineage. Only an
     # object that is one of our own recorded PUTs is re-fenced; a fork is quarantined and the lock
     # released keeping its claim; anything unconfirmable keeps the local copy (the old fallback).
-    with {:ok, etag} when not is_nil(etag) <- Storage.object_etag(state.id),
-         {:own, etag} <- Fork.put_origin(state.id, state.path, Map.get(state, :put_intents, [])),
-         {:ok, new_etag, _carried} <- upload_for_drop(%{state | etag: etag}) do
+    # BOUNDED LIKE THE FIRST UPLOAD (expert review 2026-11-07 #49). The two HEADs and the upload used
+    # to run inline here, outside `bounded_upload_for_drop/1`: checkpoint + `quick_check` + compress +
+    # a PUT with no deadline of their own (S3's client timeouts alone are 30 s send + 15 s receive),
+    # on top of the first attempt's `settle_yield_ms/0`, against a `:shard_shutdown_ms` that kills
+    # terminate outright mid-drop. `bounded_retry_upload/1` runs the whole sequence in a task under
+    # half the settle budget: a timeout is `:drop_flush_timeout`, the `other` arm below keeps the local
+    # copy and releases the lock, exactly as the first upload's timeout does.
+    with {:ok, new_etag, _carried} <- bounded_retry_upload(state) do
       Logger.info(
         "shard #{state.id}: flush 412 with lock ours; re-fenced to the object and re-uploaded"
       )
@@ -4481,6 +4593,25 @@ defmodule Fathom.Shard do
           "flush 412 with lock ours, but the re-fenced upload failed",
           other
         )
+    end
+  end
+
+  # The retry's re-fence and upload, off-process and bounded (see `retry_drop_upload/1`). Returns the
+  # upload's `{:ok, new_etag, carried}`, `:fork` (a quarantine decision the COORDINATOR acts on), or
+  # whatever did not match, which the caller treats as "keep the local copy".
+  defp bounded_retry_upload(state) do
+    task =
+      Task.async(fn ->
+        with {:ok, etag} when not is_nil(etag) <- Storage.object_etag(state.id),
+             {:own, etag} <-
+               Fork.put_origin(state.id, state.path, Map.get(state, :put_intents, [])) do
+          upload_for_drop(%{state | etag: etag})
+        end
+      end)
+
+    case Task.yield(task, div(settle_yield_ms(), 2)) || Task.shutdown(task) do
+      {:ok, result} -> result
+      _ -> {:error, :drop_flush_timeout}
     end
   end
 
@@ -4552,10 +4683,11 @@ defmodule Fathom.Shard do
   # and `snapshot_and_upload/1` already runs off-process in the periodic flush task. `Task.shutdown/1`
   # aborts an in-flight PUT cleanly (S3 PUT is atomic; a partial upload leaves the last-good object).
   #
-  # SCOPE / RIG-PENDING: this bounds the UPLOAD. A total S3 outage that also hangs the subsequent
-  # `release_lease` DELETE is a node-wide degradation left as a follow-up (a stranded lock is still
-  # reclaimed by this node's next same-incarnation open, so the local checkout recovers regardless).
-  # Brownout behavior is validated on the chaos rig before push (AGENTS.md).
+  # SCOPE / RIG-PENDING: this bounds the UPLOAD. The subsequent lease release is bounded separately
+  # (`release_with_retry/3`, expert review 2026-11-07 #13: a retry ladder inside `release_budget_ms/0`),
+  # so a total outage that also hangs the DELETE costs the drop a bounded slice; a stranded lock is
+  # still reclaimed by this node's next same-incarnation open, so the local checkout recovers
+  # regardless. Brownout behavior is validated on the chaos rig before push (AGENTS.md).
   #
   # DROP-FLUSH DURATION (expert review 2026-10-21 r7 #2). The idle drop is prod's main durability
   # producer (`SHARD_IDLE_MS` < `SHARD_FLUSH_INTERVAL_MS`), and only its route was counted. The

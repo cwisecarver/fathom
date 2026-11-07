@@ -834,6 +834,15 @@ defmodule Fathom.Telemetry do
         description:
           "Durability-flush failures (#27) — a persistent rate means flushes aren't landing and the RPO is growing silently (S3 auth / bucket-policy / reachability). The direct flush-failure signal behind the rising oldest-unflushed-age gauge"
       ),
+      # A lease release that outlived its retry ladder (expert review 2026-11-07 #13): the lock still
+      # names this node, so its live heartbeat keeps every peer, handoff and migration out of the shard.
+      # `kind` is a bounded atom set (the release form); the reason term rides event metadata for the log.
+      counter("fathom.shard.release.failed.count",
+        event_name: [:fathom, :shard, :release, :failed],
+        tags: [:kind],
+        description:
+          "Lease releases that failed even after their retry ladder (expert review 2026-11-07 #13), by release form (plain / clean / keeping_claim / fenced_marker / abandoned_open / open_failed). Each one leaves the shard's lock naming this node behind a live heartbeat — unstealable, so a rebalancer handoff target is refused and the migrator snoozes until this node reopens the shard or restarts. A PERMANENT cause (an IAM policy withholding DeleteObject) fails every release, so any sustained rate is worth a ticket"
+      ),
       counter("fathom.shards.checkout.retry.count",
         event_name: [:fathom, :shards, :checkout, :retry],
         tags: [:reason],

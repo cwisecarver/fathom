@@ -48,6 +48,20 @@ groups:
           description: "Shard flushes have been erroring for 5m — the RPO is growing and un-flushed writes are at risk if the node is lost. Check S3 reachability, credentials, and bucket policy."
           runbook: docs/runbooks/operations.md#runbook-node-disk-full-shard_data_dir
 
+      - alert: FathomLeaseReleaseFailing
+        # A shard's lease release (the DELETE / released-marker PUT on every drop) failed even after
+        # its retry ladder (expert review 2026-11-07 #13). The lock still names this node, and this
+        # node's live heartbeat makes it unstealable: handoff targets are refused and migrations snooze
+        # with nothing else logged. A sustained rate usually means a permanent cause (an IAM policy
+        # withholding DeleteObject, docs/durability.md) rather than a blip.
+        expr: sum by (node) (rate(fathom_shard_release_failed_count[5m])) > 0
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: "Shard lease releases failing on {{ $labels.node }}"
+          description: "Shard lease releases have been failing for 5m even after retries — the stranded locks block handoffs and migrations while this node's heartbeat is live. Check the object-store credentials/IAM (DeleteObject on *.lock) and S3 reachability; the `lease release FAILED` error logs name the shard and the cause."
+          runbook: docs/single-writer.md#two-directions-of-the-same-lease
+
       - alert: FathomRestoreDrillFailure
         # The automated restore drill (#24) found a durable object that is CORRUPT, of the wrong
         # lineage (schema_version mismatch), or unpullable — a bad "backup" that would otherwise
