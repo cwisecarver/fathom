@@ -39,6 +39,24 @@ defmodule Fathom.Shard.Replication.Shipper do
   has gone away must subtract from the quorum **now** — `Quorum` can then report `:impossible` as
   soon as too few remain, instead of every commit sitting on a timeout it could already prove will
   expire.
+
+  ## A link that stops answering is dropped, even when TCP says it is fine
+
+  A push holds its shard's waiter until the follower answers, and while it is held every later push
+  for that shard is refused `:already_in_flight`. If the answer never comes and the socket never
+  errors, that shard cannot reach this follower again. `TCP_USER_TIMEOUT`
+  (`Fathom.Shard.Replication.Keepalive`) covers the direct case, where the kernel itself sees its
+  data go unacknowledged. It cannot cover a TCP-terminating hop between the nodes (a proxy, a
+  sidecar, the chaos rig's toxiproxy): the hop acknowledges every byte, so the primary's socket is
+  healthy while the hop's own socket to a partitioned follower sits in retransmit backoff. Tier 0
+  measured that on 2026-11-06 as shards still `:already_in_flight` 21 s after the follower healed.
+
+  So the link is also dropped when, for `:replication_reply_timeout_ms` (default 10 s, `0`
+  disables), it has had a push awaiting a reply and has shown no progress at all: no frame
+  received, no seed chunk sent. Measuring the LINK, not the oldest push, is what keeps a slow
+  follower from being mistaken for a dead one: one that is merely behind still answers other
+  shards. Seeds are left out of "awaiting": the follower answers a seed only after installing it,
+  and `Session` already bounds that wait itself (30 s).
   """
   use GenServer
 
@@ -72,7 +90,13 @@ defmodule Fathom.Shard.Replication.Shipper do
     :id,
     :name,
     :connecting,
+    # Reply watchdog (see the moduledoc): the last moment the link made progress, and the armed
+    # check's reference, so a stale timer from an earlier link is ignored.
+    :progress_at,
+    :reply_check,
     waiters: %{},
+    # Shards whose waiter is a seed, not a push. Excluded from the watchdog.
+    seeds: MapSet.new(),
     chunk_calls: MapSet.new()
   ]
 
@@ -379,7 +403,8 @@ defmodule Fathom.Shard.Replication.Shipper do
         # which is what today does too — the difference is only how many are in flight when it runs.
         Budget.hand_off(state.name, state.writer_budget, reserved)
         Writer.frame(state.writer, encode(p), state.writer_budget, reserved)
-        {:noreply, %{state | waiters: Map.put(state.waiters, p.shard_id, from)}}
+        state = if awaiting_pushes(state) == 0, do: progressed(state), else: state
+        {:noreply, arm_reply_check(%{state | waiters: Map.put(state.waiters, p.shard_id, from)})}
     end
   end
 
@@ -398,7 +423,13 @@ defmodule Fathom.Shard.Replication.Shipper do
       # seeder exactly once, as the `:disconnected` that `drop/2` sends every waiter — the same one
       # reject the inline failure branch used to send.
       Writer.frame(state.writer, Protocol.encode_seed_begin(s), nil, 0)
-      {:noreply, %{state | waiters: Map.put(state.waiters, s.shard_id, from)}}
+
+      {:noreply,
+       %{
+         state
+         | waiters: Map.put(state.waiters, s.shard_id, from),
+           seeds: MapSet.put(state.seeds, s.shard_id)
+       }}
     end
   end
 
@@ -448,6 +479,8 @@ defmodule Fathom.Shard.Replication.Shipper do
 
   @impl true
   def handle_info({:tcp, _sock, bytes}, state) do
+    state = progressed(state)
+
     case Protocol.decode(bytes) do
       {:ok, {:ack, shard, next}} ->
         {:noreply, reply_to(state, shard, {:ack, shard, next})}
@@ -490,6 +523,8 @@ defmodule Fathom.Shard.Replication.Shipper do
   # A seed chunk's send finished in the writer (#14): answer the seeder's call. Only a call still
   # pending — one `drop/2` already answered (the link died first) is not answered twice.
   def handle_info({:sent, _writer, from, result}, state) do
+    state = progressed(state)
+
     if MapSet.member?(state.chunk_calls, from) do
       GenServer.reply(from, result)
       {:noreply, %{state | chunk_calls: MapSet.delete(state.chunk_calls, from)}}
@@ -499,6 +534,19 @@ defmodule Fathom.Shard.Replication.Shipper do
   end
 
   def handle_info(:reconnect, state), do: {:noreply, start_connect(state)}
+
+  # The reply watchdog (see the moduledoc). Matched on the armed reference, so a timer from a link
+  # that has since been dropped and replaced does nothing.
+  def handle_info({:reply_check, ref}, %{reply_check: ref} = state) do
+    state = %{state | reply_check: nil}
+    now = System.monotonic_time(:millisecond)
+
+    if reply_stalled?(now, state.progress_at, awaiting_pushes(state), reply_timeout_ms()) do
+      {:noreply, drop(state, {:reply_timeout, now - state.progress_at})}
+    else
+      {:noreply, arm_reply_check(state)}
+    end
+  end
 
   # THE ASYNC CONNECT'S RESULT (expert review 2026-10-13 #13). Matched on the task we are waiting
   # for, so a straggler from a previous attempt (this process never has two) cannot install a socket.
@@ -754,8 +802,51 @@ defmodule Fathom.Shard.Replication.Shipper do
     end
 
     Process.send_after(self(), :reconnect, @reconnect_backoff_ms)
-    %{state | sock: nil, writer: nil, writer_budget: nil, waiters: %{}, chunk_calls: MapSet.new()}
+
+    %{
+      state
+      | sock: nil,
+        writer: nil,
+        writer_budget: nil,
+        waiters: %{},
+        seeds: MapSet.new(),
+        chunk_calls: MapSet.new(),
+        reply_check: nil
+    }
   end
+
+  @doc """
+  Whether a link has stopped answering: at least one push awaits a reply and the link has made no
+  progress for `timeout_ms`. `timeout_ms` of `0` disables the check. Pure, for the boundary tests.
+  """
+  @spec reply_stalled?(integer(), integer() | nil, integer(), integer()) :: boolean()
+  def reply_stalled?(_now, _progress_at, _awaiting, timeout_ms) when timeout_ms <= 0, do: false
+  def reply_stalled?(_now, nil, _awaiting, _timeout_ms), do: false
+  def reply_stalled?(_now, _progress_at, awaiting, _timeout_ms) when awaiting <= 0, do: false
+  def reply_stalled?(now, progress_at, _awaiting, timeout_ms), do: now - progress_at >= timeout_ms
+
+  defp reply_timeout_ms, do: Application.get_env(:fathom, :replication_reply_timeout_ms, 10_000)
+
+  defp awaiting_pushes(state), do: map_size(state.waiters) - MapSet.size(state.seeds)
+
+  defp progressed(state), do: %{state | progress_at: System.monotonic_time(:millisecond)}
+
+  # At most one check is armed. It fires when the oldest possible stall would expire, so a busy
+  # link costs one timer per timeout window, not one per push.
+  defp arm_reply_check(%{reply_check: nil} = state) do
+    timeout = reply_timeout_ms()
+
+    if timeout > 0 and awaiting_pushes(state) > 0 do
+      elapsed = System.monotonic_time(:millisecond) - (state.progress_at || 0)
+      ref = make_ref()
+      Process.send_after(self(), {:reply_check, ref}, max(timeout - elapsed, 0) + 1)
+      %{state | reply_check: ref}
+    else
+      state
+    end
+  end
+
+  defp arm_reply_check(state), do: state
 
   # ONE EVENT PER REFUSED PUSH, tagged by REASON only.
   #
@@ -781,7 +872,7 @@ defmodule Fathom.Shard.Replication.Shipper do
 
       {from, waiters} ->
         send(from, {:repl_reply, state.id, msg})
-        %{state | waiters: waiters}
+        %{state | waiters: waiters, seeds: MapSet.delete(state.seeds, shard)}
     end
   end
 end
