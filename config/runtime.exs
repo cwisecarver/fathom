@@ -193,6 +193,14 @@ if env_bool.("ALLOW_NO_UDF") do
   config :fathom, :allow_no_udf, true
 end
 
+# Boot guard override (expert review 2026-11-07 #8): a prod node on the Local store (the default
+# when SHARD_STORAGE is unset) with replication on / followers set refuses to boot, because Local's
+# lease is node-local and a fleet on it split-brains at the first remap. This acknowledges that a
+# single active writer is guaranteed some other way. It does NOT cover LB_BACKENDS.
+if env_bool.("ALLOW_LOCAL_STORAGE") do
+  config :fathom, :allow_local_storage, true
+end
+
 # Per-stream Hrana idle timeout (ms). Filo's default is 10s and fathom used to pass nothing, so
 # this was unreachable on a deployed release (expert review 2026-07-24 #22). It bounds CLIENT THINK
 # TIME inside an open transaction, not the server: a stream holds live transaction state, and

@@ -202,4 +202,42 @@ defmodule Fathom.BootSecurityGuardsTest do
                "AWS_SESSION_TOKEN"
     end
   end
+
+  describe "2026-11-07 #8 the arity-0 Local-storage fleet guard reads an UNSET :shard_storage as Local" do
+    setup do
+      keys = [:replication_followers, :replication_enabled, :lb_backends, :allow_local_storage]
+      prev = Map.new(keys, &{&1, Application.fetch_env(:fathom, &1)})
+
+      on_exit(fn ->
+        for {k, v} <- prev do
+          case v do
+            {:ok, val} -> Application.put_env(:fathom, k, val)
+            :error -> Application.delete_env(:fathom, k)
+          end
+        end
+      end)
+
+      Application.put_env(:fathom, :env, :prod)
+      Application.delete_env(:fathom, :shard_storage)
+      Application.delete_env(:fathom, :lb_backends)
+      Application.delete_env(:fathom, :allow_local_storage)
+      Application.put_env(:fathom, :replication_enabled, false)
+      :ok
+    end
+
+    test "prod, SHARD_STORAGE unset, replication followers set: refuses to boot" do
+      Application.put_env(:fathom, :replication_followers, [{"n2", "10.0.0.2", 9100}])
+
+      assert_raise RuntimeError, ~r/no cross-node single-writer/, fn ->
+        Fathom.Application.check_local_storage_fleet!()
+      end
+    end
+
+    test "the ack lets that same config boot" do
+      Application.put_env(:fathom, :replication_followers, [{"n2", "10.0.0.2", 9100}])
+      Application.put_env(:fathom, :allow_local_storage, true)
+
+      assert Fathom.Application.check_local_storage_fleet!() == nil
+    end
+  end
 end

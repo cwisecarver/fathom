@@ -256,22 +256,89 @@ defmodule Fathom.Application do
     end
   end
 
-  # Expert review 2026-07-14 #3: Fathom.Shard.Storage.Local's lease is node-local only — its
-  # :global.trans is scoped to [node()] (storage/local.ex), so it provides NO cross-node
-  # single-writer guarantee. Run across a fleet (>1 node — :lb_backends non-empty) and two nodes
-  # can each believe they hold a shard's lease and both write: silent, error-free split-brain.
-  # Refuse to boot. Prod-only + only when a fleet is configured; a single-node Local deploy is fine.
+  # Expert review 2026-07-14 #3 / 2026-11-07 #8: Fathom.Shard.Storage.Local's lease is node-local
+  # only — its :global.trans is scoped to [node()] (storage/local.ex), so it provides NO
+  # cross-node single-writer guarantee. Run on a fleet and two nodes can each believe they hold a
+  # shard's lease and both write: silent, error-free split-brain at the first LB remap. Refuse to
+  # boot. Prod-only.
+  #
+  # What counts as "a fleet" is the 2026-11-07 #8 fix. The 2026-07-14 guard keyed ONLY on
+  # `:lb_backends` (the rebalancer's topology, which a fleet that has not enabled the rebalancer
+  # never sets) and compared `:shard_storage` against Local with `get_env/2` WITHOUT a default —
+  # but an unset `SHARD_STORAGE` is `nil` there while `Storage.backend/0` defaults it to Local, so
+  # the DEFAULT, unsafe store was the one case the guard could not see. Now: storage defaults to
+  # Local exactly as `Storage.backend/0` does, and a fleet is any of `:lb_backends` non-empty,
+  # `:replication_followers` non-empty, or `:replication_enabled == true` (replication is ON by
+  # default in prod and, without followers, refuses to boot in `Fleet`, so on a prod node that
+  # signal means "this node replicates to others").
+  #
+  # The ack (`ALLOW_LOCAL_STORAGE=true`, `:allow_local_storage`) is deliberately narrower than the
+  # old guard's reach: it overrides ONLY the replication signal (e.g. a primary with hot-spare
+  # followers behind an orchestrator that guarantees one active writer). `:lb_backends` — an
+  # explicit multi-node ACTIVE topology — stays refused unconditionally, as it always was; letting
+  # an ack loosen a refusal that used to be absolute would be a regression, not a fix.
+  # A single-node prod Local deploy sets REPLICATION_ENABLED=false (it had to already, or the
+  # replication guards refuse it) and needs no ack.
   @doc false
+  @spec check_local_storage_fleet!() :: nil
   def check_local_storage_fleet! do
-    if Application.get_env(:fathom, :env) == :prod and
-         Application.get_env(:fathom, :shard_storage) == Fathom.Shard.Storage.Local and
-         map_size(Application.get_env(:fathom, :lb_backends, %{})) > 0 do
-      raise "config error: :shard_storage is Fathom.Shard.Storage.Local with a multi-node fleet " <>
-              "(:lb_backends set) — Local provides no cross-node single-writer guarantee (its lease " <>
-              "is node-local only), so two nodes can each hold a shard's lease and both write " <>
-              "(silent split-brain). Use S3/R2/a conditional-write store for a fleet " <>
-              "(expert review 2026-07-14 #3)."
+    case local_storage_fleet_problem(%{
+           env: Application.get_env(:fathom, :env),
+           storage: Application.get_env(:fathom, :shard_storage, Fathom.Shard.Storage.Local),
+           lb_backends: Application.get_env(:fathom, :lb_backends, %{}),
+           replication_followers: Application.get_env(:fathom, :replication_followers, []),
+           replication_enabled: Application.get_env(:fathom, :replication_enabled, false),
+           allow_local_storage: Application.get_env(:fathom, :allow_local_storage, false)
+         }) do
+      nil -> nil
+      message -> raise message
     end
+  end
+
+  @doc """
+  Why a node with this config must not boot on the Local storage backend, or `nil`.
+
+  Pure over the passed map (keys: `:env`, `:storage`, `:lb_backends`, `:replication_followers`,
+  `:replication_enabled`, `:allow_local_storage`), so a test needs no global app env.
+  """
+  @spec local_storage_fleet_problem(%{
+          env: atom(),
+          storage: module(),
+          lb_backends: map(),
+          replication_followers: list(),
+          replication_enabled: boolean(),
+          allow_local_storage: boolean()
+        }) :: String.t() | nil
+  def local_storage_fleet_problem(%{env: :prod, storage: Fathom.Shard.Storage.Local} = cfg) do
+    cond do
+      map_size(cfg.lb_backends) > 0 ->
+        local_storage_fleet_message(":lb_backends is set")
+
+      cfg.allow_local_storage == true ->
+        nil
+
+      cfg.replication_followers != [] ->
+        local_storage_fleet_message(":replication_followers is set")
+
+      cfg.replication_enabled == true ->
+        local_storage_fleet_message(":replication_enabled is on")
+
+      true ->
+        nil
+    end
+  end
+
+  def local_storage_fleet_problem(_cfg), do: nil
+
+  defp local_storage_fleet_message(why) do
+    "config error: :shard_storage is Fathom.Shard.Storage.Local (SHARD_STORAGE unset or " <>
+      "\"local\") with a multi-node fleet (#{why}) — Local provides no cross-node single-writer " <>
+      "guarantee (its lease is node-local only), so two nodes can each hold a shard's lease and " <>
+      "both write (silent split-brain at the first LB remap). Set SHARD_STORAGE=s3 (or another " <>
+      "conditional-write store) for a fleet. A single-node deploy sets REPLICATION_ENABLED=false; " <>
+      "a replicating primary whose orchestrator guarantees one active writer may acknowledge with " <>
+      "ALLOW_LOCAL_STORAGE=true (that ack does not cover :lb_backends) " <>
+      "(expert review 2026-07-14 #3, 2026-11-07 #8)."
   end
 
   # Expert review 2026-07-14 #6: without a serving-zone anchor, Fathom.ShardExecutor.shard_from_host

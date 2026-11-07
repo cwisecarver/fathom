@@ -424,4 +424,11 @@ defmodule Fathom.RuntimeConfigTest do
       end
     end
   end
+
+  # Expert review 2026-11-07 #8: the ack for a prod Local-store node that replicates must be
+  # reachable from the environment of a release (it is read by `Application.check_local_storage_fleet!`).
+  test "ALLOW_LOCAL_STORAGE=true sets :allow_local_storage; unset leaves it unwritten" do
+    assert Keyword.fetch!(fathom_config(%{"ALLOW_LOCAL_STORAGE" => "true"}), :allow_local_storage)
+    refute Keyword.has_key?(fathom_config(%{"ALLOW_LOCAL_STORAGE" => nil}), :allow_local_storage)
+  end
 end

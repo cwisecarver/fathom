@@ -34,7 +34,8 @@ config; diff from it.
 
 | Var | Default | What it does | Safety consequence |
 |---|---|---|---|
-| `SHARD_STORAGE` | Local (`System.tmp_dir!`) | `s3` selects the S3 backend (+ reads the S3 vars); `local` a filesystem store. | `local` on a multi-node fleet has no shared durability/lease store — use `s3` (or S3-compatible) in any real cluster. |
+| `SHARD_STORAGE` | Local (`System.tmp_dir!`) | `s3` selects the S3 backend (+ reads the S3 vars); `local` a filesystem store. | `local` on a multi-node fleet has no shared durability/lease store — use `s3` (or S3-compatible) in any real cluster. **A prod node on Local (including by leaving this unset) refuses to boot when `LB_BACKENDS` is set, `REPLICATION_FOLLOWERS` is set, or replication is on (the prod default)** (expert review 2026-11-07 #8): Local's lease is node-local, so a fleet on it split-brains at the first LB remap. A single-node Local deploy sets `REPLICATION_ENABLED=false`. |
+| `ALLOW_LOCAL_STORAGE` | `false` (**strict**) | Acknowledge booting a **prod** node on the Local store with replication on / `REPLICATION_FOLLOWERS` set (expert review 2026-11-07 #8) — e.g. a primary with hot-spare followers behind an orchestrator that guarantees one active writer. | Local has **no cross-node single-writer guarantee**; with this set, nothing in fathom stops two nodes both writing the same shard. Does **not** cover `LB_BACKENDS`, which is refused on Local unconditionally. |
 | `S3_BUCKET` | — (**required when `SHARD_STORAGE=s3`**) | The bucket holding every shard object + lease/heartbeat. | The single most important object store; loss/compromise affects every tenant (harden per `docs/durability.md`). |
 | `S3_REGION` | `us-east-1` | S3 region. | — |
 | `S3_ENDPOINT` | unset (AWS) | Override for S3-compatible stores (MinIO/R2/Tigris). | — |
