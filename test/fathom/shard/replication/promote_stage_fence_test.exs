@@ -122,13 +122,13 @@ defmodule Fathom.Shard.Replication.PromoteStageFenceTest do
     :ok = frame(a, {:seed_end, id})
     assert {:ack, ^id, 0} = reply(a)
 
-    assert Task.await(stage, 10_000) == :ok
+    assert {:ok, _fence} = Task.await(stage, 10_000)
     assert rows_in(temp) == [1, 2], "the staged copy is not the pair the mutation left behind"
   end
 
   test "once staged, the deposed owner's pushes and seeds are refused", ctx do
     %{name: name, id: id, temp: temp} = ctx
-    assert Promote.stage(name, id, temp, lineage: 5) == :ok
+    assert {:ok, _fence} = Promote.stage(name, id, temp, lineage: 5)
 
     zombie = connection(name)
 
@@ -187,6 +187,60 @@ defmodule Fathom.Shard.Replication.PromoteStageFenceTest do
     assert Promote.stage(name, id, temp, lineage: 5) == {:error, :replica_busy}
     refute File.exists?(temp)
     assert %{torn: false, lineage: 3} = Follower.state_of(name, id)
+  end
+
+  # Expert review 2026-11-07 #3(a). `stage/4` fences the replica (torn, lineage raised to the new
+  # owner's) and nothing lifted that when the publish then failed, so the refused open's retry met a
+  # replica torn at the NEW lineage over the OLD bytes. `unfence/3` puts back the PRIOR row — not a
+  # torn-cleared row at the raised lineage, which would out-rank a peer holding more of the old one.
+  describe "unfence/3" do
+    test "restores the prior row exactly, durably, and the old lineage accepts pushes again",
+         ctx do
+      %{name: name, id: id, temp: temp} = ctx
+      before = Follower.state_of(name, id)
+
+      assert {:ok, fence} = Promote.stage(name, id, temp, lineage: 5)
+      assert %{torn: true, lineage: 5} = Follower.state_of(name, id), "fixture: not fenced"
+      assert File.exists?(Follower.torn_path(name, id)), "fixture: the fence is not durable"
+
+      assert :ok = Follower.unfence(name, id, fence)
+
+      assert Follower.state_of(name, id) == before,
+             "the row was not restored as it was (a torn-cleared row at lineage 5 would out-rank " <>
+               "a peer holding more of lineage 3)"
+
+      refute File.exists?(Follower.torn_path(name, id)), "the torn marker outlived the unfence"
+      assert {3, _epoch} = Follower.recovered_ownership(name, id)
+
+      # The deposed-owner window is exactly the window before the attempt: lineage 3 is accepted.
+      conn = connection(name)
+
+      :ok =
+        frame(conn, %Protocol.Push{
+          shard_id: id,
+          epoch: 1,
+          wal_gen: 0,
+          salt1: 0,
+          offset: 0,
+          payload: "a push at the replica's own lineage",
+          lineage: 3
+        })
+
+      assert {:ack, ^id, _} = reply(conn)
+    end
+
+    test "leaves a row that changed since the fence alone", ctx do
+      %{name: name, id: id, temp: temp} = ctx
+      assert {:ok, fence} = Promote.stage(name, id, temp, lineage: 5)
+
+      # A newer seed replaced the fenced row (lineage 9): not ours to rewrite.
+      :ok = Follower.seed(name, id, 1, 0, 0, 0, 9)
+      newer = Follower.state_of(name, id)
+      assert %{lineage: 9} = newer
+
+      assert {:error, :replica_changed} = Follower.unfence(name, id, fence)
+      assert Follower.state_of(name, id) == newer
+    end
   end
 
   defp wait_until(fun, tries \\ 200) do

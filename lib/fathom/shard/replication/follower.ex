@@ -278,15 +278,20 @@ defmodule Fathom.Shard.Replication.Follower do
 
   And always `torn: true`, durably: from here the row no longer describes a replica of anyone's
   history (its lineage is the new owner's, its bytes the old owner's), so it must never be ranked
-  by `Promote.fresher?/2` or offered to a peer — if the promotion goes on to fail, the replica
-  waits for a re-seed rather than being mis-ranked against the new owner's own stamps.
+  by `Promote.fresher?/2` or offered to a peer.
+
+  Returns `{:ok, fence}`: the row as it was and the row as fenced, so a promotion that fails AFTER
+  the fence but BEFORE anything is published can hand them to `unfence/3` (expert review 2026-11-07
+  #3). Without that, the fence outlived the failed attempt: the retry found a replica fenced and
+  torn at the new owner's lineage, which it could neither rank nor refill from a peer that still
+  held the same tail at the old lineage.
 
   `:expect` — the replica state the caller decided to promote on. Refused `{:error,
   :replica_changed}` if the replica has since gone torn, changed lineage or moved to a lower
   ordinal (a re-seed), because the staged copy would no longer be the replica that decision ranked.
   """
   @spec fence_for_promotion(atom(), String.t(), keyword()) ::
-          :ok | {:error, :no_replica | :replica_changed}
+          {:ok, fence()} | {:error, :no_replica | :replica_changed}
   def fence_for_promotion(name, shard_id, opts) do
     case state_of(name, shard_id) do
       nil ->
@@ -296,16 +301,59 @@ defmodule Fathom.Shard.Replication.Follower do
         if changed_since?(state, Keyword.get(opts, :expect)) do
           {:error, :replica_changed}
         else
-          put_state(name, shard_id, %{
-            state
-            | torn: true,
-              lineage: raise_to(state.lineage, Keyword.get(opts, :lineage)),
-              epoch: raise_to(state.epoch, Keyword.get(opts, :epoch))
-          })
+          fenced =
+            put_state(name, shard_id, %{
+              state
+              | torn: true,
+                lineage: raise_to(state.lineage, Keyword.get(opts, :lineage)),
+                epoch: raise_to(state.epoch, Keyword.get(opts, :epoch))
+            })
 
-          :ok
+          {:ok, %{prior: state, fenced: fenced}}
         end
     end
+  rescue
+    ArgumentError -> {:error, :no_replica}
+  end
+
+  @typedoc """
+  What `fence_for_promotion/3` changed: `prior` is the row before the fence, `fenced` the row it
+  wrote. `unfence/3` needs both.
+  """
+  @type fence :: %{prior: FollowerLog.t(), fenced: FollowerLog.t()}
+
+  @doc """
+  Undo `fence_for_promotion/3` for a promotion that failed before it published anything (expert
+  review 2026-11-07 #3): put the PRIOR row back, under the shard's lock, iff the row is still
+  exactly the fenced one. Anything else (`{:error, :replica_changed}`: a seed, a forget, a re-derive
+  since) is left alone — that row is newer than the fence and not ours to rewrite.
+
+  THE PRIOR ROW, NOT "clear `torn`". The first-draft fix was to clear the torn flag and keep the
+  raised lineage. That is wrong: the rank key is lineage first, so a row claiming the new owner's
+  lineage over the OLD owner's bytes would out-rank a peer that really holds more of the old
+  lineage's frames, and the retry would promote the shorter copy over a longer one. Restoring the
+  row restores the position it truthfully described, and the deposed owner's push window afterwards
+  is exactly the window before the attempt, so nothing regresses (the coordinator registered for
+  the shard on this node refuses every wire frame regardless, `coordinated_here?/2`).
+
+  NOT applied when verification of the staged copy failed (`Promote.stage/4` leaves that fence in
+  place): bytes that cannot be verified must not become rankable again, or the retry would choose
+  `:local` over the peer that holds a good copy and fail the same way until the window ends.
+  """
+  @spec unfence(atom(), String.t(), fence()) ::
+          :ok | {:error, :replica_changed | :replica_busy | :no_replica}
+  def unfence(name, shard_id, %{prior: prior, fenced: fenced}) do
+    with_shard_lock(name, shard_id, lock_wait_ms(), fn ->
+      if state_of(name, shard_id) == fenced do
+        put_state(name, shard_id, prior)
+        # `sync_ownership/3` writes only a stated lineage, so a prior lineage of 0 would leave the
+        # fenced lineage's sidecar behind to be recovered after a restart.
+        if Map.get(prior, :lineage, 0) == 0, do: Fathom.FS.rm(lineage_path(name, shard_id))
+        :ok
+      else
+        {:error, :replica_changed}
+      end
+    end)
   rescue
     ArgumentError -> {:error, :no_replica}
   end
@@ -1656,7 +1704,7 @@ defmodule Fathom.Shard.Replication.Follower do
       # so no legitimate seed ever goes backwards. The same fence `FollowerLog.decide/2` applies to
       # pushes; only fires when both sides state one (0 = unstated). This bounds a replay to the
       # CURRENT lineage; binding frames to a connection is the wire change parked with the finding.
-      stale_lineage_seed?(name, b) ->
+      stale_lineage_seed?(name, b, pull?) ->
         Logger.warning(
           "replication follower refusing to seed #{b.shard_id}: seed lineage #{b.lineage} is " <>
             "below the replica's (deposed primary or replayed frame)"
@@ -1669,9 +1717,18 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
-  defp stale_lineage_seed?(name, %Protocol.SeedBegin{shard_id: id, lineage: pushed})
+  # A RECOVERY PULL IS NOT A DEPOSED PRIMARY (expert review 2026-11-07 #3(b)). The fence exists for
+  # frames a PEER sends unasked. A pull is this node asking for bytes `Recovery.choose/4` already
+  # ranked, and the one local row that can sit above the peer's lineage is a TORN one: a promotion
+  # that failed verification leaves its replica fenced at the new owner's lineage over the old
+  # owner's bytes, and the peer still holds the same tail at the OLD lineage. Refusing that seed
+  # (`state lineage L2 > begin lineage L1`) left the retry able neither to rank the local copy nor to
+  # replace it. So for a pull only an UNTORN, higher-lineage row refuses (it is a real replica that
+  # `choose` would have preferred; reaching here means it changed under us). Wire seeds are unchanged.
+  defp stale_lineage_seed?(name, %Protocol.SeedBegin{shard_id: id, lineage: pushed}, pull?)
        when is_integer(pushed) and pushed > 0 do
     case state_of(name, id) do
+      %{lineage: mine, torn: true} when is_integer(mine) and mine > pushed -> not pull?
       %{lineage: mine} when is_integer(mine) and mine > pushed -> true
       _ -> false
     end
@@ -1679,7 +1736,7 @@ defmodule Fathom.Shard.Replication.Follower do
     ArgumentError -> false
   end
 
-  defp stale_lineage_seed?(_name, _begin), do: false
+  defp stale_lineage_seed?(_name, _begin, _pull?), do: false
 
   # A refused begin. Silent (the shard absent from `seeds`) for a primary's seed; a typed failed
   # entry for a recovery pull (see `begin_seed/4`). `failed: true` is what makes `finish_seed/3`

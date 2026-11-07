@@ -96,7 +96,7 @@ defmodule Fathom.Shard.Replication.CoordinatedShardFenceTest do
   # What the cold-open promotion leaves behind: replica staged + fenced, then forgotten, with the
   # new owner's coordinator registered (the Registry entry exists from the coordinator's start).
   defp promote_and_forget(%{name: name, id: id, temp: temp}) do
-    assert Promote.stage(name, id, temp, lineage: 5) == :ok
+    assert {:ok, _fence} = Promote.stage(name, id, temp, lineage: 5)
     Follower.forget(name, id)
     assert Follower.state_of(name, id) == nil
     {:ok, _} = Registry.register(Fathom.ShardRegistry, id, :lease_held)

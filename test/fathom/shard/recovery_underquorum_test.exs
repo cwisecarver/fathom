@@ -116,7 +116,7 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
     {:ok, port} = Follower.port(pid)
     :ok = Follower.seed(name, id, 1, 0, 0, 100, 3)
     :ok = Follower.note_ordinal(name, id, 5)
-    assert :ok = Follower.fence_for_promotion(name, id, [])
+    assert {:ok, _fence} = Follower.fence_for_promotion(name, id, [])
     assert %{torn: true} = Follower.state_of(name, id), "fixture: the peer is not torn"
     {"torn_#{name}", "127.0.0.1", port}
   end

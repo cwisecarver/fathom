@@ -128,29 +128,29 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
   # follower at `position`. Using the shard's own files is what makes this a real replica rather
   # than a fabrication: the WAL byte offsets refer to the primary's WAL, exactly as shipped frames
   # would leave them.
-  defp install_replica(id, position) do
+  defp install_replica(id, position, follower \\ Follower) do
     path = Fathom.Shard.db_path(id)
-    File.cp!(path, Follower.db_path(Follower, id))
+    File.cp!(path, Follower.db_path(follower, id))
 
     case File.stat(path <> "-wal") do
       {:ok, %{size: size}} when size > 0 ->
-        File.cp!(path <> "-wal", Follower.wal_path(Follower, id))
+        File.cp!(path <> "-wal", Follower.wal_path(follower, id))
 
       _ ->
-        File.write!(Follower.wal_path(Follower, id), "")
+        File.write!(Follower.wal_path(follower, id), "")
     end
 
     # THE LINEAGE IS THE RANKING FIELD, and it comes from the object's stamp (expert review
     # 2026-08-24 #12). The lock `epoch` is pinned at 1 on purpose: in production it resets to 1 on
     # every clean release, so a fixture that set it from the stamp was quietly guaranteeing the two
     # counters agreed — which is precisely the coverage gap this file's moduledoc now describes.
-    Follower.seed(Follower, id, 1, position.wal_gen, 0, position.offset, position.epoch)
+    Follower.seed(follower, id, 1, position.wal_gen, 0, position.offset, position.epoch)
 
     # THE ORDINAL A PUSHED REPLICA WOULD CARRY (expert review 2026-08-26 #2, step 3b). A seed states
     # none, so without this the replica is unrankable and never promoted. `Map.get` rather than a
     # strict read because several fixtures below deliberately build a position with NO ordinal — an
     # object stamped before step 3a — and those must stay unrankable.
-    :ok = Follower.note_ordinal(Follower, id, Map.get(position, :wal_ordinal, 0))
+    :ok = Follower.note_ordinal(follower, id, Map.get(position, :wal_ordinal, 0))
   end
 
   # The byte half of install_replica/2, callable while the live files still exist. The graceful
@@ -1087,11 +1087,213 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
         :ok
     end
 
-    # NOT asserted here: that the retry then recovers the tail. A failed publish leaves THIS node's
-    # replica fenced and torn on purpose (`Promote.stage/4`: it must refuse the deposed owner's
-    # pushes and wait for a re-seed), and this fixture's replica is the only copy. In a fleet the
-    # acked frames are on a quorum of followers, so the retry pulls them from a peer; the rig's
-    # Jepsen run is the end-to-end check for that half.
+    # That the retry then RECOVERS the tail is pinned below, in both liveness modes (expert review
+    # 2026-11-07 #3): this test used to record the gap ("NOT asserted: that the retry then recovers
+    # the tail") because the failed publish left the replica fenced and torn.
+  end
+
+  # EXPERT REVIEW 2026-11-07 #3. A promotion that fails AFTER `Promote.stage/4` fenced the replica
+  # (torn, lineage raised to this owner's) left the fence in place, so the refused open's retry met a
+  # replica it could neither rank (torn) nor refill from a peer (the peer's seed was refused as
+  # "below the replica's lineage"): the Jepsen-2026-10-24 refuse-and-retry only converted "serve stale
+  # now" into "serve stale after one window". Both halves are separable and pinned separately:
+  #
+  #   (a) a failed PUBLISH restores the PRIOR row (`Follower.unfence/3`), so the retry promotes the
+  #       local replica; (b) a replica whose VERIFY failed stays fenced and torn (unverifiable bytes
+  #       must not be rankable again) and the retry pulls the tail from a peer, whose seed the
+  #       lineage fence no longer refuses for a recovery pull.
+  #
+  # Both liveness modes: the failing step is a flush/publish and the retry re-runs the lease open.
+  describe "the retry after a failed promotion recovers the tail (expert review 2026-11-07 #3)" do
+    alias Fathom.Shard.Heartbeat
+
+    setup do
+      keys = [
+        :replication_followers,
+        :replication_quorum,
+        :replication_recovery_underquorum_window_ms,
+        :replication_recovery_refusal_ttl_ms
+      ]
+
+      prev = Map.new(keys, &{&1, Application.get_env(:fathom, &1)})
+      prev_running = Fleet.running()
+
+      on_exit(fn ->
+        Fleet.publish(prev_running)
+
+        for {k, v} <- prev do
+          if is_nil(v),
+            do: Application.delete_env(:fathom, k),
+            else: Application.put_env(:fathom, k, v)
+        end
+      end)
+
+      Application.put_env(:fathom, :replication_promote_on_open, true)
+      Application.put_env(:fathom, :replication_recover_from_peers, true)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      :ok
+    end
+
+    defp set_mode!(:legacy) do
+      refute Heartbeat.running?(), "legacy mode needs the heartbeat OFF (config/test.exs default)"
+    end
+
+    defp set_mode!(:heartbeat) do
+      hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
+      _ = :sys.get_state(hb)
+      assert Heartbeat.running?()
+    end
+
+    # Assert the coordinator really opened in the mode asked for: a scenario that silently ran
+    # legacy twice would look like two-mode coverage and be one.
+    defp assert_mode!(coordinator, :heartbeat),
+      do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "not heartbeat mode")
+
+    defp assert_mode!(coordinator, :legacy),
+      do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "not legacy mode")
+
+    # Peers are configured only AFTER the fixture is built: with them present the fixture's own
+    # flush would run as a replicating shard and stamp a different position than the replica.
+    defp configure_peers!(id, followers) do
+      Application.put_env(:fathom, :replication_followers, followers)
+      Application.put_env(:fathom, :replication_quorum, 2)
+      Application.put_env(:fathom, :replication_recovery_underquorum_window_ms, 60_000)
+      Application.put_env(:fathom, :replication_recovery_refusal_ttl_ms, 0)
+      # A NUMERIC LINEAGE. With replication off the open claims none (`open_lineage/2` answers
+      # `:disabled`), so the fence would raise nothing and "the replica is fenced at the NEW
+      # lineage" would not be a state these tests could reach. On only after the fixture is built,
+      # like the peers: its own flush must not run as a replicating shard.
+      Fathom.Test.Env.put!(:replication_enabled, true)
+
+      # A peer's offer ranks only with lineage AND ordinal on the wire (off by default in test, and
+      # off an offer reads unrankable, so recovery would never pull anything).
+      Fathom.Test.Env.put!(:replication_lineage_wire, true)
+      Fathom.Test.Env.put!(:replication_ordinal_wire, true)
+      Fleet.publish([])
+      refute Recovery.peers() == [], "fixture: the peer set is what gives the refusal a window"
+      # Owned by the `Fleet` supervisor in production; without it a refusal fails OPEN.
+      Recovery.init_table()
+
+      on_exit(fn ->
+        if :ets.whereis(Recovery.UnderQuorumWindow) != :undefined,
+          do: :ets.delete(Recovery.UnderQuorumWindow, id)
+      end)
+    end
+
+    defp refused_or_flunk!(id, what) do
+      {result, _log} = ExUnit.CaptureLog.with_log(fn -> ShardExecutor.open(id) end)
+
+      case result do
+        {:ok, served} ->
+          rows = rows(served)
+          ShardExecutor.close(served)
+          flunk("the open served the stored object (#{inspect(rows)}) after #{what}")
+
+        {:error, _} ->
+          :ok
+      end
+    end
+
+    for mode <- [:legacy, :heartbeat] do
+      test "(a) a failed publish restores the replica and the retry promotes it (#{mode})", ctx do
+        %{id: id} = ctx
+        set_mode!(unquote(mode))
+
+        {conn, coordinator} = build_shard(id, 10, 3)
+        assert_mode!(coordinator, unquote(mode))
+        assert {:ok, stamp} = Storage.object_position(id)
+
+        install_replica(id, %{
+          epoch: stamp.epoch,
+          wal_gen: stamp.wal_gen,
+          wal_ordinal: stamp.wal_ordinal,
+          offset: stamp.offset + 1
+        })
+
+        tear_down_primary(id, conn, coordinator)
+        configure_peers!(id, [{"dead1", "127.0.0.1", 1}])
+
+        prior = Follower.state_of(Follower, id)
+        assert %{torn: false} = prior, "fixture: the replica must start whole"
+
+        Application.put_env(:fathom, :storage_fault, :flush)
+        refused_or_flunk!(id, "the publish failed")
+
+        # THE PRIOR ROW, exactly: not torn, and not the raised lineage a torn-cleared row would claim.
+        assert Follower.state_of(Follower, id) == prior,
+               "the failed promotion left the replica fenced: the retry cannot rank or refill it"
+
+        # The store recovers; the retry promotes the local replica, tail included.
+        Application.delete_env(:fathom, :storage_fault)
+        assert open_and_read(id) == Enum.to_list(1..10)
+
+        assert {:ok, now} = Shards.ensure(id)
+        assert_mode!(now, unquote(mode))
+      end
+
+      test "(b) a replica that failed verification is refilled from a peer on the retry (#{mode})",
+           ctx do
+        %{id: id} = ctx
+        set_mode!(unquote(mode))
+
+        {conn, coordinator} = build_shard(id, 10, 3)
+        assert_mode!(coordinator, unquote(mode))
+        assert {:ok, stamp} = Storage.object_position(id)
+
+        position = %{
+          epoch: stamp.epoch,
+          wal_gen: stamp.wal_gen,
+          wal_ordinal: stamp.wal_ordinal,
+          offset: stamp.offset + 1
+        }
+
+        # The peer holds a GOOD copy of the tail at the old lineage; this node's own copy has one
+        # flipped byte inside the first WAL frame, which `quick_check` cannot see but SQLite's frame
+        # checksum (the `frames_match` cross-check of `Promote.stage/4`) does.
+        peer_dir =
+          Path.join(System.tmp_dir!(), "promoteopen_peer_#{System.unique_integer([:positive])}")
+
+        File.mkdir_p!(peer_dir)
+        on_exit(fn -> File.rm_rf(peer_dir) end)
+        peer = :"promoteopen_peer_#{System.unique_integer([:positive])}"
+        peer_pid = start_supervised!({Follower, name: peer, port: 0, dir: peer_dir}, id: peer)
+        {:ok, peer_port} = Follower.port(peer_pid)
+
+        install_replica(id, position)
+        install_replica(id, position, peer)
+
+        wal = Follower.wal_path(Follower, id)
+        assert byte_size(File.read!(wal)) > 100, "fixture: no WAL frames to corrupt"
+        bad = File.read!(wal)
+        flip = 32 + 24 + 100
+
+        File.write!(
+          wal,
+          binary_part(bad, 0, flip) <>
+            <<:erlang.bxor(:binary.at(bad, flip), 0xFF)>> <>
+            binary_part(bad, flip + 1, byte_size(bad) - flip - 1)
+        )
+
+        tear_down_primary(id, conn, coordinator)
+        configure_peers!(id, [{"peer", "127.0.0.1", peer_port}])
+
+        refused_or_flunk!(id, "the staged replica failed verification")
+
+        # Verification failures keep the fence on purpose: unverifiable bytes must not be rankable.
+        # And its lineage is now ABOVE the peer's, which is what the lineage fence used to refuse.
+        assert %{torn: true, lineage: mine} = Follower.state_of(Follower, id)
+        assert %{torn: false, lineage: theirs} = Follower.state_of(peer, id)
+        assert mine > theirs, "fixture: the torn local lineage must exceed the peer's"
+
+        rows_now = open_and_read(id)
+
+        assert rows_now == Enum.to_list(1..10),
+               "the retry could not refill the torn replica from the peer holding the tail"
+
+        assert {:ok, now} = Shards.ensure(id)
+        assert_mode!(now, unquote(mode))
+      end
+    end
   end
 
   # ONE DECISION READ PER COLD OPEN, NOT TWO (expert review 2026-10-01 perf #3). With shipping on,

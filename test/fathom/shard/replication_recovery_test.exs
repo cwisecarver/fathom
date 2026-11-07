@@ -455,7 +455,7 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     # Same claimed position, different bytes, then torn.
     local_db = :crypto.strong_rand_bytes(12_288)
     plant_replica(survivor, id, 9, 5, 0xDEADBEEF, local_db, wal)
-    Follower.fence_for_promotion(survivor, id, [])
+    assert {:ok, _fence} = Follower.fence_for_promotion(survivor, id, [])
 
     assert %{torn: true, lineage: 9, next_offset: offset} = Follower.state_of(survivor, id)
     assert offset == byte_size(wal), "fixture: the torn local must TIE the peer, not trail it"

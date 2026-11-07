@@ -699,16 +699,19 @@ defmodule Fathom.Shard.PromoteOnOpen do
            # Copied under the replica's lock and fenced at THIS owner's lineage before the lock is
            # released (expert review 2026-10-08 #13), and only if the replica is still the one
            # ranked above (`expect:`) — see `Promote.stage/4`.
-           :ok <- Promote.stage(follower, shard_id, temp, lineage: lineage, expect: replica),
+           {:ok, fence} <-
+             Promote.stage(follower, shard_id, temp, lineage: lineage, expect: replica),
            {:ok, new_etag, _carried} <-
-             publish_promoted(
-               shard_id,
-               path,
-               temp,
-               etag,
-               Position.flush_position(promoted_stamp_state(lease, temp, lineage, replica)),
-               Position.lineage_to_store(lineage)
-             ) do
+             publish_or_unfence(follower, shard_id, fence, fn ->
+               publish_promoted(
+                 shard_id,
+                 path,
+                 temp,
+                 etag,
+                 Position.flush_position(promoted_stamp_state(lease, temp, lineage, replica)),
+                 Position.lineage_to_store(lineage)
+               )
+             end) do
         # SIDECAR FIRST, like `Materializer.promote_pull/2` (expert review 2026-10-12 #22). Writing the
         # sidecar AFTER the rename left a crash window: the live `.db` is the promoted bytes while the
         # sidecar still names the pre-promotion etag, which the next open reads as a divergence
@@ -811,6 +814,45 @@ defmodule Fathom.Shard.PromoteOnOpen do
           restore_pre_promotion(path)
           other
       end
+    end
+  end
+
+  # A PUBLISH THAT FAILS UN-FENCES THE REPLICA (expert review 2026-11-07 #3). `Promote.stage/4` fenced
+  # it (torn, lineage raised to this owner's) so the deposed owner's pushes could not land under the
+  # copy, and nothing ever lifted that fence when the publish PUT then failed (a store pause, a 412
+  # because the object moved, ENOSPC): the refused open's retry met a replica torn at the NEW lineage
+  # over the OLD bytes, ranked it nowhere and, with the peer's L1 seed refused as "below the replica's
+  # lineage", could not refill it either — the Jepsen 2026-10-24 refuse-and-retry converted "serve
+  # stale now" into "serve stale after one window". The PRIOR row is restored, not a torn-cleared row
+  # at the raised lineage: that would claim the new lineage over old bytes and out-rank a peer that
+  # holds more of the old lineage (`Follower.unfence/3`). A raise inside the publish restores too.
+  # Only a failure BEFORE the object changed restores: past a successful publish the replica's tail
+  # is the object, and the local-rename failure (which raises, abandoning the open) leaves the fence.
+  defp publish_or_unfence(follower, shard_id, fence, publish) do
+    case publish.() do
+      {:ok, _new_etag, _carried} = ok ->
+        ok
+
+      other ->
+        unfence_after_failed_publish(follower, shard_id, fence)
+        other
+    end
+  catch
+    kind, reason ->
+      unfence_after_failed_publish(follower, shard_id, fence)
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
+  defp unfence_after_failed_publish(follower, shard_id, fence) do
+    case Follower.unfence(follower, shard_id, fence) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "shard #{shard_id}: could not restore the replica after a failed promotion publish " <>
+            "(#{inspect(reason)}); it stays fenced and torn until a peer pull or a re-seed"
+        )
     end
   end
 

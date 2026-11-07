@@ -214,6 +214,13 @@ Refinements (expert review 2026-10-13 #5, #14, #15, #40):
   tied or out-ranked a peer returned `:local`, the caller refused it as not fresher, and the stale
   object was served with no pull and no refusal. The local copy must itself be fresher than the
   object; otherwise the better peer is pulled and replaces it.
+- A **failed promotion's fence is lifted when it can be** (expert review 2026-11-07 #3). `Promote.stage`
+  fences the replica (torn, the new owner's lineage) before the publish, and a publish that then
+  fails (store pause, 412, ENOSPC) restores the PRIOR row (`Follower.unfence/3`), not a torn-cleared
+  row at the raised lineage, which would out-rank a peer holding more of the old lineage. A staged
+  copy that fails VERIFICATION stays fenced and torn (unverifiable bytes must not be rankable) and is
+  replaced by a pull: `begin_seed(pull: true)` does not apply the deposed-primary lineage fence to a
+  torn row (an untorn higher-lineage row still refuses, typed `:stale_lineage`).
 
 N and Q are this node's peer set and `REPLICATION_QUORUM`, which assumes a symmetric fleet with one
 quorum. The floor applies only against a rankable object stamp, so a brand-new shard is never

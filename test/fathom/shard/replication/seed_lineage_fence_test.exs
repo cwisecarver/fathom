@@ -48,6 +48,38 @@ defmodule Fathom.Shard.Replication.SeedLineageFenceTest do
            "a seed from lineage 3 was opened over a lineage-5 replica"
   end
 
+  # Expert review 2026-11-07 #3(b). A promotion that failed verification leaves its replica FENCED
+  # (torn, lineage raised to the new owner's) over the OLD owner's bytes, while the peer still holds
+  # the same tail at the OLD lineage. The recovery pull's seed was refused as "below the replica's
+  # lineage" (a deposed primary), so the retry could neither rank the local copy nor refill it.
+  # A pull is this node ASKING for bytes `Recovery.choose/4` already ranked, so only a wire seed is
+  # held to the fence over a torn row; an UNTORN higher-lineage row still refuses either way.
+  describe "a recovery pull (pull: true)" do
+    test "replaces a TORN row whose lineage was raised above the peer's", ctx do
+      assert {:ok, _fence} = Follower.fence_for_promotion(ctx.name, ctx.id, lineage: 9)
+      assert %{torn: true, lineage: 9} = Follower.state_of(ctx.name, ctx.id)
+
+      # Control: the same begin over the wire path is still refused (a deposed primary).
+      assert Follower.begin_seed(ctx.name, %{}, begin(ctx.id, 5)) == %{},
+             "fixture: the wire seed must still be refused over a torn higher-lineage row"
+
+      seeds = Follower.begin_seed(ctx.name, %{}, begin(ctx.id, 5), pull: true)
+
+      assert %{failed: false} = seeds[ctx.id],
+             "the recovery pull was refused by the lineage fence over a TORN replica"
+
+      _ = Follower.discard_seeds(seeds)
+    end
+
+    test "is still refused, typed, over an UNTORN higher-lineage row", ctx do
+      id = ctx.id
+      assert %{torn: false, lineage: 5} = Follower.state_of(ctx.name, id)
+
+      assert %{^id => %{failed: true, refusal: :stale_lineage}} =
+               Follower.begin_seed(ctx.name, %{}, begin(id, 3), pull: true)
+    end
+  end
+
   test "an equal or higher lineage, or an unstated one, is still accepted", ctx do
     for lineage <- [5, 6, 0] do
       seeds = Follower.begin_seed(ctx.name, %{}, begin(ctx.id, lineage))

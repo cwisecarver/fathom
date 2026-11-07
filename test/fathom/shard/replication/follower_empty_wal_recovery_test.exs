@@ -161,7 +161,7 @@ defmodule Fathom.Shard.Replication.FollowerEmptyWalRecoveryTest do
 
   defp staged_rows!(root, name, id) do
     temp = Path.join(root, "staged_#{System.unique_integer([:positive])}.db")
-    assert :ok = Promote.stage(name, id, temp)
+    assert {:ok, _fence} = Promote.stage(name, id, temp)
     rows!(temp)
   end
 

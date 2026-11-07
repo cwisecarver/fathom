@@ -274,15 +274,21 @@ defmodule Fathom.Shard.Replication.Promote do
   `fence` takes `:lineage` (the promoting owner's), `:epoch` (the promoting lease's) and `:expect`
   (the replica state the caller ranked; a replica that has moved since is refused
   `{:error, :replica_changed}` and left untouched). A failure in the copy leaves the replica
-  untouched and the promotion retryable; a failure after the fence (the checkpoint, `quick_check`,
-  the publish) leaves it fenced and torn — the safe direction: it waits for a re-seed rather than
-  being ranked against the new owner's own stamps.
+  untouched and the promotion retryable. Returns `{:ok, fence}` (`t:Follower.fence/0`), which a
+  caller whose PUBLISH then fails hands to `Follower.unfence/3` to restore the replica as it was
+  (expert review 2026-11-07 #3): left fenced, the retry found a replica torn at the new owner's
+  lineage that it could neither rank nor refill from a peer holding the same tail at the old one.
+  A failure of the VERIFY step here (the checkpoint, `quick_check`, the frame-count cross-check)
+  keeps the fence on purpose: those bytes are unverifiable, so they must not be rankable again — the
+  retry would choose `:local` over a peer with a good copy and fail the same way until the window
+  ended. They wait to be replaced by a pull (`Follower.begin_seed/4`, `pull: true`).
   """
-  @spec stage(atom(), String.t(), Path.t(), keyword()) :: :ok | {:error, term()}
+  @spec stage(atom(), String.t(), Path.t(), keyword()) ::
+          {:ok, Follower.fence()} | {:error, term()}
   def stage(follower, shard_id, temp, fence \\ []) do
-    with :ok <- fenced_copy(follower, shard_id, temp, fence),
+    with {:ok, token} <- fenced_copy(follower, shard_id, temp, fence),
          :ok <- checkpoint_and_verify(temp) do
-      :ok
+      {:ok, token}
     end
   end
 
@@ -359,7 +365,7 @@ defmodule Fathom.Shard.Replication.Promote do
       # and stamp with the 5-arity flush — but do NOT "fix" the nil stamp into carrying the
       # pre-promotion object's stamp, which is the actual rollback bug the audit imagined.
       # Fenced with the lease's epoch: this operator path has no lineage of its own to claim.
-      with :ok <- stage(follower, shard_id, temp, epoch: lease.epoch),
+      with {:ok, _fence} <- stage(follower, shard_id, temp, epoch: lease.epoch),
            {:ok, expected} <- current_object_etag(shard_id),
            :ok <- clear_stale_sidefiles(path),
            :ok <- Fathom.FS.rename(temp, path),

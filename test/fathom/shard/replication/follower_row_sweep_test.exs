@@ -122,7 +122,7 @@ defmodule Fathom.Shard.Replication.FollowerRowSweepTest do
   test "a torn row sweeps into a torn row (the durable marker, never laundered)", ctx do
     %{name: name, id: id} = ctx
     plant!(ctx)
-    assert :ok = Follower.fence_for_promotion(name, id, [])
+    assert {:ok, _fence} = Follower.fence_for_promotion(name, id, [])
     assert %{torn: true} = Follower.state_of(name, id)
     age!(name, id)
 
