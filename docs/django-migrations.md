@@ -257,6 +257,19 @@ version will need a transform *before* the fleet freezes. Wire it into CI ahead 
 If you genuinely need a non-atomic migration, it is out of band: apply it to every shard yourself
 and reconcile the directory, rather than routing it through capture.
 
+## Known gap (unconfirmed against a live run): Django's `post_migrate` rows
+
+`manage.py migrate` ends by emitting `post_migrate`, and `django.contrib.auth` / `contenttypes`
+answer it by inserting `django_content_type` and `auth_permission` rows for the models that exist
+(`bulk_create`, inside its own transaction). Capture records DDL and the `django_migrations` row;
+**those framework rows are data and are not replayed**, so a tenant migrated by rollout gets the new
+tables but not the new models' `auth_permission` rows, while a tenant born from `template@HEAD` has
+them. Symptom if you hit it: `has_perm('app.add_newmodel')` / admin / DRF `DjangoModelPermissions`
+fail for non-superusers on rollout-migrated tenants only. Remedy today: run `manage.py migrate`
+against the tenant (a no-op migration whose `post_migrate` creates the rows). This is traced from
+the Django source and fathom's capture code, **not yet reproduced** with a real migrate through a
+fathom node; the decision is parked in `docs/component-notes.md`.
+
 ## 4. Revert — if a migration is bad
 
 `docs/migration.md` → "Reverting a bad Django migration" has the full loop: `Migrator.revert(vN, vN-1)`
