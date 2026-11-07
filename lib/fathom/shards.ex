@@ -1093,25 +1093,29 @@ defmodule Fathom.Shards do
       # complete data. Re-open it (a warm open marks it dirty) and flush; never report success on
       # a copy we could not make durable.
       {:ok, []} ->
-        cond do
-          kept_local_copy?(shard_id) -> flush_kept_local(shard_id)
-          remote? -> Fathom.Shards.RemoteFlush.flush(shard_id)
-          true -> :ok
-        end
+        flush_without_coordinator(shard_id, remote?)
 
       {:ok, [{pid, _}]} ->
-        flush_pid(shard_id, pid)
+        flush_pid(shard_id, pid, remote?)
     end
   end
 
-  defp flush_kept_local(shard_id) do
+  defp flush_without_coordinator(shard_id, remote?) do
+    cond do
+      kept_local_copy?(shard_id) -> flush_kept_local(shard_id, remote?)
+      remote? -> Fathom.Shards.RemoteFlush.flush(shard_id)
+      true -> :ok
+    end
+  end
+
+  defp flush_kept_local(shard_id, remote?) do
     case ensure(shard_id) do
-      {:ok, pid} -> flush_pid(shard_id, pid)
+      {:ok, pid} -> flush_pid(shard_id, pid, remote?)
       {:error, reason} -> {:error, {:unflushed_local_copy, reason}}
     end
   end
 
-  defp flush_pid(shard_id, pid) do
+  defp flush_pid(shard_id, pid, remote?) do
     try do
       Fathom.Shard.flush_now(pid)
     catch
@@ -1122,8 +1126,8 @@ defmodule Fathom.Shards do
       :exit, {:timeout, _} ->
         {:error, :flush_timeout}
 
-      # The coordinator legitimately went away mid-call (idle-drop flushes on its way out; a
-      # steal quarantines; a normal/shutdown stop) — its stored state stands, so best-effort
+      # The coordinator legitimately went away mid-call (an idle drop flushes on its way out; a
+      # `:normal` / `:shutdown` stop) — its stored state stands, so best-effort
       # :ok. A force-stop with a pending waiter returns via an explicit reply, not this catch
       # (review 2026-07-18 #4 settles flush_waiters in every terminate clause).
       #
@@ -1131,8 +1135,18 @@ defmodule Fathom.Shards do
       :exit, {reason, _} when reason in [:noproc, :normal, :shutdown] ->
         stopped_clean(shard_id)
 
+      # A SELF-FENCE (or any `{:shutdown, _}` stop: a lost lease, a failed open) with the call still
+      # queued is NOT a clean stop (expert review 2026-11-07 #50). `terminate/2` replies
+      # `{:error, :lease_lost}` only to waiters already in `flush_waiters`; a `:flush_now` still in the
+      # mailbox exits here, and `stopped_clean/1` answered `:ok` unless a local copy survived — but
+      # `quarantine_fenced!` had just renamed the `.db` away, and the new owner is a REMOTE node that
+      # may hold unflushed writes. Export, keystone fork and `flush: true` snapshots then read a stale
+      # object after being told it was current. The coordinator is gone and the holder unknown, which
+      # is exactly the no-coordinator state: a kept local copy, then the remote holder check. It
+      # cannot answer `:ok` over a dirty marker (`RemoteFlush.free_or_unflushed/1`). A `:normal` /
+      # `:shutdown` exit above stays `stopped_clean/1`: those stops flushed on their way out.
       :exit, {{:shutdown, _}, _} ->
-        stopped_clean(shard_id)
+        flush_without_coordinator(shard_id, remote?)
 
       # Any other exit (a genuine coordinator crash reason) left durability unknown — surface
       # it rather than swallow it as a false success.
