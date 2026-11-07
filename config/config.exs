@@ -257,6 +257,28 @@ config :logger, :default_formatter,
   format: "$time $metadata[$level] $message\n",
   metadata: [:request_id]
 
+# OVERLOAD POLICY OF THE DEFAULT LOG HANDLER (expert review 2026-11-07 #45): DROP, NEVER BLOCK.
+#
+# OTP's `logger_std_h` defaults are `sync_mode_qlen: 10, drop_mode_qlen: 200, flush_qlen: 1000` and a
+# 500 lines/s burst limit. Between 10 and 200 queued lines every `Logger` call becomes a SYNCHRONOUS
+# call into the handler (`logger_olp`, 5 s call timeout), so a stalled stdout (a Docker `json-file` /
+# journald / log-shipper pipe, all ordinary) blocks the CALLER: measured on OTP 29, p99 2.8 s and max
+# 5.0 s per log call against a slow sink. Coordinators log on ~40 paths, so one slow sink stalls
+# healthy shards' mailboxes, and a Heartbeat line could delay renewals by up to 5 s against a 10 s
+# interval. With `sync_mode_qlen == drop_mode_qlen` the handler goes straight from async to dropping
+# and there is no blocking window at all; the queue is 2000 lines deep before it drops, and a
+# 4000-line backlog is flushed. The burst limit (500/s, which dropped 93.75% of an 8000-line second
+# on a FAST sink, critical lines included) is raised to 5000/s: the queue bound, not the burst limit,
+# is what protects the node. Verified at boot by `Fathom.LoggerOverloadTest`, which also drives a
+# blocking handler to prove a second process's log call returns.
+config :logger, :default_handler,
+  config: [
+    sync_mode_qlen: 2_000,
+    drop_mode_qlen: 2_000,
+    flush_qlen: 4_000,
+    burst_limit_max_count: 5_000
+  ]
+
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
