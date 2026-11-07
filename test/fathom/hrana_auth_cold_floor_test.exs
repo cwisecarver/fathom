@@ -60,10 +60,25 @@ defmodule Fathom.HranaAuthColdFloorTest do
 
   # A shard whose directory floor is `dir_floor` and whose cache is cold. The storage floor is left
   # to the test.
+  #
+  # A REVOKED shard (`dir_floor > 0`) is parked from the periodic bulk refresh: that tick (every
+  # TTL) caches every revoked shard's directory floor, and the tests that stall the storage read for
+  # the whole budget assert the answer is NOT cached, so a tick landing in that window read as
+  # `[{shard, 3, nil, _}]` (seed 146031; reproduced 3/3 by firing a tick mid-stall). The refresh is
+  # the cache's only other writer and it writes from the Revocations process, so suspending that
+  # process (resumed on exit) is the whole isolation. Suspended BEFORE the entry is cleared: a page
+  # already in its mailbox is handled first, then the delete removes what it cached.
   defp cold_shard(dir_floor) do
     shard = uniq()
     {:ok, _} = Directory.resolve(shard)
-    if dir_floor > 0, do: 1 = Directory.raise_token_version(shard, dir_floor)
+
+    if dir_floor > 0 do
+      1 = Directory.raise_token_version(shard, dir_floor)
+      revocations = Process.whereis(Revocations)
+      :ok = :sys.suspend(revocations)
+      on_exit(fn -> :sys.resume(revocations) end)
+    end
+
     :ets.delete(Revocations, shard)
     on_exit(fn -> File.rm(Path.join([Storage.Local.dir(), "tokenfloors", shard])) end)
     shard
