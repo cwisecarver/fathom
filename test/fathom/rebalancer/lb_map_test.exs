@@ -309,4 +309,32 @@ defmodule Fathom.Rebalancer.LbMapTest do
       assert LbMap.entry_count(LbMap.render(pins.(ids), backends, "fathom.test")) == length(ids)
     end
   end
+
+  # Expert review 2026-11-07 #81 (5). `upstream_name/1` is lossy ([^a-zA-Z0-9_] -> _), so
+  # `fathom-1` and `fathom_1` rendered the same `upstream` name; nginx rejects the duplicate block
+  # (`nginx -t` fails every tick) and no pin could ever be applied or removed. The collision is
+  # detected where the keys are read; this pins the detector and that the render it guards is
+  # really broken for such keys.
+  describe "upstream_name_collision/1 (#81)" do
+    test "keys that sanitise to one name are reported, sorted" do
+      assert LbMap.upstream_name_collision(["fathom_1", "fathom2", "fathom-1"]) ==
+               ["fathom-1", "fathom_1"]
+
+      assert LbMap.upstream_name_collision(["10.0.0.1", "10-0-0-1", "10_0_0_1"]) ==
+               ["10-0-0-1", "10.0.0.1", "10_0_0_1"]
+    end
+
+    test "distinct keys, and a repeated identical key, are not a collision" do
+      assert LbMap.upstream_name_collision(["fathom1", "fathom2", "fathom10"]) == nil
+      assert LbMap.upstream_name_collision(["fathom1", "fathom1"]) == nil
+      assert LbMap.upstream_name_collision([]) == nil
+    end
+
+    test "fixture check: a colliding backend set really renders a duplicate upstream block" do
+      backends = %{"fathom-1" => "a:8080", "fathom_1" => "b:8080"}
+      out = LbMap.render([override("alpha", "fathom-1")], backends, "fathom.test")
+
+      assert length(Regex.scan(~r/^upstream fathom_pin_fathom_1 \{/m, out)) == 2
+    end
+  end
 end

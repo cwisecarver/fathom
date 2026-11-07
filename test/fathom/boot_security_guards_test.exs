@@ -297,4 +297,32 @@ defmodule Fathom.BootSecurityGuardsTest do
       assert Fathom.Application.check_replication_disk!() == nil
     end
   end
+
+  describe "2026-11-07 #81 a prod flush interval <= 0 warns at boot (arity-0 wiring)" do
+    setup do
+      prev = Application.fetch_env(:fathom, :shard_flush_interval_ms)
+
+      on_exit(fn ->
+        case prev do
+          {:ok, v} -> Application.put_env(:fathom, :shard_flush_interval_ms, v)
+          :error -> Application.delete_env(:fathom, :shard_flush_interval_ms)
+        end
+      end)
+
+      Application.put_env(:fathom, :env, :prod)
+      :ok
+    end
+
+    test "0 warns, a positive interval is silent" do
+      Application.put_env(:fathom, :shard_flush_interval_ms, 0)
+
+      log = capture_log(fn -> assert Fathom.Application.check_flush_interval!() == nil end)
+      assert log =~ "DISABLES the periodic durability flush"
+
+      Application.put_env(:fathom, :shard_flush_interval_ms, 300_000)
+
+      refute capture_log(fn -> Fathom.Application.check_flush_interval!() end) =~
+               "DISABLES the periodic durability flush"
+    end
+  end
 end

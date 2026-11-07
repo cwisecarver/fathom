@@ -35,6 +35,7 @@ defmodule Fathom.Application do
     check_replication_disk!()
     check_vm_dirty_background!()
     check_replication_flush_interval!()
+    check_flush_interval!()
     check_pool_fd_budget!()
     check_soft_heap_budget!()
     check_s3_static_credentials!()
@@ -742,6 +743,45 @@ defmodule Fathom.Application do
 
     nil
   end
+
+  # A non-positive `:shard_flush_interval_ms` DISABLES the periodic durability flush
+  # (`Shard.do_schedule_flush/2`: "idle-only durability"), so a continuously active shard never
+  # flushes and its RPO is unbounded — "the worst durability for the most valuable data"
+  # (`config/runtime.exs`, which defaults prod to 300 s and says "and NOT 0"). `0` or a negative was
+  # accepted in prod with no signal (expert review 2026-11-07 #81); `check_replication_flush_interval!`
+  # only looks at 0 < interval < 30 s. WARNS rather than raises: idle-only is a documented, if
+  # dangerous, mode, and refusing to boot over it would be an opinion about a deployment's RPO
+  # tradeoff — but it must not be silent. Prod-only like every sibling.
+  @doc false
+  @spec check_flush_interval!() :: nil
+  def check_flush_interval! do
+    case flush_interval_problem(
+           Application.get_env(:fathom, :env),
+           Application.get_env(:fathom, :shard_flush_interval_ms, 5_000)
+         ) do
+      nil ->
+        nil
+
+      message ->
+        Logger.warning(message)
+        nil
+    end
+  end
+
+  @doc """
+  The boot warning for a prod flush interval that disables the periodic durability flush, or `nil`.
+  Pure over its two arguments (the env and the interval in ms).
+  """
+  @spec flush_interval_problem(atom(), term()) :: String.t() | nil
+  def flush_interval_problem(:prod, interval) when is_integer(interval) and interval <= 0 do
+    "config warning: SHARD_FLUSH_INTERVAL_MS = #{interval} DISABLES the periodic durability flush " <>
+      "(idle-only durability): a continuously active shard never flushes, so its loss window is " <>
+      "unbounded and the busiest tenants are the least protected. The prod default is 300000 " <>
+      "(5 min), which bounds it; set a positive interval unless idle-only durability is a " <>
+      "deliberate choice (expert review 2026-11-07 #81)."
+  end
+
+  def flush_interval_problem(_env, _interval), do: nil
 
   # `soft_heap_limit` is a FIXED 8 GiB whatever the node's RAM (perf review 2026-10-14 #29). It sheds
   # page cache only; the ~190 KB fixed cost per held shard (connection + coordinator) is not

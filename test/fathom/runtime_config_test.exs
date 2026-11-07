@@ -284,16 +284,106 @@ defmodule Fathom.RuntimeConfigTest do
 
   test "the default-on A2 gates leave the key UNWRITTEN when unset, so the module default stands" do
     # Not `== true`: runtime.exs must say nothing, or it would pin a value that the module's own
-    # `Application.get_env(_, _, true)` default is supposed to own. Garbage is treated as unset for
-    # the same reason — a typo'd "yes" must not be read as "off" on a gate whose default is on.
+    # `Application.get_env(_, _, true)` default is supposed to own. An EMPTY value is unset too
+    # (compose passes `X: "${X:-}"` for an unset variable).
+    #
+    # This test used to assert that garbage ("yes") was ALSO treated as unset, "so a typo'd value
+    # must not be read as off". That pinned the defect (expert review 2026-11-07 #81): the typo was
+    # silently ignored, so `REPLICATION_ENABLED=no` left replication ON and nothing said so. An
+    # unrecognised value now refuses to boot — see "env_bool is strict" below.
     cfg = fathom_config(%{})
     unset = for {_, key} <- @default_on_gates, do: refute(Keyword.has_key?(cfg, key))
     assert length(unset) == 3
 
     for {var, key} <- @default_on_gates do
-      refute Keyword.has_key?(fathom_config(%{var => "yes"}), key),
-             "#{var}=yes should be treated as unset, not as off"
+      refute Keyword.has_key?(fathom_config(%{var => ""}), key),
+             "#{var}= (empty) should be treated as unset"
     end
+  end
+
+  # Expert review 2026-11-07 #81 (2). Symptom: `env_bool` mapped any unrecognised string to `nil`
+  # ("say nothing"), so `REPLICATION_FSYNC=yes`, `TENANT_NOMUTEX=on`, `ALLOW_UNANCHORED_ROUTING=ye`
+  # silently left a gate OFF, and `REPLICATION_ENABLED=no` left a defaults-ON gate ON. Invariant: an
+  # env_bool variable is true|false|1|0 (case-insensitive) or empty/unset; anything else fails the
+  # boot NAMING the variable. Covers a default-off, a default-on and a prod-only reader.
+  describe "env_bool is strict (#81)" do
+    @bool_vars [
+      "REPLICATION_FSYNC",
+      "TENANT_NOMUTEX",
+      "ALLOW_UNANCHORED_ROUTING",
+      "REPLICATION_ENABLED",
+      "REPLICATION_PROMOTE_ON_OPEN",
+      "ALLOW_NO_UDF",
+      "ALLOW_LOCAL_STORAGE",
+      "DRAIN_ON_SHUTDOWN"
+    ]
+
+    test "an unrecognised value refuses to boot, naming the variable" do
+      for var <- @bool_vars, bad <- ["yes", "on", "no", "ye", "2", "tru"] do
+        # prod_config, not fathom_config: several of these are read only inside the prod block.
+        assert_raise RuntimeError, ~r/#{var} must be true, false, 1 or 0/, fn ->
+          prod_config(%{var => bad})
+        end
+      end
+    end
+
+    test "case and surrounding whitespace are accepted; empty is unset" do
+      assert Keyword.fetch!(
+               fathom_config(%{"REPLICATION_ENABLED" => "False"}),
+               :replication_enabled
+             ) ==
+               false
+
+      assert Keyword.fetch!(
+               fathom_config(%{"REPLICATION_ENABLED" => " TRUE "}),
+               :replication_enabled
+             ) ==
+               true
+
+      refute Keyword.has_key?(fathom_config(%{"REPLICATION_ENABLED" => ""}), :replication_enabled)
+    end
+  end
+
+  # Expert review 2026-11-07 #81 (3). Symptom: `MAX_OPEN_SHARDS=0` was stored as 0, so `at_capacity?`
+  # was always true and every new shard open was `:node_at_capacity` (a node that boots healthy and
+  # serves only what it already held). Invariant: the cap is positive or the boot fails.
+  test "MAX_OPEN_SHARDS must be positive in prod" do
+    for bad <- ["0", "-5"] do
+      assert_raise RuntimeError, ~r/MAX_OPEN_SHARDS must be a positive integer/, fn ->
+        prod_config(%{"MAX_OPEN_SHARDS" => bad})
+      end
+    end
+
+    assert Keyword.fetch!(prod_config(%{"MAX_OPEN_SHARDS" => "500"}), :max_open_shards) == 500
+  end
+
+  # Expert review 2026-11-07 #81 (4). Symptom: no bounds, so `SHARD_LEASE_TTL_MS=30` (seconds
+  # meant) gave a ~10 ms write-validity margin and every write `:not_valid`, and `300000` a
+  # five-minute failover stall. Invariant: [5 s, 10 min] or the boot fails, naming the variable.
+  test "SHARD_LEASE_TTL_MS is bounded to 5 s .. 10 min" do
+    for bad <- ["30", "4999", "600001", "0", "-1"] do
+      assert_raise RuntimeError, ~r/SHARD_LEASE_TTL_MS must be between 5000 and 600000/, fn ->
+        fathom_config(%{"SHARD_LEASE_TTL_MS" => bad})
+      end
+    end
+
+    for good <- [5_000, 10_000, 30_000, 600_000] do
+      assert Keyword.fetch!(
+               fathom_config(%{"SHARD_LEASE_TTL_MS" => "#{good}"}),
+               :shard_lease_ttl_ms
+             ) == good
+    end
+  end
+
+  # Expert review 2026-11-07 #81 (5). Symptom: node keys `fathom-1` and `fathom_1` render the same
+  # nginx `upstream` name, so `nginx -t` failed every tick and no pin could be applied or removed.
+  test "LB_BACKENDS keys that collide after nginx-name sanitising refuse to boot" do
+    assert_raise RuntimeError, ~r/same nginx upstream name/, fn ->
+      fathom_config(%{"LB_BACKENDS" => "fathom-1=a:8080,fathom_1=b:8080"})
+    end
+
+    cfg = fathom_config(%{"LB_BACKENDS" => "fathom1=a:8080,fathom2=b:8080"})
+    assert Keyword.fetch!(cfg, :lb_backends) == %{"fathom1" => "a:8080", "fathom2" => "b:8080"}
   end
 
   # Expert review 2026-10-10 #21 (SYMPTOM): prod defaulted HRANA_AUTH to "disabled", so a deploy

@@ -122,24 +122,39 @@ env_nonneg_int = fn name ->
   end
 end
 
-# A TRI-STATE boolean env var: "true"/"1" ⇒ true, "false"/"0" ⇒ false, unset or anything else ⇒
-# nil, meaning "say nothing" so the compiled default survives.
+# A TRI-STATE boolean env var: "true"/"1" ⇒ true, "false"/"0" ⇒ false (case-insensitive, surrounding
+# whitespace trimmed), unset or empty ⇒ nil, meaning "say nothing" so the compiled default survives.
+# ANYTHING ELSE RAISES, naming the variable (expert review 2026-11-07 #81).
 #
-# A flag that defaults OFF reads it as `if env_bool.("X") == true` (only "true"/"1" turn it on;
-# this replaced the older two-state `System.get_env("X") in ~w(true 1)` form, same results on every
-# input, expert review 2026-11-06 #8). A flag that defaults ON branches on all three states
-# (`case`), because an operator needs a way to turn it off short of editing config and rebuilding,
-# which is not a flag, it is a hardcode with extra steps. The A2 gates below were the first to
-# need that.
+# Until then an unrecognised string was `nil` too, which the 2026-11-06 #8 sweep kept on purpose
+# ("same results on every input"). That decision was wrong for booleans: `REPLICATION_ENABLED=False`
+# or `=no` left a defaults-ON gate ON, and `REPLICATION_FSYNC=yes`, `TENANT_NOMUTEX=on`,
+# `ALLOW_UNANCHORED_ROUTING=ye` silently left a safety gate OFF — the typo reads as configured and
+# does nothing. 2026-11-06 #8 concerned integers (`parse_int!`), not this third state. Empty stays
+# `nil` because compose files pass `X: "${X:-}"` for an unset variable. Case-folding is accepted
+# ("TRUE" is unambiguous); other spellings ("yes", "on") are not, so a deployment that wrote them
+# gets a boot error rather than a silently-ignored gate.
+#
+# A flag that defaults OFF reads it as `if env_bool.("X") == true`. A flag that defaults ON branches
+# on all three states (`case`), because an operator needs a way to turn it off short of editing
+# config and rebuilding, which is not a flag, it is a hardcode with extra steps. The A2 gates below
+# were the first to need that.
 #
 # NB: `Fathom.ConfigurationDocTest` scans this file for env-var names by matching the helper forms
 # by NAME. Adding a helper without adding it to that regex makes every knob read through it
 # invisible to the doc-completeness guard — which already happened once with `env_int`.
 env_bool = fn name ->
   case System.get_env(name) do
-    v when v in ~w(true 1) -> true
-    v when v in ~w(false 0) -> false
-    _ -> nil
+    nil ->
+      nil
+
+    raw ->
+      case raw |> String.trim() |> String.downcase() do
+        "" -> nil
+        v when v in ~w(true 1) -> true
+        v when v in ~w(false 0) -> false
+        _ -> raise "#{name} must be true, false, 1 or 0 (or unset), got: #{inspect(raw)}"
+      end
   end
 end
 
@@ -453,8 +468,21 @@ end
 
 # Node heartbeat / lease TTL (ms). Bounds how long a dead node's shards stay unstealable —
 # the failover-stall ceiling. Default 30_000.
+#
+# BOUNDED to [5 s, 10 min] (expert review 2026-11-07 #81). The write-validity margin
+# (`Heartbeat.margin_ms/0` = ttl/3) and the heartbeat renew cadence derive from it, so a unit slip is
+# not a tuning choice: `SHARD_LEASE_TTL_MS=30` (meant as
+# seconds) gives a ~10 ms margin and every write `:not_valid`; `300000` as an afterthought is a
+# five-minute failover stall. The chaos rig runs 10 s. Outside the range the boot fails, naming the
+# variable, rather than serving with a lease that cannot work or cannot fail over.
 if ttl = System.get_env("SHARD_LEASE_TTL_MS") do
-  config :fathom, :shard_lease_ttl_ms, parse_int!.("SHARD_LEASE_TTL_MS", ttl)
+  case parse_int!.("SHARD_LEASE_TTL_MS", ttl) do
+    ms when ms >= 5_000 and ms <= 600_000 ->
+      config :fathom, :shard_lease_ttl_ms, ms
+
+    ms ->
+      raise "SHARD_LEASE_TTL_MS must be between 5000 and 600000 (milliseconds), got: #{ms}"
+  end
 end
 
 # --- Node shutdown / drain (expert review 2026-11-07 #58) -------------------------------------
@@ -835,6 +863,18 @@ if spec = System.get_env("LB_BACKENDS") do
       [k, v] = String.split(pair, "=", parts: 2)
       {String.trim(k), String.trim(v)}
     end)
+
+  # Two keys that render to ONE nginx `upstream` name (`fathom-1` and `fathom_1`) make `nginx -t`
+  # fail on every tick, so no pin could ever be applied or removed (expert review 2026-11-07 #81).
+  case Fathom.Rebalancer.LbMap.upstream_name_collision(Map.keys(backends)) do
+    nil ->
+      :ok
+
+    keys ->
+      raise "LB_BACKENDS node keys #{inspect(keys)} map to the same nginx upstream name " <>
+              "(#{Fathom.Rebalancer.LbMap.upstream_name(hd(keys))}); keep them distinct after " <>
+              "replacing every character outside [a-zA-Z0-9_] with _"
+  end
 
   config :fathom, :lb_backends, backends
 end
@@ -1664,8 +1704,21 @@ if config_env() == :prod do
 
   # Per-node open-shard cap (finding #14). config.exs sets a conservative finite default; operators
   # tune it to their node's measured fd/RSS density (mix fathom.scale --ramp) here.
+  #
+  # Must be positive (expert review 2026-11-07 #81). `0` used to be stored as 0, and `at_capacity?`
+  # is then always true: every new shard open is `:node_at_capacity`, a node that boots healthy and
+  # serves only the shards it already had. Unlike its sibling knobs (`MAX_CHECKOUTS_PER_SHARD`,
+  # `SHARD_SOFT_HEAP_LIMIT_BYTES`, where 0 means "unlimited") there is no unbounded setting here to
+  # reach for: the cap is the fd-cliff protection, and `:infinity` is not an env-selectable value.
+  # So it raises instead of guessing which meaning of 0 was intended.
   if cap = System.get_env("MAX_OPEN_SHARDS") do
-    config :fathom, :max_open_shards, parse_int!.("MAX_OPEN_SHARDS", cap)
+    case parse_int!.("MAX_OPEN_SHARDS", cap) do
+      n when n > 0 ->
+        config :fathom, :max_open_shards, n
+
+      n ->
+        raise "MAX_OPEN_SHARDS must be a positive integer, got: #{n} (0 would refuse every new shard)"
+    end
   end
 
   # Background pre-eviction headroom below that cap (perf review 2026-10-21 #14). Unset = auto (1% of

@@ -52,11 +52,18 @@ defmodule Fathom.RuntimeAdminConfigTest do
     assert Keyword.get(config[:fathom], :admin_auth_blank_env) == nil
   end
 
-  test "ADMIN_WEAK_CREDENTIALS_OK=true sets the opt-out; anything else does not" do
+  # This asserted that "yes" silently left the opt-out unset. That pinned the defect (expert review
+  # 2026-11-07 #81): an unrecognised `env_bool` value is now a boot error naming the variable, so a
+  # typo'd ack is loud rather than ignored.
+  test "ADMIN_WEAK_CREDENTIALS_OK=true sets the opt-out; false/unset does not; a typo refuses to boot" do
     on = runtime_config(%{"ADMIN_WEAK_CREDENTIALS_OK" => "true"})
     assert Keyword.get(on[:fathom], :admin_weak_credentials_ok) == true
 
-    off = runtime_config(%{"ADMIN_WEAK_CREDENTIALS_OK" => "yes"})
+    off = runtime_config(%{"ADMIN_WEAK_CREDENTIALS_OK" => "false"})
     assert Keyword.get(off[:fathom], :admin_weak_credentials_ok) == nil
+
+    assert_raise RuntimeError, ~r/ADMIN_WEAK_CREDENTIALS_OK must be true, false, 1 or 0/, fn ->
+      runtime_config(%{"ADMIN_WEAK_CREDENTIALS_OK" => "yes"})
+    end
   end
 end

@@ -130,9 +130,6 @@ defmodule Fathom.Rebalancer.LbMap do
     |> Enum.count(&(String.trim(&1) != ""))
   end
 
-  # An nginx upstream name for a node_key: [a-zA-Z0-9_] only (an IP like 10.0.0.12 → a
-  # legal identifier), so the same key always renders to the same upstream name.
-  @doc false
   # The single deterministic failover target for `node`'s pin upstream: its successor in
   # sorted key order, wrapping. A pure function of the node and the backend set, so the
   # rendered map stays byte-identical across re-renders (which `LbApply`'s no-op check
@@ -150,9 +147,37 @@ defmodule Fathom.Rebalancer.LbMap do
     end
   end
 
+  # An nginx upstream name for a node_key: [a-zA-Z0-9_] only (an IP like 10.0.0.12 → a
+  # legal identifier), so the same key always renders to the same upstream name.
+  #
+  # LOSSY, deliberately kept so (expert review 2026-11-07 #81): `fathom-1` and `fathom_1` both
+  # render `fathom_pin_fathom_1`, and two `upstream` blocks of one name make `nginx -t` fail on
+  # every tick, so no pin could ever be applied or removed. An injective encoding (escaping `_` and
+  # every other character) was rejected because it renames the upstream of EVERY existing key that
+  # contains one — the chaos LB's checked-in `exceptions.conf`, anyone's hand-written references —
+  # to fix a collision that only a pair of near-identical keys can have. The collision is refused
+  # where the keys are read instead: `upstream_name_collision/1`, called from `config/runtime.exs`
+  # when `LB_BACKENDS` is parsed.
   @spec upstream_name(String.t()) :: String.t()
   def upstream_name(node_key) do
     "fathom_pin_" <> String.replace(node_key, ~r/[^a-zA-Z0-9_]/, "_")
+  end
+
+  @doc """
+  The first group of distinct node keys that render to the SAME nginx upstream name, or `nil`
+  when every key is unique after sanitising. Keys are sorted, so the answer is deterministic.
+  """
+  @spec upstream_name_collision([String.t()]) :: [String.t(), ...] | nil
+  def upstream_name_collision(node_keys) do
+    node_keys
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.group_by(&upstream_name/1)
+    |> Enum.sort()
+    |> Enum.find_value(fn
+      {_name, [_, _ | _] = keys} -> keys
+      {_name, _single} -> nil
+    end)
   end
 
   defp base_domain do
