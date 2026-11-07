@@ -246,4 +246,132 @@ defmodule Fathom.Migrator.CopyTest do
     assert %{columns: ["id", "name", "a"]} = query!(dest, "SELECT * FROM app_thing")
     assert %{rows: [[2]]} = query!(dest, "PRAGMA user_version")
   end
+
+  # Expert review 2026-11-07 #64. `id INTEGER PRIMARY KEY AUTOINCREMENT` promises ids are never
+  # reused, via the table's `sqlite_sequence` row. Django rebuilds a table for most AlterField /
+  # RemoveField (CREATE new__x / INSERT…SELECT / DROP x / RENAME), and the rebuilt table's
+  # sequence is the MAX id COPIED, not the old high-water mark: ids 1..3 with 3 deleted has
+  # `seq = 3`, and after the rebuild `seq = 2`, so the next INSERT reissued id 3. quick_check,
+  # foreign_key_check and the ledger all pass; nothing compared a sequence.
+  describe "AUTOINCREMENT high-water marks across a table rebuild (#64)" do
+    # The statement shapes are the ones in test/support/fixtures/django_migrate_capture.json
+    # (finance 0001: CREATE new__finance_transaction … / INSERT … SELECT / DROP / RENAME).
+    @rebuild [
+      {~s|CREATE TABLE "new__app_ledger" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "note" text NULL, "extra" text NULL)|,
+       []},
+      {~s|INSERT INTO "new__app_ledger" ("id", "note") SELECT "id", "note" FROM "app_ledger"|,
+       []},
+      {~s|DROP TABLE "app_ledger"|, []},
+      {~s|ALTER TABLE "new__app_ledger" RENAME TO "app_ledger"|, []},
+      {"INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002_rebuild', 'now')",
+       []}
+    ]
+
+    # ids 1..3 inserted, 3 deleted: seq = 3, max(id) = 2.
+    defp seed_ledger!(path, fun) do
+      seed_v0!(path)
+      {:ok, conn} = Connection.open(path)
+
+      :ok =
+        Connection.exec(
+          conn,
+          ~s|CREATE TABLE "app_ledger" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "note" text NULL)|
+        )
+
+      for n <- 1..3 do
+        :ok = Connection.exec(conn, "INSERT INTO app_ledger (note) VALUES ('n#{n}')")
+      end
+
+      fun.(conn)
+      Connection.close(conn)
+
+      # Fixture preconditions: the mark and the data must differ, or the test measures nothing.
+      assert %{rows: [[3]]} =
+               query!(path, "SELECT seq FROM sqlite_sequence WHERE name = 'app_ledger'")
+    end
+
+    test "a rebuild keeps the mark: the next id is NOT a reused one", %{
+      source: source,
+      dest: dest
+    } do
+      seed_ledger!(source, fn conn ->
+        :ok = Connection.exec(conn, "DELETE FROM app_ledger WHERE id = 3")
+      end)
+
+      assert %{rows: [[2]]} = query!(source, "SELECT max(id) FROM app_ledger")
+
+      assert :ok = Copy.migrate(source, dest, 2, @rebuild)
+
+      assert %{rows: [[3]]} =
+               query!(dest, "SELECT seq FROM sqlite_sequence WHERE name = 'app_ledger'"),
+             "the rebuild lowered the AUTOINCREMENT high-water mark (ids 3.. were reopened)"
+
+      {:ok, conn} = Connection.open(dest)
+      {:ok, _} = Connection.query(conn, "INSERT INTO app_ledger (note) VALUES ('new')", [])
+      {:ok, %{rows: [[next_id]]}} = Connection.query(conn, "SELECT max(id) FROM app_ledger", [])
+      Connection.close(conn)
+
+      assert next_id == 4,
+             "the next id after the rebuild must follow the old mark (3), not reuse 3"
+    end
+
+    test "an EMPTY table keeps its mark too (the rebuild leaves no sequence row at all)",
+         %{source: source, dest: dest} do
+      seed_ledger!(source, fn conn -> :ok = Connection.exec(conn, "DELETE FROM app_ledger") end)
+      assert %{rows: [[0]]} = query!(source, "SELECT count(*) FROM app_ledger")
+
+      assert :ok = Copy.migrate(source, dest, 2, @rebuild)
+
+      assert %{rows: [[3]]} =
+               query!(dest, "SELECT seq FROM sqlite_sequence WHERE name = 'app_ledger'")
+    end
+
+    test "a mark the step legitimately ADVANCED is never lowered", %{source: source, dest: dest} do
+      seed_ledger!(source, fn conn ->
+        :ok = Connection.exec(conn, "DELETE FROM app_ledger WHERE id = 3")
+      end)
+
+      # The same rebuild, then rows past the old mark (e.g. a backfill's INSERT): seq 3 -> 5.
+      steps =
+        List.delete_at(@rebuild, 4) ++
+          [
+            {"INSERT INTO app_ledger (id, note) VALUES (4, 'a'), (5, 'b')", []},
+            {"INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002_rebuild', 'now')",
+             []}
+          ]
+
+      assert :ok = Copy.migrate(source, dest, 2, steps)
+
+      assert %{rows: [[5]]} =
+               query!(dest, "SELECT seq FROM sqlite_sequence WHERE name = 'app_ledger'")
+    end
+
+    test "a table the step drops for good gets no sequence row invented", %{
+      source: source,
+      dest: dest
+    } do
+      seed_ledger!(source, fn _conn -> :ok end)
+
+      steps = [
+        {~s|DROP TABLE "app_ledger"|, []},
+        {"INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002_drop', 'now')",
+         []}
+      ]
+
+      assert :ok = Copy.migrate(source, dest, 2, steps)
+      assert %{rows: []} = query!(dest, "SELECT * FROM sqlite_sequence WHERE name = 'app_ledger'")
+    end
+
+    test "a shard with no AUTOINCREMENT table at all replays as before", %{
+      source: source,
+      dest: dest
+    } do
+      seed_v0!(source)
+
+      assert :ok =
+               Copy.migrate(source, dest, 2, [{"ALTER TABLE app_thing ADD COLUMN c TEXT", []}])
+
+      assert %{rows: [[2]]} = query!(dest, "PRAGMA user_version")
+    end
+  end
 end

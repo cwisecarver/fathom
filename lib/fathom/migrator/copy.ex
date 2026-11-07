@@ -214,11 +214,16 @@ defmodule Fathom.Migrator.Copy do
   defp replay(conn, version, statements, transform, shard_id) do
     result =
       with :ok <- Connection.exec(conn, "BEGIN"),
+           {:ok, sequences} <- sequence_snapshot(conn),
            :ok <- replay_each(conn, statements),
            # INSIDE the transaction, AFTER the DDL: the backfill needs the columns the DDL just
            # added, and a transform that failed must roll back the DDL with it rather than leaving
            # the shard with a new column and no data in it.
            :ok <- run_transform(conn, transform, shard_id, version),
+           # After the DDL and the transform, before the integrity check and the COMMIT: a table
+           # rebuild (`CREATE new__x` / `INSERT…SELECT` / `DROP x` / `RENAME`) has just lowered the
+           # AUTOINCREMENT high-water marks, and this puts them back.
+           :ok <- restore_sequences(conn, sequences),
            :ok <- foreign_key_check(conn, version),
            :ok <- Connection.exec(conn, "COMMIT") do
         :ok
@@ -232,6 +237,94 @@ defmodule Fathom.Migrator.Copy do
     # (`migrate_chain/4`).
     with :ok <- result do
       Connection.exec(conn, "PRAGMA user_version = #{version}")
+    end
+  end
+
+  # AUTOINCREMENT HIGH-WATER MARKS SURVIVE A TABLE REBUILD (expert review 2026-11-07 #64).
+  #
+  # `id INTEGER PRIMARY KEY AUTOINCREMENT` promises ids are never reused, via the `sqlite_sequence`
+  # row of the table. Django's SQLite schema editor rebuilds a table for most AlterField/RemoveField
+  # (`CREATE new__x` / `INSERT INTO new__x SELECT …` / `DROP TABLE x` / `RENAME new__x`), and the
+  # rebuilt table's sequence is the MAX id that was copied, not the old high-water mark: a tenant
+  # that had ids 1..3 and deleted 3 has `seq = 3`, and after the rebuild `seq = 2`, so the next
+  # INSERT hands out id 3 AGAIN. `quick_check`, `foreign_key_check` and the ledger all pass, and
+  # nothing in the engine compared a sequence, so a fleet-wide replay re-opened deleted-tail ids
+  # (payment references, URLs a tenant already exported) with no signal. Plain Django-on-SQLite
+  # does the same, so this is parity with the template's own behaviour — but it is silent
+  # fleet-wide, and the fix is cheap and strictly one-directional.
+  #
+  # Snapshot `sqlite_sequence` at the top of the step's transaction; before COMMIT, for every table
+  # that still exists and whose mark went DOWN (or whose row vanished), restore it to the old mark
+  # (`seq < old` only: a mark the step legitimately advanced is never lowered). `sqlite_sequence`
+  # is an ordinary writable table inside a transaction. Not restored: a table the step dropped for
+  # good (nothing to protect — and re-inserting its row would invent one). A table DROPPED AND
+  # CREATED AGAIN under the same name inherits the old mark; that only skips ids, never reuses
+  # them, and is indistinguishable here from a rebuild.
+  #
+  # The review's other half — per-table row-count conservation old vs new in `verify_migrated/2` —
+  # is not done: it would flag a `RunSQL … INSERT OR IGNORE` that drops rows, but costs one scan per
+  # table per migrated tenant on the dirty-IO permit, and a legitimate step may delete or backfill.
+  # Parked; see docs/component-notes.md.
+  defp sequence_snapshot(conn) do
+    case Connection.query(
+           conn,
+           "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'",
+           []
+         ) do
+      {:ok, %{rows: []}} ->
+        {:ok, %{}}
+
+      {:ok, %{rows: [_ | _]}} ->
+        with {:ok, %{rows: rows}} <-
+               Connection.query(conn, "SELECT name, seq FROM sqlite_sequence", []) do
+          {:ok, Map.new(rows, fn [name, seq] -> {name, seq} end)}
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp restore_sequences(_conn, before) when map_size(before) == 0, do: :ok
+
+  defp restore_sequences(conn, before) do
+    with {:ok, current} <- sequence_snapshot(conn) do
+      before
+      |> Enum.filter(fn {name, seq} -> is_integer(seq) and Map.get(current, name, 0) < seq end)
+      |> Enum.reduce_while(:ok, fn {name, seq}, :ok ->
+        case restore_sequence(conn, name, seq) do
+          :ok -> {:cont, :ok}
+          {:error, _} = error -> {:halt, error}
+        end
+      end)
+    end
+  end
+
+  defp restore_sequence(conn, name, seq) do
+    with {:ok, %{rows: [_ | _]}} <-
+           Connection.query(
+             conn,
+             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+             [name]
+           ),
+         {:ok, _} <-
+           Connection.query(
+             conn,
+             "UPDATE sqlite_sequence SET seq = ? WHERE name = ? AND seq < ?",
+             [seq, name, seq]
+           ),
+         {:ok, _} <-
+           Connection.query(
+             conn,
+             "INSERT INTO sqlite_sequence (name, seq) SELECT ?, ? " <>
+               "WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = ?)",
+             [name, seq, name]
+           ) do
+      :ok
+    else
+      # The table no longer exists: nothing to protect.
+      {:ok, %{rows: []}} -> :ok
+      {:error, _} = error -> error
     end
   end
 

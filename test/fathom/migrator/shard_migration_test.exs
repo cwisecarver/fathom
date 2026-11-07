@@ -143,6 +143,56 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
   end
 
+  # Expert review 2026-11-07 #64, at the ENGINE level (the migration gate: forward copy+transform
+  # AND the revert flip). A Django table rebuild lowers a tenant's AUTOINCREMENT high-water mark
+  # (ids 1..3 with 3 deleted: seq 3 -> 2 after the rebuild), so the next INSERT reissued id 3.
+  # Forward keeps the mark; the revert restores the retained pre-migration bytes, mark and all.
+  test "a table-rebuild migration keeps the AUTOINCREMENT mark; the revert restores the old file",
+       %{shard: shard} do
+    seed_v1!(shard)
+
+    write_live!(
+      shard,
+      "CREATE TABLE app_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT)"
+    )
+
+    write_live!(shard, "INSERT INTO app_ledger (note) VALUES ('a'), ('b'), ('c')")
+    write_live!(shard, "DELETE FROM app_ledger WHERE id = 3")
+
+    # Fixture preconditions: the mark (3) and the data (max id 2) differ.
+    assert %{rows: [[3]]} =
+             query_live!(shard, "SELECT seq FROM sqlite_sequence WHERE name = 'app_ledger'")
+
+    assert %{rows: [[2]]} = query_live!(shard, "SELECT max(id) FROM app_ledger")
+
+    {:ok, _} =
+      Migrator.release(2, "rebuild app_ledger", [
+        ~s|CREATE TABLE "new__app_ledger" ("id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, "note" text NULL, "extra" text NULL)|,
+        ~s|INSERT INTO "new__app_ledger" ("id", "note") SELECT "id", "note" FROM "app_ledger"|,
+        ~s|DROP TABLE "app_ledger"|,
+        ~s|ALTER TABLE "new__app_ledger" RENAME TO "app_ledger"|,
+        "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002_rebuild', 'now')"
+      ])
+
+    assert {:ok, %{from: 1, to: 2}} = ShardMigration.run(shard, 2)
+
+    assert %{rows: [[3]]} =
+             query_live!(shard, "SELECT seq FROM sqlite_sequence WHERE name = 'app_ledger'"),
+           "the rebuild lowered the high-water mark: the next id would reuse a deleted one"
+
+    assert %{rows: [["a", nil], ["b", nil]]} =
+             query_live!(shard, "SELECT note, extra FROM app_ledger ORDER BY id")
+
+    # The revert flip: the retained v1 bytes are restored, mark included.
+    assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1)
+    assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
+
+    assert %{rows: [[3]]} =
+             query_live!(shard, "SELECT seq FROM sqlite_sequence WHERE name = 'app_ledger'")
+
+    assert %{columns: ["id", "note"]} = query_live!(shard, "SELECT * FROM app_ledger")
+  end
+
   # Expert review 2026-07-18 #5 (the retirement outbox): the migration's cutover now enqueues the
   # old version's retention deletion ATOMICALLY (same Postgres transaction), so a Postgres blip can
   # never leave a cut-over shard whose @prev object is never scheduled for deletion — a silent,
