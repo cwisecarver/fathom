@@ -369,6 +369,16 @@ defmodule Fathom.Shard.Storage do
               claim :: pos_integer() | nil
             ) :: :ok | {:error, term()}
 
+  # Give back a lock that names `owner` when the acquire that may have written it FAILED, so there is
+  # no lease in hand to release (expert review 2026-11-07 #26). The write's reply was lost, or a
+  # later step of the acquire (the steal-touch) failed: the lock now names this live node, and every
+  # peer reads `{:held, us}` until this node happens to open the shard again. Reads the lock, and
+  # only if it names exactly `owner` (an incarnation-qualified string, so no other node wrote it)
+  # conditionally removes it, replaces it with a released marker, or leaves it — see
+  # `release_if_owned/2` for which and why. `:ok` when there is nothing of ours to give back.
+  @callback release_if_owned(shard_id :: String.t(), owner :: String.t()) ::
+              :ok | {:error, term()}
+
   # Read-only fence: confirm `lease` is still the live lock for `shard_id` (owner +
   # epoch unchanged) without writing. `:superseded` once another owner/epoch holds it.
   @callback check_lease(shard_id :: String.t(), lease :: lease()) ::
@@ -933,6 +943,33 @@ defmodule Fathom.Shard.Storage do
     backend().release_lease_keeping_claim(shard_id, lease, claim)
   end
 
+  @doc """
+  Gives back a lock that names `owner` after an acquire that may have written it FAILED (expert
+  review 2026-11-07 #26). `acquire_lease/3` returns `{:error, reason}` for a lock PUT whose reply was
+  lost (the write landed, the caller never heard) and for a steal whose touch failed; the coordinator
+  then stops with no lease in hand, and the lock names a LIVE node. Every peer reads `{:held, us}`
+  and a failover, migration or handoff acquire is refused until this node's own next open of the
+  shard reclaims it — which may be never, once the LB has remapped it.
+
+  Reads the lock and acts only when it names exactly `owner` (incarnation-qualified, so no other
+  node can have written it):
+
+    * a plain first-create lock (epoch 1, no claim, no interrupted-steal marker) is DELETED — the
+      next acquire is a fresh create and nothing is lost;
+    * a lock that still carries the interrupted-steal marker (`touch_pending`) becomes a released
+      marker, never a delete: that would make the next acquire a fresh create at epoch 1 with no
+      steal-touch, the trap `release_lease/3` exists to avoid;
+    * anything else is KEPT (`stranded_release/1` says why).
+
+  The caller decides WHEN this is safe; `Fathom.Shard` calls it only for a COLD open, where the node
+  holds no local copy whose unflushed writes the lock might be protecting.
+
+  Best effort and NOT a closed window: a PUT that is merely delayed can land after the read saw no
+  lock. Such a lock heals the way it did before — on this node's next open of the shard.
+  """
+  @spec release_if_owned(String.t(), String.t()) :: :ok | {:error, term()}
+  def release_if_owned(shard_id, owner), do: backend().release_if_owned(shard_id, owner)
+
   # Deliberately not a possible `Fathom.Shard.Heartbeat.owner/0` (`<node>#<nonce>`) nor a migrator
   # owner (`migrator@<node>@<token>`): it contains neither `@` nor `#`, so no node ever holds a
   # heartbeat under it and no acquirer can match it as "ours".
@@ -996,6 +1033,45 @@ defmodule Fathom.Shard.Storage do
       prev -> prev
     end
   end
+
+  @doc """
+  What `release_if_owned/2` does with a lock that names the caller: `:delete`, `{:marker, lease}` —
+  the released marker to write in its place — or `:keep`. Pure, shared by every backend so they
+  decide alike.
+
+    * A plain first-create lock (epoch 1, no claim, no interrupted-steal marker) holds nothing the
+      next acquire needs, so it is deleted and that acquire stays the 1-RTT fresh create.
+    * A lock still carrying an INTERRUPTED-STEAL marker was never served from, so it is a CLEAN
+      release: the marker names the previous holder (`released_by`, via `floor_owner/1`, so recovery
+      still excludes THAT node from its responder floor, not us) and keeps the touch provenance of
+      any clean marker the steal had taken over (`touched_from`/`touched_to`), so the chain the next
+      stealer follows is not cut. No touch happened, so no new provenance is invented. It is never
+      deleted: the next acquire would be a fresh create at epoch 1 with no steal-touch (see
+      `release_lease/3`).
+    * EVERY OTHER shape is KEPT. A lock at a higher epoch or carrying a claim may be an ordinary
+      lock of this node's from before the failed acquire — a coordinator that crashed while the
+      node stayed up — and while it names a live node it is what keeps peers out of a shard whose
+      local copy may hold acked-but-unflushed writes. Turning it into a marker would hand a live
+      node's dirty shard to the first peer to ask.
+  """
+  @spec stranded_release(lease()) :: :delete | {:marker, lease()} | :keep
+  def stranded_release(%{touch_pending: true} = lock) do
+    clean = Map.put(lock, :clean_release, true)
+
+    lease =
+      case lock do
+        %{touched_from: from, touched_to: to} when is_binary(from) and is_binary(to) ->
+          Map.put(clean, :clean_touch, {from, to})
+
+        _ ->
+          clean
+      end
+
+    {:marker, released_marker(lease, Map.get(lock, :claim))}
+  end
+
+  def stranded_release(%{epoch: 1} = lock) when not is_map_key(lock, :claim), do: :delete
+  def stranded_release(_lock), do: :keep
 
   @doc """
   `lease` marked as an INTERRUPTED STEAL of `prev_owner`'s lock `source` (expert review 2026-11-07

@@ -3356,6 +3356,41 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
+  # The lock a FAILED acquire may have left naming `owner` (expert review 2026-11-07 #26): read it,
+  # and only if it names exactly us, remove it, replace it with a released marker, or leave it, as
+  # `Storage.stranded_release/1` decides. Both writes are conditional on the etag just read, so a
+  # lock that has moved on since is left alone.
+  @impl true
+  def release_if_owned(shard_id, owner) do
+    case get_lock(shard_id) do
+      {:ok, %{owner: ^owner} = lock, etag} ->
+        case Storage.stranded_release(lock) do
+          :delete ->
+            case Req.delete(req(), url: lock_path(shard_id), headers: [{"if-match", etag}]) do
+              {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
+              {:ok, %{status: 412}} -> :ok
+              {:ok, %{status: status}} -> {:error, {:s3_delete_status, status}}
+              {:error, reason} -> {:error, reason}
+            end
+
+          {:marker, marker} ->
+            put_marker(shard_id, marker, etag)
+
+          :keep ->
+            :ok
+        end
+
+      {:ok, _not_ours, _etag} ->
+        :ok
+
+      :not_found ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   defp resolve_412_marker(shard_id, lease, marker) do
     Storage.resolve_stale_release(
       shard_id,

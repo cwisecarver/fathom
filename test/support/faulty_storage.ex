@@ -1,10 +1,15 @@
 defmodule Fathom.Test.FaultyStorage do
   @moduledoc """
   Test storage backend: delegates to `Fathom.Shard.Storage.Local`, but fails the operation named
-  in `config :fathom, :storage_fault` (one of `:acquire | :renew | :pull | :read_heartbeat | :flush`) so a
-  test can simulate a node being partitioned from the lease store / object store (S3). Used by the
-  S6 chaos tests to prove the node FAILS CLOSED — it must never serve without a confirmed lease, and
-  must never steal a shard when it can't read the current owner's heartbeat.
+  in `config :fathom, :storage_fault` (one of `:acquire | :acquire_lands_then_errors | :renew |
+  :pull | :read_heartbeat | :flush`, and the flush/object variants below) so a test can simulate a
+  node being partitioned from the lease store / object store (S3). Used by the S6 chaos tests to
+  prove the node FAILS CLOSED — it must never serve without a confirmed lease, and must never steal
+  a shard when it can't read the current owner's heartbeat.
+
+  `:acquire` fails BEFORE anything is written. `:acquire_lands_then_errors` is its opposite, the
+  lost reply on the lock create (`:flush_lands_then_errors`'s twin): the lock is written and the
+  caller is told the acquire failed. `FaultyStorageLockFaultsTest` pins both.
   """
   @behaviour Fathom.Shard.Storage
 
@@ -95,16 +100,36 @@ defmodule Fathom.Test.FaultyStorage do
   def acquire_lease(shard_id, owner, ttl_ms) do
     run_before(:acquire, shard_id)
 
-    if fault() == :acquire do
-      {:error, {:transient_lookup, :s3_unreachable}}
-    else
-      case Local.acquire_lease(shard_id, owner, ttl_ms) do
-        {:ok, lease} ->
-          {:ok, lease |> Map.put(:lock_etag, bump_lock_etag(shard_id)) |> maybe_recreated()}
+    cond do
+      fault() == :acquire ->
+        {:error, {:transient_lookup, :s3_unreachable}}
 
-        other ->
-          other
-      end
+      # THE LOST LOCK REPLY (expert review 2026-11-07 #26/#6). S3's lock create/steal PUT is never
+      # retried by Req, and a reset connection or a 5xx from a store that applied it reports an
+      # error for a lock that EXISTS. `:acquire` above fails before anything is written, which is
+      # the opposite case and the only one this double could express: it returned before
+      # `Local.acquire_lease` ran, so no test could stage a lock that names a node whose acquire
+      # reported failure. The error is deliberately NOT `{:transient_lookup, _}` — that is what S3's
+      # `acquire_existing/4` returns for a read blip, where nothing was written; a raw error is what
+      # an ambiguous PUT surfaces.
+      fault() == :acquire_lands_then_errors ->
+        case Local.acquire_lease(shard_id, owner, ttl_ms) do
+          {:ok, _lease} ->
+            _ = bump_lock_etag(shard_id)
+            {:error, :s3_unreachable}
+
+          other ->
+            other
+        end
+
+      true ->
+        case Local.acquire_lease(shard_id, owner, ttl_ms) do
+          {:ok, lease} ->
+            {:ok, lease |> Map.put(:lock_etag, bump_lock_etag(shard_id)) |> maybe_recreated()}
+
+          other ->
+            other
+        end
     end
   end
 
@@ -505,6 +530,18 @@ defmodule Fathom.Test.FaultyStorage do
       end,
       fn _fresh -> Local.release_lease(shard_id, lease) end
     )
+  end
+
+  # The lock a failed acquire may have left naming `owner` (expert review 2026-11-07 #26). A
+  # release WRITES the lock (a delete or a marker), so the etag rotates like any other lock write.
+  @impl true
+  def release_if_owned(shard_id, owner) do
+    run_before(:release, shard_id)
+
+    with :ok <- Local.release_if_owned(shard_id, owner) do
+      _ = bump_lock_etag(shard_id)
+      :ok
+    end
   end
 
   @impl true

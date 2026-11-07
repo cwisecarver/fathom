@@ -96,6 +96,12 @@ first means "not the lock you fenced on" (a renew is `:superseded`, so a deposed
 the second is retryable. A 404 is only the first when the error document says `NoSuchKey` — a
 `NoSuchBucket` must not mass-self-fence — and the same rule applies to the data flush's fenced PUT.
 
+**A failed acquire may have written the lock (expert review 2026-11-07 #26).** After a cold open's
+acquire fails, `Storage.release_if_owned/2` gives back a plain first-create lock naming this
+incarnation (and turns a lock with a pending steal into a released marker), so a lost reply on the
+create does not leave the shard behind a live node's lock. Anything else is left alone, and a warm
+open does not reconcile: such a lock may be what keeps peers out of unflushed local writes.
+
 **Incomplete multipart uploads.** A node killed between the touch's create and complete leaves an
 open upload holding server-side copies of up to a whole shard, invisible to ListObjectsV2. Two
 backstops (expert review 2026-10-13 #21):

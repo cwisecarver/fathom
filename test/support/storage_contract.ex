@@ -226,6 +226,57 @@ defmodule Fathom.Test.StorageContract do
         end
       end
 
+      describe "#{inspect(unquote(backend))} — a lock a FAILED acquire may have written (expert review 2026-11-07 #26)" do
+        test "a lock naming someone else is left alone" do
+          id = sid("not_ours")
+          {:ok, _} = @backend.acquire_lease(id, "a@node#1", 30_000)
+
+          assert :ok = @backend.release_if_owned(id, "b@node#2")
+          assert {:held, "a@node#1"} = @backend.lease_holder(id)
+        end
+
+        test "no lock at all is :ok" do
+          assert :ok = @backend.release_if_owned(sid("nothing"), "a@node#1")
+        end
+
+        test "a plain first-create lock is deleted, so the next acquire is a fresh create" do
+          id = sid("fresh")
+          {:ok, _} = @backend.acquire_lease(id, "a@node#1", 30_000)
+
+          assert :ok = @backend.release_if_owned(id, "a@node#1")
+          assert :free = @backend.lease_holder(id)
+
+          assert {:ok, lease} = @backend.acquire_lease(id, "b@node#2", 30_000)
+          assert lease.epoch == 1
+          refute Map.has_key?(lease, :took_over)
+        end
+
+        test "a lock above epoch 1 is never DELETED: the epoch cannot fall back to 1" do
+          # Deleting it would make the next acquire a fresh create at epoch 1 with no steal-touch:
+          # a bigger backward jump and an unfenced takeover (the trap `Storage.release_lease/3` and
+          # the steal rollback both document). Backends may differ in what they do instead — S3
+          # marks a stranded steal released, Local keeps a lock it cannot tell from a live one of
+          # the node's own — but neither may reset the epoch.
+          id = sid("not_deleted")
+          {:ok, first} = @backend.acquire_lease(id, "a@node#1", 30_000)
+          :ok = @backend.release_lease_keeping_claim(id, first, nil)
+
+          {:ok, second} = @backend.acquire_lease(id, "b@node#2", 30_000)
+          assert second.epoch == 2, "fixture: the steal of a marker must bump the epoch"
+
+          assert :ok = @backend.release_if_owned(id, "b@node#2")
+
+          case @backend.acquire_lease(id, "c@node#3", 30_000) do
+            {:ok, third} ->
+              assert third.epoch > 2, "the epoch fell back to #{third.epoch} after a release"
+              assert third.took_over == true, "a taken-over lock must be re-entered as a STEAL"
+
+            {:error, {:held, "b@node#2", _}} ->
+              :ok
+          end
+        end
+      end
+
       describe "#{inspect(unquote(backend))} — a takeover lease says what it took over" do
         test "took_over, prev_owner and the marker's last holder reach the lease" do
           # The coordinator's takeover decisions (promote-on-open's absent-object ask and warm

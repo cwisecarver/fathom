@@ -703,10 +703,12 @@ defmodule Fathom.Shard do
         Materializer.abandon_pull(pull_task, path)
         {:stop, {:shutdown, {:shard_held, holder, stealable_at}}, state}
 
-      # Fail closed: without a confirmed lease we must not open the shard.
+      # Fail closed: without a confirmed lease we must not open the shard. But a failed acquire is
+      # not proof that nothing was written: see `reconcile_failed_acquire/3`.
       {:error, reason} ->
         abandon_fork_check(fork_task)
         Materializer.abandon_pull(pull_task, path)
+        reconcile_failed_acquire(shard_id, owner, reason, file?)
         {:stop, {:shutdown, {:lease_unavailable, reason}}, state}
     end
   end
@@ -866,6 +868,68 @@ defmodule Fathom.Shard do
   # before a refused acquire, so completing or aborting mid-flight are both safe.
   defp abandon_fork_check(nil), do: :ok
   defp abandon_fork_check(task), do: Task.shutdown(task, :brutal_kill)
+
+  # A FAILED ACQUIRE IS NOT PROOF THAT NOTHING WAS WRITTEN (expert review 2026-11-07 #26). The lock
+  # create is one PUT that `Req` never retries, and its reply can be lost after the store applied
+  # it (a reset connection, a 5xx): `{:error, reason}` for a lock that now exists and names THIS
+  # live node. Nothing here holds a lease, so nothing releases it, and every peer then reads
+  # `{:held, us}` — a failover, a migration or a handoff is refused until this node happens to open
+  # the shard again. Every other post-acquire failure of this open was already hardened
+  # (`abandon_open/5`, after the 2026-08-04 `roll8` stranding); this was the one branch left.
+  #
+  # `Storage.release_if_owned/2` reads the lock and gives back only one that names exactly our
+  # incarnation-qualified owner. It narrows the window rather than closing it: a PUT that is merely
+  # DELAYED can land after the read saw no lock, and that lock heals as it did before, on this
+  # node's next open.
+  #
+  # ONLY A COLD OPEN (`file?` false) reconciles. A lock at a higher epoch, or one carrying a claim,
+  # can be an ordinary lock of this node's from BEFORE the failed acquire: a coordinator that crashed
+  # while the node stayed up leaves exactly that, and while it names a live node it is what keeps
+  # peers out of a shard whose local copy may hold acked-but-unflushed writes. Releasing it would
+  # hand that shard to the first peer to ask, over a stale object. With no local copy there is
+  # nothing for it to protect, and a lock this open could not have been the author of is still left
+  # alone by the backend (`Storage.stranded_release/1`). A WARM open whose create landed is not
+  # reconciled here: it keeps healing the way it did, on this node's next open of the shard.
+  #
+  # Skipped where the failure PROVES nothing of ours was written: a read blip before the write
+  # (`{:transient_lookup, _}`) and an undecodable lock. A steal whose touch failed is the exception
+  # (`{:touch_failed, _}`): its lock write landed first and the rollback may have failed too.
+  #
+  # Best effort, like `abandon_open/5`'s release: storage is misbehaving or we would not be here, so
+  # a failure of this call is logged, never allowed to mask the original error.
+  defp reconcile_failed_acquire(_shard_id, _owner, _reason, true = _warm?), do: :ok
+
+  defp reconcile_failed_acquire(shard_id, owner, reason, false = _warm?) do
+    if lock_possibly_written?(reason) do
+      released =
+        try do
+          Storage.release_if_owned(shard_id, owner)
+        rescue
+          e -> {:error, e}
+        catch
+          :exit, r -> {:error, {:exit, r}}
+        end
+
+      case released do
+        :ok ->
+          :ok
+
+        {:error, why} ->
+          Logger.warning(
+            "shard #{shard_id}: lease acquire failed (#{inspect(reason)}) and the lock it may " <>
+              "have written could not be given back (#{inspect(why)}); it heals on this " <>
+              "node's next open of the shard"
+          )
+      end
+    end
+
+    :ok
+  end
+
+  defp lock_possibly_written?({:transient_lookup, {:touch_failed, _}}), do: true
+  defp lock_possibly_written?({:transient_lookup, _}), do: false
+  defp lock_possibly_written?(:corrupt_lock), do: false
+  defp lock_possibly_written?(_ambiguous), do: true
 
   # A RETAINED REOPEN SKIPS THE PRE-LEASE FORK HEAD (expert review 2026-10-22 r8 #26, user decision
   # Q4 = B: retention will be used). A claimed clean-retained copy holds nothing the store lacks, and

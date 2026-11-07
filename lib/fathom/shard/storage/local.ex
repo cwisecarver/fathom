@@ -1012,6 +1012,41 @@ defmodule Fathom.Shard.Storage.Local do
     end)
   end
 
+  # The lock a FAILED acquire may have left naming `owner` (expert review 2026-11-07 #26; the
+  # decision is `Storage.stranded_release/1`, shared with S3). Under the same mutex as every other
+  # lock mutation, so it cannot interleave with an acquire.
+  @impl true
+  def release_if_owned(shard_id, owner) do
+    with_lock_mutex(shard_id, fn ->
+      case read_lock(shard_id) do
+        {:ok, %{owner: ^owner} = lock} ->
+          case Storage.stranded_release(lock) do
+            :delete ->
+              case File.rm(lock_path(shard_id)) do
+                :ok -> :ok
+                {:error, :enoent} -> :ok
+                {:error, reason} -> {:error, reason}
+              end
+
+            {:marker, marker} ->
+              case write_lock(shard_id, marker) do
+                {:ok, _} -> :ok
+                error -> error
+              end
+
+            :keep ->
+              :ok
+          end
+
+        {:error, reason} ->
+          {:error, reason}
+
+        _ ->
+          :ok
+      end
+    end)
+  end
+
   defp create_lock(shard_id, lease) do
     path = lock_path(shard_id)
     Storage.ensure_dir(Path.dirname(path))

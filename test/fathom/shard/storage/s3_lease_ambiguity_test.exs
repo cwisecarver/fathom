@@ -200,6 +200,49 @@ defmodule Fathom.Shard.Storage.S3LeaseAmbiguityTest do
         # What the coordinator keeps from the steal survives the renew (existing behaviour).
         assert renewed.touch_post_etag == lease.touch_post_etag
       end
+
+      test "a stranded steal is given back as a CLEAN marker that still names the previous holder",
+           ctx do
+        %{store: store, prev: prev, data_etag: seed_etag} = ctx
+        lost = lose_lock_reply(store)
+
+        S3EtagStore.inject(store, %{method: "GET", key: @lock_key, after: lost}, @read_fails,
+          times: :infinity
+        )
+
+        assert {:error, %Req.TransportError{}} = S3.acquire_lease(@shard, @us, 30_000)
+        assert S3EtagStore.fired(store, lost) == 1, "the fault never fired"
+        S3EtagStore.clear_faults(store)
+        assert lock_body(store)["touch_pending"] == true, "fixture: the steal must be stranded"
+
+        assert :ok = S3.release_if_owned(@shard, @us)
+
+        # Never deleted (the next acquire would be a fresh create at epoch 1 with no touch).
+        marker = lock_body(store)
+        assert marker["owner"] == Storage.released_owner()
+        assert marker["epoch"] == 6
+        assert marker["released_by"] == prev
+        refute Map.has_key?(marker, "touch_pending")
+        assert S3.lease_holder(@shard) == :free
+
+        # A peer takes the marker at once (no steal watch) and goes ABOVE the epoch, with a touch.
+        assert {:ok, lease} = S3.acquire_lease(@shard, "peer@node#2", 30_000)
+        assert lease.took_over == true and lease.epoch == 7
+        assert Storage.floor_owner(lease) == prev
+        assert lease.touch_pre_etag == seed_etag
+      end
+
+      test "an ordinary lock of ours above epoch 1 is left alone", %{store: store} do
+        assert {:ok, lease} = S3.acquire_lease(@shard, @us, 30_000)
+        # A renew rewrites the body without the steal marker: now it is an ordinary epoch-6 lock,
+        # which may be a live predecessor's of this very node.
+        assert {:ok, _} = S3.renew_lease(@shard, lease, 30_000)
+        refute Map.has_key?(lock_body(store), "touch_pending"), "fixture: the marker must be gone"
+        before = S3EtagStore.body_of(store, @lock_key)
+
+        assert :ok = S3.release_if_owned(@shard, @us)
+        assert S3EtagStore.body_of(store, @lock_key) == before
+      end
     end
   end
 
