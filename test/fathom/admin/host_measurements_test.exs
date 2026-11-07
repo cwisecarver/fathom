@@ -171,9 +171,15 @@ defmodule Fathom.Admin.HostMeasurementsTest do
     # The measurement list is private to the supervisor's init; read it from its child spec.
     {:ok, {_flags, children}} = Fathom.Telemetry.init([])
 
-    Enum.find_value(children, fn
-      %{start: {:telemetry_poller, _, [opts]}} -> Keyword.fetch!(opts, :measurements)
-      _ -> nil
-    end)
+    measurements =
+      Enum.find_value(children, fn
+        %{start: {:telemetry_poller, _, [opts]}} -> Keyword.fetch!(opts, :measurements)
+        _ -> nil
+      end)
+
+    # Every measurement is registered through `Fathom.Telemetry.Poll` (expert review 2026-11-07 #77),
+    # so the assertion is about WHAT runs, not how it is wrapped.
+    for {Fathom.Telemetry.Poll, :run, [module, fun, args]} <- measurements,
+        do: {module, fun, args}
   end
 end

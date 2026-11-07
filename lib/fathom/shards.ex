@@ -2174,7 +2174,19 @@ defmodule Fathom.Shards do
   def open_count do
     Registry.count(@registry)
   rescue
-    _ in [ArithmeticError, ArgumentError] -> DynamicSupervisor.count_children(@supervisor).active
+    _ in [ArithmeticError, ArgumentError] -> count_children_active(@supervisor)
+  end
+
+  # `DynamicSupervisor.count_children/1` EXITS `:noproc` while the supervisor is down (a data-plane
+  # restart): the gauge answers 0, which is true — no coordinator is open — instead of raising into
+  # the telemetry poller (expert review 2026-11-07 #77). Public for the test, which names a
+  # supervisor that does not exist.
+  @doc false
+  @spec count_children_active(GenServer.server()) :: non_neg_integer()
+  def count_children_active(supervisor) do
+    DynamicSupervisor.count_children(supervisor).active
+  catch
+    :exit, _ -> 0
   end
 
   defp start(shard_id) do

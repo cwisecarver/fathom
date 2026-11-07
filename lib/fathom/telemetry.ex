@@ -34,21 +34,22 @@ defmodule Fathom.Telemetry do
     children =
       [
         {:telemetry_poller,
-         measurements: [
-           {__MODULE__, :measure_active_shards, []},
-           {Fathom.Admin.Measurements, :connections, []},
-           {Fathom.Admin.Measurements, :vm_limits, []},
-           {Fathom.Admin.Measurements, :durability, []},
-           {Fathom.Admin.Measurements, :disk, []},
-           {Fathom.Admin.Measurements, :replication, []},
-           {Fathom.Admin.Measurements, :flush_gate, []},
-           {Fathom.Admin.Measurements, :schedulers, []},
-           {Fathom.Admin.Measurements, :memory_breakdown, []},
-           {Fathom.Admin.Measurements, :host, []},
-           {Fathom.Admin.Measurements, :recorder, []},
-           {Fathom.Admin.LeaseHealth, :measure, []},
-           {Fathom.Shard.Replication.LagGauge, :measure, []}
-         ],
+         measurements:
+           Fathom.Telemetry.Poll.wrap([
+             {__MODULE__, :measure_active_shards, []},
+             {Fathom.Admin.Measurements, :connections, []},
+             {Fathom.Admin.Measurements, :vm_limits, []},
+             {Fathom.Admin.Measurements, :durability, []},
+             {Fathom.Admin.Measurements, :disk, []},
+             {Fathom.Admin.Measurements, :replication, []},
+             {Fathom.Admin.Measurements, :flush_gate, []},
+             {Fathom.Admin.Measurements, :schedulers, []},
+             {Fathom.Admin.Measurements, :memory_breakdown, []},
+             {Fathom.Admin.Measurements, :host, []},
+             {Fathom.Admin.Measurements, :recorder, []},
+             {Fathom.Admin.LeaseHealth, :measure, []},
+             {Fathom.Shard.Replication.LagGauge, :measure, []}
+           ]),
          period: 10_000,
          name: Fathom.ShardPoller}
       ] ++ oban_poller() ++ prometheus_children()
@@ -66,7 +67,7 @@ defmodule Fathom.Telemetry do
     if Fathom.Admin.enabled?() do
       [
         {:telemetry_poller,
-         measurements: [{Fathom.Admin.Measurements, :oban_health, []}],
+         measurements: Fathom.Telemetry.Poll.wrap([{Fathom.Admin.Measurements, :oban_health, []}]),
          period: 30_000,
          name: Fathom.ObanPoller}
       ]
@@ -446,6 +447,15 @@ defmodule Fathom.Telemetry do
         reporter_options: [buckets: [0.5, 1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000]],
         description:
           "Shard checkout latency by outcome (ok / held / unavailable / at_capacity / novel_rate_limited / error). The full outcome set is `checkout_outcome/1` in shards.ex"
+      ),
+      # A poller measurement raised or exited (expert review 2026-11-07 #77): it is kept and retried,
+      # and this counts the failures so a persistently broken gauge is visible rather than silently
+      # absent. Tag `measurement` is the `Module.function` name: a fixed set of ~13.
+      counter("fathom.poller.measurement_failed.count",
+        event_name: [:fathom, :poller, :measurement_failed],
+        tags: [:measurement],
+        description:
+          "Telemetry-poller measurements that raised or exited (kept and retried every tick)"
       ),
       last_value("fathom.shards.active",
         event_name: [:fathom, :shards],
