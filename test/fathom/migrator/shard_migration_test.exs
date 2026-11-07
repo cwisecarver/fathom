@@ -680,6 +680,32 @@ defmodule Fathom.Migrator.ShardMigrationTest do
            "the deleted tenant's object was rewritten"
   end
 
+  # Expert review 2026-11-07 #55. `forward/9` retained (a server-side copy of the WHOLE object to
+  # `<shard>@current`) BEFORE the replay, so a deterministic per-tenant replay failure paid a full
+  # copy per attempt and left an `@current` nothing would ever retire (the retirement outbox is
+  # written only by a SUCCESSFUL cutover). The replay here fails (the column already exists — the
+  # "tenant was migrated out of band" shape). Pre-fix `retained?(shard, 1)` is true after the
+  # failed run.
+  test "a replay that fails retains nothing (#55)", %{shard: shard} do
+    seed_v1!(shard)
+
+    {:ok, _} =
+      Migrator.release(2, "dup column", [
+        "ALTER TABLE app_thing ADD COLUMN name TEXT",
+        "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002_dup', 'now')"
+      ])
+
+    {:ok, before} = Storage.object_etag(shard)
+
+    assert {:error, _replay_failure} = ShardMigration.run(shard, 2)
+
+    refute retained?(shard, 1),
+           "a failed replay left a full retained copy no retirement job will ever drop"
+
+    assert {:ok, ^before} = Storage.object_etag(shard), "the live object must be untouched"
+    assert {:ok, %{schema_version: 1, status: "active"}} = Directory.get(shard)
+  end
+
   # Expert review 2026-08-26 #8. The forward path was the ONLY durable-object producer in the
   # system that did not validate what it was about to publish. Every other one does — the
   # coordinator's periodic flush gates on quick_check, the GDPR export refuses a corrupt export,

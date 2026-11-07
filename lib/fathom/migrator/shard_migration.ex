@@ -982,11 +982,10 @@ defmodule Fathom.Migrator.ShardMigration do
       )
     end
 
-    with :ok <- retain_unless_deleted(shard_id, current),
-         # shard_id is threaded so a version's per-shard transform (#26) knows whose data it is
-         # backfilling. Passed for every migration, not only transform-carrying ones — the chain is
-         # built from release rows, so which steps carry a transform is not knowable here.
-         :ok <- Copy.migrate_chain(old, new, chain, shard_id: shard_id),
+    # shard_id is threaded so a version's per-shard transform (#26) knows whose data it is
+    # backfilling. Passed for every migration, not only transform-carrying ones — the chain is
+    # built from release rows, so which steps carry a transform is not knowable here.
+    with :ok <- Copy.migrate_chain(old, new, chain, shard_id: shard_id),
          # VALIDATE THE PRODUCT BEFORE IT BECOMES THE TENANT'S TRUTH (expert review 2026-08-26 #8).
          #
          # This was the only durable-object producer in the system that did not check what it was
@@ -1013,6 +1012,20 @@ defmodule Fathom.Migrator.ShardMigration do
          # already published.
          :ok <- verify_migrated(shard_id, new),
          :ok <- verify_ledger(shard_id, new, target),
+         # RETAIN ONLY ONCE THE PRODUCT IS KNOWN GOOD (expert review 2026-11-07 #55). This was the
+         # FIRST step of the chain — a server-side copy of the WHOLE object to `<shard>@current` —
+         # ahead of the replay, `verify_migrated` and `verify_ledger`, the steps that decide whether
+         # there will be a flush at all. A deterministic per-tenant failure (a foreign-key orphan, a
+         # table the tenant already has, a transform error) therefore paid one full copy per attempt
+         # (the job retries 5 times) and left an `@current` object nothing ever scheduled for
+         # retirement: the retirement outbox is written only by a SUCCESSFUL cutover. It still
+         # precedes the fence and the flush, and still follows the tombstone check it contains, so
+         # the retained bytes are the live object the migrator has held the lease on since the pull
+         # (a steal in between is caught by the fence and by the If-Match flush; the retained copy
+         # of a stealer's bytes would be overwritten by the next attempt's retain). The crash-forward
+         # machinery does not need the early retain: `mark_migrating/2` already wrote
+         # `retaining_version` before this chain and `finalize/2` reads that intent.
+         :ok <- retain_unless_deleted(shard_id, current),
          # Self-fence right before the clobbering flush: if we were superseded during the (long)
          # copy, abort instead of overwriting the new owner's object (finding #7).
          :ok <- fence(shard_id, lease),
