@@ -472,23 +472,35 @@ defmodule Fathom.Shard.PromoteOnOpen do
   2026-10-13 #4), so the local file is an unvetted pull and must not be served warm. Removes the db,
   its `-wal`/`-shm` and the sidecar, then the marker LAST (a crash part-way re-enters here). Returns
   true when a marker was found. The caller then opens cold, pulling and recovering again.
+
+  `{:error, posix}` when the marker's stat is INDETERMINATE (EIO, ESTALE, EACCES) — neither "found"
+  nor "not found" (FS.exists? audit, batch D follow-up; expert review 2026-11-07 #21 class). Read as
+  "no marker" it served an unvetted pull warm: the stored object a dead open pulled, which peers that
+  acked newer writes may hold more of. Read as "found" it would DELETE a copy that may hold acked
+  writes. Neither is a safe guess, so the caller refuses the open (`{:local_stat_failed, posix}`,
+  retryable) before anything is touched.
   """
-  @spec purge_if_recovering(Path.t()) :: boolean()
+  @spec purge_if_recovering(Path.t()) :: boolean() | {:error, File.posix()}
   def purge_if_recovering(path) do
     marker = recovering_path(path)
 
-    if Fathom.FS.exists?(marker) do
-      Logger.warning(
-        "shard open found #{marker}: a previous open died before peer recovery finished; " <>
-          "discarding the unvetted pull and recovering again"
-      )
+    case Fathom.FS.presence(marker) do
+      :present ->
+        Logger.warning(
+          "shard open found #{marker}: a previous open died before peer recovery finished; " <>
+            "discarding the unvetted pull and recovering again"
+        )
 
-      Enum.each(["-wal", "-shm", ""], &Fathom.FS.rm(path <> &1))
-      Fathom.FS.rm(Provenance.sidecar_path(path))
-      Fathom.FS.rm(marker)
-      true
-    else
-      false
+        Enum.each(["-wal", "-shm", ""], &Fathom.FS.rm(path <> &1))
+        Fathom.FS.rm(Provenance.sidecar_path(path))
+        Fathom.FS.rm(marker)
+        true
+
+      :absent ->
+        false
+
+      {:error, _reason} = indeterminate ->
+        indeterminate
     end
   end
 

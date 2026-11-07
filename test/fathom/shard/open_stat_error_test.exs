@@ -137,6 +137,46 @@ defmodule Fathom.Shard.OpenStatErrorTest do
         assert Local.object_etag(shard) == {:ok, e0}
       end
 
+      # FS.exists? audit, batch D follow-up. `PromoteOnOpen.purge_if_recovering/1` read an
+      # indeterminate stat of the `.recovering` marker as "no marker", so a previous open that died
+      # between installing its pulled object and finishing the peer ask had its UNVETTED pull served
+      # warm (the peers that acked newer writes were never asked). It must refuse, not guess: reading
+      # it as "found" would delete a copy that may hold acked writes.
+      test "an indeterminate stat of the .recovering marker fails the open and touches nothing",
+           %{shard: shard, db: db} do
+        e0 = put_object!(shard, "e0")
+        # A REAL database that matches the stored object and carries its sidecar: the unfixed open
+        # adopts it warm and serves it (a random-bytes fixture failed the open for an unrelated
+        # reason and discriminated only on the log line).
+        {:ok, c} = Connection.open(db)
+        :ok = Connection.exec(c, "CREATE TABLE kv (v TEXT)")
+        :ok = Connection.exec(c, "INSERT INTO kv VALUES ('e0')")
+        :ok = Connection.exec(c, "PRAGMA wal_checkpoint(TRUNCATE)")
+        Connection.close(c)
+        for s <- ["-wal", "-shm"], do: File.rm(db <> s)
+        bytes = File.read!(db)
+        :ok = Provenance.write(db, e0)
+        sidecar = File.read!(Provenance.sidecar_path(db))
+
+        marker = Fathom.Shard.PromoteOnOpen.recovering_path(db)
+        :ok = File.ln_s(marker, marker)
+
+        assert File.stat(marker) == {:error, :eloop},
+               "fixture: the marker's stat must fail with something other than ENOENT"
+
+        refute Fathom.FS.exists?(marker), "fixture: exactly what `exists?/1` collapsed to `false`"
+
+        {result, log} = with_log(fn -> ShardExecutor.open(shard) end)
+
+        assert {:error, _} = result, "the open served (or opened) despite not knowing the marker"
+        assert File.read!(db) == bytes, "the copy was served, quarantined or replaced"
+        assert File.read!(Provenance.sidecar_path(db)) == sidecar
+        assert File.read_link(marker) == {:ok, marker}
+        refute File.exists?(Materializer.pull_temp(db)), "a pull ran despite the failed stat"
+        assert log =~ "cannot tell whether a previous open left a recovery marker"
+        assert Local.object_etag(shard) == {:ok, e0}
+      end
+
       test "a definite stat answer opens as before (control: the fix does not fail every open)",
            %{shard: shard, db: db} do
         # ENOENT is a definite answer: the cold pull proceeds, the mode took, the sidecar names it.

@@ -600,8 +600,28 @@ defmodule Fathom.Shard do
     # A surviving `.recovering` marker means the previous open died between installing the pulled
     # object and finishing the peer ask, so the file on disk is an unvetted pull: purge it and open
     # COLD, which recovers again (expert review 2026-10-13 #4). One stat per open.
-    _ = PromoteOnOpen.purge_if_recovering(path)
+    #
+    # An INDETERMINATE stat of the marker (EIO, ESTALE, EACCES) is neither: read as "no marker" it
+    # served the previous open's unvetted pull warm (peers that acked newer writes may hold more of
+    # it), read as "found" it would delete a copy that may hold acked writes (FS.exists? audit,
+    # batch D follow-up, expert review 2026-11-07 #21 class). Refused BEFORE the lease and before
+    # anything is touched, exactly like the `.db` stat below.
+    case PromoteOnOpen.purge_if_recovering(path) do
+      {:error, reason} ->
+        Logger.error(
+          "shard #{shard_id}: cannot tell whether a previous open left a recovery marker (stat " <>
+            "of #{PromoteOnOpen.recovering_path(path)} failed: #{inspect(reason)}); refusing to " <>
+            "open rather than serve a possibly unvetted pull or delete a possibly dirty copy"
+        )
 
+        {:stop, {:shutdown, {:local_stat_failed, reason}}, state}
+
+      _purged? ->
+        open_coordinator_presence(state, shard_id, path, open_started)
+    end
+  end
+
+  defp open_coordinator_presence(state, shard_id, path, open_started) do
     # The warm-vs-cold decision. `Fathom.FS.exists?/1` read ANY stat error as "no local file", and
     # the cold pull then `rm`'d the dirty warm `.db` and its `-wal` (`Materializer.promote_pull/3`
     # removes whatever sits at the path before landing the pulled object) — acked-unflushed tenant
