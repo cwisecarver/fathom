@@ -40,18 +40,20 @@ defmodule Fathom.Tenants.Tombstones do
   once. A stray request for an erased id in that window finds no tombstone. What closes it without
   making admission wait for Postgres:
 
-    * the open path's absent-object branches (`Fathom.Shard`, `object_gone/3`) consult the durable
-      `tombstones/<id>` storage marker (`Storage.tombstone_present?/1`, one HEAD, PG-independent) when
-      a local copy exists and the object does not — the shape an erased tenant's residue has — and
-      refuse the open `:shard_tombstoned` after erasing the copy;
+    * the open path's absent-object branches (`Fathom.Shard`: `object_gone/3` when a local copy
+      exists, `cold_absent_gate/4` when none does — the node that holds no residue at all) consult the
+      durable `tombstones/<id>` storage marker (`Storage.tombstone_present?/1`, one HEAD,
+      PG-independent) and refuse the open `:shard_tombstoned` (erasing any local copy). An unreadable
+      marker refuses retryably rather than failing open. The read is only on those branches, so an
+      open that finds the object pays nothing; a novel shard's first open pays one HEAD;
     * `ErasureSweepJob` re-drives any purge whose object reappeared.
 
-  What is NOT done, and is a maintainer decision (it reverses the deliberate no-Postgres-at-boot
-  stance of review 2026-10-13 #20): holding admission until the DIRECTORY half of this set has loaded
-  (a synchronous load with a deadline in `init/1`, as `Suspensions.init/1` does, or `/health` 503
-  until `loaded: true`). The residual: a node with NO local residue, booting with the directory
-  unreachable, whose request for an erased id finds an absent object, opens a fresh EMPTY shard (the
-  "empty shard re-mint" variant) until the load succeeds. The options and trade-offs are in
+  Holding admission until the DIRECTORY half of this set has loaded (a synchronous load with a
+  deadline in `init/1`, as `Suspensions.init/1` does, or `/health` 503 until `loaded: true`) was
+  considered and NOT done (maintainer decision 2026-11-08, option (d)): it would reverse the
+  deliberate no-Postgres-at-boot stance of review 2026-10-13 #20, and the storage marker check closes
+  the same residual (an erased id whose request meets an absent object on a node with no local copy
+  opening a fresh EMPTY shard) without it. The options and trade-offs are in
   `docs/component-notes.md`.
   """
   use GenServer

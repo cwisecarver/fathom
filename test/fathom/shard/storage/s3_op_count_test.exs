@@ -246,6 +246,42 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
         :ok = Shards.drain(shard)
       end
 
+      # Expert review 2026-11-07 #14, decision (d): a cold open that finds NO object (a novel shard,
+      # or an erased id on a node whose tombstone set is not loaded) asks the durable marker once.
+      # The count is pinned so the extra HEAD is deliberate and cannot grow, and so an open that
+      # FINDS the object (the test above) is seen to pay none of it.
+      test "a novel cold open (no object) adds exactly one marker HEAD", %{shard: shard} do
+        clear_ops()
+
+        {:ok, pid, ref, _path} = Shards.checkout(shard)
+        ops = take_ops()
+        assert_mode!(pid, unquote(mode))
+
+        # PUT lock, GET data (404), HEAD tombstones/<id> (404).
+        assert counts(ops) == %{put: 1, get: 1, head: 1}
+
+        Shard.checkin(pid, ref)
+        :ok = Shards.drain(shard)
+      end
+
+      test "an erased id on a cold node is refused after the one marker HEAD, creating nothing",
+           %{shard: shard, table: table} do
+        :ok = Storage.put_tombstone(shard)
+        clear_ops()
+
+        assert {:error, :shard_tombstoned} = Shards.checkout(shard)
+        ops = take_ops()
+
+        # PUT lock, GET data (404), HEAD marker (200), then the failed open releases the lock.
+        assert counts(ops) == %{put: 1, get: 1, head: 1, delete: 1}
+        refute :ets.member(table, "/#{@bucket}/#{shard}.lock"), "the refused open kept the lock"
+
+        refute :ets.member(table, "/#{@bucket}/#{shard}.db"),
+               "the refused open created the object"
+
+        assert Heartbeat.running?() == (unquote(mode) == :heartbeat)
+      end
+
       test "a clean idle drop is the lock DELETE and no data PUT", %{shard: shard, table: table} do
         seed_object(shard)
         {:ok, pid, ref, _path} = Shards.checkout(shard)

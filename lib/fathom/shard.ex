@@ -1155,7 +1155,10 @@ defmodule Fathom.Shard do
          # (the head task is linked and dies with us), so the next open purges the unvetted pull.
          {head, prefetch} = await_open_head(head_task),
          {verdict, etag1} when verdict in [:ok, :repulled] <-
-           revalidate_takeover(shard_id, path, lease, etag0, warm?, head) do
+           revalidate_takeover(shard_id, path, lease, etag0, warm?, head),
+         # The marker check for the COLD open that found no object (`cold_absent_gate/4`); a bare
+         # atom clause, so it allocates nothing and every other open falls straight through.
+         :ok <- cold_absent_gate(shard_id, path, warm?, etag1) do
       # A claimed retained copy (expert review 2026-10-20-2027 #22) is warm only in the sense that
       # it skipped the pull: it equals the stored object, so for the promote decision and the dirty
       # seed it is a COLD open — no un-flushed local writes to protect, and re-flushing it on the
@@ -1782,6 +1785,53 @@ defmodule Fathom.Shard do
         end
 
       {:error, reason} ->
+        {:error, {:tombstone_check_failed, reason}}
+    end
+  end
+
+  # THE COLD OPEN THAT FOUND NO OBJECT AND NO LOCAL COPY (expert review 2026-11-07 #14, decision
+  # (d) of 2026-11-08). `object_gone/3` covers the open that holds a local copy; this is its
+  # sibling for the node that holds NOTHING: it booted with the directory half of the `Tombstones`
+  # gate not yet loaded, its request for an erased id met no object (the pull reported `:absent`
+  # and no steal sentinel, so the fence etag is nil), and without this the open mints a fresh EMPTY
+  # shard for the erased id (the 410 contract broken; the empty shard's flush creates objects the
+  # `ErasureSweepJob` then has to re-drive).
+  #
+  # Same marker, same verdicts as `object_gone/3`, one storage read, and only on this path:
+  #
+  #   * `warm?` skips: every warm absent-object branch already went through `object_gone/3`.
+  #   * a non-nil etag skips: an object (or a steal sentinel, which a lock — never an erased
+  #     tenant's — produces) exists, so this is not the shape an erasure leaves.
+  #   * marker present: refuse `:shard_tombstoned`; `drop_local/1` takes the `no object` sidecar the
+  #     pull stamped (there is no `.db`), so the refusal leaves nothing behind.
+  #   * marker unreadable: refuse retryably (`{:tombstone_check_failed, _}`). NOT fail-open: an
+  #     erased id must not be re-created because storage hiccuped, and a legitimately novel shard
+  #     just retries. The sidecar goes too (no `.db` exists; the retry re-pulls and re-stamps it).
+  #   * marker absent: a novel shard, proceed as before.
+  #
+  # The cost is one HEAD (S3) / stat (Local) per NOVEL shard open: pinned by
+  # `S3OpCountTest` and measured in the commit that added it.
+  defp cold_absent_gate(_shard_id, _path, true, _etag), do: :ok
+  defp cold_absent_gate(_shard_id, _path, false, etag) when etag != nil, do: :ok
+
+  defp cold_absent_gate(shard_id, path, false, nil) do
+    case Storage.tombstone_present?(shard_id) do
+      {:ok, false} ->
+        :ok
+
+      {:ok, true} ->
+        drop_local(path)
+
+        Logger.warning(
+          "shard #{shard_id}: a cold open found no local copy and NO stored object, but the id " <>
+            "has a durable tombstone marker — refused the open instead of minting an empty shard " <>
+            "for an erased tenant (expert review 2026-11-07 #14)"
+        )
+
+        {:error, :shard_tombstoned}
+
+      {:error, reason} ->
+        _ = Fathom.FS.rm(Provenance.sidecar_path(path))
         {:error, {:tombstone_check_failed, reason}}
     end
   end

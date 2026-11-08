@@ -61,12 +61,15 @@ status, so a late access can't un-delete it.
 **The boot window (expert review 2026-11-07 #14).** The set loads asynchronously after the Edge starts,
 so a freshly booted node answers "not tombstoned" until the load finishes (and keeps doing so if the
 load keeps failing). The open path therefore has one more guard that needs no Postgres and no loaded
-set: when an open finds a local copy and NO stored object, it HEADs the durable `tombstones/<id>`
-marker; present ⇒ the local copy is erased and the open refused `:shard_tombstoned` (a refused open is a
-410, like the set's). That branch is rare (a brand-new un-flushed shard, an operator-deleted object, an
-erased tenant's residue), so a normal open pays nothing. Not covered, and a parked maintainer decision
-(see `docs/component-notes.md`): a node with no local residue, booting with the directory unreachable,
-opens a fresh EMPTY shard for an erased id until the load succeeds.
+set: when an open finds NO stored object (with a local copy, or, since the 2026-11-08 decision (d),
+with no local copy at all: a cold open), it HEADs the durable `tombstones/<id>` marker; present ⇒ the
+local copy (if any) is erased and the open refused `:shard_tombstoned` (a refused open is a 410, like
+the set's); unreadable ⇒ refused retryably (503, never fail-open: an erased id must not be re-created
+because storage hiccuped); absent ⇒ proceed. The read is only on that branch: an open that finds the
+object pays nothing, and a NOVEL shard's first open pays one HEAD (S3) / stat (Local), pinned by
+`S3OpCountTest`. This closes the "empty shard re-mint" variant (a node with no local residue, booting
+with the directory unreachable, used to open a fresh EMPTY shard for an erased id until the load
+succeeded) without making Postgres a boot dependency.
 
 **A delete during a fork (expert review 2026-11-07 #16).** `fork/3` re-checks the source's and the
 destination's tombstone after the copy (dst lease held) and again before registering the dst row; if

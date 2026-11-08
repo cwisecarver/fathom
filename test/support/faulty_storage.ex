@@ -694,8 +694,20 @@ defmodule Fathom.Test.FaultyStorage do
 
   @impl true
   def tombstoned_ids, do: Local.tombstoned_ids()
+  # `storage_fault: {:tombstone_read, shard_id}` fails the marker read of THAT id only (the open
+  # path's cold-absent gate, expert review 2026-11-07 #14), so a test can express an unreadable
+  # marker without touching any other shard's reads. `:faulty_before {:tombstone_present, fun}` is
+  # handed the id, so a test can count the reads.
   @impl true
-  def tombstone_present?(shard_id), do: Local.tombstone_present?(shard_id)
+  def tombstone_present?(shard_id) do
+    run_before(:tombstone_present, shard_id)
+
+    case fault() do
+      {:tombstone_read, ^shard_id} -> {:error, :s3_unreachable}
+      _ -> Local.tombstone_present?(shard_id)
+    end
+  end
+
   @impl true
   def put_token_floor(shard_id, version), do: Local.put_token_floor(shard_id, version)
   @impl true

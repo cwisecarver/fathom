@@ -984,6 +984,12 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
   # The resurrection guard: a PURGED tenant also has no object, and a peer that missed the delete
   # may still hold its replica. A durable tombstone marker means the replica is never promoted.
+  #
+  # This test used to assert that the open SERVED an empty shard (`{:ok, conn}`, "no such table"):
+  # the cold-absent marker gate (expert review 2026-11-07 #14, decision (d) of 2026-11-08,
+  # `Shard.cold_absent_gate/4`) now refuses a cold open of an erased id before the promote decision
+  # is reached, a strictly stronger outcome (410 instead of an empty shard minted for an erased id).
+  # The invariant this test exists for is unchanged and still asserted: nothing was published.
   test "a takeover that finds no object never promotes a tombstoned tenant's replica", ctx do
     %{id: id} = ctx
     Application.put_env(:fathom, :replication_promote_on_open, true)
@@ -996,9 +1002,47 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     refute Fathom.Tenants.tombstoned?(id),
            "fixture: the ETS guard would refuse before the decision"
 
+    assert {:error, %{code: "FILO_TENANT_DELETED", status: 410}} = ShardExecutor.open(id)
+    assert {:ok, nil} = Storage.object_head(id), "a deleted tenant's replica was published"
+  end
+
+  # `PromoteOnOpen.decision_stamp/4` keeps its OWN marker read as defence in depth, and with the
+  # cold-absent gate in front of it the first test above no longer reaches it. The only way to reach
+  # it is the race it still covers: the marker is written AFTER the gate's read and BEFORE the
+  # decision's. `:faulty_before {:tombstone_present, _}` runs before each read of this id's marker
+  # and writes the marker on the SECOND one, so the gate sees "novel" and the decision sees "erased".
+  test "a marker that lands after the open's gate still stops the promotion", ctx do
+    %{id: id} = ctx
+    Application.put_env(:fathom, :replication_promote_on_open, true)
+    Application.put_env(:fathom, :replication_recover_from_peers, true)
+    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    build_never_flushed(id)
+
+    reads = :counters.new(1, [])
+    on_exit(fn -> File.rm(Path.join([Storage.Local.dir(), "tombstones", id])) end)
+    on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
+
+    Application.put_env(
+      :fathom,
+      :faulty_before,
+      {:tombstone_present,
+       fn
+         ^id ->
+           :counters.add(reads, 1, 1)
+           if :counters.get(reads, 1) == 2, do: :ok = Storage.Local.put_tombstone(id)
+
+         _ ->
+           :ok
+       end}
+    )
+
+    refute Fathom.Tenants.tombstoned?(id), "fixture: the ETS guard must not refuse first"
+
     {:ok, conn} = ShardExecutor.open(id)
     assert {:error, _} = ShardExecutor.execute(conn, stmt("SELECT a FROM t"))
     :ok = ShardExecutor.close(conn)
+
+    assert :counters.get(reads, 1) == 2, "the gate and the decision should each read the marker"
     assert {:ok, nil} = Storage.object_head(id), "a deleted tenant's replica was published"
   end
 
