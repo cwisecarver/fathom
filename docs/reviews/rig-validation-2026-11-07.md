@@ -1,6 +1,6 @@
 # Chaos-rig validation of the 2026-11-07 audit fixes
 
-Code: `8c888d75` (96 local commits after `dd5fa084`, the expert review 2026-11-07 fixes: A2 recovery,
+Code: `8c888d75` (98 local commits after `dd5fa084`, the expert review 2026-11-07 fixes: A2 recovery,
 lease/fence, executor accounting, open path). Five nodes on one colima VM, replication ON, prod
 `mix release` images. Every in-process bench behind those commits ran with replication OFF; this is
 the first replication-ON measurement of them. Logs (local, not committed): `logs/rig-20261107*/`.

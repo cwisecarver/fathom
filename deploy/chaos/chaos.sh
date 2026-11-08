@@ -787,13 +787,20 @@ cmd_pause_fence() {
   echo "  (promote-on-open on $survivor: ${promote_on:-unknown})"
 
   if [ "$promote_on" = "true" ]; then
-    local fenced
+    local fenced recovered
     fenced=$(compose logs --since 3m "$owner" 2>/dev/null |
       grep -ci "shard $shard: ownership unconfirmed before flush" || true)
+    # seq=300 is only legitimate here if the SURVIVOR recovered it (a promotion of its replica, or a
+    # recovery that chose :local / a peer pull). The zombie's own self-fence line proves it did not
+    # flush; this proves where the row came from. Without it a row that is present but unexplained
+    # would pass as "recovered".
+    recovered=$(compose logs --since 3m "$survivor" 2>/dev/null |
+      grep -Eci "shard $shard: (PROMOTED a local replica|takeover .*recovery chose (:local|:pull|\{:pull))" || true)
     echo "  zombie's quorum-acked write (seq=300) recovered = $zombie   (SHOULD be 1 — A2 replicated it)"
     echo "  zombie self-fenced instead of flushing          = $fenced   (MUST be >=1)"
+    echo "  survivor's own recovery/promotion of $shard      = $recovered   (MUST be >=1 when seq=300 is present)"
 
-    if [ "$live" = "1" ] && [ "$fenced" -ge 1 ]; then
+    if [ "$live" = "1" ] && [ "$fenced" -ge 1 ] && { [ "$zombie" != "1" ] || [ "$recovered" -ge 1 ]; }; then
       if [ "$zombie" = "1" ]; then
         echo "  PASS: the fence held AND A2 recovered the acked write the fence discarded"
       else
@@ -845,6 +852,22 @@ cmd_soak() {
     echo "      REPLICATION_ENABLED=$have_repl SHARD_FLUSH_INTERVAL_MS=<same as up> ./chaos.sh soak"
     return 1
   fi
+  # The flush half of the same trap: a revived node takes SHARD_FLUSH_INTERVAL_MS from THIS shell
+  # (compose default 300000), and `require_fast_flush` above only reads the live fleet, so it would
+  # pass while the revived nodes quietly change the RPO window being measured.
+  local want_flush=${SHARD_FLUSH_INTERVAL_MS:-300000} have_flush
+  have_flush=$(rpc fathom1 'IO.puts(Application.get_env(:fathom, :shard_flush_interval_ms))' | tr -d '[:space:]')
+  case "$have_flush" in
+    ''|*[!0-9]*) ;;
+    *)
+      if [ "$have_flush" != "$want_flush" ]; then
+        echo "FAIL: the fleet's flush interval is ${have_flush} ms but this command has SHARD_FLUSH_INTERVAL_MS=${want_flush} ms."
+        echo "  Revived nodes would come back at ${want_flush} ms. Re-run with the same value as \`up\`:"
+        echo "      REPLICATION_ENABLED=$have_repl SHARD_FLUSH_INTERVAL_MS=$have_flush ./chaos.sh soak"
+        return 1
+      fi
+      ;;
+  esac
   local ack_dir; ack_dir=$(mktemp -d)
   echo "soak: ${secs}s of writes across ${#tenants[@]} tenants with node churn (acks in $ack_dir)"
   # seed/1 truncates, so acked (this run) and stored are directly comparable. See seed/1.
