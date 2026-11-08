@@ -9,7 +9,7 @@ the first replication-ON measurement of them. Logs (local, not committed): `logs
 
 | check | config | result |
 |---|---|---|
-| `tpc-fleet 1024` (fresh `colima restart`) | `SHARD_FLUSH_INTERVAL_MS=30000`, `TPC_NET=container TPC_DRIVER=elixir` | **4,292 txn/s**, 0 errors, 0 shed, p50 220 ms, p99 **389 ms** (2026-10-26 with 1 GB writeback cap: 4,008 txn/s, p99 417 ms) |
+| `tpc-fleet 1024`, same-day A/B (`dd5fa084` vs `8c888d75` images, alternating, fresh `colima restart` per run, 2 runs a side) | `SHARD_FLUSH_INTERVAL_MS=30000`, `TPC_NET=container TPC_DRIVER=elixir`, three followers | base 4,314 / 4,383 txn/s, p99 393.6 / 387.3 ms; **HEAD 4,337 / 4,360 txn/s, p99 395.4 / 390.8 ms**; 0 errors, 0 shed in all four, no throughput or p99 difference. (An earlier single HEAD run: 4,292 txn/s, p99 389 ms. The 2026-10-26 figures, 4,008 txn/s / p99 417 ms, were four followers then, three now, so they are not a comparison point.) |
 | `smoke` (isolation check) | replication ON | OK, `foreign=0` for every tenant |
 | `pause-fence acme` | replication ON, flush 5 s | PASS: survivor's seq=400 present, zombie self-fenced (`:fence_skip`), the quorum-acked seq=300 recovered by promote-on-open on the survivor |
 | `pause-fence acme` | replication OFF (control), flush 5 s | PASS: seq=400 present, seq=300 resurrected = 0 |
@@ -37,8 +37,8 @@ the first replication-ON measurement of them. Logs (local, not committed): `logs
 
 ## What this does not cover
 
-Single runs of `pause-fence`, `partition` and `smoke`; the failover A/B is two runs a side;
-`tpc-fleet` was one run and is not an A/B (no baseline run on this VM today). The soak A/B against
-`dd5fa084` was attempted but its stack did not come up from a git worktree, so soak has no same-day
-baseline: the comparison is the 2026-08-12 matrix (0 rows with promote ON). No open-loop run, no
-Jepsen, no single-slow-follower or large-DB-wake arm.
+Single runs of `pause-fence`, `partition` and `smoke`; the failover and `tpc-fleet` A/Bs are two runs a
+side. The soak A/B against `dd5fa084` was attempted but its stack did not come up from a git
+worktree, so soak has no same-day baseline: the comparison is the 2026-08-12 matrix (0 rows with
+promote ON). No open-loop run, no Jepsen, no single-slow-follower or large-DB-wake arm. Each A/B
+arm ran the image built from that commit's tree (checked by image id per arm).

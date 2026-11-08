@@ -253,7 +253,8 @@ noted).
 - **reviews/chaos-run-2026-07-0{5,8,9}.md** — chaos-rig run reports (failover, pause-fence, hotspots,
   rebalance handoff — the live proofs referenced by the built-engine docs).
 - **[reviews/rig-validation-2026-11-07.md](reviews/rig-validation-2026-11-07.md)** — the first
-  replication-ON rig run of the 2026-11-07 audit fixes: `tpc-fleet 1024` 4,292 txn/s / p99 389 ms,
+  replication-ON rig run of the 2026-11-07 audit fixes: `tpc-fleet 1024` same-day A/B vs the pre-fix
+  image (4,337 / 4,360 vs 4,314 / 4,383 txn/s, p99 391-395 vs 387-394 ms, no difference),
   failover 17.3 s (identical to the pre-fix baseline), soak 0 destroyed / 0 quarantined ×3,
   pause-fence PASS in both modes — plus two harness traps (a promote-gate read without its default
   that printed a false SPLIT-BRAIN; `soak` reviving nodes from its own environment).
