@@ -772,8 +772,17 @@ cmd_pause_fence() {
   # promotion it then called a fault was the feature. Same lesson `cmd_rpo` records for
   # REPLICATION_ENABLED.
   local promote_on
+  # Two things decide whether A2 was carrying seq=300, and BOTH are read from the node:
+  #   * the promote gate, which defaults to ON when the app env is unset
+  #     (`PromoteOnOpen.promote_on_open?/0`, `Fleet`) — `get_env(...) == true` without that default
+  #     reported "false" on a default-on fleet and turned a correct promotion (the survivor
+  #     recovering the quorum-acked seq=300) into a false SPLIT-BRAIN verdict (2026-11-07);
+  #   * replication itself (`Fleet.replicating?/0`): with replication OFF there is no replica, a
+  #     promotion cannot happen, and the promote default being on is meaningless — that fleet must
+  #     take the strict branch below (seq=300 must be 0), or the control arm could not detect a
+  #     zombie overwrite.
   promote_on=$(rpc "$survivor" \
-    'IO.puts(to_string(Application.get_env(:fathom, :replication_promote_on_open) == true))' |
+    'IO.puts(to_string(Fathom.Shard.Replication.Fleet.replicating?() and Application.get_env(:fathom, :replication_promote_on_open, true) == true))' |
     tr -d '[:space:]')
   echo "  (promote-on-open on $survivor: ${promote_on:-unknown})"
 
@@ -793,11 +802,16 @@ cmd_pause_fence() {
       fi
     else
       echo "  *** SPLIT-BRAIN — the zombie overwrote the survivor"
+      return 1
     fi
   else
     echo "  zombie's dirty write (seq=300) resurrected     = $zombie   (MUST be 0 — self-fence held)"
-    [ "$live" = "1" ] && [ "$zombie" = "0" ] && echo "  PASS: single-writer held across the zombie's flush" \
-      || echo "  *** SPLIT-BRAIN — the zombie overwrote the survivor"
+    if [ "$live" = "1" ] && [ "$zombie" = "0" ]; then
+      echo "  PASS: single-writer held across the zombie's flush"
+    else
+      echo "  *** SPLIT-BRAIN — the zombie overwrote the survivor"
+      return 1
+    fi
   fi
 }
 
@@ -817,6 +831,20 @@ cmd_partition() {
 cmd_soak() {
   local secs=${1:-120} tenants=(t1 t2 t3 t4 t5 t6) t
   require_fast_flush soak || return 1
+  # `soak` revives each node it kills with `compose up -d <node>`, and compose reads
+  # REPLICATION_ENABLED / SHARD_FLUSH_INTERVAL_MS from the environment of THIS invocation. Run it
+  # without the variables `up` was given and every revived node comes back with shipping OFF: the
+  # run then reports acked rows living only in `.forked.*` copies — a harness artifact, not an A2
+  # RPO miss (2026-11-07: 3 such rows on a fleet that had been brought up replicating, 0 in three
+  # runs with the variables on the soak command). Refuse the mismatch instead of measuring it.
+  local want_repl=${REPLICATION_ENABLED:-false} have_repl
+  have_repl=$(rpc fathom1 'IO.puts(Fathom.Shard.Replication.Fleet.replicating?())' | tr -d '[:space:]')
+  if [ -n "$have_repl" ] && [ "$have_repl" != "$want_repl" ]; then
+    echo "FAIL: the fleet is replicating=$have_repl but this command has REPLICATION_ENABLED=$want_repl."
+    echo "  Revived nodes would come back with replication $want_repl. Re-run with the same variables as \`up\`:"
+    echo "      REPLICATION_ENABLED=$have_repl SHARD_FLUSH_INTERVAL_MS=<same as up> ./chaos.sh soak"
+    return 1
+  fi
   local ack_dir; ack_dir=$(mktemp -d)
   echo "soak: ${secs}s of writes across ${#tenants[@]} tenants with node churn (acks in $ack_dir)"
   # seed/1 truncates, so acked (this run) and stored are directly comparable. See seed/1.
