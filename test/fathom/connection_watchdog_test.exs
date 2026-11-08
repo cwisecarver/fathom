@@ -587,9 +587,11 @@ defmodule Fathom.ConnectionWatchdogTest do
       # `substr(.., 1 + x % 2)` makes the subject depend on the row so SQLite cannot hoist the
       # deterministic call out of the loop; MATERIALIZED builds the random subject once. The pattern
       # is state-explosive for the lazy DFA on random hex (a counted repetition after an unbounded
-      # one), so the regex crate runs its slow engine (a 512 KiB subject costs ~20 ms per call here; pre-fix the statement ran ~800 ms).
+      # one), so the regex crate runs its slow engine. The subject is 256 KiB of hex: exactly the
+      # `regexp` plain cap (it was 512 KiB, ~20 ms per call, under the previous 1 MiB cap; a
+      # subject over the cap is refused before matching and would measure nothing here).
       per_row = fn rows ->
-        "WITH big(s) AS MATERIALIZED (SELECT hex(randomblob(262144))), " <>
+        "WITH big(s) AS MATERIALIZED (SELECT hex(randomblob(131072))), " <>
           "r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r WHERE x < #{rows}) " <>
           "SELECT count(*) FROM r, big " <>
           "WHERE regexp('[0-9A-F]*A[0-9A-F]{50}[^0-9A-F]', substr(big.s, 1 + (r.x % 2)))"

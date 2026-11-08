@@ -490,7 +490,24 @@ fn prescan(chars: &[char], last_close: Option<usize>) -> Prescan {
     found
 }
 
-const CACHE_CAP: usize = 256;
+/// Cap on the positive cache, in entries (expert review 2026-11-07 #75; the decision is in
+/// docs/component-notes.md). The budget below charges COMPILE size, but every cached regex also
+/// keeps one `regex-automata` lazy-DFA `Cache` per thread that has run it, ~2.6 MiB each once a
+/// state-heavy pattern fills the default 2 MiB hybrid cache (forward + reverse), allocated by the
+/// Rust allocator outside the BEAM's allocators, `soft_heap_limit` and the byte budget. fancy-regex
+/// does not expose `hybrid_cache_capacity` and `delegate_dfa_size_limit` is the FULL-DFA limit, so
+/// the only lever on that memory is how many regexes can be alive: worst case is
+/// `CACHE_CAP x threads that can run a regexp x 2.6 MiB`. Every exqlite NIF is dirty-IO, and
+/// `rel/vm.args.eex` ships `+SDio 10`, so 20 x 10 x 2.6 MiB = 520 MiB (0.51 GiB; it was 256 x 10 x
+/// 2.6 = 6.5 GiB). 20 still holds a normal app's whole pattern set; a 21st distinct hot pattern
+/// makes a round-robin over them recompile on every call (`twenty_realistic_patterns_do_not_thrash`
+/// pins the 20, `patterns_past_the_cap_are_evicted_and_recompile_correctly` the cliff).
+const CACHE_CAP: usize = 20;
+
+/// Cap on the negative cache, in entries. Separate from [`CACHE_CAP`]: a failed compile holds no
+/// DFA caches (only the pattern text and the error, bounded by [`FAILED_BYTE_BUDGET`]), and
+/// re-running the four compile tiers costs 32-85 ms per call, so it keeps the larger bound.
+const FAILED_CAP: usize = 256;
 
 /// Patterns longer than this are refused before any work is done (expert review 2026-10-12 #1/#2):
 /// translation and compilation both run uninterruptibly inside one UDF call, where neither the
@@ -571,13 +588,14 @@ pub const MAX_FANCY_SUBJECT_BYTES: usize = 64 * 1024;
 /// runs between VDBE ops, the regex crate has no cancellation). A bigger lazy-DFA cache does not
 /// help (4 / 32 / 256 MiB all measured identical, so it is not cache thrash that decides), and
 /// the plain subject cannot be matched in windows (a match may span any window). So the work is
-/// bounded by input size: 1 MiB bounds one call to ~0.1 s for a realistic pattern and to ~1–10 s
-/// for the slowest measured ones, and the `regexp` UDF checks the statement deadline before each
-/// call so a per-row statement stops at its next row. A `__regex` over a larger value is not a
-/// realistic workload (the fancy cap is 64 KiB for the same reason). Residual, parked: a hostile
-/// pattern can still hold one thread for up to that 1–10 s once per row until the deadline; a
-/// truly interruptible matcher would need a hand-driven lazy-DFA loop (see component-notes).
-pub const MAX_PLAIN_SUBJECT_BYTES: usize = 1024 * 1024;
+/// bounded by input size: 256 KiB bounds one call to ~0.03 s for a realistic pattern and to
+/// ~2.3 s for the slowest measured one (0.11 MB/s; it was 1 MiB, ~9 s, until the maintainer
+/// lowered it), and the `regexp` UDF checks the statement deadline before each call so a per-row
+/// statement stops at its next row. A `__regex` over a larger value is not a realistic workload
+/// (the fancy cap is 64 KiB for the same reason). Residual, accepted: a hostile pattern can still
+/// hold one thread for up to that ~2.3 s once per row until the deadline. A truly interruptible
+/// matcher needs a hand-driven lazy-DFA loop; that alternative was declined (component-notes).
+pub const MAX_PLAIN_SUBJECT_BYTES: usize = 256 * 1024;
 
 /// True when the pattern needs the backtracking engine. `regex-syntax` rejects exactly the
 /// constructs fancy-regex adds (lookaround, backreferences, atomic groups); any other parse failure
@@ -662,20 +680,30 @@ fn compile(pattern: &str) -> Result<(Regex, usize), fancy_regex::Error> {
 /// threads missing on the same new pattern both compile it and the second insert wins, which is
 /// harmless.
 pub fn search(pattern: &str, subject: &str) -> Result<bool, PyreError> {
+    search_in(&CACHE, pattern, subject)
+}
+
+/// [`search`] against an explicit cache, so the cache tests need not share the process-global one
+/// (a test filling it would evict another test's pattern at [`CACHE_CAP`] = 20).
+fn search_in(
+    cache: &Mutex<Option<Cache>>,
+    pattern: &str,
+    subject: &str,
+) -> Result<bool, PyreError> {
     if pattern.len() > MAX_PATTERN_BYTES {
         return Err(PyreError::PatternTooLong(pattern.len()));
     }
-    let (re, fancy) = match cache_get(pattern)? {
+    let (re, fancy) = match cache_get(cache, pattern)? {
         Some(hit) => hit,
         None => match compile(pattern) {
             Ok((re, cost)) => {
                 let re = Arc::new(re);
                 let fancy = needs_backtracking(pattern);
-                cache_put(pattern, &re, fancy, cost);
+                cache_put(cache, pattern, &re, fancy, cost);
                 (re, fancy)
             }
             Err(e) => {
-                cache_put_failed(pattern, &e);
+                cache_put_failed(cache, pattern, &e);
                 return Err(e.into());
             }
         },
@@ -690,8 +718,11 @@ pub fn search(pattern: &str, subject: &str) -> Result<bool, PyreError> {
 }
 
 /// A hit, `None` for a miss, or the remembered compile error.
-fn cache_get(pattern: &str) -> Result<Option<(Arc<Regex>, bool)>, PyreError> {
-    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+fn cache_get(
+    cache: &Mutex<Option<Cache>>,
+    pattern: &str,
+) -> Result<Option<(Arc<Regex>, bool)>, PyreError> {
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     let Some(cache) = guard.as_mut() else {
         return Ok(None);
     };
@@ -708,8 +739,14 @@ fn cache_get(pattern: &str) -> Result<Option<(Arc<Regex>, bool)>, PyreError> {
     Ok(None)
 }
 
-fn cache_put(pattern: &str, re: &Arc<Regex>, fancy: bool, cost: usize) {
-    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+fn cache_put(
+    cache: &Mutex<Option<Cache>>,
+    pattern: &str,
+    re: &Arc<Regex>,
+    fancy: bool,
+    cost: usize,
+) {
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     let cache = guard.get_or_insert_with(new_cache);
     while !cache.map.is_empty()
         && (cache.map.len() >= CACHE_CAP || cache.bytes + cost > CACHE_BYTE_BUDGET)
@@ -738,11 +775,11 @@ fn cache_put(pattern: &str, re: &Arc<Regex>, fancy: bool, cost: usize) {
     cache.bytes += cost;
 }
 
-fn cache_put_failed(pattern: &str, err: &fancy_regex::Error) {
-    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+fn cache_put_failed(cache: &Mutex<Option<Cache>>, pattern: &str, err: &fancy_regex::Error) {
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     let cache = guard.get_or_insert_with(new_cache);
     while !cache.failed.is_empty()
-        && (cache.failed.len() >= CACHE_CAP
+        && (cache.failed.len() >= FAILED_CAP
             || cache.failed_bytes + pattern.len() > FAILED_BYTE_BUDGET)
     {
         let oldest = cache
@@ -776,15 +813,15 @@ fn new_cache() -> Cache {
 
 /// Estimated bytes currently held by the cache (test hook).
 #[cfg(test)]
-fn cache_bytes() -> usize {
-    let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+fn cache_bytes(cache: &Mutex<Option<Cache>>) -> usize {
+    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     guard.as_ref().map_or(0, |c| c.bytes)
 }
 
 /// Whether a pattern is currently in the positive / negative cache (test hook).
 #[cfg(test)]
-fn cached(pattern: &str) -> (bool, bool) {
-    let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+fn cached(cache: &Mutex<Option<Cache>>, pattern: &str) -> (bool, bool) {
+    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     guard.as_ref().map_or((false, false), |c| {
         (c.map.contains_key(pattern), c.failed.contains_key(pattern))
     })
@@ -906,10 +943,13 @@ mod tests {
     // "Max limit for backtracking count exceeded" / "Max stack size exceeded" where Python answers.
     #[test]
     fn terminal_dollars_in_alternatives_and_groups_answer_on_big_subjects() {
-        let slug = "a".repeat(1_000_000);
+        // 200 kB: over the 64 KiB fancy cap (a regression to the backtracking route errors with
+        // `SubjectTooLong` here) and under the 256 KiB plain cap. The measured ~1 MB subjects are
+        // over the plain cap since 2026-11-08, so the VM-limit failure itself is no longer reachable.
+        let slug = "a".repeat(200_000);
         assert_eq!(search("^[a-z0-9-]+$|^x$", &slug).unwrap(), true);
         assert_eq!(search("^(?:[a-z0-9-]+$)", &slug).unwrap(), true);
-        let words = "ab ".repeat(333_333);
+        let words = "ab ".repeat(66_666);
         assert_eq!(search("[a-z]+$|[0-9]+$", &words).unwrap(), false);
         assert_eq!(search("\\w+$|zz", &words).unwrap(), false);
         // And the trailing-newline rule is intact on every spelling.
@@ -1088,7 +1128,7 @@ mod tests {
             assert!(search(&p, "b").is_ok(), "{:?}", search(&p, "b"));
             // A literal 64 MiB, not the constant, so weakening the constant fails this.
             assert!(
-                cache_bytes() <= 64 * 1024 * 1024,
+                cache_bytes(&CACHE) <= 64 * 1024 * 1024,
                 "cache over budget at {i}"
             );
         }
@@ -1168,7 +1208,9 @@ mod tests {
     // keep working on big subjects up to MAX_PLAIN_SUBJECT_BYTES, not the 64 KiB fancy cap.
     #[test]
     fn plain_patterns_have_the_larger_cap() {
-        let big = format!("{}b", "a".repeat(1_000_000));
+        // 200 kB: over the 64 KiB fancy cap, under the 256 KiB plain cap.
+        let big = format!("{}b", "a".repeat(200_000));
+        assert!(big.len() > MAX_FANCY_SUBJECT_BYTES && big.len() < MAX_PLAIN_SUBJECT_BYTES);
         assert!(m("a*b", &big));
         assert!(m("a+b$", &big));
         assert!(!m("^c", &big));
@@ -1180,6 +1222,10 @@ mod tests {
     #[test]
     fn plain_patterns_refuse_subjects_over_the_plain_cap_quickly() {
         use std::time::{Duration, Instant};
+        // The maintainer's decision (2026-11-08) is 256 KiB, written as a literal so moving the
+        // constant fails here: the slowest measured pattern costs ~2.3 s per call at this size
+        // (it was ~9 s at the old 1 MiB).
+        assert_eq!(MAX_PLAIN_SUBJECT_BYTES, 256 * 1024);
         // The measured slow shape: a counted repetition after an unbounded one, on text the lazy
         // DFA cannot summarise. Over the cap it must not even start.
         let slow = "[ab]*a[ab]{200}[^ab]";
@@ -1190,14 +1236,150 @@ mod tests {
             matches!(r, Err(PyreError::PlainSubjectTooLong(n)) if n == over.len()),
             "{r:?}"
         );
-        assert!(t.elapsed() < Duration::from_millis(100), "{:?}", t.elapsed());
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            t.elapsed()
+        );
         // Cached and uncached, trivial patterns too.
         assert!(matches!(
             search("^a", &over),
             Err(PyreError::PlainSubjectTooLong(_))
         ));
-        // Exactly at the cap still answers.
-        assert!(search("^c", &"a".repeat(MAX_PLAIN_SUBJECT_BYTES)).is_ok());
+    }
+
+    // The boundary itself: a subject AT the cap still matches, one byte over is the typed error.
+    #[test]
+    fn the_plain_cap_boundary_is_exact() {
+        let at = "a".repeat(MAX_PLAIN_SUBJECT_BYTES);
+        assert!(!m("^c", &at));
+        assert!(m("^a+$", &at));
+        let over = "a".repeat(MAX_PLAIN_SUBJECT_BYTES + 1);
+        for p in ["^c", "^a+$", "a"] {
+            let r = search(p, &over);
+            assert!(
+                matches!(r, Err(PyreError::PlainSubjectTooLong(n)) if n == MAX_PLAIN_SUBJECT_BYTES + 1),
+                "{p}: {r:?}"
+            );
+        }
+        assert_eq!(
+            search("a", &over).unwrap_err().to_string(),
+            "text is 262145 bytes, over the 262144-byte limit for regular expressions"
+        );
+    }
+
+    // 20 distinct patterns of the kind a Django app sends (`__regex`/`__iregex` lookups, validators,
+    // slug/phone/uuid shapes), including two Unicode `\w` repetitions that compile at the top size
+    // tier and are charged ~10 MiB each against the 64 MiB byte budget.
+    const REALISTIC: [&str; 20] = [
+        r"^[A-Z]{2}\d{6}$",
+        r"^\d{3}-\d{3}-\d{4}$",
+        r"^[\w.@+-]{1,150}$",
+        r"(?i)^(draft|pending|active)$",
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        r"(?i)\bfoo\b",
+        r"^\s*$",
+        r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+        r"(?i)^[^@\s]+@[^@\s]+\.[a-z]{2,}$",
+        r"^\+?\d{7,15}$",
+        r"^(\d{1,3}\.){3}\d{1,3}$",
+        r"(?i)(error|warn|fatal)",
+        r"^#[0-9a-fA-F]{6}$",
+        r"^v\d+\.\d+\.\d+$",
+        r"(?i)\w{20}",
+        r"^[^/]+/[^/]+$",
+        r"(?i)^\s*select\b",
+        r"^\d{4}-\d{2}-\d{2}$",
+        r"^.{3,40}$",
+        r"(?i)^[a-z]+\d*$",
+    ];
+
+    fn cached_in(cache: &Mutex<Option<Cache>>, pattern: &str) -> bool {
+        cached(cache, pattern).0
+    }
+
+    fn cache_len(cache: &Mutex<Option<Cache>>) -> usize {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map_or(0, |c| c.map.len())
+    }
+
+    // expert review 2026-11-07 #75 (decision 2026-11-08): the cap is what bounds the lazy-DFA
+    // caches the byte budget cannot see. Written as arithmetic on literals (2.6 MiB per (regex,
+    // thread) pair measured, 10 dirty-IO threads from rel/vm.args.eex) so moving the constant back
+    // up (it was 256: 6.5 GiB) fails here and the component-notes number stays honest.
+    #[test]
+    fn the_cache_cap_bounds_the_worst_case_lazy_dfa_memory() {
+        const DIRTY_IO_THREADS: usize = 10;
+        let worst_mib_x10 = CACHE_CAP * DIRTY_IO_THREADS * 26;
+        assert!(
+            worst_mib_x10 <= 5200,
+            "worst case {} MiB",
+            worst_mib_x10 as f64 / 10.0
+        );
+        assert!(
+            CACHE_CAP >= REALISTIC.len(),
+            "a normal app's patterns must all fit"
+        );
+    }
+
+    #[test]
+    fn twenty_realistic_patterns_do_not_thrash() {
+        let cache = Mutex::new(None);
+        for p in REALISTIC {
+            assert!(search_in(&cache, p, "x").is_ok(), "{p}");
+        }
+        let first: Vec<Arc<Regex>> = REALISTIC
+            .iter()
+            .map(|p| {
+                cache_get(&cache, p)
+                    .unwrap()
+                    .expect("cached after first use")
+                    .0
+            })
+            .collect();
+        // Five more laps: every call must be a hit on the SAME compiled regex (a recompile would
+        // be a different Arc), and answers stay correct.
+        for _ in 0..5 {
+            assert!(search_in(&cache, r"^\d{4}-\d{2}-\d{2}$", "2026-11-08").unwrap());
+            for (p, was) in REALISTIC.iter().zip(&first) {
+                assert!(search_in(&cache, p, "x").is_ok());
+                let now = cache_get(&cache, p).unwrap().expect("still cached").0;
+                assert!(Arc::ptr_eq(was, &now), "{p} was evicted and recompiled");
+            }
+        }
+        assert_eq!(cache_len(&cache), REALISTIC.len());
+    }
+
+    // Past the cap the least-recently-used pattern goes, an evicted pattern recompiles on its next
+    // use, and both its answers and every survivor's stay correct.
+    #[test]
+    fn patterns_past_the_cap_are_evicted_and_recompile_correctly() {
+        let cache = Mutex::new(None);
+        let pats: Vec<String> = (0..CACHE_CAP + 5)
+            .map(|i| format!("^cap{i}x[0-9]+$"))
+            .collect();
+        for (i, p) in pats.iter().enumerate() {
+            assert!(search_in(&cache, p, &format!("cap{i}x42")).unwrap());
+            assert!(cache_len(&cache) <= CACHE_CAP);
+        }
+        assert_eq!(cache_len(&cache), CACHE_CAP);
+        for p in &pats[..5] {
+            assert!(!cached_in(&cache, p), "{p} should have been evicted");
+        }
+        for p in &pats[5..] {
+            assert!(cached_in(&cache, p), "{p} should have survived");
+        }
+        // An evicted pattern recompiles and answers both ways; it displaces the next-oldest.
+        assert!(search_in(&cache, &pats[0], "cap0x7").unwrap());
+        assert!(!search_in(&cache, &pats[0], "cap1x7").unwrap());
+        assert!(cached_in(&cache, &pats[0]));
+        assert!(!cached_in(&cache, &pats[5]));
+        assert_eq!(cache_len(&cache), CACHE_CAP);
+        // Survivors still answer correctly (no compiled form leaked across patterns).
+        for (i, p) in pats.iter().enumerate().skip(6) {
+            assert!(search_in(&cache, p, &format!("cap{i}x42")).unwrap(), "{p}");
+            assert!(!search_in(&cache, p, "cap999x1").unwrap(), "{p}");
+        }
     }
 
     // expert review 2026-10-13 #32: a failing pattern re-ran every compile tier on each call.
@@ -1205,11 +1387,15 @@ mod tests {
     fn compile_failures_are_negative_cached() {
         use std::time::Instant;
         let bad = "(?i)\\w{1000}x_negcache"; // needs ~128 MiB: refused at the top tier
-        assert_eq!(cached(bad), (false, false));
+        assert_eq!(cached(&CACHE, bad), (false, false));
         let t1 = Instant::now();
         assert!(search(bad, "b").is_err());
         let first = t1.elapsed();
-        assert_eq!(cached(bad), (false, true), "failure was not remembered");
+        assert_eq!(
+            cached(&CACHE, bad),
+            (false, true),
+            "failure was not remembered"
+        );
         let t2 = Instant::now();
         let again = search(bad, "b");
         let second = t2.elapsed();
@@ -1220,19 +1406,35 @@ mod tests {
         );
     }
 
+    // expert review 2026-11-07 #75: the positive cap is small (20) but a failed compile holds no
+    // DFA caches, so the negative cache keeps its own, larger bound.
+    #[test]
+    fn the_negative_cache_is_not_squeezed_by_the_positive_cap() {
+        let cache = Mutex::new(None);
+        let n = CACHE_CAP + 10;
+        for i in 0..n {
+            assert!(search_in(&cache, &format!("(unclosed{i}"), "x").is_err());
+        }
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(guard.as_ref().unwrap().failed.len(), n);
+        assert!(FAILED_CAP > CACHE_CAP);
+    }
+
     // expert review 2026-10-13 #32: over budget the cache used to clear() EVERYTHING, so one tenant
-    // cycling big patterns evicted every other tenant's small hot pattern.
+    // cycling big patterns evicted every other tenant's small hot pattern. Local cache, not the
+    // global one: at CACHE_CAP = 20 other tests' patterns would evict this one at random.
     #[test]
     fn a_hot_small_pattern_survives_a_fill_with_big_ones() {
+        let cache = Mutex::new(None);
         let hot = "^hot_lru_survivor$";
-        assert!(m(hot, "hot_lru_survivor"));
+        assert!(search_in(&cache, hot, "hot_lru_survivor").unwrap());
         for i in 0..40 {
             let p = format!("(?i)\\w{{100}}lru{i}");
-            assert!(search(&p, "b").is_ok());
+            assert!(search_in(&cache, &p, "b").is_ok());
             // Check BEFORE touching it again: a call re-inserts a missing pattern.
-            assert!(cached(hot).0, "hot pattern evicted at fill {i}");
-            assert!(m(hot, "hot_lru_survivor")); // keep it recently used
+            assert!(cached_in(&cache, hot), "hot pattern evicted at fill {i}");
+            assert!(search_in(&cache, hot, "hot_lru_survivor").unwrap()); // keep it recently used
         }
-        assert!(cache_bytes() <= 64 * 1024 * 1024);
+        assert!(cache_bytes(&cache) <= 64 * 1024 * 1024);
     }
 }

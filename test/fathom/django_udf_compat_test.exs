@@ -489,7 +489,32 @@ defmodule Fathom.DjangoUdfCompatTest do
 
       # Small lookaround subjects and large PLAIN-pattern subjects are unaffected.
       assert one(conn, "SELECT 'ab' REGEXP '(?<=a)b'") == 1
-      assert one(conn, "SELECT REPEAT('a', 300000) REGEXP 'a+$'") == 1
+      assert one(conn, "SELECT REPEAT('a', 200000) REGEXP 'a+$'") == 1
+    end
+
+    # expert review 2026-11-07 #34, maintainer decision 2026-11-08: every subject over 256 KiB is
+    # refused, whatever the pattern, with a typed error (the slowest measured plain pattern costs
+    # ~2.3 s per call at the cap; it was ~9 s at the previous 1 MiB). Was asserted at 300000 bytes
+    # answering `1` before the cap came down; that value now errors.
+    test "REGEXP answers a subject at the 256 KiB cap and errors one byte over it", %{conn: conn} do
+      cap = 256 * 1024
+
+      assert one(conn, "SELECT REPEAT('a', #{cap}) REGEXP 'a+$'") == 1
+      assert one(conn, "SELECT REPEAT('a', #{cap}) REGEXP '^c'") == 0
+
+      for pattern <- ["a+$", "^c", "a"] do
+        assert {:error, reason} =
+                 Connection.query(conn, "SELECT REPEAT('a', #{cap + 1}) REGEXP ?", [pattern])
+
+        assert inspect(reason) =~ "text is #{cap + 1} bytes, over the #{cap}-byte limit",
+               "pattern #{pattern}: #{inspect(reason)}"
+      end
+
+      # A bound subject takes the same path.
+      assert {:error, reason} =
+               Connection.query(conn, "SELECT ? REGEXP 'a'", [String.duplicate("a", cap + 1)])
+
+      assert inspect(reason) =~ "#{cap}-byte limit"
     end
 
     test "uuid generators return Django's 32-char dashless hex", %{conn: conn} do

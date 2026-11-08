@@ -243,11 +243,23 @@ seeded random-pattern family that must agree on every case.
   an anchor (`(?:$){,2}`) is refused by the engine.
 
 **Size limits.** A match cannot be interrupted once it starts, so `regexp` refuses a subject over
-**1 MiB** with an error for every pattern, and over **64 KiB** for a pattern that uses lookaround or a
-backreference (those run on a backtracking engine). A `__regex` over a larger value gets
-`text is N bytes, over the … limit` where Django would answer — raise the question before relying on
-`__regex` over big text columns. A `regexp` call made after its statement's deadline has passed fails
-with the timeout instead of starting (expert review 2026-11-07 #34).
+**256 KiB** (262,144 bytes) with an error for every pattern, and over **64 KiB** for a pattern that
+uses lookaround or a backreference (those run on a backtracking engine). A subject exactly at the cap
+still matches; one byte over errors with `text is N bytes, over the 262144-byte limit for regular
+expressions`. **A Django `REGEXP` / `__regex` / `__iregex` over a text value larger than 256 KiB
+therefore errors on fathom where Django answers** — a deliberate, fixed limit (a constant, not a
+setting: it bounds one uninterruptible call to ~2.3 s for the slowest pattern measured, where the
+previous 1 MiB cap allowed ~9 s; the interruptible-matcher alternative was declined). Raise the
+question before relying on `__regex` over big text columns. A `regexp` call made after its
+statement's deadline has passed fails with the timeout instead of starting (expert review
+2026-11-07 #34, decision 2026-11-08).
+
+The compiled-pattern cache holds **20 distinct patterns per node** (shared by all tenants,
+least-recently-used out). A normal app's handful of `__regex` patterns all stay cached; a node whose
+hot set is more than 20 distinct patterns recompiles (~1.6 ms each) on every call instead of hitting
+the cache. The cap exists because each cached pattern's matcher keeps memory the engine's budget does
+not see — ~2.6 MiB per (pattern, dirty-IO thread), 0.51 GiB worst case at the shipped
+`+SDio 10` (`FathomUnaccountedRssGrowth` alerts on growth; expert review 2026-11-07 #75).
 
 ##### The two remaining differences, both deliberate
 
