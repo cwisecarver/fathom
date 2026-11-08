@@ -1,0 +1,377 @@
+{
+ "source": "VERBATIM Fathom.Migrator.Capture call trace of a real `manage.py migrate` (Django 5.0.6, django-libsql 0.1.3, test/django_validation: contenttypes + auth + widgets) adding widgets.0002_gadget to a template at django_migrations count 15, captured 2026-11-08 (logs/post-migrate-capture-trace-20261108-021341.log lines 25-118, one stream/conn). `append`/`bookkeeping` are the statements the executor saw (sql + bound args) between `begin`/`commit`; counts are the template's django_migrations count at that call. Transaction 1 is the migration; the rest is Django's post_migrate (autocommit SELECTs, then one BEGIN..COMMIT per bulk_create). content_type_id 6 is the TEMPLATE's own id for widgets.gadget.",
+ "template": {
+  "content_types": [
+   [
+    1,
+    "contenttypes",
+    "contenttype"
+   ],
+   [
+    2,
+    "auth",
+    "permission"
+   ],
+   [
+    3,
+    "auth",
+    "group"
+   ],
+   [
+    4,
+    "auth",
+    "user"
+   ],
+   [
+    5,
+    "widgets",
+    "widget"
+   ]
+  ]
+ },
+ "events": [
+  {
+   "op": "begin",
+   "count": 15
+  },
+  {
+   "op": "append",
+   "sql": "CREATE TABLE \"widgets_gadget\" (\"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \"label\" varchar(100) NOT NULL)",
+   "args": []
+  },
+  {
+   "op": "bookkeeping",
+   "sql": "INSERT INTO \"django_migrations\" (\"app\", \"name\", \"applied\") VALUES (?, ?, ?) RETURNING \"django_migrations\".\"id\"",
+   "args": [
+    "widgets",
+    "0002_gadget",
+    "2026-11-08 07:13:34.656383"
+   ],
+   "count": 16
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?), QUOTE(?), QUOTE(?)",
+   "args": [
+    "widgets",
+    "0002_gadget",
+    "2026-11-08 07:13:34.656383"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "PRAGMA foreign_key_check",
+   "args": []
+  },
+  {
+   "op": "commit",
+   "count": 16
+  },
+  {
+   "op": "append",
+   "sql": "PRAGMA foreign_keys = ON",
+   "args": []
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"django_migrations\".\"id\", \"django_migrations\".\"app\", \"django_migrations\".\"name\", \"django_migrations\".\"applied\" FROM \"django_migrations\"",
+   "args": []
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"django_content_type\".\"id\", \"django_content_type\".\"app_label\", \"django_content_type\".\"model\" FROM \"django_content_type\" WHERE \"django_content_type\".\"app_label\" = ?",
+   "args": [
+    "contenttypes"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?)",
+   "args": [
+    "contenttypes"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"django_content_type\".\"id\", \"django_content_type\".\"app_label\", \"django_content_type\".\"model\" FROM \"django_content_type\" WHERE \"django_content_type\".\"app_label\" = ?",
+   "args": [
+    "contenttypes"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?)",
+   "args": [
+    "contenttypes"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"django_content_type\".\"id\", \"django_content_type\".\"app_label\", \"django_content_type\".\"model\" FROM \"django_content_type\" WHERE (\"django_content_type\".\"app_label\" = ? AND \"django_content_type\".\"model\" = ?) LIMIT 21",
+   "args": [
+    "contenttypes",
+    "contenttype"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?), QUOTE(?)",
+   "args": [
+    "contenttypes",
+    "contenttype"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"auth_permission\".\"content_type_id\", \"auth_permission\".\"codename\" FROM \"auth_permission\" INNER JOIN \"django_content_type\" ON (\"auth_permission\".\"content_type_id\" = \"django_content_type\".\"id\") WHERE \"auth_permission\".\"content_type_id\" IN (?) ORDER BY \"django_content_type\".\"app_label\" ASC, \"django_content_type\".\"model\" ASC, \"auth_permission\".\"codename\" ASC",
+   "args": [
+    1
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?)",
+   "args": [
+    1
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"django_content_type\".\"id\", \"django_content_type\".\"app_label\", \"django_content_type\".\"model\" FROM \"django_content_type\" WHERE \"django_content_type\".\"app_label\" = ?",
+   "args": [
+    "auth"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?)",
+   "args": [
+    "auth"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"django_content_type\".\"id\", \"django_content_type\".\"app_label\", \"django_content_type\".\"model\" FROM \"django_content_type\" WHERE \"django_content_type\".\"app_label\" = ?",
+   "args": [
+    "auth"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?)",
+   "args": [
+    "auth"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"django_content_type\".\"id\", \"django_content_type\".\"app_label\", \"django_content_type\".\"model\" FROM \"django_content_type\" WHERE (\"django_content_type\".\"app_label\" = ? AND \"django_content_type\".\"model\" = ?) LIMIT 21",
+   "args": [
+    "auth",
+    "permission"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?), QUOTE(?)",
+   "args": [
+    "auth",
+    "permission"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"django_content_type\".\"id\", \"django_content_type\".\"app_label\", \"django_content_type\".\"model\" FROM \"django_content_type\" WHERE (\"django_content_type\".\"app_label\" = ? AND \"django_content_type\".\"model\" = ?) LIMIT 21",
+   "args": [
+    "auth",
+    "group"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?), QUOTE(?)",
+   "args": [
+    "auth",
+    "group"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"django_content_type\".\"id\", \"django_content_type\".\"app_label\", \"django_content_type\".\"model\" FROM \"django_content_type\" WHERE (\"django_content_type\".\"app_label\" = ? AND \"django_content_type\".\"model\" = ?) LIMIT 21",
+   "args": [
+    "auth",
+    "user"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?), QUOTE(?)",
+   "args": [
+    "auth",
+    "user"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"auth_permission\".\"content_type_id\", \"auth_permission\".\"codename\" FROM \"auth_permission\" INNER JOIN \"django_content_type\" ON (\"auth_permission\".\"content_type_id\" = \"django_content_type\".\"id\") WHERE \"auth_permission\".\"content_type_id\" IN (?, ?, ?) ORDER BY \"django_content_type\".\"app_label\" ASC, \"django_content_type\".\"model\" ASC, \"auth_permission\".\"codename\" ASC",
+   "args": [
+    2,
+    3,
+    4
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?), QUOTE(?), QUOTE(?)",
+   "args": [
+    2,
+    3,
+    4
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"django_content_type\".\"id\", \"django_content_type\".\"app_label\", \"django_content_type\".\"model\" FROM \"django_content_type\" WHERE \"django_content_type\".\"app_label\" = ?",
+   "args": [
+    "widgets"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?)",
+   "args": [
+    "widgets"
+   ]
+  },
+  {
+   "op": "begin",
+   "count": 16
+  },
+  {
+   "op": "append",
+   "sql": "INSERT INTO \"django_content_type\" (\"app_label\", \"model\") VALUES (?, ?) RETURNING \"django_content_type\".\"id\"",
+   "args": [
+    "widgets",
+    "gadget"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?), QUOTE(?)",
+   "args": [
+    "widgets",
+    "gadget"
+   ]
+  },
+  {
+   "op": "commit",
+   "count": 16
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"django_content_type\".\"id\", \"django_content_type\".\"app_label\", \"django_content_type\".\"model\" FROM \"django_content_type\" WHERE \"django_content_type\".\"app_label\" = ?",
+   "args": [
+    "widgets"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?)",
+   "args": [
+    "widgets"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"django_content_type\".\"id\", \"django_content_type\".\"app_label\", \"django_content_type\".\"model\" FROM \"django_content_type\" WHERE (\"django_content_type\".\"app_label\" = ? AND \"django_content_type\".\"model\" = ?) LIMIT 21",
+   "args": [
+    "widgets",
+    "widget"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?), QUOTE(?)",
+   "args": [
+    "widgets",
+    "widget"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"django_content_type\".\"id\", \"django_content_type\".\"app_label\", \"django_content_type\".\"model\" FROM \"django_content_type\" WHERE (\"django_content_type\".\"app_label\" = ? AND \"django_content_type\".\"model\" = ?) LIMIT 21",
+   "args": [
+    "widgets",
+    "gadget"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?), QUOTE(?)",
+   "args": [
+    "widgets",
+    "gadget"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT \"auth_permission\".\"content_type_id\", \"auth_permission\".\"codename\" FROM \"auth_permission\" INNER JOIN \"django_content_type\" ON (\"auth_permission\".\"content_type_id\" = \"django_content_type\".\"id\") WHERE \"auth_permission\".\"content_type_id\" IN (?, ?) ORDER BY \"django_content_type\".\"app_label\" ASC, \"django_content_type\".\"model\" ASC, \"auth_permission\".\"codename\" ASC",
+   "args": [
+    5,
+    6
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?), QUOTE(?)",
+   "args": [
+    5,
+    6
+   ]
+  },
+  {
+   "op": "begin",
+   "count": 16
+  },
+  {
+   "op": "append",
+   "sql": "INSERT INTO \"auth_permission\" (\"name\", \"content_type_id\", \"codename\") VALUES (?, ?, ?), (?, ?, ?), (?, ?, ?), (?, ?, ?) RETURNING \"auth_permission\".\"id\"",
+   "args": [
+    "Can add gadget",
+    6,
+    "add_gadget",
+    "Can change gadget",
+    6,
+    "change_gadget",
+    "Can delete gadget",
+    6,
+    "delete_gadget",
+    "Can view gadget",
+    6,
+    "view_gadget"
+   ]
+  },
+  {
+   "op": "append",
+   "sql": "SELECT QUOTE(?), QUOTE(?), QUOTE(?), QUOTE(?), QUOTE(?), QUOTE(?), QUOTE(?), QUOTE(?), QUOTE(?), QUOTE(?), QUOTE(?), QUOTE(?)",
+   "args": [
+    "Can add gadget",
+    6,
+    "add_gadget",
+    "Can change gadget",
+    6,
+    "change_gadget",
+    "Can delete gadget",
+    6,
+    "delete_gadget",
+    "Can view gadget",
+    6,
+    "view_gadget"
+   ]
+  },
+  {
+   "op": "commit",
+   "count": 16
+  }
+ ]
+}

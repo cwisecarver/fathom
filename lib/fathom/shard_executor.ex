@@ -16,6 +16,7 @@ defmodule Fathom.ShardExecutor do
 
   alias Fathom.HranaAuth
   alias Fathom.Migrator.Capture
+  alias Fathom.Migrator.PostMigrate
   alias Fathom.Shard
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.QuorumFence
@@ -1857,7 +1858,13 @@ defmodule Fathom.ShardExecutor do
         if Capture.bookkeeping?(sql) do
           Capture.bookkeeping(conn, sql, args, migrations_count(conn))
         else
-          Capture.append(conn, sql, args)
+          # Django's `post_migrate` writes (content types / permissions) carry the TEMPLATE's literal
+          # `content_type_id`; resolve them to natural keys NOW, on the template connection, so the
+          # buffer holds replay-safe idempotent statements (`Fathom.Migrator.PostMigrate`). Every
+          # other statement is `[{sql, args}]` unchanged. Template stream only: `capture/4` never
+          # reaches here for a tenant.
+          for {s, a} <- PostMigrate.capture_pairs(sql, args, &content_type_keys(conn, &1)),
+              do: Capture.append(conn, s, a)
         end
     end
 
@@ -1896,6 +1903,19 @@ defmodule Fathom.ShardExecutor do
     case Connection.query(conn, "SELECT count(*) FROM django_migrations", [], deadline: true) do
       {:ok, %{rows: [[n]]}} -> n
       _ -> 0
+    end
+  end
+
+  # `%{id => {app_label, model}}` for the given `django_content_type` ids, read on the TEMPLATE
+  # connection (its own table is the source of truth for the ids it just bound). Ids it cannot find
+  # are simply absent, which `PostMigrate.capture_pairs/3` treats as "do not rewrite".
+  defp content_type_keys(conn, ids) do
+    case Connection.query(conn, PostMigrate.lookup_sql(ids), ids, deadline: true) do
+      {:ok, %{rows: rows}} ->
+        Map.new(rows, fn [id, app_label, model] -> {id, {app_label, model}} end)
+
+      _ ->
+        %{}
     end
   end
 

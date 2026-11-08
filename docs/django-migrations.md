@@ -257,33 +257,45 @@ version will need a transform *before* the fleet freezes. Wire it into CI ahead 
 If you genuinely need a non-atomic migration, it is out of band: apply it to every shard yourself
 and reconcile the directory, rather than routing it through capture.
 
-## Known gap (confirmed live 2026-11-08): Django's `post_migrate` rows are not replayed
+## `post_migrate` rows (content types, permissions) are replayed with the version they follow
 
 `manage.py migrate` ends by emitting `post_migrate`, and `django.contrib.auth` / `contenttypes`
 answer it by inserting `django_content_type` and `auth_permission` rows for the models that exist
 (`bulk_create`, each in its own `BEGIN … COMMIT` on the template stream, after the migration's own
-transaction). Capture records DDL and the `django_migrations` row; **those framework rows are never
-recorded as a version and so are never replayed.** Observed with a real `manage.py migrate` through a
-local fathom node (Django 5.0.6, django-libsql 0.1.3): adding a model migration, migrating the
-template, and rolling it out to a tenant created before gave that tenant the new table but **no**
-`django_content_type` row and **none** of the model's four `auth_permission` rows (5 content types /
-20 permissions vs. 6 / 24), while a tenant forked from `template@HEAD` had all of them and matched the
-template exactly. Symptom: `has_perm('app.add_newmodel')` / admin / DRF `DjangoModelPermissions` fail
-for non-superusers on rollout-migrated tenants only.
+transaction). **Fathom captures them** (expert review 2026-11-07 #53, confirmed live 2026-11-08 and
+fixed 2026-11-08): the capture hook rewrites each `auth_permission.content_type_id` — the template's own
+literal id — back to `(app_label, model)` and records natural-key, idempotent SQL
+(`INSERT … SELECT … WHERE NOT EXISTS`), appended to **the version the `migrate` run produced** (not a
+version of its own, so `PRAGMA user_version`, `shards.schema_version` and `count(django_migrations)`
+keep agreeing). A tenant migrated by rollout therefore ends with the same content types and
+permissions as one forked from `template@HEAD` — verified live (6 / 24 on both; before: 5 / 20 on the
+rollout-migrated tenant) — even when its `django_content_type` ids differ from the template's.
 
-**Remedy today:** run `manage.py migrate` against each affected tenant. It prints `No migrations to
-apply.`, but its `post_migrate` creates the missing rows (confirmed: the tenant was row-identical to
-the fork-born one afterwards). It is a per-tenant Django run — a loop over the fleet.
+Limits to know:
 
-**Alarm noise to expect:** on a template project that has `auth`/`contenttypes`, every `migrate` that
-adds a model logs `capture: a new BEGIN … superseded … statement(s) still AWAITING their
-django_migrations bookkeeping row` (5 times on a fresh migrate) and emits
-`[:fathom, :migrator, :capture_awaiting_dropped]`. That is these post_migrate transactions, not a
-lost migration — but the same message is what the real "bookkeeping row never arrived" hazard
-produces, so check `Migrator.head()` / `django_migrations` before dismissing it. Whether to fix this
-(capture the post_migrate transactions as an idempotent natural-key version) or accept it is the
-maintainer's decision, parked with the recommended shape in `docs/component-notes.md` (expert review
-2026-11-07 #53).
+- **The rows are attached while the version is still un-rolled-out.** `post_migrate` runs
+  moments after the migration's `COMMIT`; if a tenant (lazy migrate on touch, a reconcile sweep)
+  crosses the version in that window, or a rollout is already running, the append is refused. Fathom
+  logs `capture: N Django post_migrate statement(s) … could NOT be attached` and emits
+  `[:fathom, :migrator, :post_migrate_unattached]`. Tenants that already crossed the version lack the
+  rows and are **not** healed automatically. **Remedy:** run `manage.py migrate` against each affected
+  tenant. It prints `No migrations to apply.`, but its `post_migrate` inserts the missing rows. The same
+  event fires if a `migrate` that applies no migration still inserts rows (e.g. a model added without a
+  migration).
+- **Only Django 5.0's exact INSERT shapes** (`INSERT INTO "django_content_type" ("app_label", "model")
+  VALUES …`, `INSERT INTO "auth_permission" ("name", "content_type_id", "codename") VALUES …`, with or
+  without `RETURNING`) are rewritten. Anything else — a custom `post_migrate` handler, a content type id
+  the template cannot resolve — is captured raw, parked as awaiting-bookkeeping, and alarms
+  (`capture: a new BEGIN … superseded … AWAITING …`). That alarm now means what it says: it no longer
+  fires for the framework's own post_migrate transactions.
+- **A revert** of the version is still a pointer flip back to the retained pre-migration object, which
+  has no such rows; re-rolling the version afterwards converges (the statements are idempotent). Rows
+  the `post_migrate` added on the template itself stay there until you walk the template back.
+- On a brand-new template the very first statement of the first `migrate` (Django's recorder creating
+  `django_migrations` in its own transaction) still logs one `superseded … AWAITING` warning: that is a
+  genuinely superseded `CREATE TABLE`, intentionally not captured, and unrelated to post_migrate.
+- Other `post_migrate` handlers (your own signal receivers, `django.contrib.sites`' default
+  `Site`, …) are not covered; they replay only if you author them as migrations.
 
 ## 4. Revert — if a migration is bad
 

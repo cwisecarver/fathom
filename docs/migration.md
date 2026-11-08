@@ -128,6 +128,40 @@ transaction is still a no-op. Before this, such a migration read as a no-op: the
 recorded and the template silently advanced past the fleet **with no alarm** — the fork this whole
 section exists to prevent, reached through an ordinary migration rather than an `atomic = False` one.
 
+### Django's `post_migrate` rows ride with the version they follow
+
+`manage.py migrate` finishes by emitting `post_migrate`, and `django.contrib.contenttypes` / `auth`
+answer with one `BEGIN … COMMIT` per `bulk_create`: the new model's `django_content_type` row, then
+its `auth_permission` rows. They land **after** the last migration's version was recorded and never
+raise the `django_migrations` count, so the count-rise boundary never saw them (expert review #53:
+a rollout-migrated tenant lacked the new model's content type and permissions, 5/20 vs 6/24 for a
+fork from `template@HEAD`), and each parked as awaiting-bookkeeping DDL, tripping the "superseded …
+AWAITING" alarm on every `migrate`.
+
+Capture now handles them in three steps (`Fathom.Migrator.PostMigrate`):
+
+1. **Rewrite at capture time.** The executor's hook resolves each `content_type_id` Django bound (the
+   TEMPLATE's literal id) back to `(app_label, model)` on the template connection, and buffers
+   natural-key idempotent statements instead (`INSERT … SELECT … WHERE NOT EXISTS`, one per row). A
+   tenant's ids may differ from the template's; a verbatim replay would attach permissions to the
+   wrong content type. Only the two exact Django 5.0 INSERT shapes are recognized; anything else, or
+   an id the template cannot resolve, stays RAW and fails loud (parks, alarms, is flagged by the lint).
+2. **Attach, never mint.** A no-rise transaction whose only writes are those rewritten statements is
+   **appended to the newest version** (`Migrator.attach_post_migrate/2`), not recorded as its own.
+   A version with no `django_migrations` row would break the count invariant (the gap check, the ledger's
+   expected count) and leave `PRAGMA user_version` / `shards.schema_version` one ahead of Django's
+   ledger on every tenant.
+3. **Same gate as a transform attach.** The append takes the release row `FOR UPDATE` and is refused
+   if any non-template shard is already at or above the version, or migrating onto it
+   (`attach_transform/2`'s protocol). A refusal alarms (`[:fathom, :migrator, :post_migrate_unattached]`
+   + an error log): tenants that crossed the version before the rows arrived are **not** healed
+   automatically — run `manage.py migrate` against them. If the version is still queued behind a
+   control-plane outage, the rows join the queued capture instead.
+
+The lint (`data_migration_statements/1`) accepts exactly the two rewritten texts. A revert of the
+version stays a pointer flip (the retained pre-migration object has no such rows); re-rolling it is
+idempotent.
+
 ### Uncaptured template moves are detected (backwards + non-atomic)
 
 Capture's boundary detection is "the template's `django_migrations` count rose inside a tracked

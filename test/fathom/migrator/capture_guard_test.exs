@@ -84,4 +84,42 @@ defmodule Fathom.Migrator.CaptureGuardTest do
     refute_receive {:pending_on_shutdown, _}, 100
     refute log =~ "NOT yet recorded"
   end
+
+  # Expert review 2026-11-07 #53: a Django `post_migrate` transaction that arrives while the version
+  # it follows is still QUEUED behind a control-plane outage must ride with that queued capture —
+  # there is no recorded release to amend yet, and dropping it would lose the rows for good.
+  test "a post_migrate transaction attaches to the capture still pending a Postgres write" do
+    {_name, cap} = capture_with_one_pending!()
+
+    {sql, args} =
+      hd(
+        Fathom.Migrator.PostMigrate.capture_pairs(
+          ~s|INSERT INTO "django_content_type" ("app_label", "model") VALUES (?, ?) RETURNING "django_content_type"."id"|,
+          ["widgets", "gadget"],
+          fn _ -> flunk("a content-type INSERT needs no lookup") end
+        )
+      )
+
+    conn = make_ref()
+    Capture.begin(conn, 1, cap)
+    Capture.append(conn, sql, args, cap)
+    assert {:attached, :pending} = Capture.commit(conn, 1, cap)
+    assert Capture.pending_count(cap) == 1
+
+    # The control plane comes back: the retry records ONE version carrying the migration AND the rows.
+    Ecto.Adapters.SQL.Sandbox.allow(Fathom.Repo, self(), cap)
+    send(cap, :retry_pending)
+    assert Capture.pending_count(cap) == 0
+
+    version = Fathom.Migrator.head()
+
+    assert Fathom.Migrator.statements(version) == [
+             "CREATE TABLE t (v TEXT)",
+             "INSERT INTO django_migrations (app, name) VALUES ('app', '0001')",
+             sql
+           ]
+
+    assert [{pairs, nil}] = Map.values(Fathom.Migrator.statement_steps([version]))
+    assert List.last(pairs) == {sql, args}
+  end
 end

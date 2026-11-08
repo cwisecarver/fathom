@@ -1005,6 +1005,17 @@ defmodule Fathom.Telemetry do
           "Capture DDL buffers dropped by a new BEGIN while still awaiting their django_migrations bookkeeping row — a version was NOT recorded (template schema forking from fleet)"
       ),
 
+      # Django `post_migrate` rows (content types / permissions) landed on the template but could not
+      # be attached to the version they follow (expert review 2026-11-07 #53): a tenant had already
+      # crossed that version, or the registry holds nothing at the template's count. Those tenants
+      # lack the new model's content type and permissions until `manage.py migrate` is run against
+      # them. Untagged on purpose: the refusal reason is an arbitrary term (the log line has it).
+      counter("fathom.migrator.post_migrate_unattached.count",
+        event_name: [:fathom, :migrator, :post_migrate_unattached],
+        description:
+          "Django post_migrate transactions that could not be attached to their version — tenants that already crossed it lack the new model's content type/permissions"
+      ),
+
       # --- The rest of the emitted-but-unexported sweep (2026-08-06) --------------------------
       # `fork_fallback` above was not a one-off. A diff of every `:telemetry.execute` in lib/
       # against this list found 13 events that emitted into the void — no metric, no Prometheus

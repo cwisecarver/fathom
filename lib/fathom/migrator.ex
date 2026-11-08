@@ -507,6 +507,76 @@ defmodule Fathom.Migrator do
     end
   end
 
+  @doc """
+  Appends Django's rewritten `post_migrate` statements (`Fathom.Migrator.PostMigrate`) to the
+  NEWEST released version, which must be the one they follow — recorded at the template's current
+  `count` and not yanked (expert review 2026-11-07 #53).
+
+  **Why attached and not a version of their own.** Versions are minted only when the template's
+  `django_migrations` count rises, and the outside-capture gap check compares each version's starting
+  count with the last recorded count. A post_migrate "version" adds no count, so it would break that
+  invariant and put `PRAGMA user_version` / `shards.schema_version` one AHEAD of Django's ledger on
+  every tenant. The rows belong to the migration whose `migrate` run emitted them, so they ride in
+  that version's statements, after its `django_migrations` bookkeeping row.
+
+  **Why this is safe, and exactly when it is refused.** It is the `attach_transform/2` protocol: the
+  release row is locked `FOR UPDATE`, then refused if any non-template shard already sits at or above
+  the version (`refuse_if_rolled_out/1`) or is mid-copy toward it (`refuse_if_migrating_below/1`).
+  A shard's replay chain is read under `FOR SHARE` after it is marked migrating (`statement_steps/1`),
+  so every shard sees the version either entirely before or entirely after the append. A refusal means
+  some tenants have already crossed the version WITHOUT these rows; they are not healed automatically
+  (see the caller's alarm and `docs/django-migrations.md`). Rows are natural-key idempotent, so a
+  tenant that does receive them twice (e.g. a later re-run) is unaffected.
+
+  A revert of the version stays a pointer flip: the statements are only ever replayed forward, and
+  the revert restores the retained pre-migration object. The rows are then simply absent from that
+  object; on a tenant that had applied the version they are left behind in the reverted-away copy
+  only.
+  """
+  @spec attach_post_migrate(non_neg_integer(), [{String.t(), [term()]}]) ::
+          {:ok, pos_integer()} | {:error, term()}
+  def attach_post_migrate(_count, []), do: {:error, :nothing_to_attach}
+
+  def attach_post_migrate(count, pairs) when is_list(pairs) do
+    statements = Enum.map(pairs, &elem(&1, 0))
+    args = encode_args(Enum.map(pairs, &elem(&1, 1)))
+
+    Repo.transaction(fn ->
+      with {:ok, release} <- fetch_post_migrate_target(count),
+           :ok <- refuse_if_rolled_out(release.version),
+           :ok <- refuse_if_migrating_below(release.version) do
+        # `statement_args` is nil only on a hand-authored release; pad it so the parallel lists stay
+        # the same length (the changeset's own invariant) rather than misalign values.
+        existing =
+          release.statement_args || Enum.map(release.statements, fn _ -> %{"args" => []} end)
+
+        {:ok, updated} =
+          release
+          |> Ecto.Changeset.change(
+            statements: release.statements ++ statements,
+            statement_args: existing ++ args
+          )
+          |> Repo.update()
+
+        updated.version
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
+  # The release a post_migrate follows: the NEWEST one (by version, yanked or not), locked, whose
+  # recorded count is the template's current `count`. Anything else means the rows follow something
+  # this registry never recorded (a gap, a yank with no walk-back, a no-op `migrate`).
+  defp fetch_post_migrate_target(count) do
+    case Repo.one(from(r in Release, order_by: [desc: r.version], limit: 1, lock: "FOR UPDATE")) do
+      nil -> {:error, :no_release}
+      %{yanked: true, version: v} -> {:error, {:newest_version_yanked, v}}
+      %{template_migration_count: ^count} = release -> {:ok, release}
+      %{version: v, template_migration_count: c} -> {:error, {:count_mismatch, v, c, count}}
+    end
+  end
+
   defp fetch_appliable(version) do
     case Repo.get_by(Release, version: version) do
       nil -> nil

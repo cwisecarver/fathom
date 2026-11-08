@@ -34,12 +34,22 @@ defmodule Fathom.Migrator.Capture do
   An awaiting buffer that never gets confirmed is dropped on the next `BEGIN` or on stream close, so
   a genuinely empty transaction is still a no-op. Without this the migration read as a no-op, the
   version was never recorded, and the template silently advanced past the fleet with no alarm.
+
+  **Django's `post_migrate` rows are attached, not versioned** (expert review 2026-11-07 #53).
+  `manage.py migrate` ends with one `BEGIN … COMMIT` per `bulk_create` of content types and
+  permissions, AFTER the last migration's version was recorded, none of which raises the count. The
+  executor's hook rewrites them to natural-key idempotent SQL (`Fathom.Migrator.PostMigrate`); a
+  no-rise transaction made only of those is APPENDED to the version it follows
+  (`Migrator.attach_post_migrate/2`) instead of being parked as awaiting-bookkeeping DDL — so no
+  false "AWAITING" alarm, and no version without a `django_migrations` row (which would put
+  `user_version` / `schema_version` ahead of Django's ledger and trip the gap check).
   """
   use GenServer
 
   require Logger
 
   alias Fathom.Migrator
+  alias Fathom.Migrator.PostMigrate
 
   # NOT a string, despite the name. `conn_id` is the exqlite connection HANDLE that
   # `Fathom.Shard.Connection.open/2` returns (`{:ok, reference()}`), used here purely as a map key
@@ -78,10 +88,16 @@ defmodule Fathom.Migrator.Capture do
   SQL as the next version. Returns `{:recorded, version}`, `:noop`, or `{:error, _}`.
 
   A commit whose count did NOT rise keeps its buffer *awaiting bookkeeping* rather than
-  discarding it — see `bookkeeping/4`.
+  discarding it — see `bookkeeping/4`. The exception is a Django `post_migrate` transaction (only
+  the content-type / permission INSERTs `Fathom.Migrator.PostMigrate` rewrites): it is not a
+  migration, so it is ATTACHED to the version it follows and returns `{:attached, version}`
+  (`{:attached, :pending}` when that version is still queued behind a control-plane outage).
   """
   @spec commit(conn_id(), non_neg_integer(), GenServer.server()) ::
-          {:recorded, pos_integer()} | :noop | {:error, term()}
+          {:recorded, pos_integer()}
+          | {:attached, pos_integer() | :pending}
+          | :noop
+          | {:error, term()}
   def commit(conn_id, migrations_count, server \\ __MODULE__),
     do: GenServer.call(server, {:commit, conn_id, migrations_count})
 
@@ -231,6 +247,17 @@ defmodule Fathom.Migrator.Capture do
             alarm_backwards(before, count)
             {:reply, :noop, state}
 
+          # A no-count-rise transaction whose ONLY writes are Django's post_migrate content-type /
+          # permission INSERTs (already rewritten to natural-key idempotent SQL by the executor's
+          # hook, `Fathom.Migrator.PostMigrate`). It is NOT a migration and NOT superseded DDL: it
+          # follows the version it belongs to, so it is ATTACHED to that version (never minted as
+          # its own — a version without a django_migrations rise would break the count invariant
+          # and put `user_version` / `schema_version` ahead of Django's ledger). See
+          # `attach_post_migrate/3`. Checked before the awaiting branch so it never parks, never
+          # gets superseded, and never raises the "AWAITING bookkeeping" alarm (#53).
+          count == before and post_migrate_only?(buffer) ->
+            attach_post_migrate(state, Enum.reverse(buffer), count)
+
           # The count did NOT rise, but we buffered DDL. Django's SQLite backend commits the DDL
           # BEFORE writing the `django_migrations` row whenever it has to disable FK checks, so this
           # is not necessarily a no-op transaction — the bookkeeping row may be one statement away.
@@ -344,6 +371,99 @@ defmodule Fathom.Migrator.Capture do
         {:reply, {:pending, :queued_behind_earlier_capture},
          stash_pending(state, statements, count, before)}
     end
+  end
+
+  # Whether a buffer's writes are ONLY the rewritten post_migrate INSERTs (see `PostMigrate`):
+  # at least one, and nothing else once Django's introspection reads are set aside. Exact-text
+  # (`PostMigrate.rewritten?/1`), so a RAW `INSERT INTO django_content_type … VALUES` (an
+  # unresolvable id, an unknown column list) is NOT post_migrate and still parks / alarms.
+  defp post_migrate_only?(buffer) do
+    case Enum.reject(buffer, fn {sql, _args} -> pure_read?(sql) end) do
+      [] -> false
+      writes -> Enum.all?(writes, fn {sql, _args} -> PostMigrate.rewritten?(sql) end)
+    end
+  end
+
+  # Attach a post_migrate transaction to the version it FOLLOWS — the one whose recorded
+  # `template_migration_count` equals the (unchanged) current count. Two homes, in order:
+  #
+  #   1. a capture still PENDING a Postgres write (a control-plane blip) — amend that in-memory
+  #      entry, so it is recorded WITH the post_migrate rows when the retry drains;
+  #   2. the already-recorded release, via `Migrator.attach_post_migrate/2`, which refuses if any
+  #      shard has already crossed (or is migrating onto) that version.
+  #
+  # Every refusal is LOUD (`alarm_post_migrate_unattached/3`): the template now holds rows the
+  # fleet will not receive, and nothing else would say so.
+  defp attach_post_migrate(state, pairs, count) do
+    pairs = Enum.reject(pairs, fn {sql, _args} -> pure_read?(sql) end)
+
+    case Map.get(state, :pending, []) do
+      [] ->
+        case attach_to_release(count, pairs) do
+          {:ok, version} -> {:reply, {:attached, version}, state}
+          {:error, _} = error -> {:reply, error, state}
+        end
+
+      pending ->
+        case attach_to_pending(pending, pairs, count) do
+          {:ok, pending} ->
+            {:reply, {:attached, :pending}, Map.put(state, :pending, pending)}
+
+          :error ->
+            alarm_post_migrate_unattached(count, pairs, :no_pending_capture_for_count)
+            {:reply, {:error, :no_pending_capture_for_count}, state}
+        end
+    end
+  end
+
+  defp attach_to_release(count, pairs) do
+    case Migrator.attach_post_migrate(count, pairs) do
+      {:ok, _version} = ok ->
+        ok
+
+      {:error, reason} = error ->
+        alarm_post_migrate_unattached(count, pairs, reason)
+        error
+    end
+  rescue
+    e ->
+      alarm_post_migrate_unattached(count, pairs, Exception.message(e))
+      {:error, e}
+  catch
+    :exit, reason ->
+      alarm_post_migrate_unattached(count, pairs, {:exit, reason})
+      {:error, {:exit, reason}}
+  end
+
+  # The LAST pending capture recorded at `count` (the version the post_migrate follows).
+  defp attach_to_pending(pending, pairs, count) do
+    case Enum.find_index(Enum.reverse(pending), fn {_stmts, c, _before} -> c == count end) do
+      nil ->
+        :error
+
+      rev_idx ->
+        idx = length(pending) - 1 - rev_idx
+
+        {:ok,
+         List.update_at(pending, idx, fn {stmts, c, before} -> {stmts ++ pairs, c, before} end)}
+    end
+  end
+
+  defp alarm_post_migrate_unattached(count, pairs, reason) do
+    Logger.error(
+      "capture: #{length(pairs)} Django post_migrate statement(s) (content types / permissions) " <>
+        "landed on the template at django_migrations count #{count} but could NOT be attached to " <>
+        "the version they follow (#{inspect(reason)}). The fleet will not receive these rows: " <>
+        "tenants that already crossed that version lack the new model's content type and " <>
+        "permissions. Run `manage.py migrate` against each affected tenant (it prints \"No " <>
+        "migrations to apply\" but its post_migrate creates the rows). See docs/django-migrations.md."
+    )
+
+    :telemetry.execute(
+      [:fathom, :migrator, :post_migrate_unattached],
+      %{count: length(pairs)},
+      %{template_count: count, reason: reason}
+    )
   end
 
   # Record pending captures IN ORDER, stopping at the first failure — each release
@@ -561,6 +681,16 @@ defmodule Fathom.Migrator.Capture do
         # Django's own bookkeeping — exempt by its TARGET TABLE, not because the text mentions
         # `django_migrations` anywhere (a trailing `-- django_migrations` used to exempt any DML).
         targets_django_migrations?(head) ->
+          false
+
+        # Django's post_migrate rows, REWRITTEN by `Fathom.Migrator.PostMigrate` to natural-key
+        # idempotent SQL (expert review 2026-11-07 #53): exactly these two statement texts and nothing
+        # broader. They carry no template value that replays as an id — the content type is resolved
+        # on the TENANT by (app_label, model). Exact-text on purpose: the `shard_local_row_copy?/2`
+        # heuristic below happens to admit them too (a `SELECT … FROM` with no VALUES), but a pin
+        # that depends on a heuristic's blind spot is not a pin. The RAW `INSERT … VALUES` form (an
+        # unresolvable id) is not exempt and is still flagged.
+        PostMigrate.rewritten?(sql) ->
           false
 
         # `WITH … INSERT/UPDATE/DELETE` is valid SQLite DML that no `@dml_leads` prefix matches.
