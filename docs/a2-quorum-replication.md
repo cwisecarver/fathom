@@ -406,7 +406,7 @@ with its first commit. Under NORMAL that directory sync waits for the first chec
 replication Session does not fsync the directory itself. (Until 2026-11-07 this said "Erlang cannot
 fsync a directory"; that was wrong — `Fathom.FS.sync_dir/1` does it with the `:directory` open mode,
 expert review 2026-11-07 #27. Having the Session call it once per new WAL is now possible and was
-not built: a decision for the maintainers, see `docs/component-notes.md` § Shard storage.) On ext4
+not built: decided 2026-11-08 to leave it and keep the ext4/xfs requirement, see `docs/component-notes.md` § Shard storage.) On ext4
 and xfs, an `fdatasync` that
 grows a newly created file forces the journal commit that also carries its directory entry, so the
 round's sync covers the name in practice. That is filesystem behaviour, not POSIX; on another

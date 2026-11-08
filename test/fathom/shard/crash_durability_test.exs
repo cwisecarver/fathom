@@ -319,12 +319,13 @@ defmodule Fathom.Shard.CrashDurabilityTest do
       assert Path.wildcard(Path.join(remote, id <> ".lock.tmp.*")) == []
     end
 
-    # PARKED, pinned so it is not mistaken for fixed: `atomic_create/2` does not fsync (it took the
-    # Local double's cold_open_p50_us +39 %, docs/component-notes.md review #27/#83). A POWER loss
-    # that keeps the link but loses the temp's data therefore still leaves a zero-filled lock. When
-    # the fsync is shipped, flip this to `assert :ok = Local.check_lease(id, lease)` and add the
-    # `skip: [:sync_file]` bite test.
-    test "KNOWN GAP (parked): a power loss after acquire can leave a zero-filled lock",
+    # ACCEPTED GAP (decided 2026-11-08), pinned so it is not mistaken for fixed: `atomic_create/2`
+    # does not fsync (it took the Local double's cold_open_p50_us +39 %, docs/component-notes.md
+    # review #27/#83). A POWER loss that keeps the link but loses the temp's data therefore still
+    # leaves a zero-filled lock, which fails closed (`:corrupt_lock`) and `mix fathom.lock.repair`
+    # fixes; Local is not the prod store. If the fsync is ever shipped, flip this to
+    # `assert :ok = Local.check_lease(id, lease)` and add the `skip: [:sync_file]` bite test.
+    test "accepted gap: a power loss after acquire can leave a zero-filled lock",
          %{remote: remote, id: id} do
       crash = CrashFS.start!(remote)
 
