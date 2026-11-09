@@ -188,7 +188,7 @@ defmodule Fathom.MixProject do
 
   defp filo_dep do
     case System.get_env("FILO_PATH") do
-      nil -> "~> 0.4.3"
+      nil -> "~> 0.4.4"
       path -> [path: path, override: true]
     end
   end
