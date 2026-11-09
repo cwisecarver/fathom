@@ -1,11 +1,17 @@
 # syntax=docker/dockerfile:1
 # Fathom prod-release image for the chaos rig (deploy/chaos).
 #
-# BUILD CONTEXT IS THE PARENT OF BOTH REPOS (e.g. ~/NotWork), because fathom
-# depends on filo as a path dep ({:filo, path: "../filo"}) and both trees must
-# be inside the context. docker-compose.yml sets `context: ../../..` +
-# `dockerfile: fathom/deploy/chaos/Dockerfile`; Dockerfile.dockerignore next to
-# this file whitelists only fathom/ and filo/ (BuildKit per-Dockerfile ignore).
+# BUILD CONTEXT IS THE PARENT OF BOTH REPOS (e.g. ~/NotWork): fathom/ and filo/ must both be inside
+# the context so an UNRELEASED filo working tree can be built in (see FILO_PATH below).
+# docker-compose.yml sets `context: ../../..` + `dockerfile: fathom/deploy/chaos/Dockerfile`;
+# Dockerfile.dockerignore next to this file whitelists only fathom/ and filo/ (BuildKit
+# per-Dockerfile ignore).
+#
+# FILO: by default the image resolves filo from Hex (`mix.exs` `filo_dep/0`, the same as prod). To
+# build the sibling ../filo working tree instead — e.g. to run the rig on an unreleased filo fix —
+# pass `RIG_FILO_PATH=/src/filo ./chaos.sh build` (compose forwards it as the FILO_PATH build arg;
+# the tree is copied to /src/filo below). Until 2026-11-09 nothing set FILO_PATH, so the copied
+# filo tree was never used and every rig image ran Hex's filo.
 
 ARG BUILDER_IMAGE=hexpm/elixir:1.20.4-erlang-28.5.0.7-debian-bookworm-20260918-slim
 ARG RUNNER_IMAGE=debian:bookworm-slim
@@ -32,7 +38,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 ENV MIX_ENV=prod
 RUN mix local.hex --force && mix local.rebar --force
 
-# The filo path dep sits NEXT TO fathom in the context.
+# The sibling filo tree (used only when FILO_PATH=/src/filo is passed; see the header).
+ARG FILO_PATH=
+ENV FILO_PATH=$FILO_PATH
 COPY filo/ /src/filo/
 
 WORKDIR /src/fathom

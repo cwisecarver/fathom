@@ -187,8 +187,10 @@ defmodule Fathom.MixProject do
   end
 
   defp filo_dep do
+    # An empty FILO_PATH counts as unset: the chaos Dockerfile passes it through as a build ARG
+    # that is empty unless `RIG_FILO_PATH` is given, and `path: ""` would break the build.
     case System.get_env("FILO_PATH") do
-      nil -> "~> 0.4.4"
+      path when path in [nil, ""] -> "~> 0.4.4"
       path -> [path: path, override: true]
     end
   end

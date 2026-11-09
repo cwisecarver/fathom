@@ -33,7 +33,7 @@ prod auth posture, `chaos.sh tpc-sparse` drives sparse tenants with replication 
 
 ```bash
 cd deploy/chaos
-./chaos.sh build          # prod-release image (context = parent dir, for the ../filo path dep)
+./chaos.sh build          # prod-release image; filo comes from Hex (as in prod). RIG_FILO_PATH=/src/filo ./chaos.sh build builds the sibling ../filo working tree instead (unreleased filo fixes)
 ./chaos.sh up             # full stack, waits for health
 ./chaos.sh latency 30     # 30 ms each way on every node's S3 path — do this before timing
 ./chaos.sh smoke          # writes/reads a few tenants through the LB + isolation check

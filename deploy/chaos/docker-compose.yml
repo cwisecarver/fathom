@@ -378,6 +378,8 @@ services:
       # The parent of BOTH repos (fathom + the ../filo path dep), relative to this file.
       context: ../../..
       dockerfile: fathom/deploy/chaos/Dockerfile
+      args:
+        FILO_PATH: ${RIG_FILO_PATH:-}
     command: ["/app/bin/fathom", "eval", "Fathom.Release.migrate"]
     environment:
       <<: *fathom-env
