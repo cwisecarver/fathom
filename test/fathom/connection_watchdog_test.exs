@@ -581,7 +581,14 @@ defmodule Fathom.ConnectionWatchdogTest do
     # statement calling a slow `regexp` once per ~15-op row ran ~66 calls past its deadline. The UDF
     # now asks the connection's deadline BEFORE each call and fails with SQLITE_INTERRUPT, so the
     # overshoot is one call. Asserted relative to the measured cost of one call on this machine.
+    #
+    # CI 2026-11-08: one call cost 60 ms on a 2-vCPU runner (8 ms on a dev laptop, 27-60 ms under
+    # `taskpolicy -b`), and an absolute `one_us < 50_000` precondition failed the test on a machine
+    # that was merely slow. The cost of one call is a property of the machine, so it is measured on
+    # a connection with a generous deadline (a call can never be what trips it) and the 100 ms
+    # connection under test is judged against that measurement; there is no absolute upper bound.
     test "a slow regexp per row stops at the row after the deadline, not at the next progress check" do
+      calibration = backstop_conn!(60_000)
       conn = backstop_conn!(100)
 
       # `substr(.., 1 + x % 2)` makes the subject depend on the row so SQLite cannot hoist the
@@ -597,11 +604,11 @@ defmodule Fathom.ConnectionWatchdogTest do
           "WHERE regexp('[0-9A-F]*A[0-9A-F]{50}[^0-9A-F]', substr(big.s, 1 + (r.x % 2)))"
       end
 
-      # PRECONDITION: time one call (one row) — it must be slow enough that 66 of them would
-      # overshoot, and short enough to finish inside the deadline.
-      {one_us, {:ok, %{rows: [[0]]}}} = :timer.tc(fn -> query(conn, per_row.(1), []) end)
+      # PRECONDITION: time one call (one row) on the calibration connection — it must be slow
+      # enough that 66 of them would overshoot the allowance below (3 ms: 62 extra calls > 200 ms).
+      # `calibration` carries a 60 s deadline, so however slow this machine is the call completes.
+      {one_us, {:ok, %{rows: [[0]]}}} = :timer.tc(fn -> query(calibration, per_row.(1), []) end)
       assert one_us > 3_000, "one regexp call took #{one_us} us; the pattern is not slow here"
-      assert one_us < 50_000, "one regexp call took #{one_us} us; too slow for a 100 ms deadline"
 
       freezer = freeze_watchdog!(conn)
       {us, result} = :timer.tc(fn -> query(conn, per_row.(100_000), []) end)
