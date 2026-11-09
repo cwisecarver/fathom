@@ -2035,9 +2035,10 @@ defmodule Fathom.ShardExecutor do
 
   def open_error({:pull_failed, reason} = refusal)
       when reason in [:sidecar_corrupt, :no_provenance] do
-    Logger.error(
+    # Per client request while the shard stays unopenable: rate-limited per node (review #45).
+    Fathom.LogLimiter.log(:open_unrecoverable, :error, fn ->
       "cannot open shard (needs an operator, a retry will not help): #{inspect(refusal)}"
-    )
+    end)
 
     %Error{
       message: "shard needs operator repair; retrying will not help",
@@ -2063,12 +2064,14 @@ defmodule Fathom.ShardExecutor do
   # tenant -- internal terms, file paths, node names -- and the status-less error rendered as a
   # 500 anyway. The reason is logged server-side (expert review 2026-10-10 #H6).
   def open_error(reason) do
-    Logger.error("cannot open shard: #{inspect(reason)}")
+    Fathom.LogLimiter.log(:open_failed, :error, fn -> "cannot open shard: #{inspect(reason)}" end)
     %Error{message: "cannot open shard", code: "FILO_OPEN_FAILED", status: 500}
   end
 
   defp retryable_open_error(reason) do
-    Logger.warning("shard open failed (retryable): #{inspect(reason)}")
+    Fathom.LogLimiter.log(:open_retryable, :warning, fn ->
+      "shard open failed (retryable): #{inspect(reason)}"
+    end)
 
     %Error{
       message: "shard temporarily unavailable; retry",

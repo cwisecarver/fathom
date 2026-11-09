@@ -44,7 +44,13 @@ defmodule Fathom.HranaAuthColdFloorTest do
     Application.put_env(:fathom, :hrana_storage_floor_budget_ms, 200)
     Application.delete_env(:fathom, :hrana_revocation_on_error)
 
+    # `storage floor unreadable` is rate-limited per node (review #45): start from a fresh window so
+    # lines other tests spent cannot suppress the one asserted here.
+    Fathom.LogLimiter.reset(:revocation_storage_unreadable)
+
     on_exit(fn ->
+      Fathom.LogLimiter.reset(:revocation_storage_unreadable)
+
       for {k, v} <- prev do
         case v do
           {:ok, val} -> Application.put_env(:fathom, k, val)
@@ -262,6 +268,26 @@ defmodule Fathom.HranaAuthColdFloorTest do
       assert info == :unavailable
       assert us < 150_000
       assert calls(counter) == 1
+    end
+
+    # Expert review 2026-11-07 #45: during a storage outage every cooling-down hello answered at
+    # once AND logged a line, so a reconnect storm logged one line per hello. Rate-limited per node:
+    # a burst of 40 hellos logs a bounded number (the limiter admits 5 per 1 s window, two windows
+    # at most inside this burst). Pre-fix: 40 lines.
+    test "fail_closed: a burst of hellos during the cool-down logs a bounded number of lines" do
+      Application.put_env(:fathom, :hrana_revocation_on_error, :fail_closed)
+      Application.put_env(:fathom, :hrana_storage_floor_backoff_ms, 60_000)
+      shard = cold_shard(0)
+      hook_storage(shard, fn _ -> true end)
+      assert {_us, :unavailable, _log} = timed_floor_info(shard)
+
+      log =
+        capture_log(fn ->
+          for _ <- 1..40, do: assert(Revocations.floor_info(shard) == :unavailable)
+        end)
+
+      lines = log |> String.split("storage floor unreadable") |> length() |> Kernel.-(1)
+      assert lines <= 10, "#{lines} lines for 40 identical failures"
     end
 
     # Review of 9a97ec71 (2026-10-31). Symptom: a claimant whose read RAISED skipped `release/2`.

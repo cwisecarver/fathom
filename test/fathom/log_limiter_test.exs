@@ -72,4 +72,27 @@ defmodule Fathom.LogLimiterTest do
     # few lines plus one summary).
     assert length(String.split(log, "write not replicated")) - 1 <= 11
   end
+
+  test "log/4 logs the first lines of a window and names the suppressed count in the next", %{
+    key: k
+  } do
+    emit = fn now ->
+      ExUnit.CaptureLog.capture_log(fn ->
+        LogLimiter.log(k, :warning, fn -> "storm line" end,
+          limit: 2,
+          window_ms: 1_000,
+          now_ms: now
+        )
+      end)
+    end
+
+    assert emit.(10_000) =~ "storm line"
+    assert emit.(10_001) =~ "storm line"
+    # Over the limit: nothing is logged, and `message_fun` is not even run.
+    assert emit.(10_002) == ""
+    assert emit.(10_003) == ""
+
+    # The next window's first line carries the count.
+    assert emit.(11_000) =~ "storm line (2 similar lines suppressed in the previous 1000 ms)"
+  end
 end

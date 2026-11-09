@@ -3197,10 +3197,11 @@ defmodule Fathom.Shard.Replication.Follower do
         end
 
       {:error, reason} ->
-        Logger.info(
+        # Per push (per commit) while a replica stays busy: rate-limited per node (review #45).
+        Fathom.LogLimiter.log(:follower_push_busy, :info, fn ->
           "replication follower refusing a push for #{push.shard_id}: its replica is busy " <>
             "(#{inspect(reason)}); the primary re-plans on its next commit"
-        )
+        end)
 
         :telemetry.execute([:fathom, :replication, :shard_lock_busy], %{count: 1}, %{
           shard_id: push.shard_id
@@ -3211,7 +3212,10 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   rescue
     ArgumentError ->
-      Logger.warning("replication follower is shutting down; refusing #{push.shard_id}")
+      Fathom.LogLimiter.log(:follower_push_shutdown, :warning, fn ->
+        "replication follower is shutting down; refusing #{push.shard_id}"
+      end)
+
       Protocol.encode_reject(push.shard_id, :internal, 0)
   end
 
@@ -3709,10 +3713,11 @@ defmodule Fathom.Shard.Replication.Follower do
   # the alternative (hash in SeedBegin, follower answers reuse/full) breaks the seed's one-reply
   # contract the Shipper's waiter relies on. A clean drop (object = last VACUUM copy) must still seed.
   defp request_seed(name, prev, decided, push) do
-    Logger.info(
+    # Per push while a replica stays torn or unseeded: rate-limited per node (review #45).
+    Fathom.LogLimiter.log(:follower_seed_requested, :info, fn ->
       "replication follower asking for a seed of #{push.shard_id}: " <>
         if(prev.torn, do: "the replica is torn", else: "new ownership or a short reset")
-    )
+    end)
 
     put_state(name, push.shard_id, %{
       prev
@@ -4221,7 +4226,10 @@ defmodule Fathom.Shard.Replication.Follower do
         Protocol.encode_ack(push.shard_id, new_state.next_offset)
 
       {:error, reason} ->
-        Logger.error("replication write failed for #{push.shard_id}: #{inspect(reason)}")
+        Fathom.LogLimiter.log(:follower_write_failed, :error, fn ->
+          "replication write failed for #{push.shard_id}: #{inspect(reason)}"
+        end)
+
         # Report where we actually are, so the primary retries rather than assuming we advanced.
         expected = (state_of(name, push.shard_id) || %{next_offset: 0}).next_offset
         Protocol.encode_reject(push.shard_id, :internal, expected)

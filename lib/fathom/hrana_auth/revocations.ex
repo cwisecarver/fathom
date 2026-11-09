@@ -551,12 +551,19 @@ defmodule Fathom.HranaAuth.Revocations do
     {:ok, {dir_version || 0, dir_bumped}}
   rescue
     e ->
-      Logger.warning("revocation floor read failed for #{shard_id}: #{Exception.message(e)}")
+      floor_read_failed(shard_id, Exception.message(e))
       :error
   catch
     :exit, reason ->
-      Logger.warning("revocation floor read failed for #{shard_id}: #{inspect(reason)}")
+      floor_read_failed(shard_id, inspect(reason))
       :error
+  end
+
+  # One line per hello while the directory is down: rate-limited per node (review #45).
+  defp floor_read_failed(shard_id, detail) do
+    Fathom.LogLimiter.log(:revocation_floor_read_failed, :warning, fn ->
+      "revocation floor read failed for #{shard_id}: #{detail}"
+    end)
   end
 
   # `{:ok, floor}` (0 when the store holds none) or `:unreadable` — a timeout, an error status, a
@@ -621,7 +628,13 @@ defmodule Fathom.HranaAuth.Revocations do
   # a `Task.yield` timeout, and the two cannot be told apart by the caller.
   defp storage_unreadable(shard_id, dir_info) do
     floor_error(shard_id)
-    Logger.warning("revocation storage floor unreadable for #{shard_id}")
+
+    # One line per hello while storage is unreadable (the cool-down answers every later hello at
+    # once): rate-limited per node (review #45).
+    Fathom.LogLimiter.log(:revocation_storage_unreadable, :warning, fn ->
+      "revocation storage floor unreadable for #{shard_id}"
+    end)
+
     if fail_closed?(), do: :unavailable, else: dir_info
   end
 

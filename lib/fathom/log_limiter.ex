@@ -17,6 +17,8 @@ defmodule Fathom.LogLimiter do
   reported (the telemetry counter holds it).
   """
 
+  require Logger
+
   @type key :: atom()
   @type verdict :: :log | {:log, suppressed :: pos_integer()} | :suppress
 
@@ -45,6 +47,33 @@ defmodule Fathom.LogLimiter do
 
       true ->
         count(ref, limit)
+    end
+  end
+
+  @doc """
+  Logs `message_fun.()` at `level` through `check/4`: the first `:limit` lines (default 5) of each
+  `:window_ms` window (default 1 s), and the first line of the next window says how many were
+  suppressed. For lines that can fire once per client request in a failure storm (expert review
+  2026-11-07 #45). `message_fun` runs only when a line is logged. `:now_ms` is injectable for tests.
+  """
+  @spec log(key(), Logger.level(), (-> String.t()), keyword()) :: :ok
+  def log(key, level, message_fun, opts \\ []) do
+    limit = Keyword.get(opts, :limit, 5)
+    window_ms = Keyword.get(opts, :window_ms, 1_000)
+    now_ms = Keyword.get_lazy(opts, :now_ms, fn -> System.monotonic_time(:millisecond) end)
+
+    case check(key, limit, window_ms, now_ms) do
+      :log ->
+        Logger.log(level, message_fun.())
+
+      {:log, suppressed} ->
+        Logger.log(
+          level,
+          "#{message_fun.()} (#{suppressed} similar lines suppressed in the previous #{window_ms} ms)"
+        )
+
+      :suppress ->
+        :ok
     end
   end
 
