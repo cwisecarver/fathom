@@ -254,12 +254,14 @@ question before relying on `__regex` over big text columns. A `regexp` call made
 statement's deadline has passed fails with the timeout instead of starting (expert review
 2026-11-07 #34, decision 2026-11-08).
 
-The compiled-pattern cache holds **20 distinct patterns per node** (shared by all tenants,
-least-recently-used out). A normal app's handful of `__regex` patterns all stay cached; a node whose
-hot set is more than 20 distinct patterns recompiles (~1.6 ms each) on every call instead of hitting
-the cache. The cap exists because each cached pattern's matcher keeps memory the engine's budget does
-not see — ~2.6 MiB per (pattern, dirty-IO thread), 0.51 GiB worst case at the shipped
-`+SDio 10` (`FathomUnaccountedRssGrowth` alerts on growth; expert review 2026-11-07 #75).
+The compiled-pattern cache holds **64 distinct patterns per node** (shared by all tenants,
+least-recently-used out). A statement keeps its pattern — a constant or a bound parameter such as
+Django's `WHERE col REGEXP ?` — compiled for all of its rows, so a scan compiles once however many
+other patterns are in use; the cap matters between statements: a node whose hot set is more than 64
+distinct patterns recompiles (~1.6 ms each) once per statement instead of hitting the cache. The cap
+exists because each cached pattern's matcher keeps memory the engine's budget does not see — ~2.6 MiB
+per (pattern, dirty-IO thread), 1.63 GiB worst case at the shipped `+SDio 10`
+(`FathomUnaccountedRssGrowth` alerts on growth past that; expert review 2026-11-07 #75).
 
 ##### The two remaining differences, both deliberate
 

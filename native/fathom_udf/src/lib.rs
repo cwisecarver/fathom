@@ -59,6 +59,8 @@ use std::os::raw::{c_char, c_int};
 use rusqlite::functions::{Aggregate, Context, FunctionFlags};
 use rusqlite::types::{Type, Value, ValueRef};
 use rusqlite::{ffi, Connection, Error, Result};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub mod aggregates;
 pub mod auto;
@@ -146,7 +148,7 @@ fn register_common(db: &Connection) -> Result<backstop::State> {
 
     // `regexp` takes this connection's deadline: it is registered here, after the state exists, and
     // replaced together with `fathom_backstop` (see `backstop::Deadline`).
-    register_regexp(db, det, unsafe { backstop::Deadline::new(state) })?;
+    register_regexp(db, det, nondet, unsafe { backstop::Deadline::new(state) })?;
 
     // The engine half of the tenant PRAGMA gate. Registers only the set-once
     // `fathom_pragma_guard(...)` setter; the authorizer itself is installed when fathom calls it,
@@ -491,7 +493,12 @@ fn register_hashes(db: &Connection, flags: FunctionFlags) -> Result<()> {
 // regexp
 // ---------------------------------------------------------------------------------------------
 
-fn register_regexp(db: &Connection, det: FunctionFlags, deadline: backstop::Deadline) -> Result<()> {
+fn register_regexp(
+    db: &Connection,
+    det: FunctionFlags,
+    nondet: FunctionFlags,
+    deadline: backstop::Deadline,
+) -> Result<()> {
     // `X REGEXP Y` is SQLite syntax for `regexp(Y, X)` — pattern FIRST, which is also the order
     // Django registers. Getting these backwards produces a function that "works" on symmetric
     // test data and is wrong everywhere else.
@@ -501,16 +508,28 @@ fn register_regexp(db: &Connection, det: FunctionFlags, deadline: backstop::Dead
     // trailing newline (which compiled fine under the `regex` crate and quietly returned the
     // opposite answer).
     //
-    // Compiled patterns are cached inside `pyre` rather than via SQLite's auxdata: auxdata only
-    // covers a CONSTANT argument, and a Django queryset binds the pattern as a PARAMETER
-    // (`WHERE col REGEXP ?`), which would otherwise recompile per row.
+    // The compiled pattern lives at two levels. (1) SQLite AUXDATA on argument 0: SQLite keeps an
+    // auxdata value across the rows of one statement execution for any argument that is constant
+    // for that statement, and a bound PARAMETER qualifies (a Django queryset sends
+    // `WHERE col REGEXP ?`; an earlier version of this comment claimed the opposite, which
+    // measured wrong: through a loadable extension in exqlite's SQLite 3.53.4 the create closure
+    // ran once for 1000 rows with the pattern bound, once per re-execution of a reused statement,
+    // and the value was freed when the statement finished, was reset or was released mid-scan).
+    // So a statement compiles its pattern once, whatever the node-wide cache does between its
+    // rows, and nothing is pinned on an idle connection. A pattern that is NOT constant (read from
+    // a column, computed per row) gets a fresh slot per row: SQLite frees the old value before the
+    // next call, so a stale pattern is never reused. (2) `pyre`'s node-wide LRU, consulted once
+    // per auxdata miss: it is what saves the compile across statements and connections.
     //
     // A match is uninterruptible once started, so the call first asks whether its statement is
     // already past the deadline and, if so, fails with SQLITE_INTERRUPT (the code the progress
     // handler's stop produces, which `Fathom.Shard.Connection` maps to FILO_QUERY_TIMEOUT): a
     // statement that calls `regexp` per row stops at its next row instead of at the next progress
     // check, which can be ~100 rows away (expert review 2026-11-07 #34). Together with
-    // `pyre::MAX_PLAIN_SUBJECT_BYTES` that bounds the overshoot to ONE bounded call.
+    // `pyre::MAX_PLAIN_SUBJECT_BYTES` that bounds the overshoot to ONE bounded call. The check and
+    // the subject caps (`pyre::Compiled::is_match`) run on every row, auxdata hit or not.
+    let compiles = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&compiles);
     db.create_scalar_function("regexp", 2, det, move |ctx| {
         if deadline.expired() {
             return Err(Error::SqliteFailure(
@@ -522,9 +541,28 @@ fn register_regexp(db: &Connection, det: FunctionFlags, deadline: backstop::Dead
             return Ok(None);
         };
 
-        pyre::search(pattern, &text)
+        let compiled: Arc<pyre::Compiled> = ctx.get_or_create_aux(0, |_| {
+            pyre::compile_cached(pattern).map(|(compiled, fresh)| {
+                if fresh {
+                    compiles.fetch_add(1, Ordering::Relaxed);
+                }
+                compiled
+            })
+        })?;
+        compiled
+            .is_match(&text)
             .map(Some)
             .map_err(|e| Error::UserFunctionError(Box::new(e)))
+    })?;
+
+    // `fathom_regexp_compiles()`: how many regex COMPILES (node-wide cache misses) this
+    // connection's `regexp` calls have caused, since it was opened. The observable the
+    // once-per-statement claim is tested through (test/fathom/shard/regexp_statement_cache_test.exs):
+    // a bound pattern must cost one compile per statement even while other patterns churn the
+    // cache. It reports only the CALLING connection's own count (like `fathom_stmt_memused`), never
+    // the node's, so it says nothing about another tenant. Not deterministic: it reads state.
+    db.create_scalar_function("fathom_regexp_compiles", 0, nondet, move |_| {
+        Ok(i64::try_from(counter.load(Ordering::Relaxed)).unwrap_or(i64::MAX))
     })?;
 
     Ok(())

@@ -76,6 +76,18 @@ fn matches_cpython_re_on_every_generated_case() {
             Err(_) => Outcome::Error,
         };
 
+        // The `regexp` UDF does not call `search`: it takes a `Compiled` handle once per statement
+        // (SQLite auxdata) and runs `is_match` per row. That path must give CPython's answer too.
+        let via_handle = match pyre::compile_cached(pattern).and_then(|(c, _)| c.is_match(subject))
+        {
+            Ok(m) => Outcome::Match(m),
+            Err(_) => Outcome::Error,
+        };
+        assert_eq!(
+            via_handle, got,
+            "pattern {pattern:?} subject {subject:?}: the statement-handle path disagrees with search"
+        );
+
         total += 1;
         if let Outcome::Match(true) = want {
             matched += 1;

@@ -503,17 +503,20 @@ groups:
 
   # ---------------------------------------------------------------------------------------------
   # Memory outside the BEAM's allocators (expert review 2026-11-07 #75, maintainer decision
-  # 2026-11-08). `:erlang.memory` and the soft-heap accounting see only ERTS allocations. The
-  # regex cache's lazy-DFA caches (~2.6 MiB per (regex, dirty-IO thread) pair, up to
-  # pyre::CACHE_CAP x +SDio x 2.6 MiB = 520 MiB at the shipped 20 x 10) and any other NIF/extension
-  # malloc live in the Rust/C allocator, invisible to every other gauge. RSS minus the carriers ERTS
-  # holds from the OS is that remainder.
+  # 2026-11-08, cap raised 20 -> 64 the same day). `:erlang.memory` and the soft-heap accounting
+  # see only ERTS allocations. The regex cache's lazy-DFA caches (~2.6 MiB per (regex, dirty-IO
+  # thread) pair, up to pyre::CACHE_CAP x +SDio x 2.6 MiB = 1664 MiB at the shipped 64 x 10) and any
+  # other NIF/extension malloc live in the Rust/C allocator, invisible to every other gauge. RSS
+  # minus the carriers ERTS holds from the OS is that remainder.
   - name: fathom-memory
     rules:
       - alert: FathomUnaccountedRssGrowth
         # (TUNE) Growth, not a level: the gap was never measured on the fleet (the rss gauge is
-        # Linux-only), so there is no baseline to put an absolute bar on. 512 MiB in an hour is about
-        # the documented worst case of the regex lazy-DFA caches. Mapped file pages (the scan mmap)
+        # Linux-only), so there is no baseline to put an absolute bar on. 1.75 GiB (1879048192 B) in
+        # an hour sits just above the documented worst case of the regex lazy-DFA caches (1.63 GiB;
+        # it was 512 MiB over the previous 0.51 GiB ceiling), so it fires only on growth that cache
+        # working as designed cannot explain. It does NOT catch: the cache filling to its ceiling,
+        # a leak slower than 1.75 GiB/h, or a gap that was already large. Mapped file pages (the scan mmap)
         # are also resident but do not grow by this much in an hour on a steady node; a node still
         # warming up after a restart can trip it once, which the 15m `for` and a ticket severity
         # tolerate. Absent where the rss gauge is absent (non-Linux).
@@ -521,10 +524,10 @@ groups:
           delta((
             max by (node) (fathom_node_memory_breakdown_rss)
             - max by (node) (fathom_node_memory_breakdown_allocated_carriers)
-          )[1h:1m]) > 536870912
+          )[1h:1m]) > 1879048192
         for: 15m
         labels: {severity: ticket}
         annotations:
           summary: "Resident memory outside the BEAM allocators grew {{ $value | humanize1024 }}B in 1h on {{ $labels.node }}"
-          description: "RSS minus the carriers ERTS holds from the OS (the regex engine's per-thread lazy-DFA caches, other NIF/extension malloc, mapped files) has grown by more than 512 MiB over the last hour. :erlang.memory and the soft heap limit do not see it, so the OOM killer is the first thing that would. Most likely a tenant cycling many distinct state-heavy `__regex` patterns; check the extension's regex cache first."
+          description: "RSS minus the carriers ERTS holds from the OS (the regex engine's per-thread lazy-DFA caches, other NIF/extension malloc, mapped files) has grown by more than 1.75 GiB over the last hour, more than the regex cache's documented worst case (1.63 GiB at CACHE_CAP 64 x 10 dirty-IO threads x 2.6 MiB) can explain. :erlang.memory and the soft heap limit do not see it, so the OOM killer is the first thing that would. Check for a leak or runaway mapping first; the regex cache is the usual suspect only on a node with +SDio above 10."
           runbook: docs/runbooks/operations.md#runbook-rss-outside-the-beam-allocators-keeps-growing

@@ -498,11 +498,15 @@ fn prescan(chars: &[char], last_close: Option<usize>) -> Prescan {
 /// does not expose `hybrid_cache_capacity` and `delegate_dfa_size_limit` is the FULL-DFA limit, so
 /// the only lever on that memory is how many regexes can be alive: worst case is
 /// `CACHE_CAP x threads that can run a regexp x 2.6 MiB`. Every exqlite NIF is dirty-IO, and
-/// `rel/vm.args.eex` ships `+SDio 10`, so 20 x 10 x 2.6 MiB = 520 MiB (0.51 GiB; it was 256 x 10 x
-/// 2.6 = 6.5 GiB). 20 still holds a normal app's whole pattern set; a 21st distinct hot pattern
-/// makes a round-robin over them recompile on every call (`twenty_realistic_patterns_do_not_thrash`
-/// pins the 20, `patterns_past_the_cap_are_evicted_and_recompile_correctly` the cliff).
-const CACHE_CAP: usize = 20;
+/// `rel/vm.args.eex` ships `+SDio 10`, so 64 x 10 x 2.6 MiB = 1664 MiB (1.63 GiB), reached only if
+/// every entry is state-heavy AND hot on every dirty-IO thread (it was 256 x 10 x 2.6 = 6.5 GiB,
+/// then 20 x 10 x 2.6 = 0.51 GiB, which a node serving many tenants outgrew: this cache is ONE
+/// node-wide LRU across all tenants). A pattern bound as a parameter does not need to stay in this
+/// cache between ROWS (the statement's auxdata holds it, see [`Compiled`]); the cap only has to
+/// cover the distinct patterns in rotation BETWEEN statements. Past it a round-robin over the
+/// patterns recompiles on every STATEMENT, not every row (`twenty_realistic_patterns_do_not_thrash`
+/// pins the realistic set, `patterns_past_the_cap_are_evicted_and_recompile_correctly` the cliff).
+const CACHE_CAP: usize = 64;
 
 /// Cap on the negative cache, in entries. Separate from [`CACHE_CAP`]: a failed compile holds no
 /// DFA caches (only the pattern text and the error, bounded by [`FAILED_BYTE_BUDGET`]), and
@@ -533,12 +537,39 @@ const DFA_SIZE_LIMIT: usize = 4 * 1024 * 1024;
 /// churn the cache instead of accumulating.
 const CACHE_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
-/// A cached compiled pattern (see [`Cache`]).
-struct Entry {
+/// A compiled pattern, plus the one fact a search needs about it. This is the handle BOTH the cache
+/// and the `regexp` UDF's per-statement auxdata hold, so every caller searches through the same
+/// [`Compiled::is_match`] (subject caps included): the SQLite aux slot cannot bypass what the cache
+/// path enforces.
+///
+/// Cloning shares the `Arc`. Holding one keeps the regex's per-thread lazy-DFA caches alive (they
+/// live in the regex's own pool), so a holder outside the cache is retention outside
+/// [`CACHE_CAP`]; the UDF holds it only in a statement's auxdata, which SQLite frees when the
+/// statement finishes, resets or is finalized (src/lib.rs `register_regexp`).
+#[derive(Clone)]
+pub struct Compiled {
     re: Arc<Regex>,
     /// Needs fancy-regex's backtracking VM (lookaround, backreference, atomic group, ...), judged on
     /// the ORIGINAL pattern: the `$` translation introduces a lookahead that is not a reason to cap.
     fancy: bool,
+}
+
+impl Compiled {
+    /// Whether the pattern matches anywhere in `subject`, under the subject-size caps.
+    pub fn is_match(&self, subject: &str) -> Result<bool, PyreError> {
+        if self.fancy && subject.len() > MAX_FANCY_SUBJECT_BYTES {
+            return Err(PyreError::SubjectTooLong(subject.len()));
+        }
+        if subject.len() > MAX_PLAIN_SUBJECT_BYTES {
+            return Err(PyreError::PlainSubjectTooLong(subject.len()));
+        }
+        Ok(self.re.is_match(subject)?)
+    }
+}
+
+/// A cached compiled pattern (see [`Cache`]).
+struct Entry {
+    compiled: Compiled,
     cost: usize,
     /// Last-use tick, for LRU eviction.
     used: u64,
@@ -546,9 +577,10 @@ struct Entry {
 
 /// Compiled-pattern cache.
 ///
-/// SQLite's per-statement auxdata already caches a constant pattern for the life of a statement,
-/// but a pattern bound as a PARAMETER (`WHERE col REGEXP ?`, which is exactly what a Django
-/// queryset sends) gets no auxdata at all and would otherwise recompile per row. Bounded, because
+/// Shared ACROSS statements: SQLite's per-statement auxdata (the `regexp` UDF's first level) holds a
+/// constant OR bound-parameter pattern for the life of one statement execution, but a pattern the
+/// next statement binds again, a pattern read from a column, and every other connection's
+/// statements all come here. Bounded, because
 /// a pattern is tenant-supplied: an unbounded map keyed on client input is a memory-growth
 /// primitive. Over budget, least-recently-used entries are evicted one at a time (expert review
 /// 2026-10-13 #32): the old whole-map `clear()` let one tenant cycling big patterns wipe every
@@ -683,45 +715,53 @@ pub fn search(pattern: &str, subject: &str) -> Result<bool, PyreError> {
     search_in(&CACHE, pattern, subject)
 }
 
+/// The compiled form of `pattern` from the process-global cache, compiling (and caching) it on a
+/// miss. The `bool` is true when THIS call compiled it (a cache miss), so the caller can count
+/// compiles. The `regexp` UDF calls this once per statement execution and keeps the result in the
+/// statement's auxdata; [`search`] is this plus [`Compiled::is_match`].
+pub fn compile_cached(pattern: &str) -> Result<(Compiled, bool), PyreError> {
+    compile_cached_in(&CACHE, pattern)
+}
+
 /// [`search`] against an explicit cache, so the cache tests need not share the process-global one
-/// (a test filling it would evict another test's pattern at [`CACHE_CAP`] = 20).
+/// (a test filling it would evict another test's pattern at [`CACHE_CAP`] = 64).
 fn search_in(
     cache: &Mutex<Option<Cache>>,
     pattern: &str,
     subject: &str,
 ) -> Result<bool, PyreError> {
+    compile_cached_in(cache, pattern)?.0.is_match(subject)
+}
+
+/// [`compile_cached`] against an explicit cache.
+fn compile_cached_in(
+    cache: &Mutex<Option<Cache>>,
+    pattern: &str,
+) -> Result<(Compiled, bool), PyreError> {
     if pattern.len() > MAX_PATTERN_BYTES {
         return Err(PyreError::PatternTooLong(pattern.len()));
     }
-    let (re, fancy) = match cache_get(cache, pattern)? {
-        Some(hit) => hit,
-        None => match compile(pattern) {
-            Ok((re, cost)) => {
-                let re = Arc::new(re);
-                let fancy = needs_backtracking(pattern);
-                cache_put(cache, pattern, &re, fancy, cost);
-                (re, fancy)
-            }
-            Err(e) => {
-                cache_put_failed(cache, pattern, &e);
-                return Err(e.into());
-            }
-        },
-    };
-    if fancy && subject.len() > MAX_FANCY_SUBJECT_BYTES {
-        return Err(PyreError::SubjectTooLong(subject.len()));
+    if let Some(hit) = cache_get(cache, pattern)? {
+        return Ok((hit, false));
     }
-    if subject.len() > MAX_PLAIN_SUBJECT_BYTES {
-        return Err(PyreError::PlainSubjectTooLong(subject.len()));
+    match compile(pattern) {
+        Ok((re, cost)) => {
+            let compiled = Compiled {
+                re: Arc::new(re),
+                fancy: needs_backtracking(pattern),
+            };
+            cache_put(cache, pattern, &compiled, cost);
+            Ok((compiled, true))
+        }
+        Err(e) => {
+            cache_put_failed(cache, pattern, &e);
+            Err(e.into())
+        }
     }
-    Ok(re.is_match(subject)?)
 }
 
 /// A hit, `None` for a miss, or the remembered compile error.
-fn cache_get(
-    cache: &Mutex<Option<Cache>>,
-    pattern: &str,
-) -> Result<Option<(Arc<Regex>, bool)>, PyreError> {
+fn cache_get(cache: &Mutex<Option<Cache>>, pattern: &str) -> Result<Option<Compiled>, PyreError> {
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     let Some(cache) = guard.as_mut() else {
         return Ok(None);
@@ -730,7 +770,7 @@ fn cache_get(
     let tick = cache.tick;
     if let Some(entry) = cache.map.get_mut(pattern) {
         entry.used = tick;
-        return Ok(Some((Arc::clone(&entry.re), entry.fancy)));
+        return Ok(Some(entry.compiled.clone()));
     }
     if let Some((err, used)) = cache.failed.get_mut(pattern) {
         *used = tick;
@@ -739,13 +779,7 @@ fn cache_get(
     Ok(None)
 }
 
-fn cache_put(
-    cache: &Mutex<Option<Cache>>,
-    pattern: &str,
-    re: &Arc<Regex>,
-    fancy: bool,
-    cost: usize,
-) {
+fn cache_put(cache: &Mutex<Option<Cache>>, pattern: &str, compiled: &Compiled, cost: usize) {
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     let cache = guard.get_or_insert_with(new_cache);
     while !cache.map.is_empty()
@@ -763,8 +797,7 @@ fn cache_put(
     }
     cache.tick += 1;
     let entry = Entry {
-        re: Arc::clone(re),
-        fancy,
+        compiled: compiled.clone(),
         cost,
         used: cache.tick,
     };
@@ -1303,16 +1336,18 @@ mod tests {
         guard.as_ref().map_or(0, |c| c.map.len())
     }
 
-    // expert review 2026-11-07 #75 (decision 2026-11-08): the cap is what bounds the lazy-DFA
-    // caches the byte budget cannot see. Written as arithmetic on literals (2.6 MiB per (regex,
-    // thread) pair measured, 10 dirty-IO threads from rel/vm.args.eex) so moving the constant back
-    // up (it was 256: 6.5 GiB) fails here and the component-notes number stays honest.
+    // expert review 2026-11-07 #75 (decision 2026-11-08, cap raised 20 -> 64 the same day): the cap
+    // is what bounds the lazy-DFA caches the byte budget cannot see. Written as arithmetic on
+    // literals (2.6 MiB per (regex, thread) pair measured, 10 dirty-IO threads from
+    // rel/vm.args.eex) so moving the constant fails here and the component-notes number stays
+    // honest: 64 x 10 x 2.6 MiB = 1664 MiB (it was 256: 6.5 GiB; 20: 0.51 GiB).
     #[test]
     fn the_cache_cap_bounds_the_worst_case_lazy_dfa_memory() {
         const DIRTY_IO_THREADS: usize = 10;
+        assert_eq!(CACHE_CAP, 64);
         let worst_mib_x10 = CACHE_CAP * DIRTY_IO_THREADS * 26;
         assert!(
-            worst_mib_x10 <= 5200,
+            worst_mib_x10 <= 16_640,
             "worst case {} MiB",
             worst_mib_x10 as f64 / 10.0
         );
@@ -1328,13 +1363,12 @@ mod tests {
         for p in REALISTIC {
             assert!(search_in(&cache, p, "x").is_ok(), "{p}");
         }
-        let first: Vec<Arc<Regex>> = REALISTIC
+        let first: Vec<Compiled> = REALISTIC
             .iter()
             .map(|p| {
                 cache_get(&cache, p)
                     .unwrap()
                     .expect("cached after first use")
-                    .0
             })
             .collect();
         // Five more laps: every call must be a hit on the SAME compiled regex (a recompile would
@@ -1343,11 +1377,103 @@ mod tests {
             assert!(search_in(&cache, r"^\d{4}-\d{2}-\d{2}$", "2026-11-08").unwrap());
             for (p, was) in REALISTIC.iter().zip(&first) {
                 assert!(search_in(&cache, p, "x").is_ok());
-                let now = cache_get(&cache, p).unwrap().expect("still cached").0;
-                assert!(Arc::ptr_eq(was, &now), "{p} was evicted and recompiled");
+                let now = cache_get(&cache, p).unwrap().expect("still cached");
+                assert!(
+                    Arc::ptr_eq(&was.re, &now.re),
+                    "{p} was evicted and recompiled"
+                );
             }
         }
         assert_eq!(cache_len(&cache), REALISTIC.len());
+    }
+
+    // The cliff the per-statement handle exists for. `WHERE col REGEXP ?` binds the pattern as a
+    // PARAMETER; SQLite's auxdata keeps it for the statement (src/lib.rs `register_regexp`, which
+    // calls `compile_cached` once and `Compiled::is_match` per row), so the node-wide LRU is
+    // consulted once per statement. Between rows here, CACHE_CAP + 1 other patterns evict
+    // the hot one from a local cache, as a busy multi-tenant node does: the statement-shaped
+    // loop compiles it once; the same rows each asking the cache (the unfixed per-row shape) compile it
+    // on every row, ~1.6 ms each for a Unicode-class pattern.
+    #[test]
+    fn a_statement_compiles_its_bound_pattern_once_however_hard_the_cache_churns() {
+        const ROWS: usize = 20;
+        let hot = r"^[\w.@+-]{1,40}@hot_stmt\.example$";
+        let churn: Vec<String> = (0..CACHE_CAP + 1).map(|i| format!("^churn{i}x$")).collect();
+        let churn_between_rows = |cache: &Mutex<Option<Cache>>| {
+            for c in &churn {
+                assert!(search_in(cache, c, "no").is_ok());
+            }
+        };
+
+        // One statement: one handle, N rows.
+        let cache = Mutex::new(None);
+        let (handle, fresh) = compile_cached_in(&cache, hot).unwrap();
+        let mut compiles = usize::from(fresh);
+        for row in 0..ROWS {
+            let subject = if row % 2 == 0 {
+                "me@hot_stmt.example"
+            } else {
+                "nope"
+            };
+            assert_eq!(handle.is_match(subject).unwrap(), row % 2 == 0, "row {row}");
+            churn_between_rows(&cache);
+            assert!(
+                !cached_in(&cache, hot),
+                "the churn must have evicted {hot} (row {row})"
+            );
+        }
+        assert_eq!(compiles, 1, "a statement compiles its bound pattern once");
+
+        // The unfixed shape: every row asks the cache.
+        let cache = Mutex::new(None);
+        compiles = 0;
+        for row in 0..ROWS {
+            let (handle, fresh) = compile_cached_in(&cache, hot).unwrap();
+            compiles += usize::from(fresh);
+            let subject = if row % 2 == 0 {
+                "me@hot_stmt.example"
+            } else {
+                "nope"
+            };
+            assert_eq!(handle.is_match(subject).unwrap(), row % 2 == 0, "row {row}");
+            churn_between_rows(&cache);
+        }
+        assert_eq!(
+            compiles, ROWS,
+            "per-row cache lookups recompile on every row once evicted"
+        );
+    }
+
+    // The handle is the ONE search entry point: the subject caps live in `Compiled::is_match`, so
+    // a statement holding a handle in auxdata cannot search past them (a plain pattern at the
+    // plain cap, a lookaround pattern at the fancy cap), and a failing pattern never yields a
+    // handle to hold.
+    #[test]
+    fn a_held_handle_enforces_the_same_caps_and_errors_as_search() {
+        let cache = Mutex::new(None);
+        let (plain, _) = compile_cached_in(&cache, "^a+$").unwrap();
+        let (fancy, _) = compile_cached_in(&cache, "a(?=b)").unwrap();
+        let at_plain = "a".repeat(MAX_PLAIN_SUBJECT_BYTES);
+        assert!(plain.is_match(&at_plain).unwrap());
+        for _ in 0..2 {
+            assert!(matches!(
+                plain.is_match(&format!("{at_plain}a")),
+                Err(PyreError::PlainSubjectTooLong(n)) if n == MAX_PLAIN_SUBJECT_BYTES + 1
+            ));
+            assert!(matches!(
+                fancy.is_match(&"a".repeat(MAX_FANCY_SUBJECT_BYTES + 1)),
+                Err(PyreError::SubjectTooLong(n)) if n == MAX_FANCY_SUBJECT_BYTES + 1
+            ));
+        }
+        assert!(fancy.is_match("ab").unwrap());
+        assert!(matches!(
+            compile_cached_in(&cache, "(unclosed_held"),
+            Err(PyreError::Regex(_))
+        ));
+        assert!(matches!(
+            compile_cached_in(&cache, &"x".repeat(MAX_PATTERN_BYTES + 1)),
+            Err(PyreError::PatternTooLong(n)) if n == MAX_PATTERN_BYTES + 1
+        ));
     }
 
     // Past the cap the least-recently-used pattern goes, an evicted pattern recompiles on its next
@@ -1422,7 +1548,7 @@ mod tests {
 
     // expert review 2026-10-13 #32: over budget the cache used to clear() EVERYTHING, so one tenant
     // cycling big patterns evicted every other tenant's small hot pattern. Local cache, not the
-    // global one: at CACHE_CAP = 20 other tests' patterns would evict this one at random.
+    // global one: at CACHE_CAP = 64 other tests' patterns would evict this one at random.
     #[test]
     fn a_hot_small_pattern_survives_a_fill_with_big_ones() {
         let cache = Mutex::new(None);

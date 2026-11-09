@@ -112,25 +112,31 @@ fail, new-shard opens error; `checkout` outcome `error` on that node only; `df` 
 ## Runbook: RSS outside the BEAM allocators keeps growing
 
 **Symptom:** alert `FathomUnaccountedRssGrowth` — `fathom_node_memory_breakdown_rss −
-fathom_node_memory_breakdown_allocated_carriers` grew by more than 512 MiB in an hour on one node,
+fathom_node_memory_breakdown_allocated_carriers` grew by more than 1.75 GiB in an hour on one node,
 while `fathom_node_memory_total` (`:erlang.memory`) looks flat. The kernel OOM killer is the next
 event if it continues; nothing in the BEAM warns first, because this memory is not in an ERTS
 allocator.
 
-**What it usually is:** the Django `regexp` UDF's compiled-pattern cache (`native/fathom_udf`,
-`pyre::CACHE_CAP`). Each cached regex keeps one lazy-DFA cache (~2.6 MiB once a state-heavy pattern
-fills it) per dirty-IO thread that has run it, allocated by the Rust allocator. At the shipped
-`CACHE_CAP = 20` and `+SDio 10` that tops out at ~520 MiB (0.51 GiB; 52 MiB per dirty-IO thread, so
-scale it if `+SDio` was raised) — so growth well past that is **not** this cache working as designed.
-Arithmetic and measurements: `component-notes.md`, the #75 entry. Other candidates, in order: mapped
-file pages (the flush scan's `:flush_scan_mmap_bytes`), another NIF/extension allocation, a leak.
+**What it is NOT, and what it can be:** the Django `regexp` UDF's compiled-pattern cache
+(`native/fathom_udf`, `pyre::CACHE_CAP`) is the one known consumer of this kind of memory, and the
+alert's bar is set just above its ceiling. Each cached regex keeps one lazy-DFA cache (~2.6 MiB once
+a state-heavy pattern fills it) per dirty-IO thread that has run it, allocated by the Rust
+allocator. At the shipped `CACHE_CAP = 64` and `+SDio 10` that tops out at ~1664 MiB (1.63 GiB;
+166 MiB per dirty-IO thread, so scale it if `+SDio` was raised), reached only if all 64 entries are
+state-heavy and hot on every thread. So growth past 1.75 GiB in an hour is **not** that cache working
+as designed on a default-`+SDio` node (on a node with `+SDio` above 10 it can be: recompute the
+ceiling first). The alert does **not** fire for the cache filling up to its ceiling, for a leak
+slower than 1.75 GiB/h, or when the gap was already large before the window: a slow leak and a
+fully-warmed cache look the same to it. Arithmetic and measurements: `component-notes.md`, the #75
+entry. Other candidates, in order: mapped file pages (the flush scan's `:flush_scan_mmap_bytes`),
+another NIF/extension allocation, a leak.
 
 **Diagnose:**
-1. Is it a step-up that then plateaus at or below ~0.5 GiB over the pre-growth level? That is the
-   regex cache filling: expected once per distinct state-heavy pattern set, harmless, and the alert
-   should clear after the hour. Raise the threshold if your fleet legitimately runs that many
-   patterns.
-2. Does it keep growing past ~0.6 GiB (× `+SDio` / 10)? Compare `fathom_node_memory_breakdown_driver_blocks`
+1. Is it a step up that then plateaus at or below ~1.7 GiB over the pre-growth level? That is the
+   regex cache filling (only possible if the fleet runs many distinct state-heavy patterns):
+   expected, harmless, and the alert should clear after the hour. Raise the threshold if your fleet
+   legitimately runs that many patterns.
+2. Does it keep growing past ~1.8 GiB (× `+SDio` / 10)? Compare `fathom_node_memory_breakdown_driver_blocks`
    and `…_driver_carriers` (SQLite page caches; `docs/component-notes.md` § "Memory: blocks are not
    RSS") — if those explain it, it is connection/page-cache churn, not the extension.
 3. If neither, look at what the node runs: `pmap -x <beam pid>` (large anonymous regions from the Rust
@@ -139,12 +145,15 @@ file pages (the flush scan's `:flush_scan_mmap_bytes`), another NIF/extension al
 **Respond:**
 - **Shed or restart:** a rolling restart of the node returns all of it (evicting a cached regex frees
   its caches; nothing else does). Drain first (`deploy.md`) — never kill a node holding dirty shards.
-- **If a tenant is cycling patterns:** the cache is process-global and LRU, so cycling more than 20
-  distinct patterns evicts and recompiles (~1.6 ms each) rather than growing without bound. The
-  growth is then bounded by the arithmetic above; confirm the tenant and rate-limit or contact them.
-- **If the hot pattern set legitimately exceeds 20 distinct patterns** (a measured recompile storm,
-  not a guess): raise `pyre::CACHE_CAP` together with the worst-case number in the #75 entry — it is
-  `CACHE_CAP × dirty-IO threads × 2.6 MiB`.
+- **If a tenant is cycling patterns:** the cache is process-global and LRU, so cycling more than 64
+  distinct patterns evicts and recompiles (~1.6 ms each, once per STATEMENT: a statement keeps its
+  constant or bound-parameter pattern in SQLite auxdata for all its rows) rather than growing without
+  bound. The growth is then bounded by the arithmetic above; confirm the tenant and rate-limit or
+  contact them. `SELECT fathom_regexp_compiles()` on a connection answers how many compiles THAT
+  connection's `regexp` calls have caused, to tell a recompile storm from steady use.
+- **If the hot pattern set legitimately exceeds 64 distinct patterns** (a measured cross-statement
+  recompile storm, not a guess): raise `pyre::CACHE_CAP` together with the worst-case number in the
+  #75 entry — it is `CACHE_CAP × dirty-IO threads × 2.6 MiB` — and the alert's threshold.
 
 ---
 
