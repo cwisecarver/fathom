@@ -10,7 +10,7 @@ defmodule Fathom.Migrator.Copy do
   commit as an O(1) version gate (and the crash-recovery signal). On any replay
   error the transaction rolls back, leaving the copy at the old schema.
   """
-  alias Fathom.Migrator.Transform
+  alias Fathom.Migrator.{RowCounts, Transform}
   alias Fathom.Shard.{BackgroundScanGate, Connection}
 
   @doc """
@@ -212,6 +212,10 @@ defmodule Fathom.Migrator.Copy do
   end
 
   defp replay(conn, version, statements, transform, shard_id) do
+    # BEFORE `BEGIN`: the copy is private to this job, so nothing can change it in between, and a
+    # scan that fails here (see `count_snapshot/1`) leaves no transaction for SQLite to abort.
+    {:ok, counts_before} = count_snapshot(conn)
+
     result =
       with :ok <- Connection.exec(conn, "BEGIN"),
            {:ok, sequences} <- sequence_snapshot(conn),
@@ -224,6 +228,9 @@ defmodule Fathom.Migrator.Copy do
            # rebuild (`CREATE new__x` / `INSERT…SELECT` / `DROP x` / `RENAME`) has just lowered the
            # AUTOINCREMENT high-water marks, and this puts them back.
            :ok <- restore_sequences(conn, sequences),
+           # Last of the data checks, so a step that rolls back for any other reason never pays the
+           # second scan; before COMMIT, so a lossy replay is rolled back, not shipped.
+           :ok <- verify_row_counts(conn, version, statements, transform, counts_before),
            :ok <- foreign_key_check(conn, version),
            :ok <- Connection.exec(conn, "COMMIT") do
         :ok
@@ -261,10 +268,7 @@ defmodule Fathom.Migrator.Copy do
   # CREATED AGAIN under the same name inherits the old mark; that only skips ids, never reuses
   # them, and is indistinguishable here from a rebuild.
   #
-  # The review's other half — per-table row-count conservation old vs new in `verify_migrated/2` —
-  # is not done: it would flag a `RunSQL … INSERT OR IGNORE` that drops rows, but costs one scan per
-  # table per migrated tenant on the dirty-IO permit, and a legitimate step may delete or backfill.
-  # Parked; see docs/component-notes.md.
+  # The review's other half, per-table row-count conservation, is `verify_row_counts/5` below.
   defp sequence_snapshot(conn) do
     case Connection.query(
            conn,
@@ -282,6 +286,43 @@ defmodule Fathom.Migrator.Copy do
 
       {:error, _} = error ->
         error
+    end
+  end
+
+  # ROW COUNTS ARE CONSERVED (expert review 2026-11-07 #64, second half): see
+  # `Fathom.Migrator.RowCounts` for what a step may change and how a `Transform` declares or opts out.
+  # `nil` is the snapshot when `:verify_flush_integrity` is off.
+  #
+  # A scan that CANNOT RUN (a corrupt page: "database disk image is malformed") skips the check
+  # instead of failing the step with that raw error, and runs outside the transaction because
+  # SQLite may abort the transaction on a corrupt page: `ShardMigration.verify_migrated/2` runs
+  # `quick_check` next and refuses the copy with the typed `{:migrated_copy_corrupt, _}` the operator
+  # alert keys on, which this must not pre-empt (`shard_migration_test.exs`, "a corrupt stored
+  # object is refused before cutover").
+  defp count_snapshot(conn) do
+    with true <- RowCounts.enabled?(),
+         {:ok, snapshot} <- RowCounts.snapshot(conn) do
+      {:ok, snapshot}
+    else
+      _ -> {:ok, nil}
+    end
+  end
+
+  defp verify_row_counts(_conn, _version, _statements, _transform, nil), do: :ok
+
+  defp verify_row_counts(conn, version, statements, transform, before) do
+    module =
+      case Transform.resolve(transform) do
+        {:ok, module} -> module
+        {:error, _} -> nil
+      end
+
+    case RowCounts.snapshot(conn) do
+      {:ok, now} ->
+        RowCounts.verify(before, now, RowCounts.expectations(statements, module, before), version)
+
+      {:error, _unreadable} ->
+        :ok
     end
   end
 

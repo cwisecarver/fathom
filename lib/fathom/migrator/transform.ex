@@ -74,6 +74,36 @@ defmodule Fathom.Migrator.Transform do
   @callback run(conn :: reference(), shard_id :: String.t()) :: :ok | {:error, term()}
 
   @doc """
+  OPTIONAL. Declares what the transform does to per-table ROW COUNTS, for the row-count
+  conservation check the replay runs before it commits (`Fathom.Migrator.RowCounts`, expert review
+  2026-11-07 #64).
+
+  Returns a map of table name => expected delta (`integer()`: rows added minus rows removed, the
+  same for every tenant) or `:any` (the transform adds or removes a tenant-dependent number of
+  rows). **Every table not listed must keep its row count**: a transform that returns `%{}` is
+  asserting it only rewrites values in place (an `UPDATE` backfill), and a row it silently lost
+  from some other table fails the replay.
+
+  A transform that does NOT define this callback opts OUT: nothing in its step is count-checked,
+  because the engine cannot know which tables an opaque `run/2` touches. That is the default on
+  purpose, so a data migration written before the check existed keeps replaying; define the
+  callback to opt in.
+  """
+  @callback row_count_deltas() :: %{optional(String.t()) => integer() | :any}
+  @optional_callbacks row_count_deltas: 0
+
+  @doc """
+  The transform's declared row-count deltas, or `:unchecked` when `module` does not declare any
+  (see `c:row_count_deltas/0`).
+  """
+  @spec row_count_deltas(module()) :: %{optional(String.t()) => integer() | :any} | :unchecked
+  def row_count_deltas(module) when is_atom(module) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :row_count_deltas, 0),
+      do: module.row_count_deltas(),
+      else: :unchecked
+  end
+
+  @doc """
   Resolves a transform name from a release row to a module, against the configured allowlist.
 
   Returns `{:ok, module}`, `{:error, :not_allowed}` for a name that is not registered (including

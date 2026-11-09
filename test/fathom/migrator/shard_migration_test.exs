@@ -193,6 +193,67 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     assert %{columns: ["id", "note"]} = query_live!(shard, "SELECT * FROM app_ledger")
   end
 
+  # Expert review 2026-11-07 #64 (row-count conservation), at the ENGINE level. A lossy table
+  # rebuild must be refused BEFORE the flush: the shard stays at v1 with every row, serving the old
+  # schema (cross-version tolerance: the fleet keeps reading it), and the directory is untouched. A
+  # faithful rebuild of the same shape then migrates and the revert flip restores the v1 bytes.
+  # Pre-fix the lossy release migrated: v2 live with one row fewer, `quick_check` and the ledger green.
+  test "a lossy table-rebuild is refused before the flush; a faithful one migrates and reverts",
+       %{shard: shard} do
+    seed_v1!(shard)
+    write_live!(shard, "INSERT INTO app_thing (id, name) VALUES (2, 'bob'), (3, 'carol')")
+
+    rebuild = fn copy ->
+      [
+        ~s|CREATE TABLE "new__app_thing" ("id" integer NOT NULL PRIMARY KEY, "name" text NULL, "extra" text NULL)|,
+        copy,
+        ~s|DROP TABLE "app_thing"|,
+        ~s|ALTER TABLE "new__app_thing" RENAME TO "app_thing"|,
+        "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002_rebuild', 'now')"
+      ]
+    end
+
+    {:ok, _} =
+      Migrator.release(
+        2,
+        "lossy rebuild",
+        rebuild.(
+          ~s|INSERT OR IGNORE INTO "new__app_thing" ("id", "name") SELECT "id", "name" FROM "app_thing" WHERE "id" < 3|
+        )
+      )
+
+    assert {:error, {:row_count_mismatch, 2, [%{table: "app_thing", before: 3, after: 2}]}} =
+             ShardMigration.run(shard, 2)
+
+    assert {:ok, %{schema_version: 1}} = Directory.get(shard)
+    assert %{rows: [[1], [2], [3]]} = query_live!(shard, "SELECT id FROM app_thing ORDER BY id")
+    assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
+  end
+
+  test "a faithful table-rebuild migrates and the revert flip restores the v1 bytes", %{
+    shard: shard
+  } do
+    seed_v1!(shard)
+    write_live!(shard, "INSERT INTO app_thing (id, name) VALUES (2, 'bob'), (3, 'carol')")
+
+    {:ok, _} =
+      Migrator.release(2, "faithful rebuild", [
+        ~s|CREATE TABLE "new__app_thing" ("id" integer NOT NULL PRIMARY KEY, "name" text NULL, "extra" text NULL)|,
+        ~s|INSERT INTO "new__app_thing" ("id", "name") SELECT "id", "name" FROM "app_thing"|,
+        ~s|DROP TABLE "app_thing"|,
+        ~s|ALTER TABLE "new__app_thing" RENAME TO "app_thing"|,
+        "INSERT INTO django_migrations (app, name, applied) VALUES ('app', '0002_rebuild', 'now')"
+      ])
+
+    assert {:ok, %{from: 1, to: 2}} = ShardMigration.run(shard, 2)
+    assert %{rows: [[3]]} = query_live!(shard, "SELECT count(*) FROM app_thing")
+
+    assert {:ok, %{from: 2, to: 1}} = ShardMigration.revert(shard, 1)
+    assert %{rows: [[1]]} = query_live!(shard, "PRAGMA user_version")
+    assert %{columns: ["id", "name"]} = query_live!(shard, "SELECT * FROM app_thing")
+    assert %{rows: [[3]]} = query_live!(shard, "SELECT count(*) FROM app_thing")
+  end
+
   # Expert review 2026-07-18 #5 (the retirement outbox): the migration's cutover now enqueues the
   # old version's retention deletion ATOMICALLY (same Postgres transaction), so a Postgres blip can
   # never leave a cut-over shard whose @prev object is never scheduled for deletion — a silent,

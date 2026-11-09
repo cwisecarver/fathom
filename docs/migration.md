@@ -74,7 +74,10 @@ The migration copies to a **fresh file** and flips a pointer; it never mutates a
    that cannot be reconciled (a later version's migration already present, a partial release, an
    ambiguous history, a count that disagrees) is refused: the shard stays put and is quarantined
    with `last_verify_status: ledger_mismatch`. `MIGRATION_LEDGER_CHECK=warn|off` relaxes it.
-3. Validate (`quick_check`, and the same ledger check on the migrated copy, which must match the
+3. Validate (per-table row counts conserved across the replay, rolled back with
+   `{:row_count_mismatch, …}` otherwise — a `Transform` opts out by not defining
+   `row_count_deltas/0` or declares its deltas, see `Fathom.Migrator.RowCounts`; then `quick_check`, and
+   the same ledger check on the migrated copy, which must match the
    target exactly), then **`Fathom.Directory.cutover/2`** flips the shard's pointer to vN and stamps
    `cutover_at` (the same instant as `last_active_at`, so "written since cutover" is exactly
    `last_active_at > cutover_at`). The old vN-1 version is **retired with a `retain_until`** — kept
