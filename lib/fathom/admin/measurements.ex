@@ -540,7 +540,7 @@ defmodule Fathom.Admin.Measurements do
       send(reply_to, {reply_to, reply})
     end)
 
-    timeout = Application.get_env(:fathom, :disk_poll_timeout_ms, 2_000)
+    timeout = disk_read_timeout_ms()
 
     reply =
       receive do
@@ -560,6 +560,14 @@ defmodule Fathom.Admin.Measurements do
     note_blocked(kind, reply)
     reply
   end
+
+  @doc """
+  How long a `df`-backed read may take before its caller stops waiting: the `:disk_poll_timeout_ms`
+  app env (default 2 s). Shared by the node poller (`bounded_read/2`) and the replica follower's
+  seed-admission read, so one knob bounds every `df` the node starts.
+  """
+  @spec disk_read_timeout_ms() :: pos_integer()
+  def disk_read_timeout_ms, do: Application.get_env(:fathom, :disk_poll_timeout_ms, 2_000)
 
   defp run_read(fun) do
     {:ok, fun.()}

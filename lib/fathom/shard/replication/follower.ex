@@ -787,7 +787,7 @@ defmodule Fathom.Shard.Replication.Follower do
 
     # Prime seed admission's volume reading (expert review 2026-10-22 r8 #10) in the background,
     # so the first seed begin after boot finds a value rather than reading one itself.
-    refresh_disk_async(locks(name), dir, System.monotonic_time(:millisecond))
+    refresh_disk_async(locks(name), dir)
 
     # The durable half of the reboot hold, off the listener's critical path (#72).
     start_reboot_pass(name)
@@ -1988,26 +1988,42 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   @disk_cache_ms 1_000
-  @disk_timeout_ms 2_000
-  # A refresh claim older than this belongs to a refresher that died without releasing it (the read
-  # itself is bounded by `@disk_timeout_ms`), so the next reader may take it over.
-  @disk_claim_stale_ms 3 * @disk_timeout_ms
 
   # READERS NEVER FORK (expert review 2026-10-22 r8 #10, decision Q10 = A). The reading is cached
   # here, filled three ways: the node poller's 10 s `Measurements.disk/0` (`note_disk_reading/3`,
   # one `df` for the gauge and this check), a refresh started at boot, and a background refresh
-  # when a reader finds it older than `@disk_cache_ms`. That refresh is SINGLE-FLIGHT (an
-  # `:ets.insert_new` claim) and the reader uses the value it already has, so a seed storm costs
-  # one `df` per second per volume instead of one (plus a queued `disksup` call) per seed begin,
-  # and no begin waits on a subprocess. Staleness is bounded by `@disk_cache_ms` plus one read
-  # (<= ~1-2 s, or `@disk_timeout_ms` more if `df` hangs). Live reservations are still subtracted
-  # on every check, so concurrent seeds still see each other; what a stale reading misses is only
-  # the last second of OTHER writes to the volume, and the cost of that is a seed admitted or
-  # refused one reading late near the floor. A refused seed keeps the shard at its stored object
-  # (the pre-A2 RPO), and an admitted one is still bounded by the next reading.
+  # when a reader finds it older than `@disk_cache_ms`. That refresh is SINGLE-FLIGHT and the reader
+  # uses the value it already has, so a seed storm costs one `df` per second per volume instead of
+  # one (plus a queued `disksup` call) per seed begin, and no begin waits on a subprocess.
+  # Live reservations are still subtracted on every check, so concurrent seeds still see each
+  # other; what a stale reading misses is only the last second of OTHER writes to the volume, and
+  # the cost of that is a seed admitted or refused one reading late near the floor. A refused seed
+  # keeps the shard at its stored object (the pre-A2 RPO), and an admitted one is still bounded by
+  # the next reading.
+  #
+  # A HUNG `df` IS BOUNDED AND NEVER STACKED (expert review 2026-11-07 #76, the follower half; the
+  # poller half is `Measurements.bounded_read/2`). The read used to run in a `Task` that was
+  # `Task.shutdown(:brutal_kill)`ed at the timeout and released its claim, so the next reader started
+  # a NEW `df` — but killing the Elixir process does not end an OS `df` stuck in an uninterruptible
+  # `statfs` (an EBS / NFS brown-out), so every second of the stall added one more D-state process.
+  # Now one process OWNS the refresh and holds the claim for as long as the read is alive: the claim
+  # row names its owner, a refresh is started only when that owner is dead, so there is no expiry
+  # to outwait and no second `df` while the first is stuck. Past `Measurements.disk_read_timeout_ms/0`
+  # (2 s) the owner publishes `:error` and goes on waiting; if the `df` ever answers, the late reading
+  # replaces the `:error`.
+  #
+  # `:error` (unknown free space) FAILS OPEN: `headroom?/1` admits and `below_floor?/1` does not
+  # refuse, exactly as for a volume that cannot be read at all. Refusing instead was weighed and
+  # rejected: a `statfs` that hangs means THIS volume is stalled, where every write the follower makes
+  # blocks whether or not the seed was admitted, so refusing protects nothing the stall has not
+  # already taken, while it turns an unread gauge into lost redundancy (every shard that needs a
+  # seed stays at its stored object, the pre-A2 RPO) for as long as `df` is slow — including a `df`
+  # that is slow for a reason other than the volume. The block is logged once a minute, so the
+  # fail-open is not silent.
   #
   # Only with NO reading at all (the first begin after boot, before the boot refresh lands) does a
-  # reader read synchronously, one of them, and concurrent first readers wait for its answer.
+  # reader wait: it starts the refresh if none is running and waits for the answer, at most one
+  # read timeout.
   defp disk_free(name) do
     dir = dir(name)
     tab = locks(name)
@@ -2015,11 +2031,11 @@ defmodule Fathom.Shard.Replication.Follower do
 
     case :ets.lookup(tab, {:disk, dir}) do
       [{_, at, result}] ->
-        if now - at >= @disk_cache_ms, do: refresh_disk_async(tab, dir, now)
+        if now - at >= @disk_cache_ms, do: refresh_disk_async(tab, dir)
         result
 
       [] ->
-        first_disk_reading(tab, dir, now)
+        first_disk_reading(tab, dir)
     end
   rescue
     ArgumentError -> :error
@@ -2040,50 +2056,119 @@ defmodule Fathom.Shard.Replication.Follower do
     ArgumentError -> :ok
   end
 
-  defp refresh_disk_async(tab, dir, now) do
-    if claim_disk_refresh(tab, dir, now) do
-      spawn(fn -> store_disk_reading(tab, dir) end)
+  # Starts the one background read of `dir`'s volume unless its owner is still alive.
+  #
+  # The owner is spawned parked and claimed BY PID before it is released, so the claim names the
+  # process that holds the read. The lookup first keeps a stuck `df` from costing a spawn per begin.
+  defp refresh_disk_async(tab, dir) do
+    if disk_refresh_running?(tab, dir) do
+      :ok
+    else
+      owner =
+        spawn(fn ->
+          receive do
+            :go -> run_disk_refresh(tab, dir)
+          end
+        end)
+
+      if claim_disk_refresh(tab, dir, owner),
+        do: send(owner, :go),
+        else: Process.exit(owner, :kill)
+
+      :ok
     end
-
-    :ok
   end
 
-  defp store_disk_reading(tab, dir) do
-    at = System.monotonic_time(:millisecond)
-    result = read_disk_free(dir)
-    :ets.insert(tab, {{:disk, dir}, at, result})
-    result
-  rescue
-    # The follower (and with it the table) stopped mid-read.
-    ArgumentError -> :error
-  after
-    release_disk_claim(tab, dir)
+  defp disk_refresh_running?(tab, dir) do
+    case :ets.lookup(tab, {:disk_refresh, dir}) do
+      [{_, owner}] -> Process.alive?(owner)
+      [] -> false
+    end
   end
 
-  defp claim_disk_refresh(tab, dir, now) do
+  # The claim is the row `{{:disk_refresh, dir}, owner_pid}`. A row whose owner is dead (killed
+  # without reaching `release_disk_claim/2`) is taken over; a live owner is never displaced, however
+  # long its `df` takes.
+  defp claim_disk_refresh(tab, dir, owner) do
     key = {:disk_refresh, dir}
 
-    :ets.insert_new(tab, {key, now}) or
+    :ets.insert_new(tab, {key, owner}) or
       case :ets.lookup(tab, key) do
-        [{_, at} = claim] when now - at > @disk_claim_stale_ms ->
-          :ets.delete_object(tab, claim)
-          :ets.insert_new(tab, {key, now})
+        [{_, holder} = claim] ->
+          not Process.alive?(holder) and
+            :ets.delete_object(tab, claim) and :ets.insert_new(tab, {key, owner})
 
-        _ ->
-          false
+        [] ->
+          :ets.insert_new(tab, {key, owner})
       end
   end
 
   defp release_disk_claim(tab, dir) do
-    :ets.delete(tab, {:disk_refresh, dir})
+    :ets.delete_object(tab, {{:disk_refresh, dir}, self()})
   rescue
+    # The follower (and with it the table) stopped mid-read.
     ArgumentError -> true
   end
 
-  defp first_disk_reading(tab, dir, now) do
-    if claim_disk_refresh(tab, dir, now),
-      do: store_disk_reading(tab, dir),
-      else: await_disk_reading(tab, dir, now + @disk_timeout_ms + 100)
+  # The claim holder. The read itself runs in a SEPARATE process (`reader`): when `df` is stuck in
+  # `statfs` that process cannot be interrupted, so the owner, which must publish the `:error` at the
+  # timeout, cannot be the one blocked in it. The owner outlives the timeout until the reader ends,
+  # which is what keeps the claim held while the OS `df` is.
+  defp run_disk_refresh(tab, dir) do
+    owner = self()
+    ref = make_ref()
+    at = System.monotonic_time(:millisecond)
+    {reader, monitor} = spawn_monitor(fn -> send(owner, {ref, read_disk_free(dir)}) end)
+
+    receive do
+      {^ref, result} ->
+        :ets.insert(tab, {{:disk, dir}, at, result})
+
+      # The reader crashed: unknown, like an unreadable volume.
+      {:DOWN, ^monitor, :process, ^reader, _reason} ->
+        :ets.insert(tab, {{:disk, dir}, at, :error})
+    after
+      Fathom.Admin.Measurements.disk_read_timeout_ms() ->
+        :ets.insert(tab, {{:disk, dir}, System.monotonic_time(:millisecond), :error})
+        note_disk_read_blocked(dir)
+
+        receive do
+          {^ref, result} -> :ets.insert(tab, {{:disk, dir}, at, result})
+          {:DOWN, ^monitor, :process, ^reader, _reason} -> :ok
+        end
+    end
+
+    :ok
+  rescue
+    # The follower (and with it the table) stopped mid-read.
+    ArgumentError -> :ok
+  after
+    release_disk_claim(tab, dir)
+  end
+
+  defp note_disk_read_blocked(dir) do
+    case Fathom.LogLimiter.check(:follower_disk_read_blocked, 1, 60_000) do
+      :suppress ->
+        :ok
+
+      _log ->
+        Logger.warning(
+          "replication follower: the free-space read (`df`) of #{dir} did not answer in " <>
+            "#{Fathom.Admin.Measurements.disk_read_timeout_ms()} ms — a hung `statfs`, usually a " <>
+            "storage stall. Seed admission treats the volume's free space as UNKNOWN and admits " <>
+            "(fail open) until the read answers; no second `df` is started meanwhile. " <>
+            "(Logged once per minute.)"
+        )
+    end
+  end
+
+  defp first_disk_reading(tab, dir) do
+    refresh_disk_async(tab, dir)
+
+    deadline =
+      System.monotonic_time(:millisecond) + Fathom.Admin.Measurements.disk_read_timeout_ms() + 100
+
+    await_disk_reading(tab, dir, deadline)
   end
 
   # Another reader is taking the first reading. Fail OPEN (`:error`) if it does not land in time,
@@ -2108,38 +2193,28 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   # Bytes AND inodes from ONE `df` (`Measurements.volume_readings/1`, expert review 2026-10-22 r8
-  # #10), under `@disk_timeout_ms`. An unreadable inode count is `nil` (the inode floor is then
-  # skipped, fail-open like the byte check) and never costs the byte answer. When that combined read
-  # cannot answer, the old pair: bytes from `:disksup`, inodes from `df -Pi` (r7 #24).
+  # #10). An unreadable inode count is `nil` (the inode floor is then skipped, fail-open like the
+  # byte check) and never costs the byte answer. When that combined read cannot answer, the old
+  # pair: bytes from `:disksup`, inodes from `df -Pi` (r7 #24). UNBOUNDED by design: it runs in the
+  # refresh's reader process, which `run_disk_refresh/2` waits on under the timeout.
   defp read_disk_free(dir) do
-    task = Task.async(fn -> Fathom.Admin.Measurements.volume_readings([dir]) end)
-
-    case Task.yield(task, @disk_timeout_ms) || Task.shutdown(task, :brutal_kill) do
-      {:ok, [{:ok, %{free_bytes: free, free_inodes: free_inodes}}]} -> {:ok, free, free_inodes}
+    case Fathom.Admin.Measurements.volume_readings([dir]) do
+      [{:ok, %{free_bytes: free, free_inodes: free_inodes}}] -> {:ok, free, free_inodes}
       # `df` answered something this parser does not read: try the pair.
-      {:ok, _unreadable} -> read_disk_free_pair(dir)
-      # Timed out or crashed: a second subprocess would not do better inside the same budget.
-      _ -> :error
+      _unreadable -> read_disk_free_pair(dir)
     end
   end
 
   defp read_disk_free_pair(dir) do
-    bytes = Task.async(fn -> Fathom.Admin.Measurements.disk_info(dir) end)
-    inodes = Task.async(fn -> Fathom.Admin.Measurements.inode_info(dir) end)
+    with {:ok, %{free_bytes: free}} <- Fathom.Admin.Measurements.disk_info(dir) do
+      free_inodes =
+        case Fathom.Admin.Measurements.inode_info(dir) do
+          {:ok, %{free_inodes: n}} -> n
+          _ -> nil
+        end
 
-    [bytes_result, inodes_result] =
-      for {task, result} <- Task.yield_many([bytes, inodes], @disk_timeout_ms) do
-        result || Task.shutdown(task, :brutal_kill)
-      end
-
-    free_inodes =
-      case inodes_result do
-        {:ok, {:ok, %{free_inodes: n}}} -> n
-        _ -> nil
-      end
-
-    case bytes_result do
-      {:ok, {:ok, %{free_bytes: free}}} -> {:ok, free, free_inodes}
+      {:ok, free, free_inodes}
+    else
       _ -> :error
     end
   end
