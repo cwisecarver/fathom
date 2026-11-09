@@ -13,7 +13,7 @@ defmodule Fathom.Shard.StampLaneTest do
   """
   use ExUnit.Case, async: false
 
-  alias Fathom.Test.FlushGateScope
+  alias Fathom.Test.{Await, FlushGateScope}
 
   @moduletag :capture_log
 
@@ -183,20 +183,47 @@ defmodule Fathom.Shard.StampLaneTest do
 
     defp run(conn, sql), do: ShardExecutor.execute(conn, %Stmt{sql: sql, args: []})
 
-    defp await_object(id, tries) do
-      case Storage.object_head(id) do
-        {:ok, %{} = head} ->
+    # The head once `ready?.(head)`; on timeout the LAST head seen (nil: no object), so the caller's
+    # assertion reports what was actually there.
+    #
+    # `Storage.Local` writes the object and its position stamp as TWO files (`flush/6`: atomic_copy,
+    # then write_position), so a head read between them is an object with `position: nil` (CI
+    # 2026-11-09: `rankable_stamp?(nil)`; its `object_head/1` documents the mixed head). Waiting for
+    # "an object exists" therefore proves nothing about its stamp: wait for the thing asserted.
+    defp await_object(id, tries, ready? \\ &(&1 != nil)) do
+      head =
+        case Storage.object_head(id) do
+          {:ok, head} -> head
+          _ -> nil
+        end
+
+      cond do
+        ready?.(head) ->
           head
 
-        _ when tries == 0 ->
-          nil
+        tries == 0 ->
+          head
 
-        _ ->
+        true ->
           receive do
           after
-            20 -> await_object(id, tries - 1)
+            20 -> await_object(id, tries - 1, ready?)
           end
       end
+    end
+
+    defp stamped?(%{position: position}), do: Recovery.rankable_stamp?(position)
+    defp stamped?(nil), do: false
+
+    # The object is visible (the PUT landed) BEFORE the coordinator handles the flush task's reply,
+    # and that handler is what releases the gate slot and records the etag (CI-style race: the slot
+    # still counted right after the object appeared). `etag != nil` is the coordinator's own
+    # "this flush is applied"; the slot is released in the same handler.
+    defp await_flush_applied!(pid) do
+      Await.until(
+        fn -> :sys.get_state(pid).etag != nil end,
+        "the coordinator never applied the first flush's verdict"
+      )
     end
 
     for mode <- @modes do
@@ -222,13 +249,14 @@ defmodule Fathom.Shard.StampLaneTest do
 
         # 250 ms is the plain backoff; at 10k shards the herd-scaled one is ~5 s. The object must
         # appear without the main lane ever freeing.
-        head = await_object(id, 150)
+        head = await_object(id, 150, &stamped?/1)
 
         assert head,
                "the first-write stamp flush queued behind the held FlushGate slot: a crash now " <>
                  "loses every acked write"
 
         assert Recovery.rankable_stamp?(head.position)
+        await_flush_applied!(pid)
         assert FlushGateScope.stamp_in_flight(id) == 0, "the stamp slot was not released"
         :ok = ShardExecutor.close(conn)
       end
@@ -281,8 +309,7 @@ defmodule Fathom.Shard.StampLaneTest do
       {:ok, _} = run(conn, "CREATE TABLE kv (v TEXT)")
       {:ok, _} = run(conn, "INSERT INTO kv VALUES ('first')")
       assert %{} = await_object(id, 150)
-      _ = :sys.get_state(pid)
-      assert :sys.get_state(pid).etag != nil
+      await_flush_applied!(pid)
 
       {:ok, e0} = Storage.object_etag(id)
       assert :ok = FlushGate.try_acquire()
