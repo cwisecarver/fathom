@@ -258,6 +258,11 @@ noted).
   failover 17.3 s (identical to the pre-fix baseline), soak 0 destroyed / 0 quarantined ×3,
   pause-fence PASS in both modes — plus two harness traps (a promote-gate read without its default
   that printed a false SPLIT-BRAIN; `soak` reviving nodes from its own environment).
+- **[reviews/jepsen-2026-11-09.md](reviews/jepsen-2026-11-09.md)** — the Tier 0 push gate on the code
+  after the 2026-11-07 audit fixes: fault-free 2 min plus three 10 min hard mixes (power-loss, kill,
+  pause, isolate, repl-cut, s3-cut, up to 3 at once, LazyFS), all Elle-valid and liveness-valid with
+  nothing left unrecovered (slowest recovery 0.44-2.92 s), and `rpo` PASS. Notes that the liveness
+  deadline was unset (`:never-recovered` is the check that bites) and what Tier 0 does not cover.
 - Expert-panel audit reports are **deliberately absent** from this directory and from the repo.
   `/expert-audit` writes them to the gitignored `audits/` directory with a `.progress.md` log; the
   hardening they drove is folded into the code and the docs above, which is the part that ships.
