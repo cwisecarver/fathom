@@ -192,6 +192,45 @@ read 377-383 ms against 383-395 ms. Three pairs cannot separate a 1% effect from
 way past 4k on this rig, and the wake-up-latency risk the file warns about is unmeasured below
 saturation. Run the open-loop ladder on it before enabling.
 
+## Microstate accounting, and a scheduler-count A/B
+
+`:msacc` (10 s, steady state of a `tpc-fleet 1024` run at 4,269 txn/s, all five nodes, via
+`bin/fathom rpc`; `logs/ds/msacc.sh`) read the same on every node. Normal schedulers (12 per node):
+emulator 37%, "other" 25-27%, sleep 17%, port 9-10%, aux 5%, gc 3-4%, check_io 2%. Dirty-IO
+schedulers (10): emulator 75-77%, sleep 9-10%. Dirty-CPU and async threads: 100% asleep. Poll
+threads: 96% asleep.
+
+**This does not attribute CPU, and should not be read as if it did.** msacc reports wall-clock
+thread state, and this VM is oversubscribed: 1-minute load reached 88-97 on 12 vCPUs with about 40
+BEAM threads per node on five nodes, while `docker stats` gave each node about 1.5 cores. A thread
+"in the emulator" for 37% of a window may be waiting in the OS run queue for most of it. What it does
+show: schedulers are not idle (17% asleep), the dirty-IO pool that runs the SQLite NIF is the
+busiest thread type, and dirty-CPU schedulers are unused. A useful CPU attribution needs per-thread
+CPU time (`perf` or `/proc/<pid>/task/*/stat` in the VM), not msacc.
+
+Because five 12-scheduler BEAMs compete for 12 vCPUs, I tried fewer schedulers: `ERL_FLAGS="+S 3:3"`
+against the default, closed-loop `tpc-fleet 1024`, three pairs interleaved, fresh fleet each,
+confirmed on the command lines (`logs/ds/sched.sh`):
+
+| run | default txn/s | `+S 3:3` txn/s |
+|---|---|---|
+| 1 | 4,331.7 | 4,044.8 |
+| 2 | 4,316.7 | 4,010.8 |
+| 3 | 4,287.8 | 4,098.9 |
+| mean | 4,312.1 | 4,051.5 (**-6.0%**) |
+
+Three of three pairs are worse and the arms do not overlap (default spread 44 txn/s, `+S 3:3` 88).
+p99 rose from 382-407 ms to 420-438 ms. **Fewer schedulers per node lose throughput here.** I have
+no measured reason; one untested reading is that a node whose shards are busy can use cores its
+neighbours leave idle only if it has the schedulers to run on. `vm.args.eex` is unchanged.
+
+**Correction to an earlier suggestion.** I proposed batching a transaction's seven statements into
+one Hrana request as the largest lever. That changes the workload, not fathom: `tpcb_txn` runs an
+interactive `BEGIN IMMEDIATE ... COMMIT`, one request per statement, which is what an unchanged
+`django-libsql` client does, and a batched driver's txn/s would not be comparable with any earlier
+`tpc-fleet` figure. A batched driver, if wanted, is a separately labelled "pipelined client" shape.
+The lever for fathom itself is server CPU per request (about 240 µs per statement on the nodes).
+
 ## Against Aurora DSQL
 
 DSQL publishes 7.4 ms p99 single-region COMMIT latency ([paper](https://arxiv.org/pdf/2607.13276),
