@@ -1162,4 +1162,39 @@ defmodule Fathom.ShardExecutorTest do
     refute log =~ "commingles"
     refute log =~ "firewall"
   end
+
+  # Security review 2026-11-10 #1, through the wire path: Hrana `args` are BOUND by the executor,
+  # and SQLite allows `fts3_tokenizer` for a bound parameter even with the engine flag off. Before
+  # the extension's authorizer denied the name, the reader answered an 8-byte module address and the
+  # setter stored one, on `:rw` and `:ro` alike.
+  for scope <- [:rw, :ro] do
+    test "fts3_tokenizer with Hrana-bound args is refused (#{scope})", %{shard: shard} do
+      {:ok, seed} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(seed, stmt("CREATE TABLE t (v TEXT)"))
+      :ok = ShardExecutor.close(seed)
+
+      {:ok, conn} = ShardExecutor.open(shard, unquote(scope))
+      # The reader looks up a built-in; the setter uses a FRESH name, never `simple`/`porter`/
+      # `unicode61`: if the guard ever regresses, overwriting a built-in tokenizer with address 0x8
+      # would take the VM down on the next FTS use of that handle.
+      reader = Filo.Value.decode(%{"type" => "text", "value" => "simple"})
+      fresh = Filo.Value.decode(%{"type" => "text", "value" => "fathom_probe"})
+      blob = Filo.Value.decode(%{"type" => "blob", "base64" => Base.encode64(<<8::64-little>>)})
+
+      for {sql, args} <- [
+            {"SELECT fts3_tokenizer(?)", [reader]},
+            {"SELECT fts3_tokenizer(?, ?)", [fresh, blob]}
+          ] do
+        # The ENGINE's refusal, not merely some error (an arg-type mismatch would also be one).
+        assert {:error, %Error{message: message}} = ShardExecutor.execute(conn, stmt(sql, args)),
+               sql
+
+        assert message =~ "not authorized", sql
+      end
+
+      # The handle is still usable afterwards.
+      assert {:ok, %StmtResult{}} = ShardExecutor.execute(conn, stmt("SELECT 1"))
+      ShardExecutor.close(conn)
+    end
+  end
 end

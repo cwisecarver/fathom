@@ -250,6 +250,51 @@ defmodule Fathom.Shard.PragmaGuardTest do
         assert {:ok, _} = Connection.query(conn, sql, []), sql
       end
     end
+
+    # Security review 2026-11-10 #1. `fts3_tokenizer` reads/stores a raw tokenizer-module pointer,
+    # and SQLite allows both forms for a BOUND parameter even with the engine flag off. Before the
+    # authorizer denied the name, the reader below returned an 8-byte blob on both scopes and the
+    # setter stored it (:ro included: the setter writes an in-memory hash, not the file).
+    for scope <- [:rw, :ro] do
+      test "fts3_tokenizer is refused at the engine, every spelling (#{scope})", %{path: path} do
+        conn = open!(path, tenant?: true, scope: unquote(scope))
+        blob = {:blob, <<8::64-little>>}
+
+        for {sql, args} <- [
+              {"SELECT fts3_tokenizer(?1)", ["simple"]},
+              {"SELECT fts3_tokenizer(?1, ?2)", ["fathom_probe", blob]},
+              {"SELECT FTS3_TOKENIZER(?1)", ["simple"]},
+              {~s|SELECT "fts3_tokenizer"(?1)|, ["simple"]},
+              {"EXPLAIN SELECT fts3_tokenizer(?1)", ["simple"]},
+              {"SELECT * FROM (SELECT fts3_tokenizer(?1))", ["simple"]},
+              {"WITH c(x) AS (SELECT fts3_tokenizer(?1)) SELECT x FROM c", ["simple"]}
+            ] do
+          assert refused?(Connection.query(conn, sql, args)), sql
+        end
+      end
+    end
+
+    test "FTS4 and FTS5 still work for a tenant", %{path: path} do
+      conn = open!(path, tenant?: true, scope: :rw)
+
+      for mod <- ["fts4", "fts5"] do
+        table = "ft_#{mod}"
+
+        assert {:ok, _} =
+                 Connection.query(conn, "CREATE VIRTUAL TABLE #{table} USING #{mod}(body)", [])
+
+        assert {:ok, _} =
+                 Connection.query(conn, "INSERT INTO #{table}(body) VALUES (?1)", [
+                   "hello fathom world"
+                 ])
+
+        assert {:ok, %{rows: [["hello fathom world"]]}} =
+                 Connection.query(conn, "SELECT body FROM #{table} WHERE #{table} MATCH ?1", [
+                   "fathom"
+                 ]),
+               mod
+      end
+    end
   end
 
   describe "handles the guard must never be on" do
@@ -262,6 +307,10 @@ defmodule Fathom.Shard.PragmaGuardTest do
       snap = Path.join(dir, "snap.db")
       assert :ok = Connection.exec(conn, "VACUUM INTO '#{snap}'")
       assert File.exists?(snap)
+
+      # The fts3_tokenizer denial is tenant-only too: fathom's own handles keep the engine default.
+      assert {:ok, %{rows: [[<<_::binary-size(8)>>]]}} =
+               Connection.query(conn, "SELECT fts3_tokenizer(?1)", ["simple"])
     end
   end
 

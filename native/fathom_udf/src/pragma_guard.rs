@@ -73,7 +73,7 @@
 //!
 //! An authorizer runs at PREPARE time, once per action the statement contains (each column read,
 //! each table, ...). For every action but a PRAGMA or a function reference this is one integer
-//! comparison; a function reference adds one name comparison (`replication_denies`).
+//! comparison; a function reference adds two short name comparisons (`function_denied`).
 
 use std::collections::HashSet;
 use std::ffi::{c_void, CStr, CString};
@@ -204,6 +204,28 @@ pub fn replication_denies(
     }
 }
 
+/// SQL functions a tenant handle may never reference, as a pure decision on the registered name
+/// the authorizer receives (one name for both arities, however the SQL spells or quotes it).
+///
+/// * `fathom_wal_replicated`: see `replication_denies`.
+/// * `fts3_tokenizer` (security review 2026-11-10 #1). In both forms (1-argument reader, 2-argument
+///   setter) it reads or stores a raw `sqlite3_tokenizer_module*`. With
+///   `SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER` off (the default) SQLite STILL allows both forms when
+///   the argument is a BOUND PARAMETER, on the assumption that bindings come from trusted
+///   application code. Here the tenant supplies the bindings (Hrana `args`), so a tenant could
+///   disclose a module address inside this process, or register an address that a later fts3/fts4
+///   table, or the eponymous `fts3tokenize` table, calls through. FTS3/4/5 themselves are unaffected:
+///   they reach the registry through C, not through the SQL function.
+///
+///   What does NOT fix it, so nobody "simplifies" toward it: the DBCONFIG flag (already off; the
+///   bound-parameter path bypasses it), `SQLITE_DIRECTONLY` on the function (restricts only views
+///   and triggers, not top-level SQL), `trusted_schema=OFF` (same), and `:block_tenant_ddl` (no
+///   DDL is needed).
+pub fn function_denied(func: Option<&[u8]>) -> bool {
+    replication_denies(ffi::SQLITE_FUNCTION, None, func, || false)
+        || matches!(func, Some(f) if f.eq_ignore_ascii_case(b"fts3_tokenizer"))
+}
+
 /// The four node-global policy variants (see the module docs). `None` = never pushed.
 static POLICIES: RwLock<[Option<Arc<Policy>>; 4]> = RwLock::new([None, None, None, None]);
 
@@ -247,10 +269,10 @@ unsafe extern "C" fn authorize(
     arg5: *const c_char,
     _arg6: *const c_char,
 ) -> c_int {
-    // A function reference is checked for ONE name (one byte comparison per function in the
-    // statement, at prepare time); see `replication_denies`.
+    // A function reference is checked for TWO names (a short byte comparison each per function in
+    // the statement, at prepare time); see `function_denied`.
     if action == ffi::SQLITE_FUNCTION {
-        return if replication_denies(action, None, opt_bytes(arg4), || false) {
+        return if function_denied(opt_bytes(arg4)) {
             ffi::SQLITE_DENY
         } else {
             ffi::SQLITE_OK
@@ -611,6 +633,33 @@ mod tests {
             Some(&b"django_date_extract"[..]),
             || true
         ));
+    }
+
+    // Security review 2026-11-10 #1: `fts3_tokenizer` takes or returns a raw module pointer and is
+    // reachable with a bound parameter even though the engine flag is off.
+    #[test]
+    fn fts3_tokenizer_is_denied_to_tenants_in_any_case() {
+        assert!(function_denied(Some(&b"fts3_tokenizer"[..])));
+        assert!(function_denied(Some(&b"FTS3_TOKENIZER"[..])));
+        assert!(function_denied(Some(&b"Fts3_Tokenizer"[..])));
+        assert!(function_denied(Some(&b"fathom_wal_replicated"[..])));
+    }
+
+    #[test]
+    fn neighbouring_function_names_are_still_allowed() {
+        for f in [
+            &b"fts3_tokenizerx"[..],
+            b"fts3_tokenize",
+            b"fts3",
+            b"lower",
+            b"snippet",
+            b"matchinfo",
+            b"django_date_extract",
+            b"",
+        ] {
+            assert!(!function_denied(Some(f)), "{}", String::from_utf8_lossy(f));
+        }
+        assert!(!function_denied(None));
     }
 
     #[test]
