@@ -35,8 +35,12 @@ time to first byte:
   only the proxy; the two figures measure different things.
 - The latency toxic takes **whole milliseconds** (`latency`, `jitter` are integers). 0.25 ms each
   way cannot be set.
-- The smallest toxic, 1 ms each way, produces about **3.2 ms** of added round trip here, not 2:
-  the extra ~1.2 ms is unexplained (a guess: per-chunk scheduling in the toxic pipeline).
+- The smallest toxic, 1 ms each way, produces about **3.2 ms** of added round trip here, not 2. The
+  cause is not isolated, but it is not specific to this rig: the 2026-08-08 sweep in
+  `docs/a2-quorum-replication.md` (different harness, real TCP) read 26.1 ms for 10 ms each way
+  (nominal 20 + 0.56), 73.2 ms for 30 ms (nominal 60) and 131.7 ms for 60 ms (nominal 120), an
+  excess of about 5-13 ms in every row. The latency toxic delivers more than its nominal delay in
+  both harnesses; the excess is not a constant fraction, so no correction factor is claimed.
 
 Neither point is near 0.5 ms. The two arms below bracket the target from both sides (0.11 ms under
 it, 3.3 ms over it). A point at 0.5 ms needs `tc netem` in the containers, not toxiproxy.
