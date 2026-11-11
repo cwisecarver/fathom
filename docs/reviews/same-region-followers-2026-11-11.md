@@ -148,6 +148,27 @@ What it does not support:
 - **Commit mean is not monotonic in rate** (5.9, 4.8, 6.1 ms at 1,000-3,000 txn/s). It averages the
   whole run, flush windows included, so compare arms at one rate and not rates against each other.
 
+## Where the saturated rig's CPU goes
+
+One more `tpc-fleet 1024` run (4,249 txn/s, p50 220 ms, p99 402 ms, no errors) with `docker stats` and
+the VM's `top` sampled in steady state (`logs/ds/cpusplit.sh`; two samples inside the run, a third at
+its tail, so treat the split as approximate). The VM has 12 vCPUs, the host 18.
+
+| consumer | CPU (cores) |
+|---|---|
+| 5 fathom nodes | 1.4-1.55 each, about 7.3 together |
+| load driver | 1.1-1.2 |
+| nginx LB (12 workers) | 1.0-1.1 |
+| MinIO, Postgres, toxiproxy | under 0.1 each |
+| VM total | 59% user, 28% system, 5-6% softirq, 2% idle; 5-12% iowait |
+
+The VM is out of CPU (about 2% idle), so 4.2k txn/s is a capacity limit of this box. About a third of
+its CPU is kernel time (system plus softirq) on top of what the containers report as their own, which
+is the container network and storage path, not BEAM or SQLite. Accounted container CPU is about 9.8
+cores, roughly 2.3 ms per transaction (7 statements each: 2.87M queries for 410k transactions), and
+about 1.7 ms of that is in the fathom nodes. One finding that did not need a profiler: more fleet
+throughput on this rig needs more CPU or less CPU per statement; no latency setting moves it.
+
 ## Against Aurora DSQL
 
 DSQL publishes 7.4 ms p99 single-region COMMIT latency ([paper](https://arxiv.org/pdf/2607.13276),
