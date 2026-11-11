@@ -85,6 +85,28 @@ Both p99s sit in (10, 25] ms, which says nothing about DSQL's 7.4 ms. Only the m
 [INFERENCE] Interpolating that slope to a 0.5 ms RTT gives p50 about 3.6-3.7 ms and p99 about 7.3-7.4
 ms for a whole TPC-B transaction. This is an interpolation between two measured points, not a run.
 
+## Saturated: 1024 tenants, as far as the VM goes
+
+The 500 txn/s runs above are light load. The same two arms on the closed-loop `tpc-fleet` shape
+(`TPC_NET=container TPC_DRIVER=elixir REPLICATION_ENABLED=true ./chaos.sh tpc-fleet 1024`, 400
+txns per tenant, 5 nodes), one run per arm, each after `colima restart`, image from `f6280fd0`. No
+node logged `clock lags the store`; toxics read back as 0 and 10 on the 5 `repl-*` proxies.
+
+| follower links | txn/s | p50 | p95 | p99 (CI95) | errors | replication commit mean |
+|---|---|---|---|---|---|---|
+| toxiproxy hop only (~0.11 ms RTT) | 4,153 | 226.6 ms | 349 ms | 404 ms (404-405) | 0 | 35.9 ms |
+| 1 ms each way (~3.3 ms RTT) | 4,235 | 223.1 ms | 332 ms | 378 ms (377-379) | 0 | 39.4 ms |
+
+At saturation the added round trip shows up in the commit mean (+3.6 ms, about one effective round
+trip) and nowhere else: throughput and end-to-end latency are equal within a single run's noise
+(the slower-link arm read 2% higher txn/s and a lower p99, which is not a real gain). That is the
+2026-10-30 result again, at the smaller RTT: every transaction already waits about 225 ms for CPU on
+the one VM, and waiting on a follower costs no CPU, so it replaces queueing time instead of adding
+to it. Both arms are within the 4,000-4,317 txn/s band that `AGENTS.md` records for this rig and
+shape. **4,000 txn/s is therefore not a separate load point: the closed loop saturates at about
+4.2k, and the 500 txn/s runs above are the only light-load point.** An open loop at 3,500-4,000
+txn/s would sit just under saturation and was not run.
+
 ## Against Aurora DSQL
 
 DSQL publishes 7.4 ms p99 single-region COMMIT latency ([paper](https://arxiv.org/pdf/2607.13276),
