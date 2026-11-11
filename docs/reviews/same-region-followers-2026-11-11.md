@@ -169,6 +169,29 @@ cores, roughly 2.3 ms per transaction (7 statements each: 2.87M queries for 410k
 about 1.7 ms of that is in the fathom nodes. One finding that did not need a profiler: more fleet
 throughput on this rig needs more CPU or less CPU per statement; no latency setting moves it.
 
+## Scheduler busy-wait A/B (`+sbwt none +sbwtdcpu none`)
+
+`rel/vm.args.eex` leaves the flags commented out "behind an A/B" on this rig, which runs five BEAMs
+of 12 schedulers on 12 vCPUs. Closed-loop `tpc-fleet 1024`, replication on, three runs per side,
+interleaved A B A B A B, a fresh fleet and `colima restart` before each. The flags were passed with
+`ERL_FLAGS` through a new passthrough in `docker-compose.yml` (empty by default) and confirmed on the
+running nodes' command lines (`sbwt none`, `sbwtdcpu none`; absent in the A arm). Image from
+`f6280fd0`; zero errors, no clock-lag lines. The 1-minute load was 5.2 at the start (macOS daemons).
+
+| run | default txn/s | busy-wait off txn/s | pair delta |
+|---|---|---|---|
+| 1 | 4,327.6 | 4,359.3 | +31.7 |
+| 2 | 4,375.2 | 4,397.0 | +21.8 |
+| 3 | 4,307.1 | 4,384.6 | +77.5 |
+| mean | 4,336.6 | 4,380.3 | **+43.7 (+1.0%)** |
+
+All three pairs favour the flags, but the gain is 1.0% against a default-arm spread of 68 txn/s
+(1.6%), and the arms overlap (the lowest flag run, 4,359, is below the best default run, 4,375). p99
+read 377-383 ms against 383-395 ms. Three pairs cannot separate a 1% effect from noise, and the
+2026-10-26 report found the same for a 2% change. **Not enabled in `vm.args.eex`:** it is not a
+way past 4k on this rig, and the wake-up-latency risk the file warns about is unmeasured below
+saturation. Run the open-loop ladder on it before enabling.
+
 ## Against Aurora DSQL
 
 DSQL publishes 7.4 ms p99 single-region COMMIT latency ([paper](https://arxiv.org/pdf/2607.13276),

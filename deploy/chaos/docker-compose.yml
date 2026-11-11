@@ -89,6 +89,9 @@ x-fathom-env: &fathom-env
   # REPL_VIA_TOXI=1 on `up` routes every follower link through toxiproxy (see the entrypoint) so
   # `./chaos.sh repl-latency <ms>` can inject a cross-AZ / cross-region replication hop. Off by default.
   REPL_VIA_TOXI: "${REPL_VIA_TOXI:-}"
+  # Extra emulator flags for an A/B (e.g. ERL_FLAGS="+sbwt none +sbwtdcpu none", the commented-out
+  # busy-wait knob in rel/vm.args.eex). Empty by default, so ordinary runs are unchanged.
+  ERL_FLAGS: "${ERL_FLAGS:-}"
   # Set to 1 only by docker-compose.lazyfs.yml (it needs root, /dev/fuse and CAP_SYS_ADMIN too).
   LAZYFS: "${LAZYFS:-}"
   #
