@@ -98,14 +98,55 @@ node logged `clock lags the store`; toxics read back as 0 and 10 on the 5 `repl-
 | 1 ms each way (~3.3 ms RTT) | 4,235 | 223.1 ms | 332 ms | 378 ms (377-379) | 0 | 39.4 ms |
 
 At saturation the added round trip shows up in the commit mean (+3.6 ms, about one effective round
-trip) and nowhere else: throughput and end-to-end latency are equal within a single run's noise
-(the slower-link arm read 2% higher txn/s and a lower p99, which is not a real gain). That is the
-2026-10-30 result again, at the smaller RTT: every transaction already waits about 225 ms for CPU on
-the one VM, and waiting on a follower costs no CPU, so it replaces queueing time instead of adding
-to it. Both arms are within the 4,000-4,317 txn/s band that `AGENTS.md` records for this rig and
-shape. **4,000 txn/s is therefore not a separate load point: the closed loop saturates at about
-4.2k, and the 500 txn/s runs above are the only light-load point.** An open loop at 3,500-4,000
-txn/s would sit just under saturation and was not run.
+trip of 3.2 ms) and nowhere else that is readable. Throughput is the same within a single run's
+noise (4,153 vs 4,235 txn/s). The p99 difference (404 vs 378 ms) is one run per arm and is not
+interpreted: the "slower" arm reading lower is the sign of noise, not of a gain. The mechanism is the
+2026-10-30 one: every transaction already waits about 225 ms for CPU on the one VM, and waiting on a
+follower costs no CPU, so it replaces queueing time instead of adding to it. This closed loop
+measures capacity, not what a client sees; the open-loop ladder below is the latency question.
+
+## Open-loop ladder, 1024 tenants, 1,000-4,000 txn/s
+
+`TPC_TAIL_ARMS=open TPC_OPEN_RATE=<r> ./chaos.sh tpc-tail 1024 <per_client> 1000 1`, `per_client` set
+so each run lasts about 100 s, at r = 1,000 / 2,000 / 3,000 / 4,000 txn/s. Each run on its own fresh
+fleet after `colima restart` (the rig's MinIO fills after about two back-to-back 1024-tenant runs,
+`chaos.sh:2691`), arms interleaved per rate, same image as above. Zero errors, zero shed, no node
+logged `clock lags the store`, toxics read back as 0 and 10. Latency is a whole TPC-B transaction
+measured from its intended start. Script `logs/ds/sameladder.sh`.
+
+| target | follower links | achieved | p50 | p99 excl. first 10 s | replication commit mean |
+|---|---|---|---|---|---|
+| 1,000 | hop only | 999.8 | 4.67 ms | 53.3 ms | 5.89 ms |
+| 1,000 | 1 ms each way | 999.8 | 7.49 ms (+2.8) | 53.9 ms | 8.83 ms (+2.9) |
+| 2,000 | hop only | 1,999.5 | 9.18 ms | 156.5 ms | 4.80 ms |
+| 2,000 | 1 ms each way | 1,999.5 | 11.51 ms (+2.3) | 105.7 ms | 6.87 ms (+2.1) |
+| 3,000 | hop only | 2,998.7 | 23.13 ms | 149.6 ms | 6.09 ms |
+| 3,000 | 1 ms each way | 2,998.5 | 27.03 ms (+3.9) | 161.6 ms | 8.55 ms (+2.5) |
+| 4,000 | hop only | 3,994.9 | 130.23 ms | 447.6 ms | 19.32 ms |
+| 4,000 | 1 ms each way | 3,995.9 | 119.75 ms (-10.5) | 359.4 ms | 20.12 ms (+0.8) |
+
+What the ladder supports:
+
+- **The rig sustains 4,000 txn/s open loop** (99.9% of target, no errors) on 1024 tenants, with or
+  without the added follower latency.
+- **There is a knee between 3,000 and 4,000 txn/s.** Hop-only p50 goes 23 to 130 ms across it and the
+  service p99 (excluding queueing before the send) reaches 331 ms. It is the CPU limit of the one
+  VM, about 93% of the 4,317 txn/s maximum recorded for this shape, and not a replication effect.
+- **Below the knee the added round trip costs about one effective round trip at p50 and in the commit
+  mean** (+2.3 to +3.9 ms of p50 and +2.1 to +2.9 ms of commit mean for a measured +3.2 ms RTT).
+  Above it the difference disappears into the queue (+0.8 ms commit mean, p50 lower by 10 ms).
+
+What it does not support:
+
+- **No p99 comparison between arms.** Single run per arm per rate, and the p99 is erratic inside one
+  run: at 1,000 txn/s the 10-second windows of the hop-only run range from 7.6 to 123.6 ms. At 2,000
+  txn/s the arm with the extra latency has the lower p99 (106 vs 157 ms), the wrong sign for a real
+  effect. Read p50 and the commit mean; do not read the p99 columns as a result.
+- **The 53 ms p99 at 1,000 txn/s is not explained.** The 500 txn/s run on 256 tenants had a 7 ms
+  p99. This run has four times the tenants, and the host was busier (1-minute load 6.45 at the
+  start, against about 2 earlier, with macOS background daemons). I have not separated the two.
+- **Commit mean is not monotonic in rate** (5.9, 4.8, 6.1 ms at 1,000-3,000 txn/s). It averages the
+  whole run, flush windows included, so compare arms at one rate and not rates against each other.
 
 ## Against Aurora DSQL
 
