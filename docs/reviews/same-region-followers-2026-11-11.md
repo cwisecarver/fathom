@@ -28,8 +28,11 @@ time to first byte:
 | through toxiproxy, no toxic | 0.107-0.111 ms | 0.139-0.194 ms |
 | through toxiproxy, `latency=1` each way | 3.28-3.31 ms | 3.42 ms |
 
-- The proxy hop itself costs about 0.05 ms. The "about 450 µs" in `docs/a2-quorum-replication.md`
-  came from an in-process harness; it does not hold on the rig.
+- The proxy hop itself costs about 0.05 ms per request (0.06 direct vs 0.11 through, both over TCP).
+  This does not contradict the "about 450 µs" in `docs/a2-quorum-replication.md` (2026-08-08), which
+  compares a quorum commit through toxiproxy over real TCP (about 550 µs) with the in-process
+  loopback harness (96 µs). That gap includes the socket and TCP path the in-process run skips, not
+  only the proxy; the two figures measure different things.
 - The latency toxic takes **whole milliseconds** (`latency`, `jitter` are integers). 0.25 ms each
   way cannot be set.
 - The smallest toxic, 1 ms each way, produces about **3.2 ms** of added round trip here, not 2:
