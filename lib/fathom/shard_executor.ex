@@ -2575,7 +2575,37 @@ defmodule Fathom.ShardExecutor do
   defp blocked_statement(sql) when is_binary(sql), do: blocked_statement(sql, head(sql))
   defp blocked_statement(_sql), do: nil
 
+  # Security review 2026-11-10 #1. `fts3_tokenizer` stores or returns a raw tokenizer-module
+  # pointer and SQLite allows both forms for a BOUND parameter even with the engine flag off, so a
+  # tenant (a `:ro` one too) can disclose a code address or register one. With the `fathom_udf`
+  # extension loaded its authorizer refuses the function by name at the engine
+  # (native/fathom_udf/src/pragma_guard.rs, `function_denied`), however the SQL spells it. WITHOUT
+  # the extension (dev/test, or a prod node booted with ALLOW_NO_UDF) exqlite's authorizer denies by
+  # ACTION only and cannot express that, so this text gate is the only layer.
+  #
+  # A substring check on purpose, not a parser: SQLite has no identifier escape that spells the name
+  # without those literal bytes, so quoting, comments and EXPLAIN cannot hide it. The only false
+  # positive is a tenant with that word inside an inline string literal. Gated on the extension being
+  # absent (one `Application.get_env` and a `:persistent_term` read) so the normal path pays nothing.
+  # An open handle only lacks the extension when `Extension.path/0` is nil: with a path configured a
+  # failed load fails the open.
   defp blocked_statement(sql, head) do
+    if tokenizer_function_blocked?(sql) do
+      %Error{
+        message: "statement not permitted on a tenant shard",
+        code: "FILO_STATEMENT_BLOCKED",
+        status: 403
+      }
+    else
+      blocked_by_head(sql, head)
+    end
+  end
+
+  defp tokenizer_function_blocked?(sql) do
+    not Fathom.Shard.Extension.available?() and Regex.match?(~r/fts3_tokenizer/i, sql)
+  end
+
+  defp blocked_by_head(sql, head) do
     cond do
       Enum.any?(@blocked_verbs, &String.starts_with?(head, &1)) ->
         %Error{

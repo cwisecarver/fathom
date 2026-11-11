@@ -337,7 +337,8 @@ defmodule Fathom.Application do
         "config error: the fathom_udf SQLite extension is not available on this prod node " <>
           "(artifact missing — was the image built without cargo? — or :sqlite_extension " <>
           "disabled). Without it tenant handles lose the engine PRAGMA authorizer, the " <>
-          "statement-deadline backstop, the SQLite size limits and Django's UDFs. " <>
+          "statement-deadline backstop, the SQLite size limits and Django's UDFs, and the " <>
+          "only block on a tenant's fts3_tokenizer() calls is the executor's text gate. " <>
           "Build the extension, or set ALLOW_NO_UDF=true to boot degraded on purpose " <>
           "(only possible with replication off: REPLICATION_ENABLED=false)."
     end

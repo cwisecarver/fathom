@@ -17,6 +17,7 @@ defmodule Fathom.Shard.PragmaGuardTest do
 
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Extension
+  alias Fathom.ShardExecutor
 
   setup do
     assert Extension.available?(),
@@ -323,6 +324,57 @@ defmodule Fathom.Shard.PragmaGuardTest do
       assert {:error, _} = Connection.query(conn, "ATTACH DATABASE '#{victim}' AS v", [])
       # No engine pragma guard here: the text gate is the only one, as before tier (b).
       assert {:ok, _} = Connection.query(conn, "PRAGMA synchronous=FULL", [])
+    end
+
+    # Security review 2026-11-10 #1: here the executor's text gate is the only layer, so it carries
+    # the `fts3_tokenizer` refusal itself, on every entry point that reaches `blocked_statement`.
+    test "the statement gate refuses fts3_tokenizer in every spelling and entry point" do
+      Application.put_env(:fathom, :sqlite_extension, false)
+      shard = "pragma_guard_fts3_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        for base <- [
+              Path.join(Fathom.Shard.data_dir(), "#{shard}.db"),
+              Path.join(Fathom.Shard.Storage.Local.dir(), "#{shard}.db")
+            ],
+            suffix <- ["", "-wal", "-shm"],
+            do: File.rm(base <> suffix)
+      end)
+
+      {:ok, seed} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(seed, %Filo.Stmt{sql: "CREATE TABLE t (v)", args: []})
+      :ok = ShardExecutor.close(seed)
+
+      for scope <- [:rw, :ro] do
+        {:ok, h} = ShardExecutor.open(shard, scope)
+
+        for sql <- [
+              "SELECT fts3_tokenizer(?)",
+              "SELECT FTS3_TOKENIZER(?)",
+              ~s|SELECT "fts3_tokenizer"(?)|,
+              "SELECT 1 /* fts3_tokenizer */",
+              "EXPLAIN SELECT fts3_tokenizer(?)",
+              "SELECT * FROM (SELECT fts3_tokenizer(?))"
+            ] do
+          assert {:error, %Filo.Error{code: "FILO_STATEMENT_BLOCKED"}} =
+                   ShardExecutor.execute(h, %Filo.Stmt{sql: sql, args: ["simple"]}),
+                 "execute #{scope}: #{sql}"
+
+          assert {:error, %Filo.Error{code: "FILO_STATEMENT_BLOCKED"}} =
+                   ShardExecutor.describe(h, sql),
+                 "describe #{scope}: #{sql}"
+        end
+
+        # A `:ro` token cannot run a script at all (FILO_READONLY), so only `:rw` reaches the gate.
+        if scope == :rw do
+          assert {:error, %Filo.Error{code: "FILO_STATEMENT_BLOCKED"}} =
+                   ShardExecutor.execute_sequence(h, "SELECT 1; SELECT fts3_tokenizer('simple');")
+        end
+
+        # Neighbouring statements are untouched.
+        assert {:ok, _} = ShardExecutor.execute(h, %Filo.Stmt{sql: "SELECT 1", args: []})
+        ShardExecutor.close(h)
+      end
     end
   end
 end
