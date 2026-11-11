@@ -57,6 +57,24 @@ The hop-only arm reproduces the 2026-10-30 control (p50 2.88 ms, p99 5.8-6.2 ms;
 +2.2-2.3 ms to p99, so a write costs roughly 0.7-0.9 ms per ms of follower round trip at this load
 (the 15 ms arm of the 2026-10-30 run read about 1.0).
 
+**Is it one round trip per write?** The commit mean rose 2.70 ms (1.13 to 3.83) and the `collect` stage
+0.52 to 3.27 ms, against 2 ms of nominal added delay. The nominal figure is the wrong yardstick: the
+probe above measured the 1 ms-each-way toxic at +3.2 ms of real round trip, so +2.7 ms is below one
+effective round trip, with no second one needed. The same toxiproxy overshoot is why the slope
+below is per measured millisecond, and it is a slope for this toxic and load, not a general one.
+
+**The commit histogram cannot give a p99.** Its buckets are 1/2/5/10/25 ms, and the counts are
+cumulative over the whole run including the closed-loop runs and the 30 s flush windows. Share of
+commits at or under each bound:
+
+| arm | <=5 ms | <=10 ms | <=25 ms |
+|---|---|---|---|
+| hop only | 97.4% (103,182 / 105,984) | 98.9% | 99.5% |
+| 1 ms each way | 96.6% (102,400 / 105,984) | 98.5% | 99.5% |
+
+Both p99s sit in (10, 25] ms, which says nothing about DSQL's 7.4 ms. Only the means (1.13 and
+3.83 ms) and the per-transaction `tpc-tail` p99 above are usable.
+
 [INFERENCE] Interpolating that slope to a 0.5 ms RTT gives p50 about 3.6-3.7 ms and p99 about 7.3-7.4
 ms for a whole TPC-B transaction. This is an interpolation between two measured points, not a run.
 
