@@ -1,0 +1,23 @@
+# A/B overlay (audit 2026-11-11 finding #6, isolating arm): each node's primary shard directory on a bind
+# mount on the SAME block device as /var/lib/docker (/dev/vdc1, mounted at /mnt/lima-colima), so the only
+# difference from the default is the overlayfs layer. docker-compose.shardvol.yml binds under /var/tmp,
+# which is on the VM's root disk (/dev/vda1): that arm changed the device as well.
+#   colima ssh -- sh -c 'sudo rm -rf /mnt/lima-colima/rig-shards; for i in 1 2 3 4 5; do
+#     sudo mkdir -p /mnt/lima-colima/rig-shards/fathom$i; sudo chmod 777 /mnt/lima-colima/rig-shards/fathom$i; done'
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.shardvol-vdc.yml ./chaos.sh up
+services:
+  fathom1:
+    volumes:
+      - /mnt/lima-colima/rig-shards/fathom1:/data/shards
+  fathom2:
+    volumes:
+      - /mnt/lima-colima/rig-shards/fathom2:/data/shards
+  fathom3:
+    volumes:
+      - /mnt/lima-colima/rig-shards/fathom3:/data/shards
+  fathom4:
+    volumes:
+      - /mnt/lima-colima/rig-shards/fathom4:/data/shards
+  fathom5:
+    volumes:
+      - /mnt/lima-colima/rig-shards/fathom5:/data/shards

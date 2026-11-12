@@ -1,0 +1,7 @@
+# A/B overlay (audit 2026-11-11 finding #5): the LB without an access log. The default nginx image
+# logs every request to /dev/stdout, which Docker's log driver then has to collect and write.
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.noaccesslog.yml ./chaos.sh up
+services:
+  lb:
+    volumes:
+      - ./nginx.noaccesslog.conf:/etc/nginx/nginx.conf:ro

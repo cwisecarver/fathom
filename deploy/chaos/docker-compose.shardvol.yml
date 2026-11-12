@@ -1,0 +1,22 @@
+# A/B overlay (audit 2026-11-11 finding #6): each node's primary shard directory on a bind mount on the
+# colima VM's own ext4 instead of the container's overlayfs root. Create the directories first (the
+# containers run as `app`):
+#   colima ssh -- sh -c 'sudo rm -rf /var/tmp/rig-shards; for i in 1 2 3 4 5; do
+#     sudo mkdir -p /var/tmp/rig-shards/fathom$i; sudo chmod 777 /var/tmp/rig-shards/fathom$i; done'
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.shardvol.yml ./chaos.sh up
+services:
+  fathom1:
+    volumes:
+      - /var/tmp/rig-shards/fathom1:/data/shards
+  fathom2:
+    volumes:
+      - /var/tmp/rig-shards/fathom2:/data/shards
+  fathom3:
+    volumes:
+      - /var/tmp/rig-shards/fathom3:/data/shards
+  fathom4:
+    volumes:
+      - /var/tmp/rig-shards/fathom4:/data/shards
+  fathom5:
+    volumes:
+      - /var/tmp/rig-shards/fathom5:/data/shards

@@ -1,0 +1,7 @@
+# A/B overlay (audit 2026-11-11 finding #8): 4 nginx workers instead of `auto` (12 on the 12-vCPU rig VM,
+# which five BEAMs, the driver and the LB already share). Production has a dedicated LB host.
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.nginxworkers4.yml ./chaos.sh up
+services:
+  lb:
+    volumes:
+      - ./nginx.workers4.conf:/etc/nginx/nginx.conf:ro
