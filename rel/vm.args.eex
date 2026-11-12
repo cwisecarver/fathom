@@ -120,7 +120,7 @@
 ## workloads by adding wake-up latency, and there is no way to tell which way it goes for fathom
 ## without running it on the rig. Enable only behind an A/B.
 ## A/B 2026-11-11 (closed-loop tpc-fleet 1024, replication on, 3 pairs): +1.0% txn/s (4,337 -> 4,380),
-## all three pairs favourable but inside run-to-run noise (docs/reviews/same-region-followers-2026-11-11.md).
+## all three pairs favourable but inside run-to-run noise (docs/reviews/tpc-fleet-ceiling-2026-11-11.md).
 ## Below saturation, where wake-up latency would show, it has not been measured.
 ##+sbwt none
 ##+sbwtdcpu none
