@@ -119,9 +119,12 @@
 ## Left commented deliberately: unlike the knobs above it can REDUCE throughput on latency-sensitive
 ## workloads by adding wake-up latency, and there is no way to tell which way it goes for fathom
 ## without running it on the rig. Enable only behind an A/B.
-## A/B 2026-11-11 (closed-loop tpc-fleet 1024, replication on, 3 pairs): +1.0% txn/s (4,337 -> 4,380),
-## all three pairs favourable but inside run-to-run noise (docs/reviews/tpc-fleet-ceiling-2026-11-11.md).
-## Below saturation, where wake-up latency would show, it has not been measured.
+## A/B 2026-11-11 on the rig (closed-loop tpc-fleet 1024, replication on): `+sbwt none +sbwtdcpu none` alone
+## was +1.0% (3 pairs, noise). Adding `+sbwtdio none` (the dirty-IO threads were spinning too, about 34k
+## sched_yield/s per thread) gave +3.2% over 6 pairs, all positive, and open-loop 1k/2k/3k txn/s showed no
+## latency regression. That is probably a rig effect: five BEAMs spinning on 12 shared vCPUs. A production
+## BEAM on a dedicated host gets nothing from it and would pay wake-up latency, so it stays off here
+## (docs/reviews/tuning-audit-2026-11-11.md, tpc-fleet-ceiling-2026-11-11.md). On the rig use ERL_ZFLAGS.
 ##+sbwt none
 ##+sbwtdcpu none
 
