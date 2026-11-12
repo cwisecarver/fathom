@@ -57,6 +57,15 @@ RUN cd deps/exqlite && patch -p1 < /src/fathom/native/exqlite_patch/0001-multi-s
   && grep -q multi_step_tagged c_src/sqlite3_nif.c
 ENV FATHOM_EXQLITE_PATCHED=1
 
+# Smaller initial page-cache slab (tuning audit 2026-11-11 #13). SQLite allocates 20 page slots in one
+# slab on a connection's first page fetch (SQLITE_DEFAULT_PCACHE_INITSZ=20) and the slab init touches
+# them all, about 90 KB resident per connection that does little. 4 cut served memory per shard by
+# about 27% on the host bench (served_kb_per_shard 201.7 -> 148.4, two alternating rounds; pooled
+# 404.0 -> 293.0) with statement throughput and open latency inside noise. Takes effect only where the
+# NIF is built from source, as here; the Makefile appends this to exqlite's CFLAGS.
+# docs/reviews/tuning-audit-2026-11-11.md.
+ENV EXQLITE_SYSTEM_CFLAGS="-DSQLITE_DEFAULT_PCACHE_INITSZ=4"
+
 # Compile-time config first so dep compilation caches independently of app code.
 COPY fathom/config/config.exs fathom/config/prod.exs config/
 RUN mix deps.compile
