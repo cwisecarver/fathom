@@ -42,7 +42,7 @@ throughput on this rig needs more CPU or less CPU per statement; no latency sett
 `rel/vm.args.eex` leaves the flags commented out "behind an A/B" on this rig, which runs five BEAMs
 of 12 schedulers on 12 vCPUs. Closed-loop `tpc-fleet 1024`, replication on, three runs per side,
 interleaved A B A B A B, a fresh fleet and `colima restart` before each. The flags were passed with
-`ERL_FLAGS` through a new passthrough in `docker-compose.yml` (empty by default) and confirmed on the
+`ERL_FLAGS` through a passthrough added to `docker-compose.yml` for these runs (since removed: the rig's existing `ERL_ZFLAGS` hook does the same job and is what to use) and confirmed on the
 running nodes' command lines (`sbwt none`, `sbwtdcpu none`; absent in the A arm). Image from
 `f6280fd0`; zero errors, no clock-lag lines. The 1-minute load was 5.2 at the start (macOS daemons).
 
@@ -76,7 +76,7 @@ show: schedulers are not idle (17% asleep), the dirty-IO pool that runs the SQLi
 busiest thread type, and dirty-CPU schedulers are unused. A useful CPU attribution needs per-thread
 CPU time (`perf` or `/proc/<pid>/task/*/stat` in the VM), not msacc.
 
-Because five 12-scheduler BEAMs compete for 12 vCPUs, I tried fewer schedulers: `ERL_FLAGS="+S 3:3"`
+Because five 12-scheduler BEAMs compete for 12 vCPUs, I tried fewer schedulers: `ERL_FLAGS="+S 3:3"` (use `ERL_ZFLAGS` today)
 against the default, closed-loop `tpc-fleet 1024`, three pairs interleaved, fresh fleet each,
 confirmed on the command lines (`logs/ds/sched.sh`):
 
