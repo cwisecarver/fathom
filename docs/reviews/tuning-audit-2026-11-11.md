@@ -15,6 +15,16 @@ committed).
 4,219-4,382. The standard error of a 3-vs-3 difference of means is about 42 txn/s, so about 83 txn/s
 (1.9%) is the 2-sigma bar. The macOS `corespotlightd` daemon was at about 65% CPU when checked.
 
+## Top finding for production: replicated-WAL disk use (#20)
+
+Under continuous writes with replication on, each shard's `-wal` reaches **20-47 MB before it wraps** (5-11.5k
+frames, 1.25-3x the 4000-frame / 16 MB checkpoint threshold), every follower keeps a byte-for-byte copy, and
+**follower replica files were still 1,538 MB, largest 47.4 MB, more than 4 minutes after every primary had
+dropped** (`logs/ds/iter-walgrowth2.txt`, `iter-shmprobe.txt`). This is what filled the rig's Docker data disk
+(below); a production node with many continuously written shards needs about
+`active shards x 20-47 MB x (1 + followers)` of disk, and nothing reclaims the replicas after the primary drops.
+Detail and open options are at the end of "The late rig fault".
+
 ## Where the CPU goes (replication ON, saturated)
 
 One run at 4,092-4,365 txn/s, 10 s windows from `/proc` per-thread stats, bpftrace and
@@ -122,21 +132,26 @@ Consequences:
   The checkpoint is PASSIVE, which backfills but never truncates the `-wal`; the log only wraps when the next writer
   finds everything backfilled and no reader on an older mark, so under continuous load the bound is set by wrap
   opportunities, not by a missing checkpoint.
-- **Longer run: the WAL is not bounded at 16 MB under continuous writes.** 128 tenants x 3,000 transactions (about
-  12,000 frames per shard, three times the 4000-frame threshold), 3,931 txn/s, 0 errors, 29 primary shards on
-  fathom1 (`logs/ds/iter-walgrowth2.txt`). The largest primary `-wal` grew linearly from 3.6 MB (10 s) to
-  **47.4 MB (103 s)**, with no plateau at 16 MB; the matching replica files on the followers reached the same 47.4
-  MB. A file that wrapped would stop growing, so the log never wrapped, even though checkpoints ran
-  (`flush_checkpoint` result `ran` 71, `skipped_small` 39; 177 covered Session threshold checkpoints on fathom1).
-  After the run the primary WALs went to 0 (idle drop) but the follower replica files stayed at **1,538 MB for the
-  next 4 minutes** (80 WAL files, largest 47.4 MB), i.e. not reclaimed.
-- **Reading, not proven:** PASSIVE checkpoints backfill the `.db` but the log restarts only when the next writer
-  finds every frame backfilled and no older reader; with a writer that commits back to back on the same shard
-  there is always a newer frame, so the window never opens (classic WAL checkpoint starvation). The WAL then
-  grows with the shard's committed bytes (about 16 KB per transaction here) for as long as the shard stays
-  active. A production shard with idle gaps would wrap; a continuously written one would not. The sizing formula
-  is therefore `write rate x active time x ~16 KB per transaction x (1 + followers)`, not a 16 MB cap.
-- **Not decided, see progress file #20.** Options include a size-triggered `wal_checkpoint(RESTART)`/`TRUNCATE`
-  (blocks writers briefly and resets the generation the followers must follow, the cost the 2026-10-21 decision
-  avoided), follower-side reclamation of replica WAL after absorb and after the primary's clean drop, or
-  documenting the sizing. Caveat: the TPC-B driver keeps each tenant busy with no idle gap, the worst case.
+- **Longer run: the WAL wraps, but late; its high-water is 1.25-3x the 16 MB threshold.** 128 tenants x 3,000
+  transactions (about 12,000 frames per shard, three times the 4000-frame threshold), 3,931 txn/s, 0 errors, 29
+  primary shards on fathom1 (`logs/ds/iter-walgrowth2.txt`). The largest primary `-wal` grew linearly from 3.6 MB
+  (10 s) to **47.4 MB (103 s)** (the maximum over shards, so a shard that has not wrapped yet dominates it); the
+  replica files on the followers reached the same 47.4 MB. Flush checkpoints ran (`ran` 71, `skipped_small` 39) and
+  177 covered Session checkpoints were counted on fathom1.
+- **Read-only discriminator** (`logs/ds/iter-shmprobe.txt`: the `-shm` header of four hot shards every 10 s; no
+  checkpoint was issued): the log **does wrap**. Eight wraps were seen in 100 s, at file sizes of **5,009, 6,009,
+  6,009, 8,011 and 9,012 frames (19.7 to 35.4 MB)**; after a wrap `mxFrame` restarts near 0 and the file keeps its
+  high-water size. `nBackfill` advances in steps of about 1,000 frames behind `mxFrame` (4,007, 5,009, 6,009,
+  7,011, 8,012) and a wrap happens when a checkpoint reaches `mxFrame` at a moment with no older reader. Read
+  marks look normal: mark 0 is 0, mark 1 equals the current `mxFrame` (the live reader), marks 2-4 are unused.
+  So a shard's WAL is bounded by wrap opportunities at roughly 1.25-3x the intended 4000-frame (16 MB) bound,
+  not unbounded; an earlier version of this section said "never wraps", which the probe contradicts.
+- **After the run** the primary WALs went to 0 (idle drop) but the follower replica files stayed at **1,538 MB
+  for the next 4 minutes** (80 WAL files, largest 47.4 MB): replicas are not reclaimed after the primary's clean
+  drop (the open question below).
+- **Sizing:** disk per shard is about `20-47 MB x (1 + followers)` while it is continuously written, not `16 MB x`.
+  Caveat: the TPC-B driver keeps each tenant busy with no gap (worst case).
+- **Not decided, see progress file #20.** Options: lower the checkpoint threshold or add a size-triggered
+  `wal_checkpoint(RESTART)`/`TRUNCATE` (blocks writers briefly; resets the generation followers follow, the cost
+  the 2026-10-21 decision avoided), make followers reclaim replica WAL after absorb and after the primary's clean
+  drop, or document the sizing.
