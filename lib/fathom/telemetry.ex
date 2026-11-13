@@ -646,6 +646,18 @@ defmodule Fathom.Telemetry do
         reporter_options: [buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]],
         description: "Follower WAL-reset absorb (checkpoint into the .db) duration, by result"
       ),
+      # Tuning audit 2026-11-11 #20. Replicas absorbed because no push touched them for the quiet
+      # window (`Follower.quiet_absorb_pass/1`), and the `-wal` bytes that took off the disk.
+      counter("fathom.replication.follower_quiet_absorb.count",
+        event_name: [:fathom, :replication, :follower_quiet_absorb],
+        description: "Quiet replicas whose last WAL generation a follower absorbed into the .db"
+      ),
+      sum("fathom.replication.follower_quiet_absorb.wal_bytes",
+        event_name: [:fathom, :replication, :follower_quiet_absorb],
+        measurement: :wal_bytes,
+        unit: :byte,
+        description: "Bytes of replica -wal a follower's quiet absorb folded into the .db"
+      ),
       # Expert review 2026-10-08 #5. A push refused because another connection held the shard's
       # replica lock past the wait. Expected around a primary's reconnect or a promotion; a
       # sustained rate means a lock holder is stuck (e.g. a seed on a half-open connection).

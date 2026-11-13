@@ -755,7 +755,7 @@ defmodule Fathom.Shard.Replication.Follower do
     {:ok, port} = :inet.port(lsock)
     Logger.info("replication follower listening on #{bind_label(opts)}:#{port} (dir #{dir})")
 
-    {:ok, %{lsock: lsock, port: port, name: name}, {:continue, :accept}}
+    {:ok, %{lsock: lsock, port: port, name: name, quiet_ref: nil}, {:continue, :accept}}
   end
 
   @impl true
@@ -791,6 +791,7 @@ defmodule Fathom.Shard.Replication.Follower do
 
     # The durable half of the reboot hold, off the listener's critical path (#72).
     start_reboot_pass(name)
+    schedule_quiet_boot_pass()
     {:noreply, state}
   end
 
@@ -827,8 +828,22 @@ defmodule Fathom.Shard.Replication.Follower do
   end
 
   def handle_info(:sweep_rows, state) do
+    state = start_quiet_pass(state)
     _ = sweep_idle_rows(state.name)
     schedule_row_sweep()
+    {:noreply, state}
+  end
+
+  # THE QUIET-ABSORB PASS runs in its own process (an absorb is a synchronous=FULL checkpoint, and a
+  # backlog of them must not hold up `port/1` or the timers), one at a time: a pass still running
+  # when the next tick fires is left to finish. See `quiet_absorb_pass/1`.
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{quiet_ref: ref} = state),
+    do: {:noreply, %{state | quiet_ref: nil}}
+
+  # One pass over the replica directory, `quiet_absorb_ms/0` after boot: replicas that were quiet
+  # before this node started have no row to find by touch time. See `quiet_absorb_boot_pass/1`.
+  def handle_info(:quiet_boot_pass, state) do
+    state = start_quiet_pass(state, :boot)
     {:noreply, state}
   end
 
@@ -846,6 +861,33 @@ defmodule Fathom.Shard.Replication.Follower do
 
   defp seed_temp_reap_ms,
     do: Application.get_env(:fathom, :replication_seed_temp_reap_ms, 5 * 60_000)
+
+  # Off when `quiet_absorb_ms/0` is 0. The boot pass fires once, a quiet window after boot, so a
+  # replica a primary is still pushing to has been touched (and is skipped) by then.
+  defp schedule_quiet_boot_pass do
+    if quiet_absorb_enabled?(),
+      do: Process.send_after(self(), :quiet_boot_pass, quiet_absorb_ms())
+  end
+
+  defp start_quiet_pass(state, kind \\ :touched)
+
+  defp start_quiet_pass(%{quiet_ref: nil, name: name} = state, kind) do
+    if quiet_absorb_enabled?() do
+      {_pid, ref} =
+        spawn_monitor(fn ->
+          case kind do
+            :touched -> quiet_absorb_pass(name)
+            :boot -> quiet_absorb_boot_pass(name)
+          end
+        end)
+
+      %{state | quiet_ref: ref}
+    else
+      state
+    end
+  end
+
+  defp start_quiet_pass(state, _kind), do: state
 
   @impl true
   def terminate(_reason, %{lsock: lsock}), do: :gen_tcp.close(lsock)
@@ -3505,6 +3547,198 @@ defmodule Fathom.Shard.Replication.Follower do
       Map.get(derived, :wal_ordinal, 0) == Map.get(row, :wal_ordinal, 0) and
       derived.next_offset <= row.next_offset and
       (derived.torn or not row.torn)
+  end
+
+  # QUIET-SHARD ABSORB (tuning audit 2026-11-11 #20, docs/reviews/tuning-audit-2026-11-11.md).
+  # The only absorb a follower ran was `absorb_before_reset/5`, on the push that starts a NEW WAL
+  # generation. A shard whose primary then goes quiet (the idle drop folds the PRIMARY's WAL and sends
+  # nothing) therefore left its last generation on every follower as a `-wal`: measured 1,449 MB of
+  # `-wal` against 5.9 MB of `.db` across 79 replicas, byte-identical 3 minutes after every primary had
+  # dropped, and it is what filled the chaos rig's Docker volume.
+  #
+  # A replica that has had no push for `quiet_absorb_ms/0` is absorbed in place: the same checkpoint
+  # and `.db.position` record a reset would make (`absorb_recording_position/6`), then the row is
+  # REPLACED by what the files now say (`derive_state/3`, the row a follower restart would build over
+  # an empty `-wal`: epoch 0, salt 0, the recorded extent). Replacing it is not optional. The old row
+  # names a salt and an append offset in a WAL that no longer exists, and a push at that offset would
+  # land in an empty file.
+  #
+  # WHAT IT COSTS A SHARD THAT WAS NOT REALLY DROPPED. A follower cannot see its primary's coordinator.
+  # If a primary is alive and merely quiet for longer than the window (an idle Hrana stream), its next
+  # push is at an offset the row no longer holds: `decide_fresh/2` answers `:offset_mismatch` at 0, the
+  # primary re-ships its WAL from offset 0 (up to the measured 20-47 MB) and the follower accepts it as
+  # a reset. That is exactly what a follower restart or an idle-row sweep already costs one active
+  # shard (the r8 #8 comment above `recover_shard/3`), so the default window is twice
+  # `Fathom.Shard.idle_ms/0`: past the point where a primary drops a shard nobody uses.
+  #
+  # WHY THIS IS SAFE TO RUN WHILE A PUSH, A SEED OR A PROMOTION IS IN FLIGHT. It runs under the
+  # shard's lock, taken with no wait (a holder skips the shard this round), and re-reads the WAL's
+  # mtime under it, so a push that landed since the candidate was chosen is seen. A promotion's
+  # fence-and-copy holds the same lock, so it copies either the whole WAL or the absorbed `.db`, never
+  # a mix; both rank identically, because the ordinal and the extent are unchanged.
+  #
+  # ONLY A REPLICA THAT IS ALREADY WHOLE: not torn, a stated lineage and ordinal, and the pushes of
+  # this fleet state a lineage (`Protocol.ordinal_wire?/0`, the same gate that makes the epoch sidecar
+  # trustworthy). A torn replica must stay torn, and one with no stated lineage or ordinal would
+  # recover torn from its position record (none is written without them), which this must not cause.
+  # If the checkpoint succeeds but the files no longer reproduce the row, the replacement is a TORN
+  # row that appends nothing (`FollowerLog.seeded(0, 0, 0, 0, lineage)`), never the old one.
+  #
+  # BOUNDED: `@quiet_absorb_batch` absorbs per pass, in a process of its own (`start_quiet_pass/2`),
+  # so a backlog cannot stall the listener or hold every shard's lock; the 60 s tick resumes it.
+  # `:replication_quiet_absorb_ms` 0 turns it off. Candidates are rows untouched for the window
+  # (`touches/1`) and, once per boot, `*.db-wal` files that were already quiet when the node started
+  # (`quiet_absorb_boot_pass/1`: those have no row yet, and the listing is O(replicas), so it is one
+  # pass, never a timer).
+  @quiet_absorb_batch 256
+
+  @doc false
+  # The quiet window in ms; 0 = off. Public for the test.
+  @spec quiet_absorb_ms() :: non_neg_integer()
+  def quiet_absorb_ms do
+    case Application.get_env(:fathom, :replication_quiet_absorb_ms) do
+      ms when is_integer(ms) and ms >= 0 -> ms
+      _ -> 2 * Fathom.Shard.idle_ms()
+    end
+  end
+
+  defp quiet_absorb_enabled?, do: quiet_absorb_ms() > 0 and Protocol.ordinal_wire?()
+
+  @doc false
+  # Absorb every replica whose row has been untouched for the window; the count absorbed. Public for
+  # the test; the sweep tick runs it in a side process.
+  @spec quiet_absorb_pass(atom()) :: non_neg_integer()
+  def quiet_absorb_pass(name \\ __MODULE__) do
+    quiet_ms = quiet_absorb_ms()
+
+    if quiet_absorb_enabled?() do
+      cutoff = System.monotonic_time(:second) - div(quiet_ms, 1000)
+      spec = [{{:"$1", :"$2"}, [{:<, :"$2", cutoff}], [:"$1"]}]
+      quiet_chunks(name, :ets.select(touches(name), spec, @sweep_chunk), quiet_ms, 0)
+    else
+      0
+    end
+  rescue
+    ArgumentError -> 0
+  end
+
+  defp quiet_chunks(_name, :"$end_of_table", _quiet_ms, absorbed), do: absorbed
+
+  defp quiet_chunks(name, {ids, cont}, quiet_ms, absorbed) do
+    absorbed =
+      Enum.reduce_while(ids, absorbed, fn id, n ->
+        cond do
+          n >= @quiet_absorb_batch -> {:halt, n}
+          quiet_absorb_row(name, id, quiet_ms) -> {:cont, n + 1}
+          true -> {:cont, n}
+        end
+      end)
+
+    if absorbed >= @quiet_absorb_batch,
+      do: absorbed,
+      else: quiet_chunks(name, :ets.select(cont), quiet_ms, absorbed)
+  end
+
+  @doc false
+  # The once-per-boot pass over `*.db-wal` files already quiet at start. Public for the test.
+  @spec quiet_absorb_boot_pass(atom()) :: non_neg_integer()
+  def quiet_absorb_boot_pass(name \\ __MODULE__) do
+    quiet_ms = quiet_absorb_ms()
+
+    if quiet_absorb_enabled?() do
+      name
+      |> dir()
+      |> list_dir()
+      |> Enum.filter(&String.ends_with?(&1, ".db-wal"))
+      |> Enum.map(&String.replace_suffix(&1, ".db-wal", ""))
+      |> Enum.count(&quiet_absorb_row(name, &1, quiet_ms))
+    else
+      0
+    end
+  rescue
+    ArgumentError -> 0
+  end
+
+  defp quiet_absorb_row(name, shard_id, quiet_ms) do
+    with true <- Fathom.ShardId.valid?(shard_id),
+         {:ok, {:held, _} = lock} <- lock_shard(name, shard_id, 0) do
+      try do
+        quiet_absorb_locked(name, shard_id, quiet_ms)
+      after
+        unlock_shard(name, lock)
+      end
+    else
+      _invalid_busy_or_stopped -> false
+    end
+  end
+
+  defp quiet_absorb_locked(name, shard_id, quiet_ms) do
+    db = db_path(name, shard_id)
+    wal = wal_path(name, shard_id)
+
+    with {:ok, wal_bytes} <- quiet_wal_bytes(wal, quiet_ms),
+         :absorb <- absorbable(db, wal),
+         %{torn: false, lineage: lineage, wal_ordinal: ordinal} = row
+         when lineage > 0 and ordinal > 0 <- rederive_locked(name, shard_id),
+         :ok <- absorb_recording_position(name, shard_id, row, :complete, db, wal) do
+      settle_quiet_absorb(name, shard_id, row)
+
+      :telemetry.execute(
+        [:fathom, :replication, :follower_quiet_absorb],
+        %{count: 1, wal_bytes: wal_bytes},
+        %{}
+      )
+
+      true
+    else
+      {:error, reason} ->
+        Fathom.LogLimiter.log(:follower_quiet_absorb_failed, :warning, fn ->
+          "replication follower: could not absorb the quiet replica of #{shard_id} " <>
+            "(#{inspect(reason)}); its WAL is left as it is"
+        end)
+
+        false
+
+      _not_a_candidate ->
+        false
+    end
+  end
+
+  # A non-empty `-wal` whose last write is older than the window. The file's mtime, not the row's
+  # touch time: it is the one thing that is also true of a replica no row has been derived for, and
+  # it is re-read under the lock.
+  defp quiet_wal_bytes(wal, quiet_ms) do
+    case Fathom.FS.stat(wal, time: :posix) do
+      {:ok, %{size: size, mtime: mtime}} when size > 0 ->
+        if System.os_time(:second) - mtime >= div(quiet_ms, 1000), do: {:ok, size}, else: false
+
+      _ ->
+        false
+    end
+  end
+
+  # The checkpoint truncated the `-wal`, so the row must be replaced, never kept (see the section
+  # comment). What the files say is the replacement when it is no less safe than what the row said
+  # (the `rederivable?/2` tests: same ownership and ordinal, no more bytes claimed, not torn);
+  # otherwise a torn row that cannot append.
+  defp settle_quiet_absorb(name, shard_id, row) do
+    derived = derive_state(name, shard_id, false)
+
+    settled =
+      if derived != nil and not derived.torn and derived.lineage == row.lineage and
+           Map.get(derived, :wal_ordinal, 0) == row.wal_ordinal and
+           derived.next_offset <= row.next_offset do
+        derived
+      else
+        Logger.warning(
+          "replication follower: the replica of #{shard_id} was absorbed while quiet but its " <>
+            "files do not reproduce its row; holding it as torn until it is re-seeded"
+        )
+
+        %{FollowerLog.seeded(0, 0, 0, 0, row.lineage) | torn: true, wal_ordinal: row.wal_ordinal}
+      end
+
+    put_state(name, shard_id, settled)
   end
 
   # Public only so the test can pin the derivation (10 x the Shard idle default).

@@ -1140,6 +1140,17 @@ case env_bool.("REPLICATION_RESEED") do
   v -> config :fathom, :replication_reseed, v
 end
 
+# QUIET-SHARD ABSORB (tuning audit 2026-11-11 #20). A follower absorbs a replica's last WAL
+# generation into its `.db` once no push has touched it for this many ms, so a shard whose primary
+# dropped does not leave its whole WAL on every follower (measured: 1,449 MB of `-wal` against
+# 5.9 MB of `.db` over 79 replicas, unchanged 3 minutes after the primaries dropped). Default twice
+# `SHARD_IDLE_MS`; 0 turns it off. A primary that is alive but silent for longer than the window pays
+# one re-ship of its WAL from offset 0 on its next write, the cost a follower restart already has.
+# Needs the ordinal wire (the default ON in prod); inert without it.
+if ms = env_nonneg_int.("REPLICATION_QUIET_ABSORB_MS") do
+  config :fathom, :replication_quiet_absorb_ms, ms
+end
+
 # DEFERRED WAL SYNC (expert review 2026-10-21 #7). OFF BY DEFAULT, and it stays off until the rig
 # hot-shard write arm and the crash test named in the commit that added it have passed. With it on
 # (and replication on), tenant `:rw` handles run `synchronous=NORMAL` and the A2 Session issues one
