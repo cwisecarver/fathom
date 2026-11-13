@@ -18,12 +18,18 @@ committed).
 ## Top finding for production: replicated-WAL disk use (#20)
 
 Under continuous writes with replication on, each shard's `-wal` reaches **20-47 MB before it wraps** (5-11.5k
-frames, 1.25-3x the 4000-frame / 16 MB checkpoint threshold), every follower keeps a byte-for-byte copy, and
-**follower replica files were still 1,538 MB, largest 47.4 MB, more than 4 minutes after every primary had
-dropped** (`logs/ds/iter-walgrowth2.txt`, `iter-shmprobe.txt`). This is what filled the rig's Docker data disk
-(below); a production node with many continuously written shards needs about
-`active shards x 20-47 MB x (1 + followers)` of disk, and nothing reclaims the replicas after the primary drops.
-Detail and open options are at the end of "The late rig fault".
+frames, 1.25-3x the 4000-frame / 16 MB checkpoint threshold), and every follower keeps a byte-for-byte copy. Keeping
+replicas after a primary drops is by design (they are A2's failover and peer-recovery copies); the narrower
+finding is what they are made of: **99.6% of the follower footprint is `-wal`** (79 replica shards on fathom1:
+1,449.1 MB of `-wal`, 5.9 MB of `.db`; 77 of the 79 WALs over 1 MB, largest 47.4 MB), unchanged 60 s and 180 s
+after every primary had dropped (`iter-replsplit.txt`, `iter-walgrowth2.txt`, `iter-shmprobe.txt`). The follower
+only absorbs a WAL generation (`absorb_checkpoint`: PASSIVE then TRUNCATE) inside the push-reset path
+(`follower.ex:3653`, `absorb_before_reset`), so a shard's final generation sits as an unabsorbed `-wal` on every
+follower until that shard is written again. This is what filled the rig's Docker data disk (below); a production
+node needs about `active shards x 20-47 MB x (1 + followers)` of disk while shards are hot, plus the last
+generation of every quiet shard it follows. The fix is bounded (absorb a quiet shard's last generation on the
+follower, or have the primary's covered idle close end with a reset the followers absorb) and touches replication,
+so it needs the A2 gates (Jepsen Tier 0, `rpo`). Detail at the end of "The late rig fault".
 
 ## Where the CPU goes (replication ON, saturated)
 
@@ -146,12 +152,14 @@ Consequences:
   marks look normal: mark 0 is 0, mark 1 equals the current `mxFrame` (the live reader), marks 2-4 are unused.
   So a shard's WAL is bounded by wrap opportunities at roughly 1.25-3x the intended 4000-frame (16 MB) bound,
   not unbounded; an earlier version of this section said "never wraps", which the probe contradicts.
-- **After the run** the primary WALs went to 0 (idle drop) but the follower replica files stayed at **1,538 MB
-  for the next 4 minutes** (80 WAL files, largest 47.4 MB): replicas are not reclaimed after the primary's clean
-  drop (the open question below).
+- **After the run** the primary WALs went to 0 (idle drop) but the follower replica files stayed at 1,449 MB
+  for the next 4 minutes, **99.6% of it `-wal`** (`logs/ds/iter-replsplit.txt`; `.db` 5.9 MB, 79 shards; 77 WALs over
+  1 MB). Followers keep replicas by design, so the open question is narrower than reclaiming them: the follower
+  absorbs a generation only on a reset push, so a shard's last generation is never folded after a clean drop.
 - **Sizing:** disk per shard is about `20-47 MB x (1 + followers)` while it is continuously written, not `16 MB x`.
   Caveat: the TPC-B driver keeps each tenant busy with no gap (worst case).
 - **Not decided, see progress file #20.** Options: lower the checkpoint threshold or add a size-triggered
-  `wal_checkpoint(RESTART)`/`TRUNCATE` (blocks writers briefly; resets the generation followers follow, the cost
-  the 2026-10-21 decision avoided), make followers reclaim replica WAL after absorb and after the primary's clean
-  drop, or document the sizing.
+  `wal_checkpoint(RESTART)`/`TRUNCATE` on the primary (blocks writers briefly; resets the generation followers
+  follow, the cost the 2026-10-21 decision avoided); absorb a quiet shard's last generation on the follower (a
+  follower-side idle timer, or a reset push at the primary's covered idle close), which is local to the replica and
+  needs the A2 gates; or document the sizing.
