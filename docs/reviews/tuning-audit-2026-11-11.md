@@ -34,19 +34,21 @@ follower: a quiet replica's last WAL generation is absorbed in place".
 
 | Check | Result |
 |---|---|
-| 128 tenants x 3,000 txns, replica dir by suffix | 1,545 MB `-wal` at +60 s (window 40 s on the rig + the 60 s tick), then **0 `-wal` files and 8.5 MB `.db` at +180 s** (`iter-quietsplit.txt`); run 3,860 txn/s, 0 errors (3,881 before; not an A/B) |
+| 128 tenants x 3,000 txns, replica dir by suffix | 1,323.6 MB `-wal` at +60 s (window 40 s on the rig + the 60 s tick), then **0 `-wal` files and 8.4 MB `.db` at +180 s** (`iter-quietsplit.txt`); run 3,871 txn/s, 0 errors (3,881 before; not an A/B); 0 `clock lags the store` on every node. An earlier run of the same arm gave 1,545 MB then 0 files, 3,860 txn/s |
 | `RPO_QUIET_WAIT_S=80 ./chaos.sh rpo` (absorb while the primary is alive and unflushed, then kill it) | PASS: keeper `epoch 0, salt1 0, -wal 0 B`; survivor `recovery chose pull from fathom1 at L4/O3@8272`, `PROMOTED a local replica over the stored object`; gate off lost the row, gate on kept it (`iter-quiet-rpo.txt`) |
 | standard `./chaos.sh rpo` | PASS (gate off 0, gate on 1) |
-| Jepsen Tier 0 (`docs/jepsen-run-plan.md`), window set to 5 s so absorbs happen inside the faults: 1 x 2 min fault-free at 1000/s, 3 x 10 min hard mix (`power-loss,kill,pause,isolate,repl-cut,s3-cut`, 3 concurrent) | all 4 valid (8/8 shards Elle-valid, liveness valid); 110 s after each, 0 non-empty replica WALs on every node that could be read and 0 quiet-absorb warnings (`iter-jepsen-tier0.txt`) |
+| Jepsen Tier 0 (`docs/jepsen-run-plan.md`) on `019f03ea`, window AND housekeeping tick at 5 s (`REPLICATION_QUIET_ABSORB_MS`, `REPLICATION_ROW_SWEEP_MS`): 1 x 2 min fault-free at 1000/s, 3 x 10 min hard mix (`power-loss,kill,pause,isolate,repl-cut,s3-cut`, 3 concurrent) | all 4 valid (8/8 shards Elle-valid, liveness valid, `run.sh` exit 0); **absorbs actually happened**, sampled per node every 15 s (max sampled, so a lower bound across node restarts): fault-free 5-6 per node, hard mixes 12-33 per node; 110 s after each run every node's replicas were whole: `.db` = position records = 5-8 per node, 0 non-empty WALs; 0 quiet-absorb warnings; 0 `clock lags the store` (`iter-jepsen-tier0b.txt`) |
+| standard and quiet-mode `rpo`, same image | both PASS again, 0 `clock lags the store` per arm (`iter-quiet-rpo.txt`) |
 | `mix precommit` | green, 4,678 tests, dialyzer; 11 new tests, mutation-probed (keep the old row, ignore the mtime, drop the torn/lineage/ordinal guard each fail the tests that name them) |
 
-What the table does not show: (a) the Jepsen runs have no counter for absorbs that fired during the faults (the
-metric exists, `follower_quiet_absorb.count`, but was not scraped), so what they prove is that a 5 s window under
-those faults loses nothing and leaves no WAL behind, not how many absorbs it took; (b) in the last run fathom2's
-container was not found by the post-run check (the nemesis had restarted it; the run itself was valid); (c) a
-shard written every few seconds for as long as it is open still holds its 20-47 MB high-water on the primary and
-each follower. That part is the designed 2026-10-21 trade, not changed. (d) a primary that is alive but silent past
-the window pays one re-ship of its WAL from offset 0 on its next write (unit-tested, not measured on the rig).
+What the table does not show: (a) a first Tier 0 round (4/4 valid) had no absorb counter, no `.db` census and no clock-lag check
+on the rpo and split runs, so it could not tell "everything absorbed" from "no replicas found" or show the runs valid; the
+table above is the repeat that has them (the first round also let a boot-pass bug through that a review found: a boot pass that
+met a running pass was dropped for the node's life, fixed in `019f03ea` with a test); (b) a shard written every few seconds
+for as long as it is open still holds its 20-47 MB high-water on the primary and each follower. That part is the designed
+2026-10-21 trade, not changed; (c) a primary that is alive but silent past the window pays one re-ship of its WAL from offset 0
+on its next write (unit-tested, not measured on the rig); (d) the Jepsen absorb counts are for the 5 s window; the shipped
+default is 2 x `SHARD_IDLE_MS`, which the `rpo` and split runs use (40 s on the rig).
 
 ## Where the CPU goes (replication ON, saturated)
 
