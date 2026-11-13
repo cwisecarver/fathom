@@ -45,7 +45,7 @@ node), i.e. spinning. Minor faults are 1.0-1.9k/s per node, so there is no carri
 | 5 | LB access log off | **+11.1%** (4,352.1 -> 4,835.8), 3 of 3 pairs, no overlap; p99 375 -> 359 ms. dockerd/shim CPU explains it. **Rig-only**: it is VM CPU returned to the nodes; a separately hosted LB would only gain its own CPU per request. Opt-in overlay `docker-compose.noaccesslog.yml`; rig default unchanged (series continuity). Production LB logs by default (`deploy/lb/fathom.nginx.conf` has no `access_log`): prefer `buffer=64k flush=5s` or a 2xx filter to `off`. |
 | 6 | Shard dir off overlayfs | **Overlayfs is not the cost.** A bind mount on the VM root disk read +3.8%, but that moved to a different block device; the isolating arm (same device as the overlay) read **+0.38%**. The +3.8% is vda vs vdc1 (the Docker data disk and its journal). |
 | 8 | LB `worker_processes 4` vs `auto` (12) | +1.5% (4,326.1 -> 4,390.4), 3 of 3 pairs, below the 1.9% bar. Rig-only. The WebSocket arm needs new driver code and a new series. |
-| 9 | OTP 29.1.2 vs 28.5 | **Not scored.** Two A/Bs, a diagnostic pair and an instrumented diagnostic run all failed the same way in every arm, including the OTP 28 image that was clean an hour earlier (0 errors, 4.2-4.4k txn/s): 32k-56k failed transactions and 3.4-3.9k txn/s. The instrumented run shows why: every node logs `heartbeat not valid for > margin+steal_margin - fencing writes ... Writes 503` and `durability flush FAILED (:ownership_unconfirmed)` on about 200 shards, and the LB logged 2.5M `200`s and no 5xx (the errors are Hrana results). The driver's `worker_deadline` label counts any txn shortfall (`tpc_driver.exs:874`), so it is not a deadline. The S3 lease path is failing under the current rig conditions; images, VM config, disk space, host load, thermals and other compose projects were checked and did not explain it. Cause not isolated; stopped per the repo's stop-after-2 rule. **Open availability item, not closed as an environment problem:** that the same OTP 28 image was clean earlier shows the trigger is environmental; it does not show fathom reacts to it correctly. All five nodes declared their heartbeat invalid at the same time and fenced writes on about 200 shards each, which is either a store slow or failing enough to miss renewals, or a heartbeat-path weakness that a slowdown exposes, and the rig reached it by itself. Discriminating next step: heartbeat-renew PUT latency from `[:fathom, :s3, :op]` against the 10 s cadence and 30 s TTL, plus MinIO and toxiproxy logs from the same window. Whether to spend a run on it is the maintainer's call. |
+| 9 | OTP 29.1.2 vs 28.5 | First attempts invalid; cause found and fixed, rerun pending (see **The late rig fault** below). |
 | 10 | Carrier / page-fault churn | Not a problem (minor faults 1.0-1.9k/s per node). |
 | 11 | bridge-netfilter | Premise not reproduced: `br_netfilter` is not loaded during a run. |
 | 13 | `-DSQLITE_DEFAULT_PCACHE_INITSZ=4` | **Adopted.** `served_kb_per_shard` 201.6 / 201.8 -> 146.6 / 150.1 (-27%); pooled 404.0 -> 293.0; SQLite share 190.3 -> 134.9 KB. `same_shard_stmt_per_s` -0.4% / -0.7%; open and one-shot latency flat in the second round. Set in both Dockerfiles. |
@@ -68,8 +68,42 @@ extent scan-back and needs the A2 gates).
   not fathom speedups. The one production-relevant change is #13, a density win.
 - **Single host, single VM.** Each A/B used three pairs; the p99 columns are not compared between arms
   because p99 varies by an order of magnitude between 10-second windows inside one run.
-- **The rig degraded late in the session** (see #9: nodes fencing writes because the S3 lease heartbeat
-  went invalid). All scored A/Bs were run before it, each against its own interleaved default arm, all
-  with 0 errors.
+- **The rig failed late in the session** for a reason that is now understood (below). All scored A/Bs ran before it, each against its own interleaved default arm, all with 0 errors.
 - **One #18 sample is printed in exponent form** (`4.3E+3`): the driver rounds txn/s to 0.1, so that value is
   4300.0 at the driver's precision, not an estimate.
+
+## The late rig fault: the Docker data disk ran out of space
+
+Symptom: from the OTP 29 A/B on, every arm (including the OTP 28 image that was clean an hour earlier)
+had 32k-65k failed transactions and 3.1-3.9k txn/s. The driver labels any txn shortfall
+`worker_deadline` (`tpc_driver.exs:874`), so that label said nothing about deadlines.
+
+What the instrumented runs showed:
+
+- Every node logged `heartbeat renew failed for <owner>: {:s3_put_status, 507}` and
+  `durability flush failed ({:s3_put_status, 507})`, then, after the TTL plus steal margin, `heartbeat not valid
+  for > margin+steal_margin - fencing writes` on about 200 shards each and `durability flush FAILED
+  (:ownership_unconfirmed)`. The LB showed 2.5M `200`s and no 5xx, because the 503s are inside Hrana results.
+- MinIO answers 507 when its drive is full. `/dev/vdc1` (the Docker data disk, which holds MinIO's data
+  and every container's writable layer) went from 20.3 GiB free to 0.4 GiB in 85 s during a run
+  (`stat -f` on MinIO's root) and the 507s began as it reached zero.
+- The fleet itself writes that data: each node's writable layer grew about 58 MB/s (primary WAL plus three
+  followers' WAL copies, about 270 MB/s fleet-wide), 3.4 GB per node after 80 s, and the shard WALs were
+  not shrinking inside that window. A healthy 1024-tenant `tpc-fleet` run peaks at about **22 GiB** of disk
+  (62.1 GiB free at the start, 40.3 GiB minimum during the run).
+- My OTP 29 and throwaway-image Docker builds had filled the build cache (46 GB reclaimable), taking the
+  free space down to 20 GiB, below that peak. After `docker builder prune -af` (62 GiB free)
+  one default run read 4,234.9 txn/s, 0 errors, 0 heartbeat renew failures, 0 fenced shards.
+
+Consequences:
+
+- **The rig needs about 25-30 GiB of free space on the Docker data disk** for a 1024-tenant run, and Docker
+  builds eat it silently. Prune the build cache (`docker builder prune -af`) after building images.
+- **Fathom's behaviour was the designed one**: a store that rejects the lease-heartbeat PUT for longer than
+  the TTL makes every node fence writes (fail closed), and every node depends on the one bucket. A bucket-wide
+  failure is a fleet-wide write outage by design (`docs/single-writer.md`; the cross-region report notes the
+  bucket as a single dependency). Nothing here shows a heartbeat-path weakness.
+- Not examined: why the shard WALs do not shrink within a 30 s flush interval under replication. It is
+  what sets the rig's 22 GiB peak, and the same growth costs disk on a production node, so it is worth a
+  look separately.
+
