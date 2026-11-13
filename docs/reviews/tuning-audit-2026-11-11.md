@@ -15,21 +15,38 @@ committed).
 4,219-4,382. The standard error of a 3-vs-3 difference of means is about 42 txn/s, so about 83 txn/s
 (1.9%) is the 2-sigma bar. The macOS `corespotlightd` daemon was at about 65% CPU when checked.
 
-## Top finding for production: replicated-WAL disk use (#20)
+## Top finding for production: replicated-WAL disk use (#20), FIXED for quiet shards
 
 Under continuous writes with replication on, each shard's `-wal` reaches **20-47 MB before it wraps** (5-11.5k
 frames, 1.25-3x the 4000-frame / 16 MB checkpoint threshold), and every follower keeps a byte-for-byte copy. Keeping
 replicas after a primary drops is by design (they are A2's failover and peer-recovery copies); the narrower
-finding is what they are made of: **99.6% of the follower footprint is `-wal`** (79 replica shards on fathom1:
+finding was what they were made of: **99.6% of the follower footprint was `-wal`** (79 replica shards on fathom1:
 1,449.1 MB of `-wal`, 5.9 MB of `.db`; 77 of the 79 WALs over 1 MB, largest 47.4 MB), unchanged 60 s and 180 s
 after every primary had dropped (`iter-replsplit.txt`, `iter-walgrowth2.txt`, `iter-shmprobe.txt`). The follower
-only absorbs a WAL generation (`absorb_checkpoint`: PASSIVE then TRUNCATE) inside the push-reset path
-(`follower.ex:3653`, `absorb_before_reset`), so a shard's final generation sits as an unabsorbed `-wal` on every
-follower until that shard is written again. This is what filled the rig's Docker data disk (below); a production
-node needs about `active shards x 20-47 MB x (1 + followers)` of disk while shards are hot, plus the last
-generation of every quiet shard it follows. The fix is bounded (absorb a quiet shard's last generation on the
-follower, or have the primary's covered idle close end with a reset the followers absorb) and touches replication,
-so it needs the A2 gates (Jepsen Tier 0, `rpo`). Detail at the end of "The late rig fault".
+only absorbed a WAL generation (`absorb_checkpoint`: PASSIVE then TRUNCATE) inside the push-reset path
+(`follower.ex`, `absorb_before_reset`), so a shard's final generation sat as an unabsorbed `-wal` on every
+follower until that shard was written again. This is what filled the rig's Docker data disk (below).
+
+**The fix** (`aba4830d`, `Follower.quiet_absorb_pass/1`, `REPLICATION_QUIET_ABSORB_MS`, default 2 x `SHARD_IDLE_MS`,
+0 = off): a replica no push has touched for the window is absorbed in place under its shard lock, and its row is
+replaced by what the files then say (the row a restart builds over an empty WAL). Component-notes entry: "A2
+follower: a quiet replica's last WAL generation is absorbed in place".
+
+| Check | Result |
+|---|---|
+| 128 tenants x 3,000 txns, replica dir by suffix | 1,545 MB `-wal` at +60 s (window 40 s on the rig + the 60 s tick), then **0 `-wal` files and 8.5 MB `.db` at +180 s** (`iter-quietsplit.txt`); run 3,860 txn/s, 0 errors (3,881 before; not an A/B) |
+| `RPO_QUIET_WAIT_S=80 ./chaos.sh rpo` (absorb while the primary is alive and unflushed, then kill it) | PASS: keeper `epoch 0, salt1 0, -wal 0 B`; survivor `recovery chose pull from fathom1 at L4/O3@8272`, `PROMOTED a local replica over the stored object`; gate off lost the row, gate on kept it (`iter-quiet-rpo.txt`) |
+| standard `./chaos.sh rpo` | PASS (gate off 0, gate on 1) |
+| Jepsen Tier 0 (`docs/jepsen-run-plan.md`), window set to 5 s so absorbs happen inside the faults: 1 x 2 min fault-free at 1000/s, 3 x 10 min hard mix (`power-loss,kill,pause,isolate,repl-cut,s3-cut`, 3 concurrent) | all 4 valid (8/8 shards Elle-valid, liveness valid); 110 s after each, 0 non-empty replica WALs on every node that could be read and 0 quiet-absorb warnings (`iter-jepsen-tier0.txt`) |
+| `mix precommit` | green, 4,678 tests, dialyzer; 11 new tests, mutation-probed (keep the old row, ignore the mtime, drop the torn/lineage/ordinal guard each fail the tests that name them) |
+
+What the table does not show: (a) the Jepsen runs have no counter for absorbs that fired during the faults (the
+metric exists, `follower_quiet_absorb.count`, but was not scraped), so what they prove is that a 5 s window under
+those faults loses nothing and leaves no WAL behind, not how many absorbs it took; (b) in the last run fathom2's
+container was not found by the post-run check (the nemesis had restarted it; the run itself was valid); (c) a
+shard written every few seconds for as long as it is open still holds its 20-47 MB high-water on the primary and
+each follower. That part is the designed 2026-10-21 trade, not changed. (d) a primary that is alive but silent past
+the window pays one re-ship of its WAL from offset 0 on its next write (unit-tested, not measured on the rig).
 
 ## Where the CPU goes (replication ON, saturated)
 
@@ -158,8 +175,6 @@ Consequences:
   absorbs a generation only on a reset push, so a shard's last generation is never folded after a clean drop.
 - **Sizing:** disk per shard is about `20-47 MB x (1 + followers)` while it is continuously written, not `16 MB x`.
   Caveat: the TPC-B driver keeps each tenant busy with no gap (worst case).
-- **Not decided, see progress file #20.** Options: lower the checkpoint threshold or add a size-triggered
-  `wal_checkpoint(RESTART)`/`TRUNCATE` on the primary (blocks writers briefly; resets the generation followers
-  follow, the cost the 2026-10-21 decision avoided); absorb a quiet shard's last generation on the follower (a
-  follower-side idle timer, or a reset push at the primary's covered idle close), which is local to the replica and
-  needs the A2 gates; or document the sizing.
+- **Decided and built:** follower-side absorb of a quiet shard's last generation (above). Not done, and not needed for
+  it: lowering the checkpoint threshold or a size-triggered primary `RESTART`/`TRUNCATE` (blocks writers, resets the
+  generation followers follow, the cost the 2026-10-21 decision avoided) for the 20-47 MB high-water of a hot shard.

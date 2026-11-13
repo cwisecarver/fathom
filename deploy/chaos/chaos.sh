@@ -1389,6 +1389,14 @@ rpo_trial() {
     # 10 minutes: long enough that no periodic flush can fire inside this trial. Read on every
     # re-arm, so it takes effect after the timer currently in flight.
     rpc "$n" 'Application.put_env(:fathom, :shard_flush_interval_ms, 600_000)' >/dev/null 2>&1
+    # QUIET-ABSORB MODE (RPO_QUIET_WAIT_S > 0, tuning audit 2026-11-11 #20): the followers must absorb
+    # the replica while the primary is still alive and unflushed, so the primary may not idle-drop
+    # (which flushes) inside the wait, and the quiet window must fit inside it. Leaves
+    # `:shard_idle_ms` at 1 h on every node: bring the rig down after.
+    if [ "${RPO_QUIET_WAIT_S:-0}" -gt 0 ]; then
+      rpc "$n" 'Application.put_env(:fathom, :shard_idle_ms, 3_600_000)' >/dev/null 2>&1
+      rpc "$n" "Application.put_env(:fathom, :replication_quiet_absorb_ms, ${RPO_QUIET_ABSORB_MS:-5000})" >/dev/null 2>&1
+    fi
   done
   sleep 7
 
@@ -1467,6 +1475,31 @@ rpo_trial() {
       echo "it — that is a stamping/durability problem, not a survivor-selection one"
       echo INVALID; return ;;
   esac
+
+  # Quiet-absorb mode: let every follower absorb this shard's replica (the 60 s row-sweep tick, after
+  # the quiet window), then check that it DID, that nothing reached S3 meanwhile, and only then kill.
+  # The recovery the trial exercises is then a pull of an ABSORBED replica: a `.db` holding the row
+  # and an empty `-wal`, ranked by the position record.
+  if [ "${RPO_QUIET_WAIT_S:-0}" -gt 0 ]; then
+    echo "quiet-absorb mode: no writes for ${RPO_QUIET_WAIT_S}s so the followers absorb $shard's replica"
+    sleep "$RPO_QUIET_WAIT_S"
+    keeper_pos=$(rpc "$keeper" "IO.inspect(Fathom.Shard.Replication.Follower.state_of(Fathom.Shard.Replication.Follower, \"$shard\"))")
+    echo "keeper replica after the wait: $keeper_pos"
+    local kwal
+    kwal=$(rpc "$keeper" "IO.puts(case File.stat(Fathom.Shard.Replication.Follower.wal_path(Fathom.Shard.Replication.Follower, \"$shard\")) do {:ok, %{size: s}} -> s; _ -> 0 end)" | tail -1)
+    echo "keeper -wal bytes after the wait: $kwal"
+    case "$keeper_pos" in
+      *"salt1: 0"*) [ "$kwal" = "0" ] || { echo "the keeper's WAL is not empty after the wait"; echo INVALID; return; } ;;
+      *) echo "the keeper's replica was NOT absorbed during the wait; this run proves nothing about it"
+         echo INVALID; return ;;
+    esac
+    count=$(rpo_object_count "$shard" fathom1 999)
+    if [ "$count" != "0" ]; then
+      echo "seq=999 reached the stored object during the wait (count=$count): the trial is void"
+      echo INVALID; return
+    fi
+    echo "keeper absorbed, seq=999 still NOT in S3: the recovery below is a pull of an absorbed replica"
+  fi
 
   rpc "$victim" 'Application.put_env(:fathom, :replication_promote_on_open, true)' >/dev/null 2>&1
   rpc "$victim" "Application.put_env(:fathom, :replication_recover_from_peers, $gate)" >/dev/null 2>&1
