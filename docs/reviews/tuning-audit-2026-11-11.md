@@ -45,7 +45,7 @@ node), i.e. spinning. Minor faults are 1.0-1.9k/s per node, so there is no carri
 | 5 | LB access log off | **+11.1%** (4,352.1 -> 4,835.8), 3 of 3 pairs, no overlap; p99 375 -> 359 ms. dockerd/shim CPU explains it. **Rig-only**: it is VM CPU returned to the nodes; a separately hosted LB would only gain its own CPU per request. Opt-in overlay `docker-compose.noaccesslog.yml`; rig default unchanged (series continuity). Production LB logs by default (`deploy/lb/fathom.nginx.conf` has no `access_log`): prefer `buffer=64k flush=5s` or a 2xx filter to `off`. |
 | 6 | Shard dir off overlayfs | **Overlayfs is not the cost.** A bind mount on the VM root disk read +3.8%, but that moved to a different block device; the isolating arm (same device as the overlay) read **+0.38%**. The +3.8% is vda vs vdc1 (the Docker data disk and its journal). |
 | 8 | LB `worker_processes 4` vs `auto` (12) | +1.5% (4,326.1 -> 4,390.4), 3 of 3 pairs, below the 1.9% bar. Rig-only. The WebSocket arm needs new driver code and a new series. |
-| 9 | OTP 29.1.2 vs 28.5 | First attempts invalid; cause found and fixed, rerun pending (see **The late rig fault** below). |
+| 9 | OTP 29.1.2 vs 28.5 | **No gain: -1.8%** (4,320.7 -> 4,243.6 txn/s), all 3 pairs lower (-10, -138, -83), p99 +6 to +24 ms, 0 errors in all six runs. Run after the rig fault below was fixed, with a runner image that has `libsctp1` (OTP 29 otherwise prints `ESOCK WARNING ... libsctp.so.1` on every `bin/fathom rpc`, which breaks `chaos.sh` parsing). Same commit built twice. Not adopted. |
 | 10 | Carrier / page-fault churn | Not a problem (minor faults 1.0-1.9k/s per node). |
 | 11 | bridge-netfilter | Premise not reproduced: `br_netfilter` is not loaded during a run. |
 | 13 | `-DSQLITE_DEFAULT_PCACHE_INITSZ=4` | **Adopted.** `served_kb_per_shard` 201.6 / 201.8 -> 146.6 / 150.1 (-27%); pooled 404.0 -> 293.0; SQLite share 190.3 -> 134.9 KB. `same_shard_stmt_per_s` -0.4% / -0.7%; open and one-shot latency flat in the second round. Set in both Dockerfiles. |
@@ -99,6 +99,7 @@ Consequences:
 
 - **The rig needs about 25-30 GiB of free space on the Docker data disk** for a 1024-tenant run, and Docker
   builds eat it silently. Prune the build cache (`docker builder prune -af`) after building images.
+  `chaos.sh up` now warns when the disk has under 30 GiB free (`RIG_MIN_FREE_GB`, 0 to silence).
 - **Fathom's behaviour was the designed one**: a store that rejects the lease-heartbeat PUT for longer than
   the TTL makes every node fence writes (fail closed), and every node depends on the one bucket. A bucket-wide
   failure is a fleet-wide write outage by design (`docs/single-writer.md`; the cross-region report notes the

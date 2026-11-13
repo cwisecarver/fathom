@@ -411,7 +411,7 @@ cmd_build_driver() { compose build driver; }
 # exit code of its final command, so ordering it before `compose ps`/`check_lb_port` — both of which
 # succeed — silently swallowed the failure and `up` returned 0 with a node dead, which is the exact
 # thing this check exists to stop.
-cmd_up()    { set_vm_writeback; compose up -d --wait --wait-timeout 180 || true; compose ps; check_lb_port; ensure_nodes_up; }
+cmd_up()    { set_vm_writeback; check_docker_disk_headroom; compose up -d --wait --wait-timeout 180 || true; compose ps; check_lb_port; ensure_nodes_up; }
 
 # Cap the docker VM's dirty page cache so writeback runs steadily instead of in bursts.
 #
@@ -431,6 +431,26 @@ set_vm_writeback() {
     echo "vm writeback: vm.dirty_background_bytes=$bytes" >&2
   else
     echo "WARNING: could not set vm.dirty_background_bytes; p99 will show ~30 s writeback spikes" >&2
+  fi
+}
+
+# The Docker data disk needs headroom, or the whole fleet fences writes mid-run.
+#
+# A 1024-tenant tpc-fleet run writes about 22 GiB onto the Docker data disk (each node's primary WAL plus
+# three followers' WAL copies, ~270 MB/s fleet-wide, and the shard WALs do not shrink within a run). MinIO's
+# data lives on the same disk, so when it fills MinIO answers 507 to the lease-heartbeat PUT, every node logs
+# `heartbeat renew failed ... {:s3_put_status, 507}` and then fences writes (~80 s in), and the run reads as
+# 12%+ failed txns and ~3.5k txn/s. It looks like a regression and is not one (docs/reviews/tuning-audit-2026-11-11.md,
+# "The late rig fault"). Docker image builds silently eat the headroom (the build cache grows by tens of GB):
+# `docker builder prune -af` gets it back. This only WARNS; RIG_MIN_FREE_GB=0 silences it (default 30).
+check_docker_disk_headroom() {
+  local min_gb=${RIG_MIN_FREE_GB:-30} avail_kb
+  [ "$min_gb" = "0" ] && return 0
+  avail_kb=$("$DOCKER" run --rm alpine:3.20 df -k / 2>/dev/null | awk 'NR==2 {print $4}')
+  case "$avail_kb" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$avail_kb" -lt $(( min_gb * 1024 * 1024 )) ]; then
+    echo "WARNING: the Docker data disk has $(( avail_kb / 1024 / 1024 )) GiB free; a 1024-tenant run needs about 22 GiB and MinIO starts answering 507" >&2
+    echo "  (nodes then fence writes: failed txns, ~3.5k txn/s) when it fills. Free space first: \`docker builder prune -af\`. RIG_MIN_FREE_GB=0 silences this." >&2
   fi
 }
 
