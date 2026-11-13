@@ -442,7 +442,9 @@ set_vm_writeback() {
 # `heartbeat renew failed ... {:s3_put_status, 507}` and then fences writes (~80 s in), and the run reads as
 # 12%+ failed txns and ~3.5k txn/s. It looks like a regression and is not one (docs/reviews/tuning-audit-2026-11-11.md,
 # "The late rig fault"). Docker image builds silently eat the headroom (the build cache grows by tens of GB):
-# `docker builder prune -af` gets it back. This only WARNS; RIG_MIN_FREE_GB=0 silences it (default 30).
+# Diagnose with `docker system df`; free it by removing stale `fathom-chaos:*` tags/images. `docker builder prune`
+# is a last resort: Docker is machine-wide, so it also makes every other project's next build cold.
+# This only WARNS; RIG_MIN_FREE_GB=0 silences it (default 30).
 check_docker_disk_headroom() {
   local min_gb=${RIG_MIN_FREE_GB:-30} avail_kb
   [ "$min_gb" = "0" ] && return 0
@@ -450,7 +452,7 @@ check_docker_disk_headroom() {
   case "$avail_kb" in ''|*[!0-9]*) return 0 ;; esac
   if [ "$avail_kb" -lt $(( min_gb * 1024 * 1024 )) ]; then
     echo "WARNING: the Docker data disk has $(( avail_kb / 1024 / 1024 )) GiB free; a 1024-tenant run needs about 22 GiB and MinIO starts answering 507" >&2
-    echo "  (nodes then fence writes: failed txns, ~3.5k txn/s) when it fills. Free space first: \`docker builder prune -af\`. RIG_MIN_FREE_GB=0 silences this." >&2
+    echo "  (nodes then fence writes: failed txns, ~3.5k txn/s) when it fills. See \`docker system df\`; remove stale fathom-chaos:* images (\`docker builder prune\` is a last resort: it slows every project's next build). RIG_MIN_FREE_GB=0 silences this." >&2
   fi
 }
 

@@ -98,13 +98,23 @@ What the instrumented runs showed:
 Consequences:
 
 - **The rig needs about 25-30 GiB of free space on the Docker data disk** for a 1024-tenant run, and Docker
-  builds eat it silently. Prune the build cache (`docker builder prune -af`) after building images.
+  builds eat it silently. Check `docker system df` and remove stale `fathom-chaos:*` images after building (`docker builder prune` is machine-wide and slows every project's next build; use it last).
   `chaos.sh up` now warns when the disk has under 30 GiB free (`RIG_MIN_FREE_GB`, 0 to silence).
 - **Fathom's behaviour was the designed one**: a store that rejects the lease-heartbeat PUT for longer than
   the TTL makes every node fence writes (fail closed), and every node depends on the one bucket. A bucket-wide
   failure is a fleet-wide write outage by design (`docs/single-writer.md`; the cross-region report notes the
   bucket as a single dependency). Nothing here shows a heartbeat-path weakness.
-- Not examined: why the shard WALs do not shrink within a 30 s flush interval under replication. It is
-  what sets the rig's 22 GiB peak, and the same growth costs disk on a production node, so it is worth a
-  look separately.
-
+- **Why the disk fills, measured on fathom1** (197 primary shards; `logs/ds/iter-walgrowth.txt`, healthy rig,
+  62 GiB free, 4,381.8 txn/s, 0 errors). Primary `-wal` files grew linearly from 104 MB (12 s) to 1,106 MB (93 s,
+  5.6 MB per shard) and did **not** reset at any of the three 30 s flush boundaries; the `.db` files stayed at
+  1-8 MB. Received replica files grew 322 MB -> 3,562 MB (about 600 shards' replicas). At the run's end the
+  primary WALs went to 0 (idle flush-and-drop folds them), but **the replica files stayed at 3,562 MB for the 90 s
+  observed afterwards** (2,601 files). The periodic flush uploads a `VACUUM INTO` snapshot without checkpointing
+  the live WAL (`Fathom.Shard`, the checkpoint comment at `shard.ex:4776`: live streams hold read marks, so
+  `wal_checkpoint(TRUNCATE)` only runs on the drop/drain path), and the 4000-frame (16 MB) autocheckpoint
+  threshold is never reached by 400 transactions per tenant (1,600 frames), so nothing folds the WAL until the shard idles.
+- **What that means, not yet decided** (new finding, see the progress file): a shard under sustained writes holds a
+  WAL of up to about 16 MB (4000 frames) and each of its followers holds a copy, so a node's WAL high-water is
+  roughly `active shards x 16 MB x (1 + followers)`. That is a capacity-planning number for production disks, and
+  a rig sizing number here. Open: whether follower replica files are ever reclaimed after the primary's clean
+  drop (they were not within 90 s), and whether 16 MB x 4 per active shard is the intended bound.

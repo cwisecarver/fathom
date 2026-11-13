@@ -78,5 +78,5 @@ three followers' WAL copies). MinIO's data is on the same disk, so when it fills
 lease-heartbeat PUT, every node logs `heartbeat renew failed ... {:s3_put_status, 507}`, then fences writes
 about 80 s in, and the run reads as 12%+ failed transactions at ~3.5k txn/s. That looks like a performance
 regression and is a full disk. Docker image builds eat the headroom silently (the build cache grows by tens of
-GB): run `docker builder prune -af` after building images. `./chaos.sh up` warns when under 30 GiB is free
+GB). Check `docker system df`, remove stale `fathom-chaos:*` tags/images you built, and treat `docker builder prune` as a last resort: Docker is shared machine-wide, so it also makes every other project's next build cold. `./chaos.sh up` warns when under 30 GiB is free
 (`RIG_MIN_FREE_GB`; 0 silences it). Evidence: docs/reviews/tuning-audit-2026-11-11.md, "The late rig fault".
