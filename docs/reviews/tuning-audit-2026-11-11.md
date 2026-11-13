@@ -106,15 +106,23 @@ Consequences:
   bucket as a single dependency). Nothing here shows a heartbeat-path weakness.
 - **Why the disk fills, measured on fathom1** (197 primary shards; `logs/ds/iter-walgrowth.txt`, healthy rig,
   62 GiB free, 4,381.8 txn/s, 0 errors). Primary `-wal` files grew linearly from 104 MB (12 s) to 1,106 MB (93 s,
-  5.6 MB per shard) and did **not** reset at any of the three 30 s flush boundaries; the `.db` files stayed at
-  1-8 MB. Received replica files grew 322 MB -> 3,562 MB (about 600 shards' replicas). At the run's end the
-  primary WALs went to 0 (idle flush-and-drop folds them), but **the replica files stayed at 3,562 MB for the 90 s
-  observed afterwards** (2,601 files). The periodic flush uploads a `VACUUM INTO` snapshot without checkpointing
-  the live WAL (`Fathom.Shard`, the checkpoint comment at `shard.ex:4776`: live streams hold read marks, so
-  `wal_checkpoint(TRUNCATE)` only runs on the drop/drain path), and the 4000-frame (16 MB) autocheckpoint
-  threshold is never reached by 400 transactions per tenant (1,600 frames), so nothing folds the WAL until the shard idles.
-- **What that means, not yet decided** (new finding, see the progress file): a shard under sustained writes holds a
-  WAL of up to about 16 MB (4000 frames) and each of its followers holds a copy, so a node's WAL high-water is
-  roughly `active shards x 16 MB x (1 + followers)`. That is a capacity-planning number for production disks, and
-  a rig sizing number here. Open: whether follower replica files are ever reclaimed after the primary's clean
-  drop (they were not within 90 s), and whether 16 MB x 4 per active shard is the intended bound.
+  5.6 MB per shard) and did not shrink at the 30 s flush boundaries; the `.db` files stayed at 1 MB until about
+  t+73 s, then grew to 8 MB (a checkpoint backfilled them, late). Received replica files grew 322 MB -> 3,562 MB
+  (about 600 shards' replicas). At the run's end the primary WALs went to 0 (idle flush-and-drop folds them),
+  but **the replica files stayed at 3,562 MB for the 90 s observed afterwards** (2,601 files).
+- **This is the designed trade, not a missing checkpoint** (`replication/session.ex:2487-2494`, corrected after
+  review). With replication on, the flush's checkpoint runs in `Session.checkpoint_after_snapshot`: pinned,
+  gated on the quorum holding the WAL, and **skipped until the WAL's commit extent reaches
+  `flush_checkpoint_min_bytes` (about 4 MB, a quarter of the 4000-frame Session threshold)**; the user decision of
+  2026-10-21 is that the replicated flush gains no new checkpoint because each is a WAL-generation reset the
+  followers pay for (measured 22-25% txn/s between a 5 s and a 30 s flush). A busy WAL is bounded by the Session's
+  threshold checkpoint (4000 frames = 16 MB) and a quiet one folds at the covered idle close. The data fits: shards
+  reach about 4 MB (roughly 290 of the 400 transactions) around t+70 s, which is when the `.db` files start to grow.
+  The checkpoint is PASSIVE, which backfills but never truncates the `-wal`; the log only wraps when the next writer
+  finds everything backfilled and no reader on an older mark, so under continuous load the bound is set by wrap
+  opportunities, not by a missing checkpoint.
+- **What that means, not yet decided** (new finding, see the progress file): a shard under sustained writes holds
+  a WAL of up to about 16 MB and each of its followers holds a copy, so a node's WAL high-water is roughly
+  `active shards x 16 MB x (1 + followers)`. That is a capacity-planning number for production disks, and a rig
+  sizing number here. Open: whether follower replica files are ever reclaimed after the primary's clean drop (they
+  were not within 90 s), and whether 16 MB x 4 per active shard is the intended bound.
