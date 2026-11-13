@@ -177,6 +177,9 @@ x-fathom-env: &fathom-env
   # Quiet-shard absorb window on a follower (tuning audit 2026-11-11 #20). Empty = the shipped default
   # (twice SHARD_IDLE_MS, i.e. 40 s on this rig); 0 turns it off, which is the A/B control.
   REPLICATION_QUIET_ABSORB_MS: "${REPLICATION_QUIET_ABSORB_MS:-}"
+  # Follower housekeeping tick (idle-row sweep + quiet absorb), default 60 s. Empty = the default; the
+  # Jepsen Tier 0 runs of tuning audit 2026-11-11 #20 set 5000 so absorbs land inside the faults.
+  REPLICATION_ROW_SWEEP_MS: "${REPLICATION_ROW_SWEEP_MS:-}"
   # Membership source (Layer 3). `static` by default so the per-node lists below stay in charge;
   # `REPLICATION_MEMBERSHIP=roster` switches to endpoints nodes publish to `rebalancer_nodes`.
   #

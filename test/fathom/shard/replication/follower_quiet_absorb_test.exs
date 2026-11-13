@@ -40,7 +40,8 @@ defmodule Fathom.Shard.Replication.FollowerQuietAbsorbTest do
       :replication_lineage_wire,
       :replication_ordinal_wire,
       :replication_row_idle_ms,
-      :replication_quiet_absorb_ms
+      :replication_quiet_absorb_ms,
+      :replication_quiet_boot_retry_ms
     ]
 
     prev = for k <- keys, do: {k, Application.get_env(:fathom, k)}
@@ -62,7 +63,7 @@ defmodule Fathom.Shard.Replication.FollowerQuietAbsorbTest do
     name = :"quiet_f_#{System.unique_integer([:positive])}"
     pid = start_supervised!({Follower, name: name, port: 0, dir: Path.join(root, "f")})
     {:ok, port} = Follower.port(pid)
-    %{id: id, root: root, name: name, port: port}
+    %{id: id, root: root, name: name, port: port, pid: pid}
   end
 
   # A real SQLite source with `rows` committed rows still in its WAL (kept open: the last close
@@ -340,5 +341,42 @@ defmodule Fathom.Shard.Replication.FollowerQuietAbsorbTest do
 
     assert Follower.quiet_absorb_boot_pass(name) == 0
     assert wal_size(name, id) == before
+  end
+
+  # The one-shot boot pass is the only thing that finds replicas already quiet at boot. A touched pass
+  # still running when it fires used to make `start_quiet_pass/2` return the state unchanged, which
+  # dropped the boot pass for the node's life.
+  test "a boot pass that meets a running pass is retried, not dropped", ctx do
+    %{name: name, id: id, pid: pid} = ctx
+    plant!(ctx)
+    age!(name, id)
+    :ets.delete(Follower.table(name), id)
+    :ets.delete(Follower.touches(name), id)
+    Application.put_env(:fathom, :replication_quiet_boot_retry_ms, 10)
+
+    test = self()
+    handler = "quiet-boot-retry-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:fathom, :replication, :follower_quiet_absorb],
+        fn _event, _measurements, _meta, _config -> send(test, :absorbed) end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    # A pass is "running".
+    :sys.replace_state(pid, &%{&1 | quiet_ref: make_ref()})
+    send(pid, :quiet_boot_pass)
+    _ = :sys.get_state(pid)
+    refute_receive :absorbed, 100
+    assert wal_size(name, id) > 0, "the boot pass ran over a running pass"
+
+    # The running pass ends: the retried boot pass must now run.
+    :sys.replace_state(pid, &%{&1 | quiet_ref: nil})
+    assert_receive :absorbed, 2_000
+    assert wal_size(name, id) == 0
   end
 end

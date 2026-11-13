@@ -887,7 +887,20 @@ defmodule Fathom.Shard.Replication.Follower do
     end
   end
 
+  # A touched pass still running when the one-shot boot pass is due must not DROP it: the boot pass
+  # is the only thing that ever finds replicas that were already quiet at boot, so it is retried.
+  # (The periodic pass needs no retry: the next tick runs it.)
+  defp start_quiet_pass(%{quiet_ref: ref} = state, :boot) when ref != nil do
+    if quiet_absorb_enabled?(),
+      do: Process.send_after(self(), :quiet_boot_pass, quiet_boot_retry_ms())
+
+    state
+  end
+
   defp start_quiet_pass(state, _kind), do: state
+
+  defp quiet_boot_retry_ms,
+    do: Application.get_env(:fathom, :replication_quiet_boot_retry_ms, 5_000)
 
   @impl true
   def terminate(_reason, %{lsock: lsock}), do: :gen_tcp.close(lsock)

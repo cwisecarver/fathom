@@ -1151,6 +1151,14 @@ if ms = env_nonneg_int.("REPLICATION_QUIET_ABSORB_MS") do
   config :fathom, :replication_quiet_absorb_ms, ms
 end
 
+# How often the follower's housekeeping tick runs: the idle-row sweep and the quiet-shard absorb above
+# (default 60 s). A tick only does work for replicas past their window, so shortening it makes a quiet
+# absorb land sooner after its window, nothing more; the rig sets it so a short Jepsen run can see
+# absorbs inside its faults. 0 and unset keep the default.
+if ms = env_nonneg_int.("REPLICATION_ROW_SWEEP_MS") do
+  if ms > 0, do: config(:fathom, :replication_row_sweep_ms, ms)
+end
+
 # DEFERRED WAL SYNC (expert review 2026-10-21 #7). OFF BY DEFAULT, and it stays off until the rig
 # hot-shard write arm and the crash test named in the commit that added it have passed. With it on
 # (and replication on), tenant `:rw` handles run `synchronous=NORMAL` and the A2 Session issues one
