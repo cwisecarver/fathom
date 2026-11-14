@@ -51,7 +51,10 @@ defmodule Fathom.Shard.Storage.S3CorruptLockTest do
 
   test "acquire returns :corrupt_lock (not :transient_lookup), logs loudly, writes nothing",
        %{store: store} do
-    :telemetry_test.attach_event_handlers(self(), [[:fathom, :storage, :lock_corrupt]])
+    ref = :telemetry_test.attach_event_handlers(self(), [[:fathom, :storage, :lock_corrupt]])
+
+    # The handler is global: detach it, or it keeps sending to this dead pid (audit 2026-11-13 #39).
+    on_exit(fn -> :telemetry.detach(ref) end)
 
     log =
       capture_log(fn ->

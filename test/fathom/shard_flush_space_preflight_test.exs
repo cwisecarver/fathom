@@ -21,7 +21,10 @@ defmodule Fathom.ShardFlushSpacePreflightTest do
   setup do
     shard = "flush_space_#{System.unique_integer([:positive])}"
     Measurements.clear_data_free_bytes()
-    :telemetry_test.attach_event_handlers(self(), [[:fathom, :shard, :flush, :no_space]])
+    ref = :telemetry_test.attach_event_handlers(self(), [[:fathom, :shard, :flush, :no_space]])
+    # Detach on exit: the handler is global and would otherwise keep sending to this dead pid on
+    # every later `:no_space` emission in the VM (audit 2026-11-13 #39).
+    on_exit(fn -> :telemetry.detach(ref) end)
 
     on_exit(fn ->
       Measurements.clear_data_free_bytes()
