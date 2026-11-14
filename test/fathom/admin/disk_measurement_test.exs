@@ -43,8 +43,6 @@ defmodule Fathom.Admin.DiskMeasurementTest do
       assert meas.free_bytes <= meas.total_bytes
     end
 
-    # (The warm-cache-volume gauge test was removed 2026-09-14 with the WarmFollower retirement.)
-
     # SHARD_DATA_DIR is created lazily, so on a freshly booted node the
     # directory does not exist yet — which is exactly when disk headroom is most worth knowing
     # (that node is about to pull its working set). Resolving to the nearest existing ancestor
@@ -118,7 +116,4 @@ defmodule Fathom.Admin.DiskMeasurementTest do
                :error
     end
   end
-
-  # The "warm-cache disk back-pressure" describe block was removed 2026-09-14 with the WarmFollower
-  # retirement — it tested WarmFollower.disk_headroom?/headroom?, both deleted.
 end

@@ -356,8 +356,6 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     assert Process.alive?(poller)
   end
 
-  # (The "warm command is best-effort" test was removed 2026-09-14 with the WarmFollower retirement.)
-
   test "a batch task killed by an exit signal frees its in-flight ids — no permanent leak (#19)",
        %{node: node} do
     # The detached batch task's try/after sends {:batch_done} on a normal exit or a raise, but NOT

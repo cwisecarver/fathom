@@ -1,7 +1,6 @@
 defmodule Fathom.ClusterShardCase do
   @moduledoc """
-  Test case for cluster-phase shard tests (S3 lease handoff, S4 crash contract, and the S6
-  chaos/isolation gate to come).
+  Test case for cluster-phase shard tests (S3 lease handoff, S4 crash contract, S6 isolation gate).
 
   In the LB-keyspace-partition model, "two nodes" coordinate only through shared storage: one
   owner string per node and one shared `.lock`. These tests simulate that — a `put_raw_lock`

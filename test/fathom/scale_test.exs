@@ -27,8 +27,6 @@ defmodule Fathom.ScaleTest do
     end
   end
 
-  # The warm-density scale test was removed 2026-09-14 with the WarmFollower retirement.
-
   test "hotspots: a Zipf drive yields a detectable, stable hot set via ShardLoad" do
     # The harness flips :shard_load on and pins the cap/idle for the run; snapshot
     # those so this test doesn't leak global config into the rest of the suite.

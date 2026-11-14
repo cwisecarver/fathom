@@ -131,8 +131,7 @@ defmodule Fathom.Shard.Storage.S3SentinelCopyTest do
     end
 
     # Restore promotes bytes it first downloads with pull_snapshot/3, so THAT is where a sentinel
-    # snapshot has to be refused. (The by-id restore_snapshot/2 this test used to cover was removed
-    # 2026-10-01 as dead code; production never called it.)
+    # snapshot has to be refused.
     test "pull_snapshot/3 reads a sentinel snapshot as absent, so restore never promotes it" do
       store = start_store(%{"acme.lock" => dead_lock()})
       :ok = steal_to_plant_sentinel(store, "acme")
