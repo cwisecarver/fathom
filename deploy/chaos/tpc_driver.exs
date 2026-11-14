@@ -698,7 +698,8 @@ defmodule Tpc do
                 true -> nil
               end
 
-            after_gap? = gaps_ms != nil and k > 1 and Enum.at(gaps_ms, k - 1) * 1000 >= gap_thresh_us
+            after_gap? =
+              gaps_ms != nil and k > 1 and Enum.at(gaps_ms, k - 1) * 1000 >= gap_thresh_us
 
             if intended do
               wait = intended - System.monotonic_time(:microsecond)
