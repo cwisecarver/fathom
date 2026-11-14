@@ -1,9 +1,9 @@
 defmodule Fathom.Rebalancer.Command do
   @moduledoc """
   One cross-node handoff command — an instruction the orchestrator writes for a specific
-  node to execute (`drain` a shard so it releases the lease, or `drain_for_migration`, the same
-  drain issued by a migration; the `warm` pre-pull command was removed 2026-09-14 with the
-  WarmFollower retirement). The target node's `Fathom.Rebalancer.CommandPoller` picks up commands
+  node to execute (`drain` a shard so it releases the lease, `drain_for_migration`, the same
+  drain issued by a migration, or `flush`, a non-disruptive force-flush asked of the shard's holder; the
+  `warm` pre-pull command was removed 2026-09-14 with the WarmFollower retirement). The target node's `Fathom.Rebalancer.CommandPoller` picks up commands
   addressed to its `node` (a `Fathom.Rebalancer.node_key/0`), runs them, and flips `status` to
   `done` or `failed`. This is how the control plane reaches a node it can't RPC (no BEAM cluster).
   """

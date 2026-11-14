@@ -21,10 +21,10 @@ defmodule Fathom.Rebalancer.CommandPoller do
 
   Commands in a poll batch run **concurrently** off the poller via a `Task.Supervisor`
   (`async_stream_nolink`, bounded by `:command_poll_concurrency`), so a slow `drain` (up to
-  `Shards.drain`'s safety net) never head-of-line-blocks the `warm` commands the node needs
-  when it's simultaneously a handoff target. The timer path **dispatches each batch as a
+  `Shards.drain`'s safety net) never head-of-line-blocks the other commands the node needs
+  (a `flush`, another shard's drain) when it's simultaneously a handoff target. The timer path **dispatches each batch as a
   detached child task and reschedules immediately** (finding #11), so a slow batch doesn't gate
-  the *next* tick either — a `warm` arriving just after a drain batch begins is picked up on the
+  the *next* tick either — a command arriving just after a drain batch begins is picked up on the
   next tick rather than waiting the whole drain out. In-flight command ids are tracked in state
   so an overlapping tick can't re-select a command still running (it stays `pending` in Postgres
   until its task calls `complete/3`). The poller **monitors** each detached batch task, so one
@@ -73,7 +73,7 @@ defmodule Fathom.Rebalancer.CommandPoller do
   end
 
   # Timer path: dispatch this tick's fresh commands as a detached batch and reschedule
-  # IMMEDIATELY (finding #11), so a slow batch never gates the next tick's warm pickup.
+  # IMMEDIATELY (finding #11), so a slow batch never gates the next tick's command pickup.
   @impl true
   def handle_info(:poll, state) do
     state = dispatch(state)

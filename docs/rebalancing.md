@@ -72,15 +72,15 @@ If it decides, it enqueues a unique-per-shard `HandoffJob`.
 
 ## 3. Execute — the handoff, and why the ordering is safe
 
-`Rebalancer.HandoffJob` runs a specific sequence: **warm the target → pin + flip the LB → drain the
-source → target acquires.**
+`Rebalancer.HandoffJob` runs a specific sequence: **pin + flip the LB → drain the source → target
+acquires.** (There is no warm-the-target step: it went with the WarmFollower on 2026-09-14, and the
+picker prefers a target that already holds an A2 replica.)
 
-1. **Warm** the target (pre-pull the shard so the flip lands on a warm copy).
-2. **Flip** — write the `shard_overrides` row (Postgres), render the nginx exception map
+1. **Flip** — write the `shard_overrides` row (Postgres), render the nginx exception map
    (`Rebalancer.LbMap`), reload the LB (`Rebalancer.LbApply`).
-3. **Drain** the source — it checkpoints, flushes, and **releases the lease**.
-4. The target's next request (already routed there) **acquires the freed lease** and serves from the
-   warm cache.
+2. **Drain** the source — it checkpoints, flushes, and **releases the lease**.
+3. The target's next request (already routed there) **acquires the freed lease** and serves from its A2
+   replica when it holds one (promote-on-open), else a cold pull.
 
 The ordering is **flip-before-drain**, and that is safe rather than a split-brain risk because the
 `{owner, epoch}` lease blocks any double-write *regardless* of routing — a healthy node **cannot be
@@ -101,10 +101,11 @@ on every node, so set `LB_MAP_PATH` on all of them.
 
 ## Reaching a node the orchestrator can't call
 
-"Warm the target" and "drain the source" are instructions for *other* nodes, which the orchestrator
-can't RPC. They travel over a **`rebalance_commands` Postgres channel** + a per-node
+"Drain the source" (and a migration's `drain_for_migration`, and `flush`) are instructions for *other*
+nodes, which the orchestrator can't RPC. They travel over a **`rebalance_commands` Postgres channel** + a per-node
 `Rebalancer.CommandPoller` (each node polls Postgres for commands addressed to it, gated
-`:command_poller`). The command types are `drain` and `drain_for_migration`: the second is the same
+`:command_poller`). The command types are `drain`, `drain_for_migration` and `flush` (a non-disruptive force-flush asked of
+the shard's holder by an export / fork / snapshot that landed elsewhere); `drain_for_migration` is the same
 drain, issued by `Fathom.Migrator.ShardMigration` when a migration or revert finds the shard's lease held by
 a coordinator on another node. It differs from `drain` only in that it needs no active rebalance pin. The LB reload itself: the app writes the exception map to a shared dir; on the
 chaos rig an `lb-reloader` sidecar shares nginx's PID namespace and HUPs the master on a map change
@@ -125,7 +126,7 @@ expert-panel pass (18 findings; report kept locally, not in the repo).
 ## One-line summary
 
 Each node reports its hot shards into Postgres; one elected node decides (p99-relative / absolute-
-floor hotness with anti-flap, cooldown, improvement, and warm-affinity guards); a handoff job warms
-the target, flips the LB exception map, and drains the source's lease so the target picks it up —
+floor hotness with anti-flap, cooldown, improvement, and warm-affinity guards); a handoff job flips
+the LB exception map and drains the source's lease so the target picks it up —
 all coordinated through Postgres, S3, and the LB, because there is no BEAM cluster to coordinate
 through.

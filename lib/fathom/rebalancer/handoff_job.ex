@@ -6,17 +6,18 @@ defmodule Fathom.Rebalancer.HandoffJob do
 
   ## The sequence (ordering is the safety)
 
-  1. **Warm the target** (best-effort) — pre-pull the shard onto the target so its open is
-     a 304, not a full body transfer.
-  2. **Pin + flip the LB** — write the override (shard → target) and apply the LB map. New
+  (There is no warm-the-target step: the WarmFollower pre-pull was dropped with warm standby on
+  2026-09-14, and the picker prefers a target that already holds an A2 replica.)
+
+  1. **Pin + flip the LB** — write the override (shard → target) and apply the LB map. New
      requests for the shard now route to the target. The target can't serve yet (the source
      still holds the lease → `acquire_lease` returns `{:held}`), but `Fathom.Shards.checkout`
      sees this node is the pinned handoff target and **holds + retries the acquire** up to the
      drain window (finding #20) — so the first post-flip requests QUEUE for a few seconds
      rather than erroring; existing connections on the source finish.
-  3. **Drain the source** — with new traffic now going to the target, the source's
+  2. **Drain the source** — with new traffic now going to the target, the source's
      in-flight connections finish and it flushes + releases the lease.
-  4. The target's next request (already routed there) acquires the freed lease and serves
+  3. The target's next request (already routed there) acquires the freed lease and serves
      from an A2 replica when it holds one (promote-on-open), else a cold pull.
 
   **Why this order.** Draining first would leave the shard routed to the source (old hash
@@ -35,7 +36,7 @@ defmodule Fathom.Rebalancer.HandoffJob do
     queue: :rebalance,
     max_attempts: 3,
     # period: :infinity — a handoff routinely outlives Oban's default 60s unique window
-    # (warm await + drain await + retry backoff across 3 attempts). With a 60s period, once
+    # (drain await + retry backoff across 3 attempts). With a 60s period, once
     # the first job's inserted_at ages past 60s a second HandoffJob for the same shard is no
     # longer deduped even while the first is still executing/retryable — two handoffs then
     # pin + drain the same shard. With :infinity + the live states below, uniqueness is

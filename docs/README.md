@@ -57,7 +57,7 @@ single-node basics first, then what happens across nodes.
    instead of a warm cache.
 6. **[rebalancing.md](rebalancing.md)** — how a persistently-hot shard is moved off an overloaded
    node: detect (per-node load reporting) → decide (a fleet-singleton policy) → execute (the
-   warm → flip-the-LB → drain-the-lease handoff).
+   flip-the-LB → drain-the-lease handoff; the target then acquires).
 7. **[migration.md](migration.md)** — how a schema change rolls across millions of shards:
    blue/green copy-then-flip per shard, cold-tail convergence, a guarded revert, and how the app
    tolerates a mixed vN-1/vN fleet.
