@@ -325,14 +325,6 @@ unsafe extern "C" fn destroy(p: *mut c_void) {
     drop(Box::from_raw(p as *mut Backstop));
 }
 
-/// Register the setters AND install the handlers on this connection: the explicit
-/// `load_extension` path, where the handlers can go in at once because exqlite has already
-/// installed its own.
-pub fn install(db: &Connection) -> Result<()> {
-    let state = register(db)?;
-    unsafe { attach(db.handle(), state) }
-}
-
 /// The per-connection state, opaque outside this module: what `attach` needs.
 pub type State = *mut c_void;
 

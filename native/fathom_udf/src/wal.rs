@@ -147,13 +147,6 @@ pub fn adjust(path: &[u8], delta: i64) -> (Vec<u8>, i64) {
     }
 }
 
-/// Install the commit hook, the registration function, and (only when probing is enabled) the
-/// read-back functions: the explicit `load_extension` path.
-pub fn install(db: &Connection) -> Result<()> {
-    unsafe { install_hook(db.handle()) };
-    install_functions(db)
-}
-
 /// Install the commit hook on `db`, replacing whatever holds the slot (SQLite's own
 /// autocheckpoint hook, see the module docs).
 ///
