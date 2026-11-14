@@ -494,7 +494,7 @@ defmodule Fathom.HranaAuth do
     # — so `limit: 100` still materialized every affected shard in the fleet — and then
     # `Enum.each`ed one `Oban.insert/1` per shard: N serialized round trips, each its own
     # transaction, onto a `tokens` queue with concurrency 3. That is the identical shape
-    # `Migrator.enqueue_unique/1` was written to replace, and this runs during a
+    # `BulkEnqueue.unique/1` (formerly `Migrator.enqueue_unique/1`) was written to replace, and this runs during a
     # credential-compromise response, i.e. when it matters most.
     #
     # `Stream.take/2` on a keyset stream stops FETCHING, not just counting, so a bounded call now

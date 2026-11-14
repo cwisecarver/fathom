@@ -9,7 +9,7 @@ defmodule Fathom.DirectoryBindParameterTest do
 
   The finding conflated two mechanisms that look alike and are not:
 
-    * `Fathom.Migrator.enqueue_unique/1` really does chunk at 5 000, because Oban's `insert_all`
+    * `Fathom.BulkEnqueue.unique/1` really does chunk at 5 000, because Oban's `insert_all`
       emits one parameter per column per ROW. Its comment records a real crash past ~7 281 jobs,
       found by `scripts/directory_scale.exs` at 3.1M rows.
     * a `WHERE … IN` does not grow that way at all.

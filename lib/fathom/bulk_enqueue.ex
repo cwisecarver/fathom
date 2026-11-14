@@ -49,6 +49,17 @@ defmodule Fathom.BulkEnqueue do
   # from a worker so the dedup and the chunking travel together.
   @unique_states ~w(scheduled available executing retryable suspended)
 
+  @doc """
+  The in-flight Oban states a worker's `unique` config dedups against. The one place the list lives:
+  `Fathom.Migrator` and `Fathom.Rebalancer.RebalanceJob` read it here instead of restating it, so the
+  dedup here and their "is a job in flight" queries cannot drift (cleanliness audit 2026-11-13 #22).
+  `Fathom.Directory`'s partial-index SQL keeps its own LITERAL copy on purpose: the planner only matches
+  a partial index when the query's predicate is that literal, so that list must be written out and
+  kept in step by hand (see the comment there).
+  """
+  @spec unique_states() :: [String.t()]
+  def unique_states, do: @unique_states
+
   # 5 000 jobs x ~9 params = 45 000, under Postgres's 65 535 bind-parameter cap.
   @chunk 5_000
 

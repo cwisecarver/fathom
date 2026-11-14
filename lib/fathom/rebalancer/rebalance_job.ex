@@ -151,7 +151,7 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   # tenant — or one a migration is copying — used to be handed off like any hot shard, pinning an LB
   # override for it. Looked up only for the shards present in the samples (a bounded head).
   @migration_workers ["Fathom.Migrator.ShardMigrationJob", "Fathom.Migrator.RevertJob"]
-  @migration_live_states ~w(scheduled available executing retryable suspended)
+  @migration_live_states Fathom.BulkEnqueue.unique_states()
   defp ineligible_shards(samples) do
     ids = samples |> Enum.map(& &1.shard_id) |> Enum.uniq()
 
@@ -233,10 +233,9 @@ defmodule Fathom.Rebalancer.RebalanceJob do
   # A HandoffJob is actively moving this shard iff an Oban job for it sits in a non-terminal
   # state (expert review 2026-07-14 #10). Matches HandoffJob's worker + its string-keyed
   # `shard_id` arg (the enqueue shape in enqueue/2); states mirror the migrator's in-flight
-  # set (`~w(scheduled available executing retryable suspended)` — HandoffJob's own uniqueness
-  # states plus :available).
+  # set (`Fathom.BulkEnqueue.unique_states/0` — HandoffJob's own uniqueness states plus :available).
   @handoff_worker "Fathom.Rebalancer.HandoffJob"
-  @handoff_live_states ~w(scheduled available executing retryable suspended)
+  @handoff_live_states Fathom.BulkEnqueue.unique_states()
   defp handoff_in_flight?(shard_id) do
     Repo.exists?(
       from j in Oban.Job,

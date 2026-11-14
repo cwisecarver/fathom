@@ -23,7 +23,8 @@ defmodule Fathom.Migrator do
   # The in-flight states a worker's `unique` config dedups against (see ShardMigrationJob /
   # RevertJob). The basic Oban engine's insert_all/1 does NOT honor :unique, so the bulk
   # sweeps below filter candidates against jobs already in these states before inserting.
-  @unique_states ~w(scheduled available executing retryable suspended)
+  # (Read from `Fathom.BulkEnqueue.unique_states/0`, the one copy of the list.)
+  @unique_states Fathom.BulkEnqueue.unique_states()
 
   # yank/1 cancels every NOT-YET-STARTED forward job, but deliberately NOT `executing` (expert
   # review 2026-09-05 #22): an Oban cancel of an executing job is a brutal Task.Supervisor exit,
@@ -1313,7 +1314,7 @@ defmodule Fathom.Migrator do
           |> Enum.map(
             &{&1.shard_id, ShardMigrationJob.new(%{shard_id: &1.shard_id, target: head})}
           )
-          |> enqueue_unique()
+          |> Fathom.BulkEnqueue.unique()
 
         {:ok, count}
     end
@@ -1384,7 +1385,7 @@ defmodule Fathom.Migrator do
     |> Enum.reduce(0, fn ids, acc ->
       ids = if skip_guarded? and not force?, do: Directory.ids_passing_write_age(ids), else: ids
 
-      # Expert review #23: the per-shard dedup in enqueue_unique ignores `force`, so in the
+      # Expert review #23: the per-shard dedup in `BulkEnqueue.unique/1` ignores `force`, so in the
       # intended operator flow — non-force sweep, guard cancels some shards, re-issue with
       # force: true — any shard whose first RevertJob was still in flight (snoozing on
       # :shard_busy / {:held, _}) was silently dropped from the force sweep; the surviving
@@ -1398,7 +1399,7 @@ defmodule Fathom.Migrator do
       enqueued =
         ids
         |> Enum.map(&{&1, RevertJob.new(%{shard_id: &1, to_version: to_version, force: force?})})
-        |> enqueue_unique()
+        |> Fathom.BulkEnqueue.unique()
 
       acc + enqueued + forced
     end)
@@ -1467,7 +1468,7 @@ defmodule Fathom.Migrator do
     |> Enum.map(fn {id, _version} ->
       {id, ShardMigrationJob.new(%{shard_id: id, target: head})}
     end)
-    |> enqueue_unique()
+    |> Fathom.BulkEnqueue.unique()
   end
 
   @doc """
@@ -1552,10 +1553,4 @@ defmodule Fathom.Migrator do
       acc + n
     end)
   end
-
-  # LIFTED to `Fathom.BulkEnqueue` (expert review 2026-08-26 #31), because `RetirementJob`,
-  # `RevokeJob` and `DeleteJob` all want the same thing and the token revoke had reimplemented the
-  # shape this replaces. Delegated rather than inlined at the call sites so this module's existing
-  # readers still find `enqueue_unique/1` where they expect it.
-  defp enqueue_unique(id_changesets), do: Fathom.BulkEnqueue.unique(id_changesets)
 end

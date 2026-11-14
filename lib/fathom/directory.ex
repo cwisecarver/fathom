@@ -2161,7 +2161,7 @@ defmodule Fathom.Directory do
   # **one** parameter carrying an array. `Ecto.Adapters.SQL.to_sql/4` on this exact query with
   # 70 000 ids returns `PARAM_COUNT: 1`, `SHAPES: [list: 70000]`.
   #
-  # The finding conflated two different mechanisms. `Fathom.Migrator.enqueue_unique/1` genuinely
+  # The finding conflated two different mechanisms. `Fathom.BulkEnqueue.unique/1` genuinely
   # does chunk at 5 000, but it uses Oban's `insert_all`, which emits one parameter per column per
   # ROW — that is the real crash past ~7 281 jobs its comment records. A `WHERE … IN` does not
   # grow that way, so the same cap does not reach this call. Chunking here would add a loop, and a

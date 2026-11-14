@@ -27,7 +27,7 @@ defmodule Fathom.Migrator.ReconcileJob do
   # hourly run bounded (migration-queue depth + S3 headroom), but at fleet scale a deep cold tail
   # (100k–millions) converges glacially — 100/hour is 2,400/day, i.e. months. Operators raise
   # `:reconcile_batch_size` to size convergence to their fleet + S3 pool; the per-shard uniqueness
-  # dedup keeps a bigger bite idempotent, and enqueue_unique chunks under the Postgres bind cap.
+  # dedup keeps a bigger bite idempotent, and `BulkEnqueue.unique/1` chunks under the Postgres bind cap.
   @default_batch_size 100
 
   # Bound the run under Lifeline's `rescue_after` (config.exs, 60 min) so a wedged job ends instead

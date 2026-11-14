@@ -222,7 +222,7 @@ defmodule Fathom.MigratorTest do
   # `args`, and none could use an index — Oban's own GIN index on `args` is jsonb_ops, which serves
   # containment (@>) but NOT the `->>` extraction these use, and there was no index on `worker`
   # either. During a rollout the live job set is hundreds of thousands of rows, and
-  # `enqueue_unique_chunk/1` runs this once per 5,000-shard chunk.
+  # `Fathom.BulkEnqueue.unique/1` runs this once per 5,000-shard chunk.
   #
   # A partial expression index is only worth anything if the planner can actually match it, and on a
   # small table a seq scan wins regardless — so force the choice and read the plan, exactly as the

@@ -189,7 +189,7 @@ defmodule Fathom.Migrator.RolloutTest do
     # Found by scripts/directory_scale.exs at 3.1M directory rows: Postgres caps a statement
     # at 65,535 bind parameters, so one unpartitioned Oban.insert_all crashed past ~7,281
     # jobs (9 params each) — which a fleet revert (unbounded: every shard at a version) or a
-    # rollout limit above that hits at real fleet size. enqueue_unique must chunk both the
+    # rollout limit above that hits at real fleet size. `BulkEnqueue.unique/1` must chunk both the
     # dedup pre-check and the insert.
     test "a sweep bigger than the bind-parameter cap enqueues in chunks, not one statement" do
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
