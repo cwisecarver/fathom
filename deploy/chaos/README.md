@@ -53,8 +53,11 @@ each node's admin dashboard is 4001–5. toxiproxy's API is on `:8474`.
 
 ## Rig-specific tuning (docker-compose.yml)
 
-`SHARD_LEASE_TTL_MS=10000` (the failover-stall ceiling), `SHARD_FLUSH_INTERVAL_MS=5000`,
-`SHARD_IDLE_MS=20000` — shorter than prod defaults so scenarios iterate in seconds.
+`SHARD_LEASE_TTL_MS=10000` (the failover-stall ceiling) and `SHARD_IDLE_MS=20000` — shorter than prod
+defaults so scenarios iterate in seconds. `SHARD_FLUSH_INTERVAL_MS` is **not** shortened: it defaults to
+300000, prod's value, and `failover`, `rpo` and `soak` set a short interval themselves (a rig run at 5 s
+measures checkpoint churn, see docs/component-notes.md). Ask for 5 s on `up` only when a scenario needs it:
+`SHARD_FLUSH_INTERVAL_MS=5000 ./chaos.sh up`.
 The lock/heartbeat fence probe runs at boot against MinIO — if MinIO ever stops
 enforcing conditional writes, nodes refuse to serve (that's the point).
 

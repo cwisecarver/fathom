@@ -43,8 +43,8 @@ x-fathom-env: &fathom-env
   # Short TTL so failover experiments iterate quickly; the TTL is the
   # failover-stall ceiling (a dead node's shards stay unstealable up to this long).
   SHARD_LEASE_TTL_MS: "10000"
-  # Fast flush cadence so scenarios observe durability PUTs within seconds, and a
-  # short idle threshold so flush-and-drop happens inside a scenario's window.
+  # The idle threshold (SHARD_IDLE_MS, below) is short so flush-and-drop happens inside a scenario's
+  # window. The FLUSH INTERVAL is not shortened:
   # MATCHES PRODUCTION BY DEFAULT (expert review 2026-08-20 #33). This used to default to 5,000 --
   # 60x tighter than `runtime.exs`'s prod default of 300,000 -- so the rig that validates
   # replication was measuring a setting production never uses, and a regression that only appears

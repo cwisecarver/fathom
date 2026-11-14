@@ -63,7 +63,7 @@ window scales with write rate and interval, not with the host):
 | `:shard_flush_interval_ms` | lost rows (p50 / p99) | lost window (p50 / p99) |
 |---|---|---|
 | 1 000 | 97 / 160 | 0.6 s / 1.0 s |
-| 5 000 (default) | 452 / 800 | 2.7 s / 4.8 s |
+| 5 000 (library default; prod and the rig run 300 000) | 452 / 800 | 2.7 s / 4.8 s |
 | 30 000 | 2 647 / 4 800 | 15.9 s / 28.9 s |
 | 0 (idle-only) | 2 600 / 4 800 | 16 s / 29 s — run-bounded, **unbounded** for a never-idle shard |
 
@@ -88,7 +88,7 @@ real-S3 PUT cost is the `FATHOM_S3_TEST_*` / chaos-rig complement):
 
 | `:shard_flush_interval_ms` | flushes / 60 s | flush µs (p50 / p99) | $ / M writes¹ |
 |---|---|---|---|
-| 5 000 (default) | 12 | 6.0 ms / 7.7 ms | $0.010 |
+| 5 000 (library default; prod runs 300 000) | 12 | 6.0 ms / 7.7 ms | $0.010 |
 | 30 000 | 2 | 5.1 ms / 5.1 ms | $0.0017 |
 
 ¹ **Derived, not measured.** The flush *counts* are measured; the dollars are list-price arithmetic
@@ -123,12 +123,13 @@ tenant costs object storage and nothing else, because the flush is write-gated a
 never PUTs. The interval does not touch that; it prices only the write-active fraction. Where it
 *does* bite is the continuously-hot shard: at 1 s the ~$12.96/month PUT bill lands in the same range
 as a small provisioned instance, so **sub-second RPO is the point where per-shard request cost stops
-being free** and wants pricing against that tenant's plan. At the 5 s default it is ~$2.59/month at
-the ceiling and effectively nothing for bursty tenants.
+being free** and wants pricing against that tenant's plan. At 5 s (the library default; prod runs 300 s, so
+this column is the cost of tightening, not what a prod shard pays) it is ~$2.59/month at the
+ceiling and effectively nothing for bursty tenants.
 
 The flush **rate scales ~1/interval** (12 vs 2 — ~6× for 5 s vs 30 s) at **~constant per-flush cost**
 (~5–8 ms on Local, dominated by the VACUUM INTO snapshot, which is also the long-lived reader that
-holds back the passive WAL checkpoint). So the default 5 s buys its ~6× smaller loss window (2.7 s vs
+holds back the passive WAL checkpoint). So a 5 s interval (the library default; prod runs 300 s) buys its ~6× smaller loss window (2.7 s vs
 15.9 s p50, above) at ~6× the VACUUM/PUT rate — the tradeoff review #20 flagged, now measured on the
 benefit **and** cost sides. The 6× PUT rate shares the S3 Finch pool with cold-opens, so before
 tightening below 5 s price the real-S3 PUT cost + that contention with `scripts/benchmark_s3_latency.sh`.
