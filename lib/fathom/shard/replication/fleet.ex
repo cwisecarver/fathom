@@ -430,6 +430,14 @@ defmodule Fathom.Shard.Replication.Fleet do
   @spec replicating?() :: boolean()
   def replicating?, do: Application.get_env(:fathom, :replication_enabled, false) == true
 
+  @doc """
+  The commit quorum Q (`:replication_quorum`, default 2): acks required before a commit returns. The one
+  place the default lives (cleanliness audit 2026-11-13 #29: six private copies of
+  `Application.get_env(:fathom, :replication_quorum, 2)` could drift apart).
+  """
+  @spec quorum() :: integer()
+  def quorum, do: Application.get_env(:fathom, :replication_quorum, 2)
+
   @doc "Is this node accepting frames as somebody's follower? (`:replication_listen`)"
   @spec listening?() :: boolean()
   def listening?, do: Application.get_env(:fathom, :replication_listen, false) == true
@@ -512,7 +520,7 @@ defmodule Fathom.Shard.Replication.Fleet do
   # two followers with a quorum of two and got exactly that.
   defp validate_quorum! do
     n = length(followers())
-    q = Application.get_env(:fathom, :replication_quorum, 2)
+    q = quorum()
 
     cond do
       n == 0 ->

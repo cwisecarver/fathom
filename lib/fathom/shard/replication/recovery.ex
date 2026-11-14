@@ -81,6 +81,7 @@ defmodule Fathom.Shard.Replication.Recovery do
 
   require Logger
 
+  alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.{Fleet, Follower, FollowerLog, Promote, Protocol}
   alias Fathom.Shard.Replication.Recovery.{QueryPool, UnderQuorum}
 
@@ -417,7 +418,7 @@ defmodule Fathom.Shard.Replication.Recovery do
       # path down with the crash it is handling.
       needed =
         try do
-          max(length(peers) - Keyword.get(opts, :quorum, quorum()) + 1, 1)
+          max(length(peers) - Keyword.get(opts, :quorum, Fleet.quorum()) + 1, 1)
         rescue
           _ -> length(peers)
         end
@@ -469,7 +470,7 @@ defmodule Fathom.Shard.Replication.Recovery do
   @spec answers_needed([endpoint()], map() | :absent | nil, keyword()) :: number()
   def answers_needed(peers, object_stamp, opts \\ []) do
     if rankable_stamp?(object_stamp) do
-      length(peers) - Keyword.get(opts, :quorum, quorum()) + 1
+      length(peers) - Keyword.get(opts, :quorum, Fleet.quorum()) + 1
     else
       0
     end
@@ -499,8 +500,6 @@ defmodule Fathom.Shard.Replication.Recovery do
   def rankable_stamp?(:absent), do: true
 
   def rankable_stamp?(_stamp), do: false
-
-  defp quorum, do: Application.get_env(:fathom, :replication_quorum, 2)
 
   defp search(shard_id, object_stamp, local, follower, peers, needed, opts) do
     cond do
@@ -926,7 +925,7 @@ defmodule Fathom.Shard.Replication.Recovery do
 
   # Informational only (the struct), so a bad quorum config must not fail the cached refusal.
   defp floor_needed do
-    max(length(peers()) - quorum() + 1, 1)
+    max(length(peers()) - Fleet.quorum() + 1, 1)
   rescue
     _ -> 1
   end

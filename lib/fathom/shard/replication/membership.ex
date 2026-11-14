@@ -52,6 +52,7 @@ defmodule Fathom.Shard.Replication.Membership do
 
   require Logger
 
+  alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.{Fleet, Shipper}
 
   @poll_ms 30_000
@@ -265,10 +266,9 @@ defmodule Fathom.Shard.Replication.Membership do
   end
 
   defp check(endpoints, reason) do
-    if length(endpoints) >= quorum() + 1, do: {:ok, endpoints}, else: {:refused, reason}
+    if length(endpoints) >= Fleet.quorum() + 1, do: {:ok, endpoints}, else: {:refused, reason}
   end
 
-  defp quorum, do: Application.get_env(:fathom, :replication_quorum, 2)
   defp poll_ms, do: Application.get_env(:fathom, :replication_membership_poll_ms, @poll_ms)
 
   # -- applying ------------------------------------------------------------------------------
@@ -324,13 +324,13 @@ defmodule Fathom.Shard.Replication.Membership do
 
   defp boot_error(:static_list_too_small) do
     ":replication_enabled is on but :replication_followers has fewer than " <>
-      "#{quorum() + 1} entries — a quorum of #{quorum()} cannot be satisfied. Q=N tolerates zero " <>
+      "#{Fleet.quorum() + 1} entries — a quorum of #{Fleet.quorum()} cannot be satisfied. Q=N tolerates zero " <>
       "follower failures; see docs/a2-quorum-replication.md"
   end
 
   defp boot_error(reason) do
     "replication membership could not be resolved at boot (#{reason}). In :roster mode the " <>
-      "fleet roster must already carry #{quorum() + 1} nodes advertising REPLICATION_ADVERTISE_HOST, " <>
+      "fleet roster must already carry #{Fleet.quorum() + 1} nodes advertising REPLICATION_ADVERTISE_HOST, " <>
       "or :replication_followers must supply them as the floor."
   end
 end

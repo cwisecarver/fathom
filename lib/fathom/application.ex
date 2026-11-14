@@ -261,7 +261,7 @@ defmodule Fathom.Application do
            env: Application.get_env(:fathom, :env),
            extension: udf_extension_status(),
            allow_no_udf: Application.get_env(:fathom, :allow_no_udf, false),
-           replication_enabled: Application.get_env(:fathom, :replication_enabled, false)
+           replication_enabled: Fathom.Shard.Replication.Fleet.replicating?()
          }) do
       nil -> nil
       message -> raise message
@@ -393,7 +393,7 @@ defmodule Fathom.Application do
            storage: Application.get_env(:fathom, :shard_storage, Fathom.Shard.Storage.Local),
            lb_backends: Application.get_env(:fathom, :lb_backends, %{}),
            replication_followers: Application.get_env(:fathom, :replication_followers, []),
-           replication_enabled: Application.get_env(:fathom, :replication_enabled, false),
+           replication_enabled: Fathom.Shard.Replication.Fleet.replicating?(),
            allow_local_storage: Application.get_env(:fathom, :allow_local_storage, false)
          }) do
       nil -> nil
@@ -824,7 +824,7 @@ defmodule Fathom.Application do
     interval = Application.get_env(:fathom, :shard_flush_interval_ms, 5_000)
 
     if Application.get_env(:fathom, :env) == :prod and
-         Application.get_env(:fathom, :replication_enabled, false) == true and
+         Fathom.Shard.Replication.Fleet.replicating?() and
          is_integer(interval) and interval > 0 and interval < @replication_flush_floor_ms do
       Logger.warning(
         "config warning: replication is ON with :shard_flush_interval_ms = #{interval} ms. A " <>
@@ -961,7 +961,7 @@ defmodule Fathom.Application do
     # Replication holds a raw read fd on the `-wal` AND one on the `-shm` wal-index per replicated
     # shard (`Session`'s `wal_fd`, expert review 2026-08-26 #32 and 2026-10-20 #1), invisible to
     # the cap too (expert review 2026-10-10 #P1).
-    replicating? = Application.get_env(:fathom, :replication_enabled, false) == true
+    replicating? = Fathom.Shard.Replication.Fleet.replicating?()
 
     if Application.get_env(:fathom, :env) == :prod and (pooled? or replicating?) and
          is_integer(cap) do

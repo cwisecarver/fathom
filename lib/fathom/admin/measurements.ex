@@ -1060,7 +1060,7 @@ defmodule Fathom.Admin.Measurements do
   def replication do
     if Fathom.Shard.Replication.Session.enabled?() do
       status = Fathom.Shard.Replication.Fleet.connection_status()
-      quorum = Application.get_env(:fathom, :replication_quorum, 2)
+      quorum = Fathom.Shard.Replication.Fleet.quorum()
       connected = Enum.count(status, fn {_key, up?} -> up? end)
       slack = connected - quorum
 

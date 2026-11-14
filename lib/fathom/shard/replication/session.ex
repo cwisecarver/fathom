@@ -39,6 +39,7 @@ defmodule Fathom.Shard.Replication.Session do
 
   require Logger
 
+  alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication
   alias Fathom.Shard.Replication.LagGauge
@@ -112,9 +113,9 @@ defmodule Fathom.Shard.Replication.Session do
   # api
   # ------------------------------------------------------------------------------------------
 
-  @doc "Whether commit-path replication is on. Off by default."
+  @doc "Whether commit-path replication is on. Off by default. `Fleet.replicating?/0`, the one definition."
   @spec enabled?() :: boolean()
-  def enabled?, do: Application.get_env(:fathom, :replication_enabled, false)
+  def enabled?, do: Fathom.Shard.Replication.Fleet.replicating?()
 
   @doc """
   Replicate everything committed to `wal_path` since the last successful ship.
@@ -926,7 +927,7 @@ defmodule Fathom.Shard.Replication.Session do
     # a transient window, never a configuration — and a tenant write in it is refused, not acked.
     # (`Quorum.new/2` would also have RAISED inside the commit for `0 < n <= q`; this answers it
     # the same way.) Catch-up / idle-close cycles ack nobody and keep their old behaviour.
-    if mode == :checkpoint and length(shippers()) <= quorum() do
+    if mode == :checkpoint and length(shippers()) <= Fleet.quorum() do
       {:reply, {:error, {:no_quorum, :impossible}}, state}
     else
       do_commit_round(wal_path, state, deadline, mode)
@@ -1821,7 +1822,7 @@ defmodule Fathom.Shard.Replication.Session do
           )
       end)
 
-    held >= quorum()
+    held >= Fleet.quorum()
   end
 
   # The per-shipper rejects, without `bump_replans/1`'s counter.
@@ -2144,7 +2145,7 @@ defmodule Fathom.Shard.Replication.Session do
   # refuse, never ack, so this is safety-neutral. Out of time before sending: refuse without sending
   # — and without recording an expectation for a push that never left.
   defp deliver(state, header, plans, pushes, current, skipped, deadline) do
-    needed = max(quorum() - current, 0)
+    needed = max(Fleet.quorum() - current, 0)
     remaining = deadline - System.monotonic_time(:millisecond)
 
     if needed > 0 and remaining <= 0 do
@@ -3089,7 +3090,7 @@ defmodule Fathom.Shard.Replication.Session do
           is_integer(o),
           do: o
 
-    case Enum.at(Enum.sort(held, :desc), quorum() - 1) do
+    case Enum.at(Enum.sort(held, :desc), Fleet.quorum() - 1) do
       nil -> false
       o -> o >= extent
     end
@@ -3225,7 +3226,7 @@ defmodule Fathom.Shard.Replication.Session do
   defp await_stragglers_if_short(state, wal_path, deadline) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
-    if map_size(state.inflight) == 0 or free_followers(state) >= quorum() or remaining <= 0 do
+    if map_size(state.inflight) == 0 or free_followers(state) >= Fleet.quorum() or remaining <= 0 do
       state
     else
       refs = seed_refs(state)
@@ -3474,7 +3475,7 @@ defmodule Fathom.Shard.Replication.Session do
     now = System.monotonic_time(:millisecond)
     late? = &seed_late?(&1, rate, now, remaining)
 
-    Enum.any?(own, late?) and feasible_holders(state, target, late?) < quorum()
+    Enum.any?(own, late?) and feasible_holders(state, target, late?) < Fleet.quorum()
   end
 
   defp hopeless_seed?(_state, _own, _remaining, _target), do: false
@@ -4146,7 +4147,6 @@ defmodule Fathom.Shard.Replication.Session do
   defp stable?(_, _, reason), do: {:error, reason}
 
   defp shippers, do: Fathom.Shard.Replication.Fleet.shippers()
-  defp quorum, do: Application.get_env(:fathom, :replication_quorum, 2)
 
   # THE MOST WAL ONE PUSH MAY CARRY. This is the bound that breaks the feedback loop; the
   # per-node byte budget in `Fathom.Shard.Replication.Budget` is the safety net underneath it.
