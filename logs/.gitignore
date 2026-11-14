@@ -1,9 +1,10 @@
-# This dir is a tracked run record (measurement sweeps like rpo-sweep-*). Ephemeral
-# output stays ignored: test/precommit logs are pruned daily, bench raw logs are
-# superseded by the tracked ../scripts/perf_history.jsonl, server logs are local.
-test-*.log
-precommit*.log
-bench-*.log
-server-*.log
-# Ad-hoc suite runs (e.g. the --include s3 repeat runs used to chase a flake).
-s3-*.log
+# Ignore EVERYTHING in this directory by default (cleanliness audit 2026-11-13 #27). It used to
+# ignore five prefixes, so ~900 run logs (every rig run, A/B chain and probe) showed as untracked and
+# buried any real new source file in `git status`.
+#
+# A log worth keeping is a run record: commit it deliberately with `git add -f logs/<name>` and cite it
+# from the report that uses it. Files already tracked here stay tracked (an ignore rule does not
+# untrack); the ones nothing cites can be dropped with `git rm --cached`, which needs the owner's
+# approval because the repo is public.
+*
+!.gitignore
