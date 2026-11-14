@@ -1948,10 +1948,14 @@ defmodule Fathom.Shard.Replication.Session do
     # RE-READ THE HEADER AND CONFIRM IT DID NOT MOVE (expert review 2026-08-20 #16).
     #
     # The header above came from a `Wal.read/1` in `ship/5`; the payloads come from separate
-    # `open`+`pread` pairs here. Nothing serialises the two against the coordinator's flush task,
-    # which runs OFF-PROCESS by design — `shard.ex` does not reference this module at all — and
-    # `native/fathom_udf/src/wal.rs` gives the tenant's OWN commit thread a second uncoordinated
-    # source of the same generation change at 4000 frames.
+    # held-fd preads here. Nothing serialises this READ against a log restart. The coordinator's
+    # flush task runs OFF-PROCESS by design and does call into this module (`checkpoint_after_snapshot/3`,
+    # `with_flush_pin/3`: its checkpoints are pinned and quorum-gated, so they cannot backfill frames this
+    # Session has not read), but a pin is about which frames may be folded, not a lock on the file while a
+    # payload is being read. And `native/fathom_udf/src/wal.rs` gives the tenant's OWN commit thread a
+    # second source of the same generation change at 4000 frames, with no pin at all. So the recheck below
+    # is what makes this safe, not an assumption that the restart cannot happen (cleanliness audit
+    # 2026-11-13 #17: this paragraph used to say `shard.ex` does not reference this module at all).
     #
     # `read_delta_held/4`'s `byte_size(bin) == len` guard only fires if the file SHRANK. A checkpoint
     # that restarts the log without shrinking it — a PASSIVE checkpoint followed by a write, which

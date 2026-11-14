@@ -10,7 +10,7 @@ defmodule Fathom.Bench.Gate do
 
   Direction is per metric: latency and memory are higher-is-worse; copy throughput
   is lower-is-worse. A metric that is `nil` in either run (e.g. the directory bench
-  with no Postgres, or the always-`nil` `hrana_rt_us` placeholder) or whose parent
+  with no Postgres, or an opt-in S3 metric that was not run) or whose parent
   value is zero is skipped, never silently treated as flat.
   """
 
@@ -25,8 +25,8 @@ defmodule Fathom.Bench.Gate do
     {:warm_s3_shards_per_s, :lower_worse},
     # The failover RTO metric. `failover_warm_s3_p50_us` (the 304-promote-from-warm-cache arm) was
     # dropped 2026-09-14 with the WarmFollower retirement — that code path no longer exists, so there
-    # is nothing to time; the honest successor is an A2 promote-on-open RTO metric, not yet built.
-    # `failover_cold_s3_p50_us` is today's real failover cost and is opt-in like `cold_open_s3_p50_us`
+    # is nothing to time; its successor, the A2 promote-on-open RTO metric, is `failover_promote_p50_us`
+    # below. `failover_cold_s3_p50_us` is today's real failover cost and is opt-in like `cold_open_s3_p50_us`
     # above (nil ⇒ skipped): gating an opt-in metric costs nothing when unset and compares it when set.
     {:failover_cold_s3_p50_us, :higher_worse},
     # The A2 promote-on-open failover arm — the honest successor to the removed warm 304-promote

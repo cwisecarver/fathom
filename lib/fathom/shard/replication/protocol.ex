@@ -972,9 +972,6 @@ defmodule Fathom.Shard.Replication.Protocol do
     end
   end
 
-  # ABOVE the `@push_ext` clause and matching its own type code, so the two never compete.
-  # `wal_ordinal` is the trailing field; everything before it is byte-identical to `@push_ext`,
-  # which is what makes this additive rather than a layout change.
   # ABOVE the `@push_ord` clause and matching its own type code, so the two never compete. `lineage`
   # is the trailing field; everything before it is byte-identical to `@push_ord`, which is what makes
   # this additive (expert review 2026-09-05 #4/#12).
@@ -1025,6 +1022,9 @@ defmodule Fathom.Shard.Replication.Protocol do
      }}
   end
 
+  # ABOVE the `@push_ext` clause and matching its own type code, so the two never compete.
+  # `wal_ordinal` is the trailing field; everything before it is byte-identical to `@push_ext`,
+  # which is what makes this additive rather than a layout change.
   defp decode_frame(
          <<@version::8, @push_ord::8, slen::16, epoch::64, gen::64, salt::64, off::64, prev::64,
            ord::64, rest::binary>>

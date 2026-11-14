@@ -1348,8 +1348,9 @@ defmodule Fathom.Shard do
         # table that died mid-flight would read clean against the fresh table's counts).
         flush_task: nil,
         # Whether the in-flight flush task reserved a Fathom.Shard.FlushGate slot (expert review
-        # #17): true only when the node-wide concurrent-flush cap is enabled and we acquired. The
-        # slot is released at every site that clears flush_task (completion, crash, terminate).
+        # #17): `false` (none), `true` (a slot, when the node-wide concurrent-flush cap is enabled and
+        # we acquired) or `:stamp` (a slot taken on the stamp lane). The slot is released at every site
+        # that clears flush_task (completion, crash, terminate).
         flush_slot_held: false,
         # Timer for the coordinator-side flush deadline (expert review 2026-11-04 #3); cancelled
         # wherever the slot is released, so a finished flush leaves no timer behind to wake a
@@ -1902,10 +1903,6 @@ defmodule Fathom.Shard do
         end
     end
   end
-
-  # The pull / warm-promotion / open-materialization path moved to `Fathom.Shard.Materializer`
-  # (2026-09-13, Phase 4): start_pull/2, await_pull/3, promote_pull/3, abandon_pull/2, pull_temp/1
-  # (public), and rm_pull_temp (private). It is the concern that blocks on the S3 GET.
 
   # Best-effort, mirroring Heartbeat.broadcast_lapse: a missing PubSub (the
   # scale/bench harness) must not fail an open — the flush-time fence still guards.
@@ -4914,9 +4911,6 @@ defmodule Fathom.Shard do
     end
   end
 
-  # Integrity classification (classify_integrity_failure/corrupt_reason) moved to
-  # `Fathom.Shard.Integrity` (2026-09-13, Phase 2) as `classify_failure/1`.
-
   @doc """
   Stamp provenance on a shard file that was placed in the live data dir out-of-band.
 
@@ -4946,8 +4940,6 @@ defmodule Fathom.Shard do
   @doc false
   @spec verify_integrity(Path.t()) :: :ok | {:error, term()}
   def verify_integrity(path), do: Integrity.verify(path)
-
-  # quarantine_corrupt! moved to `Fathom.Shard.Integrity.quarantine_corrupt!/3` (2026-09-13, Phase 2).
 
   # The fence decision itself lives in Fathom.Shard.Fence (unit-tested there). This
   # projects the coordinator state down to the fields the fence reads; the caller
@@ -5446,18 +5438,6 @@ defmodule Fathom.Shard do
   defp warm_check_etag(_shard_id, {:ok, nil}), do: {:ok, nil}
   defp warm_check_etag(_shard_id, {:ok, %{etag: etag}}), do: {:ok, etag}
   defp warm_check_etag(_shard_id, {:error, _} = error), do: error
-
-  # A2 promote-on-open (maybe_promote_replica/7 and its helpers) moved to
-  # `Fathom.Shard.PromoteOnOpen` (2026-09-13, Phase 5). It runs after the lease + fork verdict
-  # are settled and decides which bytes are served; every non-win branch returns etag unchanged.
-
-  # The etag provenance sidecar (`<path>.etag`) moved to `Fathom.Shard.Provenance` (2026-09-13,
-  # Phase 1). `Provenance.read/1` / `write/2` / `write_durable/2` / `write_no_object/1` /
-  # `sidecar_path/1` are the pure I/O; `stamp_local_provenance/1` above stays here as the public
-  # out-of-band seam and delegates to them.
-
-  # Warm-restart fork detection (evidence/2, resolve/4, quarantine!/3) moved to
-  # `Fathom.Shard.Fork` (2026-09-13, Phase 3), along with `adopt_unprovenanced_warm?/0`.
 
   # Track a failed durability flush (expert review #27). Emits [:fathom, :shard, :flush, :failed]
   # with the running consecutive count every time, and ESCALATES to Logger.error past a threshold —
@@ -6650,9 +6630,6 @@ defmodule Fathom.Shard do
       %{shard_id: state.id, mode: mode}
     )
   end
-
-  # run_quick_check/1, integrity_verdict/1 and verify_flush_integrity?/0 moved to
-  # `Fathom.Shard.Integrity` (2026-09-13, Phase 2) as run_quick_check/1, verdict/1 and verify_flush?/0.
 
   # Wait out an in-flight durability-flush task and fold its result into the state
   # (expert review #27) — used on the terminate path so the final drop-flush never

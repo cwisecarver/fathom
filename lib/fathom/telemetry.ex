@@ -743,10 +743,6 @@ defmodule Fathom.Telemetry do
         tags: [:source],
         description: "Followers in the set after the most recent swap (A2 membership)"
       ),
-      # THE ONE TO ALERT ON, and it is quiet by construction. A refusal means a computed set was
-      # below quorum+1 and the PREVIOUS set is still live — so writes keep succeeding and nothing
-      # else moves, while the node is pinned to a membership the fleet has moved on from. Left
-      # alone it ends as a set of followers that no longer exist.
       # SATURATION, leading then lagging. Replication does not degrade gracefully as tenant count
       # rises — 512 -> 1024 -> 2048 measured 3,340 -> 2,776 -> 258 txn/s, a 10.8x collapse for the
       # last doubling — and throughput looks healthy right up to the cliff, so it cannot be the
@@ -802,6 +798,10 @@ defmodule Fathom.Telemetry do
         tags: [:result],
         description: "Bytes declared by A2 seeds this node sent (db + wal), by result."
       ),
+      # THE ONE TO ALERT ON, and it is quiet by construction. A refusal means a computed set was
+      # below quorum+1 and the PREVIOUS set is still live — so writes keep succeeding and nothing
+      # else moves, while the node is pinned to a membership the fleet has moved on from. Left
+      # alone it ends as a set of followers that no longer exist.
       counter("fathom.replication.membership_refused.count",
         event_name: [:fathom, :replication, :membership_refused],
         measurement: :kept,

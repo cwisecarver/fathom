@@ -2,7 +2,7 @@
 # Run fathom's hot-path benchmarks prod-compiled, append one line to
 # scripts/perf_history.jsonl, and tee the human-readable run to logs/.
 #
-#   scripts/benchmark.sh                 # bench all four metrics, append history
+#   scripts/benchmark.sh                 # bench every metric, append history
 #   scripts/benchmark.sh --only cold_open,copy,fanout   # skip the directory bench
 #   scripts/benchmark.sh --trials 3 --copy-rows 200000  # pass-through to the task
 #

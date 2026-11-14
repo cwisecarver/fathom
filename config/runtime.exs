@@ -271,7 +271,7 @@ end
 # rate-limit finding on the grounds that noisy-neighbour was "already covered by the per-query
 # resource bounds". Those bounds were not reachable.
 #
-# QUERY_TIMEOUT_MS defaults to @default_query_timeout_ms in prod (see `Fathom.Shard.Connection`);
+# QUERY_TIMEOUT_MS defaults to 30_000 ms in prod (`config/config.exs`, `:query_timeout_ms`);
 # set 0 to opt out and restore the unbounded park.
 if ms = env_nonneg_int.("QUERY_TIMEOUT_MS") do
   config :fathom, :query_timeout_ms, if(ms == 0, do: nil, else: ms)
@@ -587,7 +587,7 @@ else
 end
 
 # The ± spread on every periodic durability-flush re-arm, as a fraction of the interval (default
-# 0.25 = `Fathom.Shard.@default_flush_jitter_ratio`; 0 = none; values above 1.0 act as 1.0). An env
+# 0.25 = `Fathom.Shard.@default_flush_jitter_ratio`; 0 = none; a value outside [0, 1] fails the boot). An env
 # knob so the rig can A/B timer phase lock after a mass (re)open without a rebuild (expert review
 # 2026-10-22 r8 #11). A malformed value fails the boot rather than silently keeping 0.25.
 if raw = System.get_env("SHARD_FLUSH_JITTER_RATIO") do

@@ -1839,9 +1839,9 @@ defmodule Fathom.Shard.Replication.Follower do
   # from OTHER NODES' write traffic, and both directories default under `System.tmp_dir!()`, so out
   # of the box the replica store and the live shard data dir SHARE A VOLUME.
   #
-  # The asymmetry with the warm cache is the tell. That cache holds a READ copy whose loss costs
-  # only failover latency, and it has three independent bounds plus a disk_pressure event. This one
-  # holds acked, quorum-durable writes and had a gauge and an alert rule.
+  # The asymmetry with the warm cache (removed 2026-09-14 with the WarmFollower) was the tell. That cache
+  # held a READ copy whose loss cost only failover latency, and it had three independent bounds plus a
+  # disk_pressure event. This store holds acked, quorum-durable writes and had a gauge and an alert rule.
   #
   # What a full volume does here is the unbounded-RPO failure AGENTS.md already documents: every
   # cold-open `pull` and every dirty shard's `VACUUM INTO` fails, while SQLite's own small WAL
