@@ -1209,9 +1209,11 @@ end
 #
 # ON BY DEFAULT since 2026-08-25 — `REPLICATION_PROMOTE_ON_OPEN=false` turns it off. It was a
 # separate opt-in gate while its safety was unproven; the three fail-safe properties above are now
-# the reason it can lead rather than follow. It is INERT for a node that is not receiving replicas,
-# which is every node until `REPLICATION_LISTEN` is on, so defaulting it on costs nothing and
-# removes a step from the rollout that people were reaching failover without having taken.
+# the reason it can lead rather than follow. It is INERT only for a node that is not receiving
+# replicas, i.e. one with `REPLICATION_LISTEN` turned off. `REPLICATION_LISTEN` is ON BY DEFAULT in
+# prod (off in dev/test, `config/config.exs`), so on a prod node this is LIVE and pays the cost listed
+# under peer recovery below; it removes a step from the rollout that people were reaching failover
+# without having taken.
 case env_bool.("REPLICATION_PROMOTE_ON_OPEN") do
   nil -> :ok
   v -> config :fathom, :replication_promote_on_open, v
@@ -1238,8 +1240,8 @@ end
 #
 # ON BY DEFAULT since 2026-08-25 — `REPLICATION_RECOVER_FROM_PEERS=false` turns it off. Requires
 # `REPLICATION_LISTEN` on THIS node (the pull installs through the local replica directory), which
-# is off by default, so on a node that is not part of a replicating fleet this is inert and never
-# opens a socket. It defaults on so that a fleet which turns listening and shipping on gets the
+# is ON by default in prod (off in dev/test, `config/config.exs`), so on a prod node this is live; it
+# is inert, and never opens a socket, only where listening was turned off. It defaults on so that a fleet which turns listening and shipping on gets the
 # whole RPO story, rather than the "~0-if-lucky" half that a forgotten fourth flag leaves behind.
 case env_bool.("REPLICATION_RECOVER_FROM_PEERS") do
   nil -> :ok
