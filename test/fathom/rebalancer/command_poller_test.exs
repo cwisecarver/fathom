@@ -196,7 +196,6 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     assert Commands.get(cmd.id).status == "cancelled"
     # The coordinator was NOT drained (still alive serving the source).
     refute_receive {:DOWN, ^down, :process, ^pid, _}, 500
-    assert Process.alive?(pid)
   end
 
   test "a Postgres outage makes a poll tick a no-op without crashing (#13)", %{shard: shard} do

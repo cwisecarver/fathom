@@ -1226,6 +1226,11 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       %{pid: task} = Map.fetch!(seeding, bh)
       assert Process.alive?(task), "the black hole answered, which it must not"
 
+      # Monitor NOW, before the expiry kill. The kill is sent by the Session, and BEAM orders signals
+      # only per sender/receiver pair, so a third party polling `Process.alive?` after learning of the
+      # kill through `:sys.get_state/1` can still see `true` (cleanliness audit 2026-11-13 #6).
+      task_ref = Process.monitor(task)
+
       # Anything already outstanding is now past its expiry. Nothing about the task changed --
       # it is still alive and still stuck, which is the whole point.
       Application.put_env(:fathom, :replication_seed_expiry_ms, 0)
@@ -1240,7 +1245,9 @@ defmodule Fathom.Shard.ReplicationCommitTest do
             "seeded again -- silently, while the quorum kept reporting healthy"
         )
 
-      refute Process.alive?(task), "the expired task was forgotten but left running"
+      assert_receive {:DOWN, ^task_ref, :process, ^task, :killed},
+                     3_000,
+                     "the expired task was forgotten but left running"
 
       assert is_pid(Map.fetch!(seeding2, bh).pid),
              "the expiry forgot the wedged seed without recording a replacement"
@@ -1411,6 +1418,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
 
       on_exit(fn -> Process.exit(wedged, :kill) end)
       assert_receive :wedged_registered, 2_000
+      wedged_ref = Process.monitor(wedged)
 
       task = Task.async(fn -> Session.commit(id, path <> "-wal", coordinator) end)
 
@@ -1418,7 +1426,10 @@ defmodule Fathom.Shard.ReplicationCommitTest do
              "commit/3 was still replacing a wedged predecessor Session after 3.5 s"
 
       assert result == :ok or match?({:error, _}, result)
-      refute Process.alive?(wedged), "the wedged predecessor was not killed"
+
+      assert_receive {:DOWN, ^wedged_ref, :process, ^wedged, :killed},
+                     3_000,
+                     "the wedged predecessor was not killed"
     end
 
     test "a stopped session does not leave a seed streaming for a shard it no longer owns", ctx do

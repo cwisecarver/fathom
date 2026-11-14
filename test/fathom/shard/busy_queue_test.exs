@@ -73,13 +73,15 @@ defmodule Fathom.Shard.BusyQueueTest do
     end)
   end
 
-  # Arrival is staggered by a fixed gap so each writer is queued (its first step yields BUSY at
-  # once) before the next one starts. Under the old ladder the gap is what made the order LIFO.
-  defp gap do
-    receive do
-    after
-      15 -> :ok
-    end
+  # Arrival is serialised on a real signal: writer `n` has a row in the busy queue (its first step
+  # yielded BUSY) before the next one starts. This used to be a fixed 15 ms pause, which on a loaded
+  # runner let writer i+1 reach the handler before writer i and broke the FIFO assertion
+  # (cleanliness audit 2026-11-13 #6). Under the old ladder the staggering is what made the order LIFO.
+  defp await_queued(n) do
+    Fathom.Test.Await.until(
+      fn -> :ets.info(@queue, :size) == n end,
+      "writer #{n} never reached the busy queue (size #{inspect(:ets.info(@queue, :size))})"
+    )
   end
 
   test "lock waiters acquire the freed lock in arrival order (FIFO)" do
@@ -89,7 +91,7 @@ defmodule Fathom.Shard.BusyQueueTest do
     for i <- 1..n do
       spawn_writer(path, i)
       assert_receive {:writing, ^i}, 2_000
-      gap()
+      await_queued(i)
     end
 
     assert {:ok, _} = q(holder, "COMMIT")
@@ -115,10 +117,10 @@ defmodule Fathom.Shard.BusyQueueTest do
 
     victim = spawn_writer(path, 1)
     assert_receive {:writing, 1}, 2_000
-    gap()
+    await_queued(1)
     spawn_writer(path, 2)
     assert_receive {:writing, 2}, 2_000
-    gap()
+    await_queued(2)
 
     ref = Process.monitor(victim)
     Process.exit(victim, :kill)
@@ -153,7 +155,7 @@ defmodule Fathom.Shard.BusyQueueTest do
     {path, holder} = locked_shard!("tel")
     spawn_writer(path, 1)
     assert_receive {:writing, 1}, 2_000
-    gap()
+    await_queued(1)
     assert {:ok, _} = q(holder, "COMMIT")
     assert_receive {:wrote, 1, {:ok, _}, 0}, 2_000
 

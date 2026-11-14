@@ -121,8 +121,9 @@ defmodule Fathom.Shards.NovelLimiterTest do
              Fathom.Shards.checkout(unique_shard("novel_spray"))
 
     # Pre-fix, evicted_for_room? had already flushed+dropped `legit` (its coordinator stops → DOWN).
-    refute_receive {:DOWN, ^a_mon, :process, ^pid_a, _}, 800
-    assert Process.alive?(pid_a), "a rate-refused novel spray must not churn a warm co-tenant"
+    refute_receive {:DOWN, ^a_mon, :process, ^pid_a, _},
+                   800,
+                   "a rate-refused novel spray must not churn a warm co-tenant"
   end
 
   # --- the token bucket itself (private instance, injected clock) ---

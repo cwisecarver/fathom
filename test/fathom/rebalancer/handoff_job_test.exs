@@ -201,7 +201,6 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
     assert Commands.pending_for(node) |> Enum.filter(&(&1.command == "drain")) == []
     # Source coordinator was NOT drained.
     refute_receive {:DOWN, ^down, :process, ^pid, _}, 300
-    assert Process.alive?(pid)
     # Reverted to a cooldown record.
     assert Overrides.for_shard(shard).failed_at != nil
   end
