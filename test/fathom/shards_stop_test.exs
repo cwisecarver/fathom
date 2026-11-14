@@ -35,6 +35,7 @@ defmodule Fathom.ShardsStopTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Await
   alias Filo.Stmt
 
   setup do
@@ -181,7 +182,11 @@ defmodule Fathom.ShardsStopTest do
     # `Process.alive?` was already false. That window is identical under the old
     # `DynamicSupervisor.terminate_child/2` (it also returned on the `:DOWN`), so it is neither
     # introduced nor widened by review #9; asserting it synchronously was simply wrong.
-    assert :ok = wait_until(fn -> Registry.lookup(Fathom.ShardRegistry, a) == [] end)
+    Await.until(
+      fn -> Registry.lookup(Fathom.ShardRegistry, a) == [] end,
+      "the registry still resolves #{a} after stop/1 returned",
+      3_000
+    )
   end
 
   # Expert review 2026-08-26 #3. The drop-flush had a fast path that uploaded the LIVE database:
@@ -302,20 +307,6 @@ defmodule Fathom.ShardsStopTest do
     case File.stat(path, time: :posix) do
       {:ok, %{mtime: m, size: s}} -> {m, s}
       {:error, _} -> :absent
-    end
-  end
-
-  # Poll a condition rather than sleeping a fixed amount: AGENTS.md forbids Process.sleep as a
-  # synchronisation primitive, and a fixed sleep here would either be flaky or slow.
-  defp wait_until(fun, remaining_ms \\ 3_000)
-  defp wait_until(_fun, remaining_ms) when remaining_ms <= 0, do: :timeout
-
-  defp wait_until(fun, remaining_ms) do
-    if fun.() do
-      :ok
-    else
-      Process.sleep(10)
-      wait_until(fun, remaining_ms - 10)
     end
   end
 end

@@ -22,8 +22,10 @@ defmodule Fathom.Shard.DropCompactionTest do
 
   alias Fathom.Shard.{ScanGate, Storage}
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Fathom.Test.LivenessMode
+  alias Fathom.Test.ShardFlush
 
   @modes [:legacy, :heartbeat]
 
@@ -91,7 +93,12 @@ defmodule Fathom.Shard.DropCompactionTest do
     end
 
     ShardExecutor.close(conn)
-    settle_close(path)
+
+    Await.until(
+      fn -> not File.exists?(path <> "-wal") end,
+      "the last close never folded the WAL",
+      4_000
+    )
 
     {:ok, %{freelist: free, page_count: count}} = Fathom.Shard.SqliteHeader.free_pages(path)
 
@@ -101,27 +108,6 @@ defmodule Fathom.Shard.DropCompactionTest do
         assert(free / count < 0.1, "fixture: control file unexpectedly free (#{free}/#{count})")
 
     coordinator
-  end
-
-  defp settle_close(path, tries \\ 400) do
-    cond do
-      not File.exists?(path <> "-wal") ->
-        :ok
-
-      tries == 0 ->
-        flunk("the last close never folded the WAL")
-
-      true ->
-        wait(10)
-        settle_close(path, tries - 1)
-    end
-  end
-
-  defp wait(ms) do
-    receive do
-    after
-      ms -> true
-    end
   end
 
   # Stops the shard while tracing (all processes: the drop-flush runs in a Task) the calls that
@@ -250,8 +236,7 @@ defmodule Fathom.Shard.DropCompactionTest do
     coordinator = seed!(id, path, true)
     local_size = File.stat!(path).size
 
-    send(coordinator, :durability_flush)
-    settle(coordinator)
+    ShardFlush.flush!(coordinator, 4_000)
 
     assert_received {:flush_route, :vacuum}
     refute_received {:flush_route, :pinned_live}
@@ -263,26 +248,11 @@ defmodule Fathom.Shard.DropCompactionTest do
        %{id: id, path: path} do
     coordinator = seed!(id, path, false)
 
-    send(coordinator, :durability_flush)
-    settle(coordinator)
+    ShardFlush.flush!(coordinator, 4_000)
 
     assert_received {:flush_route, :pinned_live}
     refute_received {:flush_route, :vacuum}
     assert rows(object(id)) == 800
-  end
-
-  defp settle(c, tries \\ 400) do
-    cond do
-      :sys.get_state(c).flush_task == nil ->
-        :ok
-
-      tries == 0 ->
-        flunk("flush task never settled")
-
-      true ->
-        wait(10)
-        settle(c, tries - 1)
-    end
   end
 
   test "#10: the drop checkpoint+quick_check waits on the ScanGate, then scans anyway", %{

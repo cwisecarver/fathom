@@ -6,6 +6,7 @@ defmodule Fathom.Shard.ScanGateTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.ScanGate
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
 
   setup do
@@ -61,12 +62,12 @@ defmodule Fathom.Shard.ScanGateTest do
 
     waiter = Task.async(fn -> ScanGate.acquire(5_000, gate) end)
     # Sync: the waiter's call is queued once stats shows it waiting.
-    wait_until(fn -> ScanGate.stats(gate).waiting == 1 end)
+    Await.until(fn -> ScanGate.stats(gate).waiting == 1 end, "condition never held", 1_000)
 
     send(a, :release)
     assert Task.await(waiter) == :ok
     # The waiter task has exited, so its permit is freed by its monitor: only `b` still holds.
-    wait_until(fn -> ScanGate.stats(gate).held == 1 end)
+    Await.until(fn -> ScanGate.stats(gate).held == 1 end, "condition never held", 1_000)
     assert %{waiting: 0} = ScanGate.stats(gate)
   end
 
@@ -76,7 +77,7 @@ defmodule Fathom.Shard.ScanGateTest do
     ref = Process.monitor(a)
     Process.exit(a, :kill)
     assert_receive {:DOWN, ^ref, :process, ^a, :killed}
-    wait_until(fn -> ScanGate.stats(gate).held == 1 end)
+    Await.until(fn -> ScanGate.stats(gate).held == 1 end, "condition never held", 1_000)
     _ = b
   end
 
@@ -98,22 +99,5 @@ defmodule Fathom.Shard.ScanGateTest do
     assert ScanGate.acquire(10, :scan_gate_under_test) == :ok
     Application.put_env(:fathom, :shard_flush_scan_permits, 1)
     assert ScanGate.acquire(10, :scan_gate_not_started) == :ok
-  end
-
-  defp wait_until(fun, tries \\ 200) do
-    cond do
-      fun.() ->
-        :ok
-
-      tries == 0 ->
-        flunk("condition never held")
-
-      true ->
-        # A bare timed receive: yields without consuming any mailbox message.
-        receive do
-        after
-          5 -> wait_until(fun, tries - 1)
-        end
-    end
   end
 end

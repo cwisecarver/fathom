@@ -26,6 +26,7 @@ defmodule Fathom.Shard.StampOnOpenTest do
   alias Fathom.Shard.Replication.Recovery
   alias Fathom.Test.Env
   alias Fathom.Test.LivenessMode
+  alias Fathom.Test.ShardFlush
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -67,19 +68,8 @@ defmodule Fathom.Shard.StampOnOpenTest do
   defp open_settled!(shard, mode) do
     {:ok, pid} = Shards.ensure(shard)
     LivenessMode.assert!(pid, mode)
-    settle(pid, 400)
+    ShardFlush.settle!(pid, 4_000)
     pid
-  end
-
-  defp settle(_pid, 0), do: flunk("the open's flush never settled")
-
-  defp settle(pid, tries) do
-    if :sys.get_state(pid).flush_task == nil do
-      :ok
-    else
-      Process.sleep(10)
-      settle(pid, tries - 1)
-    end
   end
 
   for mode <- @modes do

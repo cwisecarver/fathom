@@ -36,6 +36,7 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Shards
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Fathom.Test.ReplicationWire
   import Fathom.Test.ReplicationCase
@@ -72,30 +73,6 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     {coordinator, conn, path}
   end
 
-  defp await_seeded(name, id, commit, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      case Follower.state_of(name, id) do
-        nil ->
-          commit.()
-          Process.sleep(20)
-          :waiting
-
-        state ->
-          state
-      end
-    end)
-    |> Enum.find(fn
-      :waiting -> System.monotonic_time(:millisecond) > deadline
-      _ -> true
-    end)
-    |> case do
-      :waiting -> flunk("follower never got seeded")
-      state -> state
-    end
-  end
-
   # A reset push: offset 0, a generation and salt that differ from what the follower holds, so
   # `FollowerLog.decide/2` returns `{:reset_then_append, _}` and `absorb_before_reset/4` runs.
   defp reset_push(id, state, prev_extent) do
@@ -130,7 +107,20 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
     assert :ok = Session.commit(id, wal, coordinator)
-    await_seeded(name, id, fn -> Session.commit(id, wal, coordinator) end)
+
+    Await.until(
+      fn ->
+        case Follower.state_of(name, id) do
+          nil ->
+            Session.commit(id, wal, coordinator)
+            false
+
+          _state ->
+            true
+        end
+      end,
+      "follower never got seeded"
+    )
 
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
     assert :ok = Session.commit(id, wal, coordinator)

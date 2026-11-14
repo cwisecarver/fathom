@@ -13,6 +13,7 @@ defmodule Fathom.Shard.AbandonedPullTempTest do
 
   alias Fathom.Shard.Materializer
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
 
   defmodule SlowBody do
@@ -71,7 +72,11 @@ defmodule Fathom.Shard.AbandonedPullTempTest do
     # Precondition: the download really is mid-flight with its temp on disk. Without this the
     # test would pass vacuously (nothing was ever written). The temp is created on the first data
     # chunk, which the client may still be flushing when the server's notice arrives.
-    wait_for_dl(dir)
+    Await.until(
+      fn -> Path.wildcard(Path.join(dir, "shard.db.pull.dl.*")) != [] end,
+      "the fixture did not leave an in-flight download temp",
+      2_000
+    )
 
     :ok = Materializer.abandon_pull(task, path)
 
@@ -100,19 +105,5 @@ defmodule Fathom.Shard.AbandonedPullTempTest do
     :ok = Materializer.abandon_pull(task, path)
 
     assert File.ls!(dir) == [], "abandoned pull stranded temps: #{inspect(File.ls!(dir))}"
-  end
-
-  defp wait_for_dl(dir, tries \\ 100) do
-    cond do
-      Path.wildcard(Path.join(dir, "shard.db.pull.dl.*")) != [] ->
-        :ok
-
-      tries == 0 ->
-        flunk("the fixture did not leave an in-flight download temp")
-
-      true ->
-        Process.sleep(20)
-        wait_for_dl(dir, tries - 1)
-    end
   end
 end

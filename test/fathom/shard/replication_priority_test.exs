@@ -13,6 +13,7 @@ defmodule Fathom.Shard.ReplicationPriorityTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Fleet, Follower, Priority, Session, Shipper}
   alias Fathom.Shards
+  alias Fathom.Test.Await
 
   @registry Fathom.Shard.Replication.SessionRegistry
   @keys [
@@ -111,7 +112,12 @@ defmodule Fathom.Shard.ReplicationPriorityTest do
     )
 
     start_supervised!(Fleet)
-    await!(fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end)
+
+    Await.until(
+      fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end,
+      "never: shippers connect",
+      5_000
+    )
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -153,19 +159,5 @@ defmodule Fathom.Shard.ReplicationPriorityTest do
   defp prio(pid) do
     {:priority, p} = Process.info(pid, :priority)
     p
-  end
-
-  defp await!(fun, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        fun.() -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(10) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("never: shippers connect")
   end
 end

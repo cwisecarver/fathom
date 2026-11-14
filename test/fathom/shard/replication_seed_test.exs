@@ -27,6 +27,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Shards
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   import Fathom.Test.ReplicationCase
 
@@ -57,47 +58,19 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # returns as soon as the outcome is known, so a straggler's `:unknown_shard` arrives after the
   # fact and is picked up by the next commit's drain. So this drives commits while it waits, which
   # is exactly what a live shard under write traffic does.
-  # Polls (the follower exposes no notification) until `name` holds the shard's WAL through
-  # `extent`, then returns; flunks with the follower's position if it never gets there.
-  defp await_caught_up(name, id, extent, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    caught_up =
-      Stream.repeatedly(fn ->
-        case Follower.state_of(name, id) do
-          %{next_offset: o} when o >= extent ->
-            :caught_up
-
-          _ ->
-            Process.sleep(10)
-            :waiting
-        end
-      end)
-      |> Enum.find(fn r -> r == :caught_up or System.monotonic_time(:millisecond) > deadline end)
-
-    assert caught_up == :caught_up,
-           "#{name} never reached the committed extent #{extent}: #{inspect(Follower.state_of(name, id))}"
-  end
-
   defp await_seeded(name, id, commit, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      if Follower.state_of(name, id) do
-        :seeded
-      else
-        commit.()
-        Process.sleep(25)
-      end
-    end)
-    |> Enum.find(fn
-      :seeded -> true
-      _ -> System.monotonic_time(:millisecond) > deadline
-    end)
-    |> case do
-      :seeded -> :ok
-      _ -> flunk("follower #{name} was never seeded for #{id}")
-    end
+    Await.until(
+      fn ->
+        if Follower.state_of(name, id) do
+          true
+        else
+          commit.()
+          false
+        end
+      end,
+      "follower #{name} was never seeded for #{id}",
+      timeout
+    )
   end
 
   # THE FIRST WRITE IS THE ONE THAT MATTERS, and nothing pinned it until the chaos rig found it
@@ -211,20 +184,6 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # volume rather than to database size.
   #
   # `docs/reviews/a2-checkpoint-torn-replica-2026-08-12.md`.
-  defp await_gen_change(name, id, gen_before, tries \\ 250) do
-    case Follower.state_of(name, id) do
-      %{wal_gen: gen} when gen != gen_before ->
-        :ok
-
-      _ when tries > 0 ->
-        Process.sleep(20)
-        await_gen_change(name, id, gen_before, tries - 1)
-
-      state ->
-        flunk("follower never applied the reset: #{inspect(state)}")
-    end
-  end
-
   test "a follower ABSORBS its WAL at a reset, so the replica is still a database", ctx do
     %{id: id, root: root} = ctx
     followers = start_followers!(root, 3, "seed")
@@ -258,7 +217,13 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     # q=2 of 3, so `commit/3` returns on two acks and `name` can be the third, still applying the
     # reset. The per-shard follower workers (2026-10-01 perf #7) made that window easy to hit. The
     # straggler class the rest of this file guards against, in the one test that read too early.
-    await_gen_change(name, id, gen_before)
+    assert Await.eventually?(
+             fn ->
+               match?(%{wal_gen: gen} when gen != gen_before, Follower.state_of(name, id))
+             end,
+             5_000
+           ),
+           "follower never applied the reset: #{inspect(Follower.state_of(name, id))}"
 
     # THE ASSERTION, and it is checked BEFORE the flag so a regression reports the data loss rather
     # than the bookkeeping. Open the replica the way promotion does: 1 and 2 come back out of the
@@ -309,9 +274,10 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     # (CI OTP 29: "the WAL was not recreated"). Wait until no seed is in flight.
     [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
 
-    Enum.find_value(1..500, fn _ ->
-      :sys.get_state(session).seeding == %{} || (Process.sleep(10) && nil)
-    end) || flunk("the initial seeds never landed")
+    Await.until(
+      fn -> :sys.get_state(session).seeding == %{} end,
+      "the initial seeds never landed"
+    )
 
     {:ok, before} = Wal.read(wal)
 
@@ -533,22 +499,19 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
     # The seed is a ~6 MB stream in 4 KiB chunks, so it can still be running when the 40 commits
     # finish. Keep committing (a real shard keeps writing) until it lands, bounded.
-    deadline = System.monotonic_time(:millisecond) + 30_000
-
-    healed? =
-      Stream.repeatedly(fn ->
+    Await.until(
+      fn ->
         if Follower.state_of(name, id).torn do
           {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (0, NULL)", [])
           _ = Session.commit(id, wal, coordinator)
-          Process.sleep(50)
-          :torn
+          false
         else
-          :healed
+          true
         end
-      end)
-      |> Enum.find(fn r -> r == :healed or System.monotonic_time(:millisecond) > deadline end)
-
-    assert healed? == :healed, "the torn replica was never re-seeded"
+      end,
+      "the torn replica was never re-seeded",
+      30_000
+    )
   end
 
   # A COMMIT MUST WAIT FOR ITS PREDECESSOR'S STRAGGLERS RATHER THAN FAIL ON THEM (2026-10-02, the
@@ -1427,7 +1390,15 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     # still fails here, which is the bug this test exists for.
     {:ok, %{commit_extent: extent}} = Wal.read(wal)
 
-    for {name, _} <- followers, Follower.state_of(name, id), do: await_caught_up(name, id, extent)
+    for {name, _} <- followers, Follower.state_of(name, id) do
+      assert Await.eventually?(
+               fn ->
+                 match?(%{next_offset: o} when o >= extent, Follower.state_of(name, id))
+               end,
+               5_000
+             ),
+             "#{name} never reached the committed extent #{extent}: #{inspect(Follower.state_of(name, id))}"
+    end
 
     # Open a COPY of each replica the way promotion would, so the follower's own files are untouched.
     for {name, _} <- followers, Follower.state_of(name, id) do

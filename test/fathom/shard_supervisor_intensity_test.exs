@@ -7,6 +7,7 @@ defmodule Fathom.ShardSupervisorIntensityTest do
   # are now restart: :temporary — finding #8 — so their crashes never restart or consume this
   # budget at all; the raised budget stays as defense-in-depth for any restartable child.)
   use ExUnit.Case, async: true
+  alias Fathom.Test.Await
 
   test "shard supervisor opts raise the restart budget above the OTP default" do
     opts = Fathom.Application.shard_supervisor_opts()
@@ -38,19 +39,19 @@ defmodule Fathom.ShardSupervisorIntensityTest do
       ref = Process.monitor(pid)
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
-      await_restart(sup, pid)
+      Await.until(fn -> restarted?(sup, pid) end, "the supervisor never brought up a fresh child")
     end
 
     assert Process.alive?(sup)
   end
 
-  # Wait (event-driven, no sleep) for the supervisor to bring up a fresh child pid after a
-  # kill. which_children settles a poll or two after the restart; if the supervisor itself
-  # died (the pre-fix failure), which_children raises and the test fails.
-  defp await_restart(sup, old_pid) do
-    case DynamicSupervisor.which_children(sup) do
-      [{_, pid, _, _}] when is_pid(pid) and pid != old_pid -> :ok
-      _ -> await_restart(sup, old_pid)
-    end
+  # Poll for the supervisor to bring up a fresh child pid after a kill. which_children settles a
+  # poll or two after the restart; if the supervisor itself died (the pre-fix failure),
+  # which_children raises and the test fails.
+  defp restarted?(sup, old_pid) do
+    match?(
+      [{_, pid, _, _}] when is_pid(pid) and pid != old_pid,
+      DynamicSupervisor.which_children(sup)
+    )
   end
 end

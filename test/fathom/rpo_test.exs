@@ -16,6 +16,7 @@ defmodule Fathom.RpoTest do
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Test.Env
+  alias Fathom.Test.ShardFlush
   alias Filo.Stmt
 
   setup do
@@ -33,21 +34,6 @@ defmodule Fathom.RpoTest do
   end
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
-
-  # Drive one durability flush and wait for the off-process snapshot/upload task to settle.
-  defp flush_now(coordinator) do
-    send(coordinator, :durability_flush)
-    wait_flush_settled(coordinator, 400)
-  end
-
-  defp wait_flush_settled(_coordinator, 0), do: flunk("durability flush task never settled")
-
-  defp wait_flush_settled(coordinator, tries) do
-    case :sys.get_state(coordinator) do
-      %{flush_task: nil} -> :ok
-      _ -> Process.sleep(5) && wait_flush_settled(coordinator, tries - 1)
-    end
-  end
 
   # The survivor's view: pull the stored object and read its newest seq — exactly what a failover
   # cold-open would see.
@@ -70,7 +56,7 @@ defmodule Fathom.RpoTest do
   end
 
   test "node loss loses exactly the writes committed after the last flush", %{shard: shard} do
-    # Interval 0 ⇒ only the explicit flush_now reaches storage, so the loss boundary is exact.
+    # Interval 0 ⇒ only the explicit flush reaches storage, so the loss boundary is exact.
     Env.put!(:shard_flush_interval_ms, 0)
     Env.put!(:shard_idle_ms, 600_000)
 
@@ -79,7 +65,7 @@ defmodule Fathom.RpoTest do
     {:ok, coordinator} = Shards.ensure(shard)
 
     insert_range(h, 1, 10)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator, 2_000)
     insert_range(h, 11, 15)
 
     survivor = survivor_max_seq(shard)
@@ -102,10 +88,10 @@ defmodule Fathom.RpoTest do
     {:ok, coordinator} = Shards.ensure(shard)
 
     insert_range(h, 1, 10)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator, 2_000)
     insert_range(h, 11, 13)
     # A second flush at 13 — the extra cadence a smaller :shard_flush_interval_ms buys.
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator, 2_000)
     insert_range(h, 14, 15)
 
     assert survivor_max_seq(shard) == 13,
@@ -126,7 +112,7 @@ defmodule Fathom.RpoTest do
     {:ok, coordinator} = Shards.ensure(shard)
 
     insert_range(h, 1, 5)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator, 2_000)
     # The stored object now lags at 5; the local disk keeps advancing.
     insert_range(h, 6, 20)
 

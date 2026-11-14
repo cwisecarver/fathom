@@ -10,6 +10,7 @@ defmodule Fathom.ConnectionLiveGaugeTest do
 
   alias Fathom.Application, as: App
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Await
 
   setup do
     dir = Path.join(System.tmp_dir!(), "live_gauge_#{System.unique_integer([:positive])}")
@@ -87,16 +88,13 @@ defmodule Fathom.ConnectionLiveGaugeTest do
     assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
 
     released? =
-      Enum.reduce_while(1..40, false, fn _, _ ->
-        for p <- Process.list(), do: :erlang.garbage_collect(p)
-
-        if fd_open?(path) do
-          Process.sleep(50)
-          {:cont, false}
-        else
-          {:halt, true}
-        end
-      end)
+      Await.eventually?(
+        fn ->
+          for p <- Process.list(), do: :erlang.garbage_collect(p)
+          not fd_open?(path)
+        end,
+        5_000
+      )
 
     assert released?, "orphaned handle was never GC-closed: the live table retains the resource"
   end

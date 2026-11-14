@@ -16,7 +16,7 @@ defmodule Fathom.ShardsCheckoutRetryCounterTest do
 
   alias Fathom.{Shard, Shards}
   alias Fathom.Shard.Storage
-  alias Fathom.Test.Env
+  alias Fathom.Test.{Await, Env}
 
   setup do
     shard = "retrycount_#{System.unique_integer([:positive])}"
@@ -55,7 +55,15 @@ defmodule Fathom.ShardsCheckoutRetryCounterTest do
     task = Task.async(fn -> Shards.checkout(shard) end)
 
     # The caller's `:checkout` call is queued behind the idle-timeout once the mailbox holds both.
-    wait_queued(pid)
+    Await.until(
+      fn ->
+        {:messages, msgs} = Process.info(pid, :messages)
+        Enum.any?(msgs, &match?({:"$gen_call", _, _}, &1))
+      end,
+      "the checkout never queued behind the idle-timeout",
+      2_000
+    )
+
     :ok = :sys.resume(pid)
 
     assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
@@ -70,24 +78,5 @@ defmodule Fathom.ShardsCheckoutRetryCounterTest do
     Env.put!(:shard_idle_ms, 60_000)
     assert {:ok, _pid, _ref, _path} = Shards.checkout(shard)
     refute_receive {:retry, _, _}, 100
-  end
-
-  # Wait until the caller's `GenServer.call` itself (not just any message) is in the mailbox.
-  defp wait_queued(pid, tries \\ 200) do
-    {:messages, msgs} = Process.info(pid, :messages)
-
-    cond do
-      Enum.any?(msgs, &match?({:"$gen_call", _, _}, &1)) ->
-        :ok
-
-      tries == 0 ->
-        flunk("the checkout never queued behind the idle-timeout")
-
-      true ->
-        receive do
-        after
-          10 -> wait_queued(pid, tries - 1)
-        end
-    end
   end
 end

@@ -8,6 +8,7 @@ defmodule Fathom.Admin.CollectorErrorsTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Admin.{EventRing, MetricsCollector}
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
 
   @events [
@@ -28,12 +29,12 @@ defmodule Fathom.Admin.CollectorErrorsTest do
     {:ok, pid: start_supervised!(MetricsCollector)}
   end
 
-  defp await_handlers(events, tries \\ 200) do
-    cond do
-      Enum.all?(events, &(:telemetry.list_handlers(&1) != [])) -> :ok
-      tries == 0 -> flunk("reporter never attached handlers for #{inspect(events)}")
-      true -> Process.sleep(10) && await_handlers(events, tries - 1)
-    end
+  defp await_handlers(events) do
+    Await.until(
+      fn -> Enum.all?(events, &(:telemetry.list_handlers(&1) != [])) end,
+      "reporter never attached handlers for #{inspect(events)}",
+      2_000
+    )
   end
 
   # A blank scrape holds the diff baselines (no families exist until something is recorded), so

@@ -23,7 +23,7 @@ defmodule Fathom.Shard.ReplicationCatchupNeedTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Fleet, Follower, Session, Shipper, Wal}
   alias Fathom.Shards
-  alias Fathom.Test.PausablePeer
+  alias Fathom.Test.{Await, PausablePeer}
 
   @registry Fathom.Shard.Replication.SessionRegistry
 
@@ -100,7 +100,11 @@ defmodule Fathom.Shard.ReplicationCatchupNeedTest do
     )
 
     start_supervised!(Fleet)
-    await!(fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end, "shippers connect")
+
+    Await.until(
+      fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end,
+      "never: shippers connect"
+    )
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -113,7 +117,12 @@ defmodule Fathom.Shard.ReplicationCatchupNeedTest do
     wal = path <> "-wal"
     assert :ok = Session.commit(id, wal, coordinator)
     [{session, _}] = Registry.lookup(@registry, id)
-    await!(fn -> all_current?(session) end, "every follower current after the first commit")
+
+    Await.until(
+      fn -> all_current?(session) end,
+      "never: every follower current after the first commit"
+    )
+
     flush_cycles()
     %{peer: peer, conn: conn, wal: wal, coordinator: coordinator, session: session}
   end
@@ -132,20 +141,6 @@ defmodule Fathom.Shard.ReplicationCatchupNeedTest do
       _ ->
         false
     end
-  end
-
-  defp await!(fun, what, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        fun.() -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(10) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("never: #{what}")
   end
 
   defp flush_cycles do
@@ -185,12 +180,15 @@ defmodule Fathom.Shard.ReplicationCatchupNeedTest do
 
     # The straggler's ack lands while the Session is idle (well before the 300 ms timer).
     {:ok, _} = PausablePeer.release(peer)
-    await!(fn -> all_current?(session) end, "the straggler's held ack settled")
+    Await.until(fn -> all_current?(session) end, "never: the straggler's held ack settled")
 
     {_, reads} =
       count_calls(session, {Wal, :read_held, 2}, fn ->
         # The timer fires at ~300 ms; nothing is short, so nothing runs.
-        await!(fn -> :sys.get_state(session).catchup_ref == nil end, "the timer fired")
+        Await.until(
+          fn -> :sys.get_state(session).catchup_ref == nil end,
+          "never: the timer fired"
+        )
       end)
 
     refute_received {:cycle, :catch_up}, "the catch-up ran a cycle with every follower current"
@@ -211,12 +209,12 @@ defmodule Fathom.Shard.ReplicationCatchupNeedTest do
     {_, reads} =
       count_calls(session, {Wal, :read_held, 2}, fn ->
         # Fired and re-armed: a new timer ref, the straggler still held.
-        await!(
+        Await.until(
           fn ->
             ref = :sys.get_state(session).catchup_ref
             ref != nil and ref != first
           end,
-          "the timer re-armed"
+          "never: the timer re-armed"
         )
       end)
 
@@ -225,7 +223,7 @@ defmodule Fathom.Shard.ReplicationCatchupNeedTest do
 
     # Released: the ack lands, the next fire finds nothing short and clears.
     {:ok, _} = PausablePeer.release(peer)
-    await!(fn -> :sys.get_state(session).catchup_ref == nil end, "the timer cleared")
+    Await.until(fn -> :sys.get_state(session).catchup_ref == nil end, "never: the timer cleared")
     assert all_current?(session)
     refute_received {:cycle, :catch_up}
   end

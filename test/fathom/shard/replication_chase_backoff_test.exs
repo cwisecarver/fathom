@@ -18,6 +18,7 @@ defmodule Fathom.Shard.ReplicationChaseBackoffTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Fleet, Follower, Session, Shipper}
   alias Fathom.Shards
+  alias Fathom.Test.Await
 
   @registry Fathom.Shard.Replication.SessionRegistry
   @keys [
@@ -49,20 +50,6 @@ defmodule Fathom.Shard.ReplicationChaseBackoffTest do
     end)
 
     %{id: id, root: root}
-  end
-
-  defp await!(fun, what, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        fun.() -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(10) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("never: #{what}")
   end
 
   # Three live followers and one dead one at Q=2, the shard written once and settled.
@@ -101,9 +88,9 @@ defmodule Fathom.Shard.ReplicationChaseBackoffTest do
 
     start_supervised!(Fleet)
 
-    await!(
+    Await.until(
       fn -> Enum.count(Fleet.shippers(), &Shipper.connected?/1) == 3 end,
-      "the three live shippers connect"
+      "never: the three live shippers connect"
     )
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
@@ -117,7 +104,7 @@ defmodule Fathom.Shard.ReplicationChaseBackoffTest do
     for {n, _} <- live, do: Follower.seed(n, id, epoch, 0, 0, 0, lineage)
     _ = Session.commit(id, wal, coordinator)
     [{session, _}] = Registry.lookup(@registry, id)
-    await!(fn -> :sys.get_state(session).inflight == %{} end, "first commit settles")
+    Await.until(fn -> :sys.get_state(session).inflight == %{} end, "never: first commit settles")
     %{session: session, conn: conn, wal: wal, coordinator: coordinator}
   end
 
@@ -128,7 +115,12 @@ defmodule Fathom.Shard.ReplicationChaseBackoffTest do
     # Enter a catch-up episode the way the (capped) timer would. The cycle is one non-blocking round
     # (r7 #8): the dead follower's `:disconnected` reject arrives after it, as a late reply.
     send(session, :catch_up)
-    await!(fn -> :sys.get_state(session).inflight == %{} end, "the catch-up round settles")
+
+    Await.until(
+      fn -> :sys.get_state(session).inflight == %{} end,
+      "never: the catch-up round settles"
+    )
+
     st = :sys.get_state(session)
     assert st.catchup_chase, "no catch-up episode: the test exercises nothing"
     assert st.catchup_fails > 0, "the dead follower was not refused: the test exercises nothing"
@@ -139,7 +131,7 @@ defmodule Fathom.Shard.ReplicationChaseBackoffTest do
       {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?)", [i])
       _ = Session.commit(id, wal, coordinator)
       # Let this commit's straggler ack land (and any chase it schedules be received).
-      await!(fn -> :sys.get_state(session).inflight == %{} end, "commit #{i} settles")
+      Await.until(fn -> :sys.get_state(session).inflight == %{} end, "never: commit #{i} settles")
     end
 
     _ = :sys.get_state(session)

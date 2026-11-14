@@ -16,6 +16,7 @@ defmodule Fathom.ShardFlushSpacePreflightTest do
 
   alias Fathom.Admin.Measurements
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.ShardFlush
   alias Filo.Stmt
 
   setup do
@@ -43,22 +44,6 @@ defmodule Fathom.ShardFlushSpacePreflightTest do
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
 
-  defp flush!(coordinator) do
-    send(coordinator, :durability_flush)
-    settle(coordinator, 400)
-  end
-
-  defp settle(_c, 0), do: flunk("durability flush task never settled")
-
-  defp settle(c, tries) do
-    if :sys.get_state(c).flush_task == nil do
-      :ok
-    else
-      Process.sleep(10)
-      settle(c, tries - 1)
-    end
-  end
-
   defp dirty_shard(shard) do
     {:ok, coordinator} = Shards.ensure(shard)
     {:ok, conn} = ShardExecutor.open(shard)
@@ -73,7 +58,7 @@ defmodule Fathom.ShardFlushSpacePreflightTest do
     assert :sys.get_state(coordinator).flush_failures == 0
 
     Measurements.put_data_free_bytes(0)
-    flush!(coordinator)
+    ShardFlush.flush!(coordinator, 4_000)
 
     assert_receive {[:fathom, :shard, :flush, :no_space], _ref, %{need: need, free: 0},
                     %{shard_id: ^shard}},
@@ -88,7 +73,7 @@ defmodule Fathom.ShardFlushSpacePreflightTest do
 
     # Space came back (a fresh reading): the next flush goes through and clears the failure.
     Measurements.put_data_free_bytes(10 * 1024 * 1024 * 1024)
-    flush!(coordinator)
+    ShardFlush.flush!(coordinator, 4_000)
     state = :sys.get_state(coordinator)
     assert state.flush_failures == 0
     refute Fathom.Shard.dirty?(coordinator)
@@ -99,7 +84,7 @@ defmodule Fathom.ShardFlushSpacePreflightTest do
     {coordinator, conn} = dirty_shard(shard)
 
     assert Measurements.data_free_bytes() == :unknown
-    flush!(coordinator)
+    ShardFlush.flush!(coordinator, 4_000)
 
     refute_received {[:fathom, :shard, :flush, :no_space], _, _, _}
     refute Fathom.Shard.dirty?(coordinator), "with no reading the flush must proceed as before"

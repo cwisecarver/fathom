@@ -35,6 +35,7 @@ defmodule Fathom.Shard.FlushPositionTest do
   alias Fathom.Shard.Storage
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.ShardFlush
 
   describe "encode/parse round trip" do
     test "round-trips a position" do
@@ -216,28 +217,11 @@ defmodule Fathom.Shard.FlushPositionTest do
 
     defp stmt(sql, args \\ []), do: %Filo.Stmt{sql: sql, args: args}
 
-    # The snapshot + upload run off-process, so syncing the mailbox is not enough.
-    defp flush!(coordinator) do
-      send(coordinator, :durability_flush)
-      settle(coordinator, 400)
-    end
-
-    defp settle(_coordinator, 0), do: flunk("durability flush task never settled")
-
-    defp settle(coordinator, tries) do
-      if :sys.get_state(coordinator).flush_task == nil do
-        :ok
-      else
-        Process.sleep(10)
-        settle(coordinator, tries - 1)
-      end
-    end
-
     test "a flush stamps the object and the stamp advances with writes", ctx do
       %{id: id, coordinator: coordinator, conn: conn} = ctx
 
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (a INTEGER)"))
-      flush!(coordinator)
+      ShardFlush.flush!(coordinator)
 
       assert {:ok, first} = Storage.object_position(id)
       refute is_nil(first), "the flush wrote no position stamp"
@@ -247,7 +231,7 @@ defmodule Fathom.Shard.FlushPositionTest do
         {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (?1)", [i]))
       end
 
-      flush!(coordinator)
+      ShardFlush.flush!(coordinator)
       assert {:ok, second} = Storage.object_position(id)
 
       assert {second.epoch, second.wal_gen, second.offset} >=
@@ -277,7 +261,7 @@ defmodule Fathom.Shard.FlushPositionTest do
       before = File.stat!(path <> "-wal").size
       assert before > 0, "no WAL to measure against — this test would prove nothing"
 
-      flush!(coordinator)
+      ShardFlush.flush!(coordinator)
       assert {:ok, pos} = Storage.object_position(id)
 
       assert pos.offset >= before,
@@ -325,7 +309,7 @@ defmodule Fathom.Shard.FlushPositionTest do
              "fixture: the in-window commit did not move the WAL"
 
       send(flush_task, :go)
-      settle(coordinator, 400)
+      ShardFlush.settle!(coordinator)
       Application.delete_env(:fathom, :flush_after_snapshot_hook)
 
       # Precondition: the object really does lack the in-window write.
@@ -451,7 +435,7 @@ defmodule Fathom.Shard.FlushPositionTest do
       # NEGATIVE FIRST, on the same shard: nothing has asked for an ordinal, so the coordinator is
       # standing on no salt and must refuse to state one. With replication off this is every flush,
       # which is why it is the case that has to be silent rather than zero.
-      flush!(coordinator)
+      ShardFlush.flush!(coordinator)
       assert {:ok, unstamped} = Storage.object_position(id)
 
       refute Map.has_key?(unstamped, :wal_ordinal),
@@ -474,7 +458,7 @@ defmodule Fathom.Shard.FlushPositionTest do
              "fixture: the coordinator assigned no ordinal, so the positive half below would " <>
                "pass for the same reason the negative half does"
 
-      flush!(coordinator)
+      ShardFlush.flush!(coordinator)
       assert {:ok, stamped} = Storage.object_position(id)
 
       assert stamped.wal_ordinal == ordinal,

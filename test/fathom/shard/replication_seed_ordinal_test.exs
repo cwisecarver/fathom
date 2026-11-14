@@ -37,6 +37,7 @@ defmodule Fathom.Shard.ReplicationSeedOrdinalTest do
   alias Fathom.Shard.Storage
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.Await
   alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
@@ -118,24 +119,10 @@ defmodule Fathom.Shard.ReplicationSeedOrdinalTest do
 
     start_supervised!(Fleet)
 
-    await!(
+    Await.until(
       fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end,
       "shippers never connected"
     )
-  end
-
-  defp await!(fun, msg, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn -> fun.() || Process.sleep(20) end)
-    |> Enum.find(fn
-      v when v in [nil, false, :ok] -> System.monotonic_time(:millisecond) > deadline
-      _ -> true
-    end)
-    |> case do
-      v when v in [nil, false, :ok] -> flunk(msg)
-      v -> v
-    end
   end
 
   defp stmt(sql, args \\ []), do: %Filo.Stmt{sql: sql, args: args}

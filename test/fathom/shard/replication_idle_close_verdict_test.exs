@@ -20,6 +20,7 @@ defmodule Fathom.Shard.ReplicationIdleCloseVerdictTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Fleet, Follower, Session, Shipper}
   alias Fathom.Shards
+  alias Fathom.Test.Await
   alias Fathom.Test.PausablePeer
 
   @registry Fathom.Shard.Replication.SessionRegistry
@@ -51,20 +52,6 @@ defmodule Fathom.Shard.ReplicationIdleCloseVerdictTest do
     end)
 
     %{id: id, root: root}
-  end
-
-  defp await!(fun, what, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        fun.() -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(10) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("never: #{what}")
   end
 
   defp ask(session) do
@@ -106,7 +93,11 @@ defmodule Fathom.Shard.ReplicationIdleCloseVerdictTest do
     )
 
     start_supervised!(Fleet)
-    await!(fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end, "shippers connect")
+
+    Await.until(
+      fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end,
+      "never: shippers connect"
+    )
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -119,7 +110,7 @@ defmodule Fathom.Shard.ReplicationIdleCloseVerdictTest do
     for n <- [a, b, c], do: Follower.seed(n, id, epoch, 0, 0, 0, lineage)
     assert :ok = Session.commit(id, wal, coordinator)
     [{session, _}] = Registry.lookup(@registry, id)
-    await!(fn -> :sys.get_state(session).inflight == %{} end, "first commit settles")
+    Await.until(fn -> :sys.get_state(session).inflight == %{} end, "never: first commit settles")
 
     # C falls far behind: its replies are held, so after its first push every commit skips it.
     :ok = PausablePeer.pause(peer)
@@ -131,7 +122,12 @@ defmodule Fathom.Shard.ReplicationIdleCloseVerdictTest do
 
     # C answers its one push and is FREE but ~80 KB (5+ capped pushes) behind; then slow again.
     {:ok, _} = PausablePeer.release(peer)
-    await!(fn -> :sys.get_state(session).inflight == %{} end, "C's held reply settles")
+
+    Await.until(
+      fn -> :sys.get_state(session).inflight == %{} end,
+      "never: C's held reply settles"
+    )
+
     :ok = PausablePeer.pause(peer)
 
     {verdict, ms} = ask(session)
@@ -142,18 +138,7 @@ defmodule Fathom.Shard.ReplicationIdleCloseVerdictTest do
     # The covered close still converges: with C answering again, repeated asks reach :ready.
     {:ok, _} = PausablePeer.release(peer)
 
-    ready? =
-      Enum.reduce_while(1..40, false, fn _, _ ->
-        case ask(session) do
-          {:ready, _} ->
-            {:halt, true}
-
-          _ ->
-            Process.sleep(50)
-            {:cont, false}
-        end
-      end)
-
-    assert ready?, "repeated idle-close asks never reached :ready"
+    assert Await.eventually?(fn -> match?({:ready, _}, ask(session)) end, 2_000),
+           "repeated idle-close asks never reached :ready"
   end
 end

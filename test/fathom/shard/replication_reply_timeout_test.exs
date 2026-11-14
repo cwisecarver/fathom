@@ -16,6 +16,7 @@ defmodule Fathom.Shard.ReplicationReplyTimeoutTest do
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Protocol.{Push, SeedBegin}
   alias Fathom.Shard.Replication.Shipper
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
 
   @timeout 300
@@ -71,17 +72,14 @@ defmodule Fathom.Shard.ReplicationReplyTimeoutTest do
     name = :"reply_timeout_#{System.unique_integer([:positive])}"
     pid = start_supervised!({Shipper, name: name, host: ~c"127.0.0.1", port: port}, id: name)
     assert_receive :peer_connected, 2_000
-    wait_connected(pid, 50)
+
+    Await.until(
+      fn -> Shipper.connected?(pid) end,
+      "shipper #{inspect(pid)} never connected",
+      1_000
+    )
+
     pid
-  end
-
-  defp wait_connected(pid, 0), do: flunk("shipper #{inspect(pid)} never connected")
-
-  defp wait_connected(pid, n) do
-    unless Shipper.connected?(pid) do
-      receive after: (20 -> :ok)
-      wait_connected(pid, n - 1)
-    end
   end
 
   defp push(pid, shard),

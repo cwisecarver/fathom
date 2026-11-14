@@ -20,7 +20,7 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Storage
   alias Fathom.Shards
-  alias Fathom.Test.Env
+  alias Fathom.Test.{Await, Env}
   import Fathom.Test.ReplicationCase
 
   setup do
@@ -36,22 +36,6 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
     end)
 
     %{id: id, root: root}
-  end
-
-  defp await_seeded(name, id, commit, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      if Follower.state_of(name, id), do: :seeded, else: commit.() && Process.sleep(25)
-    end)
-    |> Enum.find(fn
-      :seeded -> true
-      _ -> System.monotonic_time(:millisecond) > deadline
-    end)
-    |> case do
-      :seeded -> :ok
-      _ -> flunk("follower #{name} was never seeded for #{id}")
-    end
   end
 
   # Drives a real shard through a real coordinator until every follower holds its bytes, then
@@ -70,8 +54,14 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
     # See the note at the top of this file's first seed test.
     assert :ok = Session.commit(id, wal, coordinator)
 
-    for {name, _} <- followers,
-        do: await_seeded(name, id, fn -> Session.commit(id, wal, coordinator) end)
+    for {name, _} <- followers do
+      Await.until(
+        fn ->
+          Follower.state_of(name, id) || (Session.commit(id, wal, coordinator) && false)
+        end,
+        "follower #{name} was never seeded for #{id}"
+      )
+    end
 
     for i <- 1..rows do
       {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (?1, ?2)", [i, "row-#{i}"])

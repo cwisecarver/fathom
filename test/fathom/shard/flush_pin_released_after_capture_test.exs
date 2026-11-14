@@ -31,6 +31,7 @@ defmodule Fathom.Shard.FlushPinReleasedAfterCaptureTest do
   alias Fathom.Test.Env
   alias Fathom.Test.LivenessMode
   alias Fathom.Test.S3EtagStore
+  alias Fathom.Test.ShardFlush
 
   @modes [:legacy, :heartbeat]
 
@@ -114,26 +115,6 @@ defmodule Fathom.Shard.FlushPinReleasedAfterCaptureTest do
     Env.put!(:shard_storage, S3)
   end
 
-  defp flush!(c, tries \\ 400) do
-    send(c, :durability_flush)
-    settle(c, tries)
-  end
-
-  defp settle(_c, 0), do: flunk("flush task never settled")
-
-  defp settle(c, tries) do
-    if :sys.get_state(c).flush_task == nil do
-      :ok
-    else
-      receive do
-      after
-        10 -> :ok
-      end
-
-      settle(c, tries - 1)
-    end
-  end
-
   defp object_row_count(store, id) do
     body = S3EtagStore.plain_body_of(store, "#{id}.db")
     assert is_binary(body), "no object was uploaded"
@@ -169,7 +150,7 @@ defmodule Fathom.Shard.FlushPinReleasedAfterCaptureTest do
 
     # Arm the PUT hook only now, so the shard's earlier lifecycle PUTs (lease) are not hooked.
     Agent.update(armed, fn _ -> true end)
-    flush!(c)
+    ShardFlush.flush!(c)
 
     assert_received {:route, :pinned_live},
                     "precondition: the flush must take the pinned-live route"

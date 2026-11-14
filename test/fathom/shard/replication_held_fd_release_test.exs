@@ -22,6 +22,7 @@ defmodule Fathom.Shard.ReplicationHeldFdReleaseTest do
   alias Fathom.Shard
   alias Fathom.Shard.Replication.{Fleet, Follower, Session}
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Await
   alias Filo.Stmt
 
   @keys [
@@ -88,14 +89,6 @@ defmodule Fathom.Shard.ReplicationHeldFdReleaseTest do
   defp exec!(h, sql), do: {:ok, _} = ShardExecutor.execute(h, %Stmt{sql: sql, args: []})
   defp pid_of({pid, _ref, _conn, _id, _sc, _v, _o}), do: pid
 
-  defp eventually(fun, tries \\ 300) do
-    cond do
-      fun.() -> true
-      tries == 0 -> false
-      true -> Process.sleep(10) && eventually(fun, tries - 1)
-    end
-  end
-
   # fds this OS process holds on DELETED files whose path contains `id`. Linux: /proc's link text
   # carries " (deleted)". Elsewhere: `lsof +L1` (link count < 1, i.e. unlinked).
   defp deleted_fds(id) do
@@ -127,7 +120,7 @@ defmodule Fathom.Shard.ReplicationHeldFdReleaseTest do
     :ok = ShardExecutor.close(h)
 
     # The drain grace's close ran and SQLite unlinked the WAL (and -shm with it).
-    assert eventually(fn ->
+    assert Await.eventually?(fn ->
              st = :sys.get_state(coordinator)
 
              Shard.HandlePool.count(st.pool) == 0 and
@@ -140,7 +133,7 @@ defmodule Fathom.Shard.ReplicationHeldFdReleaseTest do
            "precondition: the coordinator (and Session) survive the gap"
 
     # Pre-fix: 2 (the deleted -wal and -shm), held until the coordinator's idle stop (300 s default).
-    assert eventually(fn -> deleted_fds(id) == [] end, 100),
+    assert Await.eventually?(fn -> deleted_fds(id) == [] end, 1_000),
            "fds still held on deleted inodes: #{inspect(deleted_fds(id))}"
 
     # The release is a starting state, not a broken one: the next write replicates.
@@ -149,7 +142,7 @@ defmodule Fathom.Shard.ReplicationHeldFdReleaseTest do
     exec!(h2, "INSERT INTO t VALUES (99, randomblob(10))")
     :ok = ShardExecutor.close(h2)
     # The write above was quorum-acked (Q = 2 of 3), and nobody is left behind.
-    assert eventually(fn -> match?(%{behind_followers: 0}, Session.lag_info(id)) end)
+    assert Await.eventually?(fn -> match?(%{behind_followers: 0}, Session.lag_info(id)) end)
   end
 
   # Integration review of expert review 2026-10-20-2027 #2. Symptom: the release timer was armed
@@ -170,7 +163,7 @@ defmodule Fathom.Shard.ReplicationHeldFdReleaseTest do
 
     [{session, _}] = Registry.lookup(Fathom.Shard.Replication.SessionRegistry, id)
 
-    assert eventually(fn -> :sys.get_state(session).wal_fd == nil end),
+    assert Await.eventually?(fn -> :sys.get_state(session).wal_fd == nil end),
            "precondition: the quiet-shard release never closed the fds"
 
     # `seen: []` is a fresh Session's "nothing read yet", which `catch_up_need/1` answers `:short`,
@@ -185,7 +178,7 @@ defmodule Fathom.Shard.ReplicationHeldFdReleaseTest do
            "the catch-up cycle reopened the WAL fds with no release timer armed"
 
     # And the armed timer does release them again.
-    assert eventually(fn -> :sys.get_state(session).wal_fd == nil end)
+    assert Await.eventually?(fn -> :sys.get_state(session).wal_fd == nil end)
     :ok = ShardExecutor.close(h)
   end
 end

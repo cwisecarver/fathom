@@ -26,6 +26,7 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
 
   alias Fathom.Shards
   alias Fathom.Shards.Lru
+  alias Fathom.Test.Await
   alias Fathom.Test.FaultyStorage
   alias Fathom.Test.LivenessMode
   import Fathom.Test.TelemetryScope, only: [received_for: 2]
@@ -109,22 +110,6 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
     end
   end
 
-  defp wait_until(fun, tries \\ 400) do
-    cond do
-      fun.() ->
-        :ok
-
-      tries == 0 ->
-        flunk("condition never held")
-
-      true ->
-        receive do
-        after
-          5 -> wait_until(fun, tries - 1)
-        end
-    end
-  end
-
   defp cleanup(ids) do
     Application.put_env(:fathom, :max_open_shards, :infinity)
     Enum.each(ids, &Shards.stop/1)
@@ -170,9 +155,11 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
 
       # The admission adopted the offer and is waiting for the victim, not evicting anyone.
       # Pre-fix it never adopts: it walks the LRU, evicts the next idle shard and returns.
-      wait_until(fn ->
-        match?([{_, _, ref}] when is_reference(ref), :ets.lookup(Lru.Offered, victim))
-      end)
+      Await.until(
+        fn -> match?([{_, _, ref}] when is_reference(ref), :ets.lookup(Lru.Offered, victim)) end,
+        "condition never held",
+        2_000
+      )
 
       # Scoped to this test's tenants: the handler is node-global, and an earlier test's lingering
       # shard evicted at the cap would otherwise fail the refute (expert review 2026-11-06 #6).

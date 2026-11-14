@@ -10,6 +10,7 @@ defmodule Fathom.Tenants.TombstonesDrTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Await
   alias Fathom.Tenants.Tombstones
 
   setup do
@@ -53,34 +54,22 @@ defmodule Fathom.Tenants.TombstonesDrTest do
     :ok = GenServer.stop(pid)
     assert_receive {:DOWN, ^ref, :process, ^pid, _}, 2_000
 
-    new_pid = wait_for_restart(pid)
+    # A supervisor restart is async with no signal to await, so poll on a real time budget — a tight
+    # spin-loop finishes in microseconds, far faster than the restart, and spuriously "times out"
+    # under suite contention.
+    Await.until(
+      fn -> match?(p when is_pid(p) and p != pid, Process.whereis(Tombstones)) end,
+      "Tombstones did not restart within 2s",
+      2_000
+    )
+
+    new_pid = Process.whereis(Tombstones)
 
     # Sync on init having run (load_from_directory + load_from_storage complete before it handles this).
     _ = :sys.get_state(new_pid)
 
     assert Tombstones.tombstoned?(id),
            "a booted node must refuse a storage-tombstoned id even after the directory forgot it"
-  end
-
-  # Wait for the supervisor to restart the Tombstones singleton under a NEW pid. A supervisor restart
-  # is async with no signal to await, so poll on a real time budget — a tight spin-loop finishes in
-  # microseconds, far faster than the restart, and spuriously "times out" under suite contention.
-  defp wait_for_restart(old_pid),
-    do: wait_for_restart(old_pid, System.monotonic_time(:millisecond) + 2_000)
-
-  defp wait_for_restart(old_pid, deadline) do
-    case Process.whereis(Tombstones) do
-      pid when is_pid(pid) and pid != old_pid ->
-        pid
-
-      _ ->
-        if System.monotonic_time(:millisecond) < deadline do
-          Process.sleep(10)
-          wait_for_restart(old_pid, deadline)
-        else
-          flunk("Tombstones did not restart within 2s")
-        end
-    end
   end
 
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()

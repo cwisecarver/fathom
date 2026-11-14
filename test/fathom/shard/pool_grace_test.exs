@@ -23,6 +23,7 @@ defmodule Fathom.Shard.PoolGraceTest do
   alias Exqlite.Sqlite3
   alias Fathom.Shard
   alias Fathom.Shard.{Connection, HandlePool, Heartbeat, PoolBudget, Storage, WriteFence}
+  alias Fathom.Test.Await
   alias Fathom.Test.LivenessMode
   alias Fathom.{ShardExecutor, Shards}
   alias Filo.Stmt
@@ -91,20 +92,6 @@ defmodule Fathom.Shard.PoolGraceTest do
 
       nil ->
         :ok
-    end
-  end
-
-  defp eventually(fun, tries \\ 200) do
-    cond do
-      fun.() ->
-        true
-
-      tries == 0 ->
-        false
-
-      true ->
-        Process.sleep(10)
-        eventually(fun, tries - 1)
     end
   end
 
@@ -179,8 +166,11 @@ defmodule Fathom.Shard.PoolGraceTest do
         pid = pid_of(hd(hs))
 
         # Wait out the grace (if any) and the close it ends in.
-        assert eventually(fn -> pool_count(pid) == 0 end),
-               "the pool never drained after the grace"
+        Await.until(
+          fn -> pool_count(pid) == 0 end,
+          "the pool never drained after the grace",
+          2_000
+        )
 
         await_closes(pid)
 
@@ -511,8 +501,11 @@ defmodule Fathom.Shard.PoolGraceTest do
       Process.exit(pid, :kill)
       assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
 
-      assert eventually(fn -> PoolBudget.total() == base end),
-             "a killed coordinator's pooled handle stayed counted against the node budget"
+      Await.until(
+        fn -> PoolBudget.total() == base end,
+        "a killed coordinator's pooled handle stayed counted against the node budget",
+        2_000
+      )
     end
   end
 

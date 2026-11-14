@@ -29,6 +29,7 @@ defmodule Fathom.Shard.ReplicationMissedGenerationTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Fleet, Follower, Session, Shipper, Wal}
   alias Fathom.Shards
+  alias Fathom.Test.Await
 
   @keys [
     :replication_enabled,
@@ -71,22 +72,6 @@ defmodule Fathom.Shard.ReplicationMissedGenerationTest do
     pid = start_supervised!({Follower, name: name, port: port, dir: dir}, id: name)
     {:ok, port} = Follower.port(pid)
     {name, port}
-  end
-
-  defp await(what, fun, timeout \\ 10_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      if fun.(), do: :ok, else: Process.sleep(25)
-    end)
-    |> Enum.find(fn
-      :ok -> true
-      _ -> System.monotonic_time(:millisecond) > deadline
-    end)
-    |> case do
-      :ok -> :ok
-      _ -> flunk("timed out waiting for #{what}")
-    end
   end
 
   defp commit!(s), do: assert(:ok = Session.commit(s.id, s.wal, s.coordinator))
@@ -170,7 +155,12 @@ defmodule Fathom.Shard.ReplicationMissedGenerationTest do
       )
 
       start_supervised!(Fleet)
-      await("shippers to connect", fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end)
+
+      Await.until(
+        fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end,
+        "timed out waiting for shippers to connect",
+        10_000
+      )
 
       {:ok, coordinator, ref, path} = Shards.checkout(id)
       on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -183,10 +173,14 @@ defmodule Fathom.Shard.ReplicationMissedGenerationTest do
       write!(s, "INSERT INTO t VALUES (1)")
       g0 = header(s)
 
-      await("every follower to hold generation g-1", fn ->
-        _ = Session.commit(id, s.wal, coordinator)
-        Enum.all?(followers, fn {n, _} -> holds?(n, id, g0) end)
-      end)
+      Await.until(
+        fn ->
+          _ = Session.commit(id, s.wal, coordinator)
+          Enum.all?(followers, fn {n, _} -> holds?(n, id, g0) end)
+        end,
+        "timed out waiting for every follower to hold generation g-1",
+        10_000
+      )
 
       # F goes down holding ALL of g-1 — it is not short in its own generation.
       stop_supervised!(f)
@@ -198,7 +192,11 @@ defmodule Fathom.Shard.ReplicationMissedGenerationTest do
       g1 = %{g1 | commit_extent: header(s).commit_extent}
 
       for {n, _} <- [a, b] do
-        await("#{n} to hold generation g", fn -> holds?(n, id, g1) end)
+        Await.until(
+          fn -> holds?(n, id, g1) end,
+          "timed out waiting for #{n} to hold generation g",
+          10_000
+        )
       end
 
       # GENERATIONS g+1.., still without F. Each touches only `t`'s page.
@@ -207,19 +205,25 @@ defmodule Fathom.Shard.ReplicationMissedGenerationTest do
       # F comes back on the same port with its g-1 files, and the next commit reaches it with a reset.
       {^f, ^f_port} = start_follower!(root, f, f_port)
 
-      await("F's shipper to reconnect", fn ->
-        Enum.all?(Fleet.shippers(), &Shipper.connected?/1)
-      end)
+      Await.until(
+        fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end,
+        "timed out waiting for F's shipper to reconnect",
+        10_000
+      )
 
       write!(s, "INSERT INTO t VALUES (3)")
 
       # Converge: F either absorbs (pre-fix) or is re-seeded (post-fix). Either way it ends untorn at
       # the primary's position — the state in which promotion trusts it.
-      await("F to converge, untorn, at the primary's position", fn ->
-        _ = Session.commit(id, s.wal, coordinator)
-        st = Follower.state_of(f, id)
-        st != nil and st.torn == false and holds?(f, id, header(s))
-      end)
+      Await.until(
+        fn ->
+          _ = Session.commit(id, s.wal, coordinator)
+          st = Follower.state_of(f, id)
+          st != nil and st.torn == false and holds?(f, id, header(s))
+        end,
+        "timed out waiting for F to converge, untorn, at the primary's position",
+        10_000
+      )
 
       expected = later + 2
 

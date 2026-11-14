@@ -9,6 +9,7 @@ defmodule Fathom.SnapshotsTest do
 
   alias Fathom.{ShardExecutor, Shards, Snapshots}
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Filo.Stmt
 
@@ -50,22 +51,12 @@ defmodule Fathom.SnapshotsTest do
   # used elsewhere — returns the instant it advances, so a passing case is fast and only a
   # never-renewed lock pays the full deadline.
   defp wait_stealable_advanced(shard, base, timeout) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      case Storage.lease_stealable_at(shard) do
-        {:held, _owner, at} when at > base -> :advanced
-        _ -> Process.sleep(10)
-      end
-    end)
-    |> Enum.find(fn
-      :advanced -> true
-      _ -> System.monotonic_time(:millisecond) > deadline
-    end)
-    |> case do
-      :advanced -> true
-      _ -> false
-    end
+    Await.eventually?(
+      fn ->
+        match?({:held, _owner, at} when at > base, Storage.lease_stealable_at(shard))
+      end,
+      timeout
+    )
   end
 
   test "snapshot then restore reverts the live object", %{shard: shard} do

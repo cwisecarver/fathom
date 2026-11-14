@@ -10,7 +10,7 @@ defmodule Fathom.Shard.BackgroundScanGateTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.{BackgroundScanGate, ScanGate}
-  alias Fathom.Test.Env
+  alias Fathom.Test.{Await, Env}
 
   @gate :background_scan_gate_under_test
 
@@ -98,7 +98,12 @@ defmodule Fathom.Shard.BackgroundScanGateTest do
     end
 
     # Exactly `cap` are inside and every other caller is queued, not inside.
-    wait_until(fn -> BackgroundScanGate.stats(gate) == %{held: 2, waiting: n - 2} end)
+    Await.until(
+      fn -> BackgroundScanGate.stats(gate) == %{held: 2, waiting: n - 2} end,
+      "condition never held",
+      1_000
+    )
+
     assert :atomics.get(inside, 1) == 2
 
     # Let them out one at a time. Each freed permit goes to the next waiter, and no one ever sees
@@ -110,7 +115,11 @@ defmodule Fathom.Shard.BackgroundScanGateTest do
       assert_receive {:done, ^i, ^i}
     end
 
-    wait_until(fn -> BackgroundScanGate.stats(gate) == %{held: 0, waiting: 0} end)
+    Await.until(
+      fn -> BackgroundScanGate.stats(gate) == %{held: 0, waiting: 0} end,
+      "condition never held",
+      1_000
+    )
   end
 
   test "a release hands the permit to the oldest waiter", %{gate: gate} do
@@ -119,7 +128,12 @@ defmodule Fathom.Shard.BackgroundScanGateTest do
     assert %{held: 2, waiting: 0} = BackgroundScanGate.stats(gate)
 
     waiter = Task.async(fn -> BackgroundScanGate.acquire(5_000, gate) end)
-    wait_until(fn -> BackgroundScanGate.stats(gate).waiting == 1 end)
+
+    Await.until(
+      fn -> BackgroundScanGate.stats(gate).waiting == 1 end,
+      "condition never held",
+      1_000
+    )
 
     send(a, :release)
     assert Task.await(waiter) == :ok
@@ -131,7 +145,12 @@ defmodule Fathom.Shard.BackgroundScanGateTest do
     assert %{held: 2} = BackgroundScanGate.stats(gate)
 
     waiter = Task.async(fn -> BackgroundScanGate.acquire(5_000, gate) end)
-    wait_until(fn -> BackgroundScanGate.stats(gate).waiting == 1 end)
+
+    Await.until(
+      fn -> BackgroundScanGate.stats(gate).waiting == 1 end,
+      "condition never held",
+      1_000
+    )
 
     ref = Process.monitor(a)
     Process.exit(a, :kill)
@@ -147,13 +166,22 @@ defmodule Fathom.Shard.BackgroundScanGateTest do
     _b = hold_in_task(gate)
 
     waiter = spawn(fn -> BackgroundScanGate.acquire(:infinity, gate) end)
-    wait_until(fn -> BackgroundScanGate.stats(gate).waiting == 1 end)
+
+    Await.until(
+      fn -> BackgroundScanGate.stats(gate).waiting == 1 end,
+      "condition never held",
+      1_000
+    )
 
     ref = Process.monitor(waiter)
     Process.exit(waiter, :kill)
     assert_receive {:DOWN, ^ref, :process, ^waiter, :killed}
 
-    wait_until(fn -> BackgroundScanGate.stats(gate) == %{held: 2, waiting: 0} end)
+    Await.until(
+      fn -> BackgroundScanGate.stats(gate) == %{held: 2, waiting: 0} end,
+      "condition never held",
+      1_000
+    )
   end
 
   test "with_permit/3 times out with a clear error, never runs fun, and leaks nothing",
@@ -185,7 +213,7 @@ defmodule Fathom.Shard.BackgroundScanGateTest do
       BackgroundScanGate.with_permit(fn -> raise "boom" end, gate, 1_000)
     end
 
-    wait_until(fn -> BackgroundScanGate.stats(gate).held == 0 end)
+    Await.until(fn -> BackgroundScanGate.stats(gate).held == 0 end, "condition never held", 1_000)
   end
 
   test "queued/2 has no deadline of its own: it waits, then runs, then releases", %{gate: gate} do
@@ -205,13 +233,18 @@ defmodule Fathom.Shard.BackgroundScanGateTest do
         )
       end)
 
-    wait_until(fn -> BackgroundScanGate.stats(gate).waiting == 1 end)
+    Await.until(
+      fn -> BackgroundScanGate.stats(gate).waiting == 1 end,
+      "condition never held",
+      1_000
+    )
+
     refute_received :ran
 
     send(a, :release)
     assert Task.await(task) == :ok
     assert_received :ran
-    wait_until(fn -> BackgroundScanGate.stats(gate).held == 1 end)
+    Await.until(fn -> BackgroundScanGate.stats(gate).held == 1 end, "condition never held", 1_000)
   end
 
   test "with_wait_ms/2 sets the default wait for this process, nests, and restores" do
@@ -290,23 +323,6 @@ defmodule Fathom.Shard.BackgroundScanGateTest do
       Env.put!(:background_scan_permits, 5)
       assert ScanGate.cap() == flush_default
       assert flush_default == ScanGate.default_cap(:erlang.system_info(:dirty_io_schedulers))
-    end
-  end
-
-  defp wait_until(fun, tries \\ 200) do
-    cond do
-      fun.() ->
-        :ok
-
-      tries == 0 ->
-        flunk("condition never held")
-
-      true ->
-        # A bare timed receive: yields without consuming any mailbox message.
-        receive do
-        after
-          5 -> wait_until(fun, tries - 1)
-        end
     end
   end
 end

@@ -47,6 +47,7 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
   alias Filo.{Stmt, StmtResult}
@@ -178,12 +179,9 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
 
   # Bounded poll (never sleeps forever if the awaited state never arrives): signals the
   # test process on timeout so a broken ordering surfaces as a failed refute, not a hang.
-  defp wait_until(test_pid, fun, tries \\ 500) do
-    cond do
-      fun.() -> :ok
-      tries <= 0 -> send(test_pid, :ordering_never_reached)
-      true -> Process.sleep(5) && wait_until(test_pid, fun, tries - 1)
-    end
+  defp wait_until(test_pid, fun, timeout_ms \\ 2_500) do
+    unless Await.eventually?(fun, timeout_ms), do: send(test_pid, :ordering_never_reached)
+    :ok
   end
 
   # Open, read the single kv value (which lineage the takeover served), close the stream.

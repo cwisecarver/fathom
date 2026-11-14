@@ -64,6 +64,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Fathom.Test.LivenessMode
   alias Filo.Stmt
@@ -726,29 +727,14 @@ defmodule Fathom.ShardLeaseReleaseTest do
       # not enough: it completes hundreds of round trips inside the 1 ms timer and reports the
       # clock unset, which is a fixture race and not the bug. (Same bounded-poll idiom as
       # `shard_kill_cleanup_test.exs`'s registry wait.)
-      deadline = System.monotonic_time(:millisecond) + 2_000
-
-      started =
-        Stream.repeatedly(fn ->
-          case :sys.get_state(coordinator).not_valid_since do
-            nil ->
-              if System.monotonic_time(:millisecond) > deadline,
-                do: :timeout,
-                else: Process.sleep(1)
-
-            since ->
-              since
-          end
-        end)
-        |> Enum.find(&(&1 != :ok))
-
-      # `is_integer/1`, not a bare truthiness check: the poll answers `:timeout` on expiry, which
-      # is TRUTHY and would have made this pass vacuously.
-      assert is_integer(started),
-             "the not-valid clock never started. The shard is clean, so no flush tick runs and " <>
-               "nothing else observes the lapse — the breaker will not arm until some future " <>
-               "write dirties the shard, and it will then measure from THAT write rather than " <>
-               "from when ownership was actually lost."
+      Await.until(
+        fn -> is_integer(:sys.get_state(coordinator).not_valid_since) end,
+        "the not-valid clock never started. The shard is clean, so no flush tick runs and " <>
+          "nothing else observes the lapse — the breaker will not arm until some future " <>
+          "write dirties the shard, and it will then measure from THAT write rather than " <>
+          "from when ownership was actually lost.",
+        2_000
+      )
     end
 
     test "a durability flush still uploads while the Heartbeat process is down", %{shard: shard} do

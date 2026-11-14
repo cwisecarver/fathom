@@ -5,8 +5,10 @@ defmodule Fathom.ShardDurabilityTest do
   # like the idle flush. Not async: shards are global.
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Fathom.Test.FlushGateScope
+  alias Fathom.Test.ShardFlush
 
   import ExUnit.CaptureLog
 
@@ -99,41 +101,6 @@ defmodule Fathom.ShardDurabilityTest do
     )
   end
 
-  # Drive exactly one durability flush and wait for it to settle. The snapshot +
-  # upload now run in an off-process task (expert review #27), so syncing the
-  # mailbox isn't enough — poll until the task has been consumed (bounded).
-  defp flush_now(coordinator) do
-    send(coordinator, :durability_flush)
-    wait_flush_settled(coordinator, 400)
-  end
-
-  defp wait_flush_settled(_coordinator, 0), do: flunk("durability flush task never settled")
-
-  defp wait_flush_settled(coordinator, tries) do
-    case :sys.get_state(coordinator) do
-      %{flush_task: nil} ->
-        :ok
-
-      _ ->
-        Process.sleep(5)
-        wait_flush_settled(coordinator, tries - 1)
-    end
-  end
-
-  # Poll a predicate until true (bounded) — for an eventually-consistent effect delivered by an
-  # async message (here, a monitor :DOWN the runtime enqueues after a process dies), which has no
-  # clean monitor-based synchronization from the test's side. Mirrors wait_flush_settled's shape.
-  defp until_true(_fun, 0), do: false
-
-  defp until_true(fun, tries) do
-    if fun.() do
-      true
-    else
-      Process.sleep(5)
-      until_true(fun, tries - 1)
-    end
-  end
-
   test "a durability flush snapshots committed writes to storage while a connection stays open",
        %{shard: shard} do
     {:ok, conn} = ShardExecutor.open(shard)
@@ -145,7 +112,7 @@ defmodule Fathom.ShardDurabilityTest do
     # Cold shard, connection still open: nothing has reached storage yet.
     refute File.exists?(remote_db(shard))
 
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
 
     # The consistent snapshot reached storage mid-session, and it captured the
     # committed row.
@@ -182,7 +149,7 @@ defmodule Fathom.ShardDurabilityTest do
 
     {:ok, coordinator} = Shards.ensure(shard)
     # Clean baseline: flush the CREATE so flushed_through == count.
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard)
 
     # Open a transaction and write a row (bumps WriteCounter; uncommitted, invisible to a
@@ -195,7 +162,7 @@ defmodule Fathom.ShardDurabilityTest do
     # A flush lands mid-transaction, AFTER the last bumping statement: its snapshot can't see the
     # uncommitted row, but it advances the watermark to the current count — so the shard now reads
     # clean past an uncommitted write, with no further statement able to re-dirty it before COMMIT.
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
 
     refute dirty?(shard),
            "the mid-transaction flush advances the watermark past the uncommitted row"
@@ -234,7 +201,7 @@ defmodule Fathom.ShardDurabilityTest do
 
     {:ok, coordinator} = Shards.ensure(shard)
     # Clean baseline: flush the seed so flushed_through == count.
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard)
 
     before = Fathom.Shard.WriteCounter.count(shard)
@@ -273,7 +240,7 @@ defmodule Fathom.ShardDurabilityTest do
     :ok = ShardExecutor.close(setup_conn)
 
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard), "clean baseline"
 
     {:ok, conn} = ShardExecutor.open(shard)
@@ -299,7 +266,7 @@ defmodule Fathom.ShardDurabilityTest do
     :ok = ShardExecutor.close(setup_conn)
 
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard), "clean baseline"
 
     {:ok, conn} = ShardExecutor.open(shard)
@@ -323,7 +290,7 @@ defmodule Fathom.ShardDurabilityTest do
     :ok = ShardExecutor.close(setup_conn)
 
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard), "clean baseline"
 
     {:ok, conn} = ShardExecutor.open(shard)
@@ -350,7 +317,7 @@ defmodule Fathom.ShardDurabilityTest do
     :ok = ShardExecutor.close(setup_conn)
 
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard), "clean baseline"
 
     {:ok, conn} = ShardExecutor.open(shard)
@@ -378,7 +345,7 @@ defmodule Fathom.ShardDurabilityTest do
     {:ok, _} = ShardExecutor.execute(conn, stmt("COMMIT"))
 
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard)
 
     before = Fathom.Shard.WriteCounter.count(shard)
@@ -414,7 +381,7 @@ defmodule Fathom.ShardDurabilityTest do
       ShardExecutor.execute(conn, stmt("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"))
 
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard)
 
     # Leading keyword is WITH, so dml?/1 does not see it — only changes>0 marks it a write.
@@ -445,7 +412,7 @@ defmodule Fathom.ShardDurabilityTest do
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1, 'alice')"))
 
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard)
 
     before = Fathom.Shard.WriteCounter.count(shard)
@@ -474,7 +441,7 @@ defmodule Fathom.ShardDurabilityTest do
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
 
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard)
 
     {:ok, _} = ShardExecutor.execute(conn, stmt("SAVEPOINT a"))
@@ -482,7 +449,7 @@ defmodule Fathom.ShardDurabilityTest do
     # Resets sqlite3_changes() to 0 so the RELEASE cannot ride inherited changes.
     {:ok, _} = ShardExecutor.execute(conn, stmt("UPDATE kv SET v = 'x' WHERE 1 = 0"))
 
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
 
     refute dirty?(shard),
            "the mid-savepoint flush advances the watermark past the uncommitted row"
@@ -526,7 +493,7 @@ defmodule Fathom.ShardDurabilityTest do
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
 
       {:ok, coordinator} = Shards.ensure(shard)
-      flush_now(coordinator)
+      ShardFlush.flush!(coordinator)
       refute dirty?(shard)
 
       {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
@@ -538,7 +505,7 @@ defmodule Fathom.ShardDurabilityTest do
       {:ok, _} = ShardExecutor.execute(conn, stmt("UPDATE kv SET v = 'x' WHERE 1 = 0"))
       {:ok, _} = ShardExecutor.execute(conn, stmt(@rollback))
 
-      flush_now(coordinator)
+      ShardFlush.flush!(coordinator)
       {:ok, _} = ShardExecutor.execute(conn, stmt("COMMIT"))
 
       close_and_stop(shard, conn)
@@ -564,7 +531,7 @@ defmodule Fathom.ShardDurabilityTest do
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard)
 
     # A second stream checks out a connection (the coordinator monitors the caller), then dies
@@ -582,8 +549,12 @@ defmodule Fathom.ShardDurabilityTest do
     Process.exit(holder, :kill)
 
     # The coordinator force-dirties on the abnormal :DOWN (delivered async → poll).
-    assert until_true(fn -> dirty?(shard) end, 100),
-           "an abnormal connection death must force the shard dirty"
+    # `Await.until` bounded at the original 100 tries x 5 ms.
+    Await.until(
+      fn -> dirty?(shard) end,
+      "an abnormal connection death must force the shard dirty",
+      500
+    )
 
     ShardExecutor.close(conn)
   end
@@ -599,7 +570,7 @@ defmodule Fathom.ShardDurabilityTest do
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard), "a flushed shard must be clean before the :noproc DOWN"
 
     # A second checkout registers a monitored conn; `ref` is its key in `state.conns`. `conn` above
@@ -1130,7 +1101,7 @@ defmodule Fathom.ShardDurabilityTest do
 
     # Free the sibling's slot; the coordinator's next flush is admitted and the shard goes durable.
     FlushGate.release()
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute Shard.dirty?(coordinator), "once a slot frees, the flush runs and the shard is clean"
 
     assert FlushGateScope.in_flight(shard) == 0,
@@ -1155,7 +1126,7 @@ defmodule Fathom.ShardDurabilityTest do
              ShardExecutor.execute(conn, stmt("PRAGMA synchronous"))
 
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
 
     assert {:ok, %StmtResult{rows: [[2]]}} =
              ShardExecutor.execute(conn, stmt("PRAGMA synchronous")),
@@ -1198,7 +1169,7 @@ defmodule Fathom.ShardDurabilityTest do
     assert grown > 0, "precondition: the writes produced a WAL"
 
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
 
     # A PASSIVE checkpoint does not TRUNCATE the file — SQLite resets the write position and reuses
     # the space — so the observable is not that the WAL shrinks, it is that it STOPS GROWING: the
@@ -1234,7 +1205,7 @@ defmodule Fathom.ShardDurabilityTest do
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER)"))
 
     {:ok, pid} = Shards.ensure(shard)
-    flush_now(pid)
+    ShardFlush.flush!(pid)
     refute dirty?(shard)
 
     # Still busy (a connection is checked out) ⇒ the timer stays armed.
@@ -1246,7 +1217,7 @@ defmodule Fathom.ShardDurabilityTest do
     # The disarm happens on the next tick, not at checkin: the already-armed timer fires once,
     # observes idle+clean, and declines to re-arm. So a coordinator self-quiesces after at most one
     # extra wakeup rather than paying one every interval forever.
-    flush_now(pid)
+    ShardFlush.flush!(pid)
 
     assert :sys.get_state(pid).flush_timer == nil,
            "an idle, clean coordinator must not burn a timer — it cannot become dirty until the " <>
@@ -1426,7 +1397,7 @@ defmodule Fathom.ShardDurabilityTest do
 
     {:ok, coordinator} = Shards.ensure(shard)
     # Busy shard (connection still open) → the periodic flush snapshots via VACUUM INTO.
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
 
     assert_stored_object_valid(shard, 3)
     ShardExecutor.close(conn)
@@ -1525,7 +1496,7 @@ defmodule Fathom.ShardDurabilityTest do
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
 
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
 
     assert Shard.dirty?(coordinator),
            "a write during the flush must keep the shard dirty, not be cleared by the flush"
@@ -1579,7 +1550,7 @@ defmodule Fathom.ShardDurabilityTest do
 
     # Release the flush and let it settle; the write reached storage.
     send(flush_task_pid(coordinator), :release_flush)
-    wait_flush_settled(coordinator, 400)
+    ShardFlush.settle!(coordinator)
     assert File.exists?(remote_db(shard))
 
     ShardExecutor.close(conn)
@@ -1647,7 +1618,7 @@ defmodule Fathom.ShardDurabilityTest do
 
     # Release the reconcile: lock still ours ⇒ resolve {:reconciled, etag}, keep serving.
     send(reconcile_pid, :release_reconcile)
-    wait_flush_settled(coordinator, 400)
+    ShardFlush.settle!(coordinator)
 
     refute_receive {:DOWN, ^ref, :process, ^coordinator, {:shutdown, :lease_lost}}, 200
     assert Process.alive?(coordinator), "a 412 with the lock still ours must not self-fence"
@@ -1702,7 +1673,7 @@ defmodule Fathom.ShardDurabilityTest do
     {:ok, _} =
       ShardExecutor.execute(conn, stmt("CREATE TABLE kv (id INTEGER PRIMARY KEY, v TEXT)"))
 
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard), "baseline: the shard is clean after a flush"
 
     {:ok, %StmtResult{}} =
@@ -1734,13 +1705,13 @@ defmodule Fathom.ShardDurabilityTest do
     assert dirty?(shard)
 
     {:ok, coordinator} = Shards.ensure(shard)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     assert File.exists?(remote_db(shard)), "a dirty durability flush uploads"
     refute dirty?(shard), "the flush clears the dirty flag"
 
     # Now clean: remove the object and flush again — a clean flush must NOT recreate it.
     File.rm!(remote_db(shard))
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute File.exists?(remote_db(shard)), "a clean durability flush skips the upload"
 
     close_and_stop(shard, conn)
@@ -1764,14 +1735,14 @@ defmodule Fathom.ShardDurabilityTest do
     # The upload fails: the shard MUST stay dirty (retry next interval, flush before drop).
     Env.put!(:storage_fault, :flush)
 
-    capture_log(fn -> flush_now(coordinator) end)
+    capture_log(fn -> ShardFlush.flush!(coordinator) end)
 
     assert dirty?(shard), "a failed durability upload must NOT clear the dirty flag"
     refute File.exists?(remote_db(shard)), "the failed upload left nothing in storage"
 
     # Storage recovers: the next flush uploads the still-dirty state and clears the flag.
     Application.delete_env(:fathom, :storage_fault)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
 
     assert File.exists?(remote_db(shard)), "the retry uploads the un-lost writes"
     refute dirty?(shard), "a successful flush clears the flag"
@@ -1815,17 +1786,17 @@ defmodule Fathom.ShardDurabilityTest do
     Env.put!(:storage_fault, :flush)
 
     # First failure: consecutive == 1, below threshold (no error escalation).
-    capture_log(fn -> flush_now(coordinator) end)
+    capture_log(fn -> ShardFlush.flush!(coordinator) end)
     assert_receive {:flush_failed, %{count: 1, consecutive: 1}, %{shard_id: ^shard}}
 
     # Second failure: consecutive == 2, hits the threshold ⇒ escalate to Logger.error.
-    log = capture_log(fn -> flush_now(coordinator) end)
+    log = capture_log(fn -> ShardFlush.flush!(coordinator) end)
     assert_receive {:flush_failed, %{count: 1, consecutive: 2}, %{shard_id: ^shard}}
     assert log =~ "FAILED 2× consecutively"
 
     # Storage recovers: a durable flush RESETS the counter and emits NO failure event.
     Application.delete_env(:fathom, :storage_fault)
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     # Pin the shard. The handler above is attached to the GLOBAL event, so a bare
     # `refute_receive {:flush_failed, _, _}` also matches a CONCURRENT test's shard — which is
     # exactly how this failed in CI on 2026-08-14 (run 31757415032, OTP 29, seed 711283:
@@ -1836,7 +1807,7 @@ defmodule Fathom.ShardDurabilityTest do
     # A fresh write + failure starts the count over at 1 — proving the reset.
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('bob')"))
     Env.put!(:storage_fault, :flush)
-    capture_log(fn -> flush_now(coordinator) end)
+    capture_log(fn -> ShardFlush.flush!(coordinator) end)
     assert_receive {:flush_failed, %{consecutive: 1}, %{shard_id: ^shard}}
 
     ShardExecutor.close(conn)
@@ -1879,12 +1850,12 @@ defmodule Fathom.ShardDurabilityTest do
     Env.put!(:storage_fault, :renew)
 
     # First skip: consecutive == 1 (pre-fix: no telemetry at all — assert_receive would time out).
-    capture_log(fn -> flush_now(coordinator) end)
+    capture_log(fn -> ShardFlush.flush!(coordinator) end)
     assert_receive {:flush_failed, %{count: 1, consecutive: 1}, %{shard_id: ^shard}}
 
     # Second skip: consecutive == 2, hits the threshold ⇒ escalate to Logger.error carrying the
     # distinct :ownership_unconfirmed reason (proving it's the skip path, not a PUT failure).
-    log = capture_log(fn -> flush_now(coordinator) end)
+    log = capture_log(fn -> ShardFlush.flush!(coordinator) end)
     assert_receive {:flush_failed, %{count: 1, consecutive: 2}, %{shard_id: ^shard}}
     assert log =~ "FAILED 2× consecutively"
     assert log =~ ":ownership_unconfirmed"
@@ -1962,7 +1933,7 @@ defmodule Fathom.ShardDurabilityTest do
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, coordinator} = Shards.ensure(shard)
 
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
 
     assert_receive {:flush, %{duration: d}, %{shard_id: ^shard, outcome: :uploaded}}
     assert is_integer(d) and d > 0
@@ -2244,7 +2215,7 @@ defmodule Fathom.ShardDurabilityTest do
 
     # Clean baseline so the pragma is the ONLY thing that can re-dirty the shard.
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
-    flush_now(coordinator)
+    ShardFlush.flush!(coordinator)
     refute dirty?(shard), "baseline: clean after a flush"
 
     # The read form and a connection-local assignment must NOT dirty.
@@ -2561,11 +2532,10 @@ defmodule Fathom.ShardDurabilityTest do
     vanish = fn ->
       # The pull runs concurrently with this acquire — wait for its temp, then
       # delete the object so the revalidation's etag read sees nothing.
-      Enum.reduce_while(1..400, :ok, fn _, _ ->
-        if File.exists?(pull_temp) or File.exists?(local_db(shard)),
-          do: {:halt, :ok},
-          else: Process.sleep(5) && {:cont, :ok}
-      end)
+      Await.eventually?(
+        fn -> File.exists?(pull_temp) or File.exists?(local_db(shard)) end,
+        2_000
+      )
 
       File.rm(remote_db(shard))
     end
@@ -2822,7 +2792,12 @@ defmodule Fathom.ShardDurabilityTest do
     assert_receive {:DOWN, ^ref, :process, ^wc, :killed}, 1_000
 
     capture_log(fn ->
-      assert wait_restarted(Fathom.Shard.WriteCounter, wc), "WriteCounter should restart"
+      Await.until(
+        fn -> restarted?(Fathom.Shard.WriteCounter, wc) end,
+        "WriteCounter should restart",
+        1_000
+      )
+
       # The restarted counter notified registered coordinators during init; sync the
       # coordinator so the reset message has been processed before we ask.
       {:ok, coordinator} = Shards.ensure(shard)
@@ -2893,7 +2868,12 @@ defmodule Fathom.ShardDurabilityTest do
       ref = Process.monitor(wc)
       Process.exit(wc, :kill)
       assert_receive {:DOWN, ^ref, :process, ^wc, :killed}, 1_000
-      assert wait_restarted(Fathom.Shard.WriteCounter, wc), "WriteCounter should restart"
+
+      Await.until(
+        fn -> restarted?(Fathom.Shard.WriteCounter, wc) end,
+        "WriteCounter should restart",
+        1_000
+      )
 
       # An acknowledged write lands in the FRESH table — its count sits far below the
       # dead table's watermark the in-flight task is about to restore.
@@ -2901,7 +2881,7 @@ defmodule Fathom.ShardDurabilityTest do
 
       # Release the flush; its reply restores flushed_through from flush_pending.
       send(flush_pid, :release_flush)
-      wait_flush_settled(coordinator, 400)
+      ShardFlush.settle!(coordinator)
 
       assert Shard.dirty?(coordinator),
              "a watermark from the dead counter table must not classify the shard clean"
@@ -2920,11 +2900,14 @@ defmodule Fathom.ShardDurabilityTest do
     Connection.close(ro)
   end
 
-  defp wait_restarted(name, old, tries \\ 200) do
+  defp restarted?(name, old) do
     case Process.whereis(name) do
-      pid when is_pid(pid) and pid != old -> _ = :sys.get_state(pid) && true
-      _ when tries > 0 -> Process.sleep(5) && wait_restarted(name, old, tries - 1)
-      _ -> false
+      pid when is_pid(pid) and pid != old ->
+        _ = :sys.get_state(pid)
+        true
+
+      _ ->
+        false
     end
   end
 

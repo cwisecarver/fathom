@@ -13,6 +13,7 @@ defmodule Fathom.HranaWsHibernateTest do
 
   alias Fathom.Bench.HranaClient
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
 
   @hibernate_ms 200
@@ -64,25 +65,13 @@ defmodule Fathom.HranaWsHibernateTest do
     :ok
   end
 
-  defp wait_hibernated(pid, deadline) do
+  defp hibernated?(pid) do
     case :erlang.process_info(pid, :current_function) do
       # OTP 29 parks a hibernated gen_server in gen_server:loop_hibernate/4; older OTPs show
       # erlang:hibernate/3.
-      {:current_function, {:gen_server, :loop_hibernate, _}} ->
-        true
-
-      {:current_function, {:erlang, :hibernate, _}} ->
-        true
-
-      _ ->
-        if System.monotonic_time(:millisecond) > deadline do
-          false
-        else
-          receive do
-          after
-            25 -> wait_hibernated(pid, deadline)
-          end
-        end
+      {:current_function, {:gen_server, :loop_hibernate, _}} -> true
+      {:current_function, {:erlang, :hibernate, _}} -> true
+      _ -> false
     end
   end
 
@@ -106,8 +95,10 @@ defmodule Fathom.HranaWsHibernateTest do
 
     {:memory, before} = :erlang.process_info(handler, :memory)
 
-    assert wait_hibernated(handler, System.monotonic_time(:millisecond) + 5_000),
-           "the WS connection process never hibernated (no hibernate_after on the handler)"
+    Await.until(
+      fn -> hibernated?(handler) end,
+      "the WS connection process never hibernated (no hibernate_after on the handler)"
+    )
 
     {:memory, after_mem} = :erlang.process_info(handler, :memory)
 

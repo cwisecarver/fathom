@@ -14,6 +14,7 @@ defmodule Fathom.ShardExecutorScriptTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.Replication.{Fleet, Follower, Session}
+  alias Fathom.Test.Await
   alias Filo.{Error, Stmt}
 
   setup do
@@ -80,20 +81,6 @@ defmodule Fathom.ShardExecutorScriptTest do
       2
   end
 
-  defp await_quorum(followers, id, tries \\ 100) do
-    cond do
-      quorum_holds?(followers, id) ->
-        true
-
-      tries == 0 ->
-        false
-
-      true ->
-        Process.sleep(20)
-        await_quorum(followers, id, tries - 1)
-    end
-  end
-
   defp open!(id, followers) do
     {:ok, conn} = ShardExecutor.open(id)
     {:ok, _coordinator} = Shards.ensure(id)
@@ -107,7 +94,12 @@ defmodule Fathom.ShardExecutorScriptTest do
     test "an autocommit script is on a follower quorum when it is acked", %{id: id, followers: f} do
       conn = open!(id, f)
       assert :ok = ShardExecutor.execute_sequence(conn, "INSERT INTO t VALUES (1, 'a');")
-      assert await_quorum(f, id), "a script was acked while no follower quorum held its frames"
+
+      Await.until(
+        fn -> quorum_holds?(f, id) end,
+        "a script was acked while no follower quorum held its frames",
+        2_000
+      )
     end
 
     test "a script that leaves a transaction open ships at the COMMIT", %{id: id, followers: f} do
@@ -115,7 +107,12 @@ defmodule Fathom.ShardExecutorScriptTest do
 
       assert :ok = ShardExecutor.execute_sequence(conn, "BEGIN; INSERT INTO t VALUES (1, 'a');")
       {:ok, _} = run(conn, "COMMIT")
-      assert await_quorum(f, id), "the COMMIT closing a script's transaction was acked unshipped"
+
+      Await.until(
+        fn -> quorum_holds?(f, id) end,
+        "the COMMIT closing a script's transaction was acked unshipped",
+        2_000
+      )
     end
 
     # Expert review 2026-10-21 rv6 F4. The ship decision read SQLite's autocommit flag only at

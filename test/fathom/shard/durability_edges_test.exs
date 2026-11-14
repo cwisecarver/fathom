@@ -12,7 +12,7 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
 
   alias Fathom.Shard.Storage.Local
   alias Fathom.Shard.WriteCounter
-  alias Fathom.Test.Env
+  alias Fathom.Test.{Await, Env}
 
   # Expert review 2026-08-26 #4: a long-lived WRITING stream silently got 10x the advertised RPO.
   #
@@ -56,7 +56,7 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
 
       # Let the flush land so the shard goes CLEAN while the stream is still held. This is the
       # moment the slow (10x) timer used to be armed.
-      assert wait_for(fn -> not Fathom.Shard.dirty?(pid) end),
+      assert Await.eventually?(fn -> not Fathom.Shard.dirty?(pid) end, 2_000),
              "precondition: the first write never flushed, so the slow cadence is never reached"
 
       # THE SECOND WRITE, on the same connection. signal_dirty_once/2 has already fired for this
@@ -71,7 +71,7 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
                "the RPO bound docs/durability.md advertises"
 
       # And it really does flush again promptly, not 10 intervals later.
-      assert wait_for(fn -> not Fathom.Shard.dirty?(pid) end, 3_000),
+      assert Await.eventually?(fn -> not Fathom.Shard.dirty?(pid) end, 3_000),
              "the second write never flushed within a reasonable multiple of the interval"
     end
 
@@ -84,21 +84,9 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
       {:ok, _} = Fathom.ShardExecutor.execute(conn, %Filo.Stmt{sql: "SELECT 1"})
       {:ok, pid} = Fathom.Shards.ensure(id)
 
-      assert wait_for(fn -> :sys.get_state(pid).flush_timer_slow? end),
+      assert Await.eventually?(fn -> :sys.get_state(pid).flush_timer_slow? end, 2_000),
              "a read-only held stream should poll at the slow cadence — the optimisation from " <>
                "review 2026-08-01 #42 has been lost"
-    end
-  end
-
-  defp wait_for(fun, remaining_ms \\ 2_000)
-  defp wait_for(_fun, remaining_ms) when remaining_ms <= 0, do: false
-
-  defp wait_for(fun, remaining_ms) do
-    if fun.() do
-      true
-    else
-      Process.sleep(10)
-      wait_for(fun, remaining_ms - 10)
     end
   end
 

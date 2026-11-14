@@ -16,6 +16,7 @@ defmodule Fathom.Shard.Replication.FollowerDiskAdmissionTest do
 
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Protocol
+  alias Fathom.Test.Await
 
   setup do
     root = Path.join(System.tmp_dir!(), "replcdisk_#{System.unique_integer([:positive])}")
@@ -50,7 +51,7 @@ defmodule Fathom.Shard.Replication.FollowerDiskAdmissionTest do
     # also guarantees a reading on either side of the fix (the pre-fix follower read on demand).
     _ = :sys.get_state(pid)
     name |> Follower.begin_seed(%{}, begin("cd_prime")) |> Follower.discard_seeds()
-    await_reading!(name, dir)
+    Await.until(fn -> reading_settled?(name, dir) end, "no volume reading landed for #{dir}")
 
     %{name: name, dir: dir}
   end
@@ -77,19 +78,8 @@ defmodule Fathom.Shard.Replication.FollowerDiskAdmissionTest do
   defp refreshing?(name, dir), do: :ets.lookup(Follower.locks(name), {:disk_refresh, dir}) != []
 
   # A reading is present and no refresh is in flight.
-  defp await_reading!(name, dir, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        reading(name, dir) != nil and not refreshing?(name, dir) -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(5) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("no volume reading landed for #{dir}")
-  end
+  defp reading_settled?(name, dir),
+    do: reading(name, dir) != nil and not refreshing?(name, dir)
 
   # An EXPIRED reading saying the volume is full.
   defp inject_stale_full!(name, dir) do
@@ -108,7 +98,7 @@ defmodule Fathom.Shard.Replication.FollowerDiskAdmissionTest do
     refute Map.has_key?(Follower.begin_seed(name, %{}, begin("cd_stale")), "cd_stale"),
            "the begin read the volume itself instead of using the cached (expired) reading"
 
-    await_reading!(name, dir)
+    Await.until(fn -> reading_settled?(name, dir) end, "no volume reading landed for #{dir}")
     assert {_at, {:ok, free, _}} = reading(name, dir)
     assert free > 1, "the background refresh never replaced the expired reading"
 
@@ -153,7 +143,7 @@ defmodule Fathom.Shard.Replication.FollowerDiskAdmissionTest do
     refute_received {:trace, _, :call, {Follower, :read_disk_free, _}},
                     "a begin read the volume itself"
 
-    await_reading!(name, dir)
+    Await.until(fn -> reading_settled?(name, dir) end, "no volume reading landed for #{dir}")
     {at1, _} = reading(name, dir)
     assert at1 > at0 - 60_000, "nothing refreshed the expired reading"
   end

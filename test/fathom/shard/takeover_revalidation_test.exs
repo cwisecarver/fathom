@@ -13,6 +13,7 @@ defmodule Fathom.Shard.TakeoverRevalidationTest do
 
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Filo.{Stmt, StmtResult}
 
@@ -68,15 +69,10 @@ defmodule Fathom.Shard.TakeoverRevalidationTest do
     temp = Path.join(local_dir(), "#{shard}.db.pull")
 
     zombie_flush = fn ->
-      wait_for = fn wait_for, tries ->
-        cond do
-          File.exists?(temp) -> :ok
-          tries <= 0 -> send(test_pid, :pull_temp_never_appeared)
-          true -> Process.sleep(5) && wait_for.(wait_for, tries - 1)
-        end
+      unless Await.eventually?(fn -> File.exists?(temp) end, 2_000) do
+        send(test_pid, :pull_temp_never_appeared)
       end
 
-      wait_for.(wait_for, 400)
       seed_remote!(shard, "zombie-final-write")
       :ok
     end

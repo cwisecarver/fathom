@@ -26,6 +26,7 @@ defmodule Fathom.Shard.StealTouchWarmStandbyTest do
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
   alias Filo.{Stmt, StmtResult}
@@ -62,16 +63,6 @@ defmodule Fathom.Shard.StealTouchWarmStandbyTest do
     })
   end
 
-  # Bounded poll (never Process.sleep-forever if the pull never fires): signals the
-  # test process on timeout so a broken ordering surfaces as a failed refute, not a hang.
-  defp wait_until(test_pid, fun, tries \\ 500) do
-    cond do
-      fun.() -> :ok
-      tries <= 0 -> send(test_pid, :pull_never_served)
-      true -> Process.sleep(5) && wait_until(test_pid, fun, tries - 1)
-    end
-  end
-
   test "a cold crash-steal takeover adopts the touched etag without a full body re-pull",
        %{shard: shard} do
     # The last flushed object the survivor's pull will capture (single-form MD5 etag).
@@ -103,7 +94,11 @@ defmodule Fathom.Shard.StealTouchWarmStandbyTest do
         # flaky wall-clock race; the object doesn't actually rotate until the touch's PUT,
         # after this hold releases.
         conn.method == "GET" and data? and touch_read? ->
-          wait_until(test_pid, fn -> Agent.get(pull_served, & &1) end)
+          # Bounded poll (never Process.sleep-forever if the pull never fires): signals the
+          # test process on timeout so a broken ordering surfaces as a failed refute, not a hang.
+          unless Await.eventually?(fn -> Agent.get(pull_served, & &1) end, 2_500),
+            do: send(test_pid, :pull_never_served)
+
           S3EtagStore.serve(conn, store)
 
         # A correct open pulls the data object ONCE (the speculative pull). The pre-#15

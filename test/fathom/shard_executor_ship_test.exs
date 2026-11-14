@@ -13,6 +13,7 @@ defmodule Fathom.ShardExecutorShipTest do
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Fleet, Follower, Session}
+  alias Fathom.Test.Await
   alias Filo.Stmt
 
   setup do
@@ -72,21 +73,6 @@ defmodule Fathom.ShardExecutorShipTest do
       2
   end
 
-  # A commit returns at the Q-th ack, so poll briefly for the quorum's bytes.
-  defp await_quorum(followers, id, tries \\ 100) do
-    cond do
-      quorum_holds?(followers, id) ->
-        true
-
-      tries == 0 ->
-        false
-
-      true ->
-        Process.sleep(20)
-        await_quorum(followers, id, tries - 1)
-    end
-  end
-
   defp open!(id, followers) do
     {:ok, conn} = ShardExecutor.open(id)
     {:ok, _coordinator} = Shards.ensure(id)
@@ -110,7 +96,12 @@ defmodule Fathom.ShardExecutorShipTest do
     assert Connection.autocommit?(elem(conn, 2)), "fixture: SQLite did not roll back"
 
     {:ok, _} = run(conn, "INSERT INTO t VALUES (3, 'c')")
-    assert await_quorum(f, id), "autocommit write after an auto-rollback was acked unshipped"
+    # A commit returns at the Q-th ack, so poll briefly for the quorum's bytes.
+    Await.until(
+      fn -> quorum_holds?(f, id) end,
+      "autocommit write after an auto-rollback was acked unshipped",
+      2_000
+    )
   end
 
   test "an autocommit write ships after savepoint-only usage", %{id: id, followers: f} do
@@ -121,7 +112,12 @@ defmodule Fathom.ShardExecutorShipTest do
     assert Connection.autocommit?(elem(conn, 2)), "fixture: still in a transaction"
 
     {:ok, _} = run(conn, "INSERT INTO t VALUES (2, 'b')")
-    assert await_quorum(f, id), "autocommit write after SAVEPOINT/RELEASE was acked unshipped"
+
+    Await.until(
+      fn -> quorum_holds?(f, id) end,
+      "autocommit write after SAVEPOINT/RELEASE was acked unshipped",
+      2_000
+    )
   end
 
   # Expert review 2026-10-10 #P1: one Session per replicated shard, mostly idle -- it must sweep

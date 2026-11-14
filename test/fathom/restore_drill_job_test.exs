@@ -13,6 +13,7 @@ defmodule Fathom.RestoreDrillJobTest do
   alias Fathom.Directory.Shard, as: DirShard
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
   alias Filo.Stmt
@@ -707,7 +708,13 @@ defmodule Fathom.RestoreDrillJobTest do
       assert_receive :holding
 
       task = Task.async(fn -> RestoreDrillJob.run_drill(10) end)
-      wait_until(fn -> Fathom.Shard.BackgroundScanGate.stats().waiting >= 1 end)
+
+      Await.until(
+        fn -> Fathom.Shard.BackgroundScanGate.stats().waiting >= 1 end,
+        "condition never held",
+        2_000
+      )
+
       assert Task.yield(task, 50) == nil, "the drill scanned without a permit"
 
       send(holder, :stop)
@@ -746,7 +753,12 @@ defmodule Fathom.RestoreDrillJobTest do
       assert_receive :holding
 
       task = Task.async(fn -> RestoreDrillJob.run_drill(10) end)
-      wait_until(fn -> Fathom.Shard.BackgroundScanGate.stats().waiting >= 1 end)
+
+      Await.until(
+        fn -> Fathom.Shard.BackgroundScanGate.stats().waiting >= 1 end,
+        "condition never held",
+        2_000
+      )
 
       # Past the whole deadline, with the shard still queued.
       assert Task.yield(task, 2_500) == nil
@@ -759,22 +771,6 @@ defmodule Fathom.RestoreDrillJobTest do
 
       assert summary[:ok] >= 1
       assert Repo.get_by!(DirShard, shard_id: id).last_verify_status == "ok"
-    end
-  end
-
-  defp wait_until(fun, tries \\ 400) do
-    cond do
-      fun.() ->
-        :ok
-
-      tries == 0 ->
-        flunk("condition never held")
-
-      true ->
-        receive do
-        after
-          5 -> wait_until(fun, tries - 1)
-        end
     end
   end
 end

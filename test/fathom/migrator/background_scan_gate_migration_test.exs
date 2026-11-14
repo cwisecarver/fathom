@@ -16,6 +16,7 @@ defmodule Fathom.Migrator.BackgroundScanGateMigrationTest do
   alias Fathom.Migrator.{Copy, ShardMigration, ShardMigrationJob}
   alias Fathom.Shard.{BackgroundScanGate, Connection, Storage}
   alias Fathom.Directory
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
 
   @v2_statements [
@@ -49,17 +50,12 @@ defmodule Fathom.Migrator.BackgroundScanGateMigrationTest do
         send(parent, {:holder, holder})
       end
 
-      wait_queued(BackgroundScanGate.stats())
-    end
-
-    # Both holders are in the gate's books (one held, one queued behind it) before the replay returns.
-    defp wait_queued(%{held: 2, waiting: 1}), do: :ok
-
-    defp wait_queued(_) do
-      receive do
-      after
-        5 -> wait_queued(BackgroundScanGate.stats())
-      end
+      # Both holders are in the gate's books (one held, one queued behind it) before the replay
+      # returns.
+      Await.until(
+        fn -> match?(%{held: 2, waiting: 1}, BackgroundScanGate.stats()) end,
+        "the two holders never reached the gate's books (one held, one queued)"
+      )
     end
   end
 
@@ -175,7 +171,7 @@ defmodule Fathom.Migrator.BackgroundScanGateMigrationTest do
 
     # A permit frees up: the same call now succeeds, and holds nothing afterwards.
     free_holders!(holders)
-    wait_until(fn -> BackgroundScanGate.stats().held == 0 end)
+    Await.until(fn -> BackgroundScanGate.stats().held == 0 end, "condition never held")
     assert :ok = Copy.migrate(src, dest, 2, statements)
     assert %{held: 0, waiting: 0} = BackgroundScanGate.stats()
   end
@@ -199,7 +195,7 @@ defmodule Fathom.Migrator.BackgroundScanGateMigrationTest do
     assert {:ok, %{schema_version: 1, status: "active"}} = Directory.get(shard)
 
     free_holders!(holders)
-    wait_until(fn -> BackgroundScanGate.stats().held == 0 end)
+    Await.until(fn -> BackgroundScanGate.stats().held == 0 end, "condition never held")
 
     assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
     assert {:ok, %{schema_version: 2, status: "active"}} = Directory.get(shard)
@@ -259,21 +255,5 @@ defmodule Fathom.Migrator.BackgroundScanGateMigrationTest do
     refute log =~ "failed quick_check"
     assert {:ok, %{schema_version: 2, status: "active"}} = Directory.get(shard)
     assert live_user_version!(shard) == 2
-  end
-
-  defp wait_until(fun, tries \\ 200) do
-    cond do
-      fun.() ->
-        :ok
-
-      tries == 0 ->
-        flunk("condition never held")
-
-      true ->
-        receive do
-        after
-          5 -> wait_until(fun, tries - 1)
-        end
-    end
   end
 end

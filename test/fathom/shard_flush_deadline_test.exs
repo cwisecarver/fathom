@@ -15,6 +15,7 @@ defmodule Fathom.ShardFlushDeadlineTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{FlushGate, Storage}
+  alias Fathom.Test.Await
   alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
@@ -90,22 +91,11 @@ defmodule Fathom.ShardFlushDeadlineTest do
     :ok = ShardExecutor.close(conn)
   end
 
-  defp await(coordinator, fun, tries \\ 100) do
-    cond do
-      fun.() ->
-        :ok
-
-      tries == 0 ->
-        flunk(
-          "condition never held: #{inspect(Map.take(:sys.get_state(coordinator), [:flush_failures, :flush_task, :flush_timer, :lease_lost, :flush_retry_ms, :etag]))}"
-        )
-
-      true ->
-        receive do
-        after
-          50 -> await(coordinator, fun, tries - 1)
-        end
-    end
+  defp await(coordinator, fun) do
+    Await.eventually?(fun, 5_000) or
+      flunk(
+        "condition never held: #{inspect(Map.take(:sys.get_state(coordinator), [:flush_failures, :flush_task, :flush_timer, :lease_lost, :flush_retry_ms, :etag]))}"
+      )
   end
 
   for mode <- [:legacy, :heartbeat], fault <- [:flush_hangs, :flush_lands_then_hangs] do

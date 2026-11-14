@@ -28,7 +28,7 @@ defmodule Fathom.Shard.FlushPinnedMainFileCheckTest do
   alias Fathom.Shard.Replication.Wal
   alias Fathom.ShardExecutor
   alias Fathom.Shards
-  alias Fathom.Test.{Env, LivenessMode}
+  alias Fathom.Test.{Env, LivenessMode, ShardFlush}
 
   @modes [:legacy, :heartbeat]
 
@@ -65,29 +65,6 @@ defmodule Fathom.Shard.FlushPinnedMainFileCheckTest do
         do:
           {:ok, _} =
             ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (?1, zeroblob(500))", [i]))
-  end
-
-  defp wait(ms) do
-    receive do
-    after
-      ms -> :ok
-    end
-  end
-
-  defp flush!(coordinator, tries \\ 400) do
-    send(coordinator, :durability_flush)
-    settle(coordinator, tries)
-  end
-
-  defp settle(_c, 0), do: flunk("flush task never settled")
-
-  defp settle(c, tries) do
-    if :sys.get_state(c).flush_task == nil do
-      :ok
-    else
-      wait(10)
-      settle(c, tries - 1)
-    end
   end
 
   # Overwrite every page past the schema page and the table's root with garbage, as the probe did.
@@ -151,7 +128,7 @@ defmodule Fathom.Shard.FlushPinnedMainFileCheckTest do
           end
         end)
 
-        flush!(coordinator)
+        ShardFlush.flush!(coordinator, 4_000)
         Application.delete_env(:fathom, :flush_pin_held_hook)
 
         assert_received {:under_pin, pinned_unbackfilled, backfilled}

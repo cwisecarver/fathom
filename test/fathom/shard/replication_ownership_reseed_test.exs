@@ -37,6 +37,7 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
   alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shard.Storage
   alias Fathom.Shards
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Fathom.Test.ReplicationWire
 
@@ -118,24 +119,10 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
 
     start_supervised!(Fleet)
 
-    await!(
+    Await.until(
       fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end,
       "shippers never connected"
     )
-  end
-
-  defp await!(fun, msg, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn -> fun.() || Process.sleep(20) end)
-    |> Enum.find(fn
-      v when v in [nil, false, :ok] -> System.monotonic_time(:millisecond) > deadline
-      _ -> true
-    end)
-    |> case do
-      v when v in [nil, false, :ok] -> flunk(msg)
-      v -> v
-    end
   end
 
   # A follower holding a REAL seeded replica — a `.db`, a non-empty WAL and a stated lineage — then
@@ -152,7 +139,7 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
     assert :ok = Session.commit(id, path <> "-wal", coordinator)
 
-    await!(
+    Await.until(
       fn ->
         _ = Session.commit(id, path <> "-wal", coordinator)
         match?(%{next_offset: o} when o > 0, Follower.state_of(name, id))
@@ -333,7 +320,7 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
   # Every follower CURRENT with the primary: re-seeded at the new lineage, untorn, holding exactly
   # the primary's WAL. Commits are re-driven while waiting, since seeding is write-gated.
   defp await_current!(followers, id, lineage, {coordinator, _ref, path, _conn}) do
-    await!(
+    Await.until(
       fn ->
         _ = Session.commit(id, path <> "-wal", coordinator)
         wal = File.read!(path <> "-wal")
@@ -372,7 +359,7 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
     {:ok, _} = Connection.query(conn1, "UPDATE u SET v = 'pre-restore'", [])
     write_more!(id, one, 6..10)
 
-    await!(
+    Await.until(
       fn -> Enum.all?(followers, fn {n, _} -> Follower.state_of(n, id) end) end,
       "no replica"
     )
@@ -425,7 +412,7 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
     {c1, _, _, _} = one
     lineage1 = Fathom.Shard.lineage(c1)
 
-    await!(
+    Await.until(
       fn -> Enum.all?(followers, fn {n, _} -> Follower.state_of(n, id) end) end,
       "no replica"
     )

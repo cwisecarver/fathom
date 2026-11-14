@@ -21,6 +21,7 @@ defmodule Fathom.Shard.ReplicationSeedChunkTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Protocol.SeedBegin
+  alias Fathom.Test.Await
 
   setup do
     root = Path.join(System.tmp_dir!(), "seedchunk_#{System.unique_integer([:positive])}")
@@ -226,19 +227,8 @@ defmodule Fathom.Shard.ReplicationSeedChunkTest do
 
     # The handler Task notices the closed socket and drops the partial seed. Polled rather than
     # slept on: the close and the cleanup are in different processes.
-    deadline = System.monotonic_time(:millisecond) + 5_000
-
-    Stream.repeatedly(fn ->
-      if leftover_temps(dir) == [], do: :clean, else: Process.sleep(10)
-    end)
-    |> Enum.find(fn
-      :clean -> true
-      _ -> System.monotonic_time(:millisecond) > deadline
-    end)
-    |> case do
-      :clean -> :ok
-      _ -> flunk("partial seed temps survived the connection: #{inspect(leftover_temps(dir))}")
-    end
+    assert Await.eventually?(fn -> leftover_temps(dir) == [] end, 5_000),
+           "partial seed temps survived the connection: #{inspect(leftover_temps(dir))}"
 
     refute installed?(name, id)
     assert is_nil(Follower.state_of(name, id))

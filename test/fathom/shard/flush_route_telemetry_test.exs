@@ -22,7 +22,7 @@ defmodule Fathom.Shard.FlushRouteTelemetryTest do
   alias Fathom.Admin.Measurements
   alias Fathom.ShardExecutor
   alias Fathom.Shards
-  alias Fathom.Test.Env
+  alias Fathom.Test.{Env, ShardFlush}
   alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
@@ -63,26 +63,6 @@ defmodule Fathom.Shard.FlushRouteTelemetryTest do
 
   defp stmt(sql, args \\ []), do: %Filo.Stmt{sql: sql, args: args}
 
-  defp flush!(c, tries \\ 400) do
-    send(c, :durability_flush)
-    settle(c, tries)
-  end
-
-  defp settle(_c, 0), do: flunk("flush task never settled")
-
-  defp settle(c, tries) do
-    if :sys.get_state(c).flush_task == nil do
-      :ok
-    else
-      receive do
-      after
-        10 -> :ok
-      end
-
-      settle(c, tries - 1)
-    end
-  end
-
   defp flush_event! do
     assert_receive {:ev, [:fathom, :shard, :flush, :route], _, %{route: counted}}, 5_000
     assert_receive {:ev, [:fathom, :shard, :flush], %{duration: d}, meta}, 5_000
@@ -109,20 +89,20 @@ defmodule Fathom.Shard.FlushRouteTelemetryTest do
         :ok = Fathom.Shard.Connection.exec(reader, "BEGIN")
         {:ok, _} = Fathom.Shard.Connection.query(reader, "SELECT count(*) FROM t", [])
         {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (2)"))
-        flush!(c)
+        ShardFlush.flush!(c)
         assert {:vacuum, :vacuum} = flush_event!()
         _ = Fathom.Shard.Connection.rollback_if_open(reader)
         :ok = Fathom.Shard.Connection.close(reader)
 
         # No reader now: the PASSIVE folds the WAL and the flush takes the pinned-live route.
         {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (3)"))
-        flush!(c)
+        ShardFlush.flush!(c)
         assert {:pinned_live, :pinned_live} = flush_event!()
 
         # A flush refused before any route (the free-space preflight) reports :none.
         {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (5)"))
         Measurements.put_data_free_bytes(0)
-        _ = capture_log(fn -> flush!(c) end)
+        _ = capture_log(fn -> ShardFlush.flush!(c) end)
         Measurements.clear_data_free_bytes()
 
         assert_receive {:ev, [:fathom, :shard, :flush], _, %{outcome: :error, route: :none}},

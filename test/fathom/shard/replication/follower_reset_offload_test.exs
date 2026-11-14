@@ -16,6 +16,7 @@ defmodule Fathom.Shard.Replication.FollowerResetOffloadTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Replication.{Follower, Protocol}
+  alias Fathom.Test.Await
 
   setup do
     name = :"resetoffload_#{System.unique_integer([:positive])}"
@@ -66,16 +67,10 @@ defmodule Fathom.Shard.Replication.FollowerResetOffloadTest do
   end
 
   defp await_link(worker) do
-    case Process.info(worker, :links) do
-      {:links, [_ | _]} ->
-        :ok
-
-      _ ->
-        receive do
-        after
-          2 -> await_link(worker)
-        end
-    end
+    Await.until(
+      fn -> match?({:links, [_ | _]}, Process.info(worker, :links)) end,
+      "the worker never linked to the task it spawned for the frame"
+    )
   end
 
   test "an offset-0 push stuck in its step does not block another shard on the same worker",

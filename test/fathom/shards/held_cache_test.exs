@@ -16,6 +16,7 @@ defmodule Fathom.Shards.HeldCacheTest do
   alias Fathom.Shard.Storage.S3
   alias Fathom.Shards
   alias Fathom.Shards.HeldCache
+  alias Fathom.Test.Await
   alias Fathom.Test.LivenessMode
   alias Fathom.Test.S3EtagStore
 
@@ -86,7 +87,12 @@ defmodule Fathom.Shards.HeldCacheTest do
       test "after the window the attempt goes through to Storage again", %{id: id} do
         assert {:error, {:shard_held, _, _}} = Shards.checkout(id)
         flush_messages()
-        await_expiry(id)
+
+        Await.until(
+          fn -> HeldCache.recent(id) == nil end,
+          "held cache entry never expired",
+          2_000
+        )
 
         assert {:error, {:shard_held, _, _}} = Shards.checkout(id)
         assert_received :s3_call
@@ -126,7 +132,12 @@ defmodule Fathom.Shards.HeldCacheTest do
         assert {:error, {:shard_held, _, _}} = Shards.checkout(id),
                "inside the window the replay is still served"
 
-        await_expiry(id)
+        Await.until(
+          fn -> HeldCache.recent(id) == nil end,
+          "held cache entry never expired",
+          2_000
+        )
+
         assert {:ok, pid, ref, _path} = Shards.checkout(id)
         Fathom.Shard.checkin(pid, ref)
         Shards.stop(id)
@@ -146,7 +157,7 @@ defmodule Fathom.Shards.HeldCacheTest do
       Application.put_env(:fathom, :held_refusal_cache_ms, 60)
       HeldCache.put(id, "o", now + 600_000)
       assert {:shard_held, "o", _} = HeldCache.recent(id)
-      await_expiry(id)
+      Await.until(fn -> HeldCache.recent(id) == nil end, "held cache entry never expired", 2_000)
 
       HeldCache.put(id, "o", now + 600_000)
       HeldCache.clear(id)
@@ -232,20 +243,6 @@ defmodule Fathom.Shards.HeldCacheTest do
   end
 
   defp put_lock(store, id, body), do: S3EtagStore.set_body(store, "#{id}.lock", body)
-
-  defp await_expiry(id, tries \\ 100) do
-    cond do
-      HeldCache.recent(id) == nil ->
-        :ok
-
-      tries == 0 ->
-        flunk("held cache entry never expired")
-
-      true ->
-        Process.sleep(20)
-        await_expiry(id, tries - 1)
-    end
-  end
 
   defp flush_messages do
     receive do

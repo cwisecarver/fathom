@@ -4,6 +4,7 @@ defmodule Fathom.Telemetry.ProtocolTest do
 
   alias Fathom.Shard.Storage.S3
   alias Fathom.Telemetry.Protocol
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
 
   setup do
@@ -181,15 +182,12 @@ defmodule Fathom.Telemetry.ProtocolTest do
 
       # Filo answers GET /v2 with some status; any class counts.
       Req.get!("http://127.0.0.1:#{pa}/v2", retry: false, http_errors: :return)
-      assert_eventually(fn -> stats().http.rate |> Map.values() |> Enum.sum() == 1.0 end)
-    end
 
-    defp assert_eventually(fun, tries \\ 50) do
-      cond do
-        fun.() -> :ok
-        tries == 0 -> flunk("condition never held")
-        true -> Process.sleep(20) && assert_eventually(fun, tries - 1)
-      end
+      Await.until(
+        fn -> stats().http.rate |> Map.values() |> Enum.sum() == 1.0 end,
+        "condition never held",
+        1_000
+      )
     end
   end
 

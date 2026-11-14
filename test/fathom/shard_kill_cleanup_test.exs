@@ -37,6 +37,7 @@ defmodule Fathom.ShardKillCleanupTest do
   """
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Fathom.Test.FlushGateScope
 
@@ -67,21 +68,11 @@ defmodule Fathom.ShardKillCleanupTest do
     #
     # Harmless in production for the same reason it is invisible here: the walk simply spends one
     # probe slot and the next walk cleans the row.
-    deadline = System.monotonic_time(:millisecond) + 2_000
-
-    Stream.repeatedly(fn ->
-      if Registry.lookup(Fathom.ShardRegistry, id) == [],
-        do: :gone,
-        else: Process.sleep(5)
-    end)
-    |> Enum.find(fn
-      :gone -> true
-      _ -> System.monotonic_time(:millisecond) > deadline
-    end)
-    |> case do
-      :gone -> :ok
-      _ -> flunk("the registry still resolves #{id} after its coordinator died")
-    end
+    Await.until(
+      fn -> Registry.lookup(Fathom.ShardRegistry, id) == [] end,
+      "the registry still resolves #{id} after its coordinator died",
+      2_000
+    )
 
     path
   end

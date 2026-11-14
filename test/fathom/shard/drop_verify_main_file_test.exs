@@ -18,7 +18,7 @@ defmodule Fathom.Shard.DropVerifyMainFileTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
-  alias Fathom.Test.Env
+  alias Fathom.Test.{Await, Env}
   alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
@@ -76,21 +76,6 @@ defmodule Fathom.Shard.DropVerifyMainFileTest do
       "INSERT INTO t SELECT x, 'row_' || x || '_pad_pad_pad_pad_pad' FROM c"
   ]
 
-  defp settle_wal_gone(path, tries \\ 400) do
-    cond do
-      not File.exists?(path <> "-wal") -> :ok
-      tries == 0 -> flunk("the last close never removed the WAL")
-      true -> wait_then(10, fn -> settle_wal_gone(path, tries - 1) end)
-    end
-  end
-
-  defp wait_then(ms, fun) do
-    receive do
-    after
-      ms -> fun.()
-    end
-  end
-
   # Count `Connection.open/1,2` calls (all processes: the drop flush runs in a Task) during `fun`.
   defp count_opens(fun) do
     me = self()
@@ -142,7 +127,13 @@ defmodule Fathom.Shard.DropVerifyMainFileTest do
       {:ok, coordinator} = Shards.ensure(id)
       LivenessMode.assert!(coordinator, unquote(mode))
       write!(id, @seed)
-      settle_wal_gone(path)
+
+      Await.until(
+        fn -> not File.exists?(path <> "-wal") end,
+        "the last close never removed the WAL",
+        4_000
+      )
+
       assert Shard.dirty?(coordinator), "fixture: the drop must have something to upload"
 
       opens = count_opens(fn -> assert :ok = Shards.stop(id) end)
@@ -195,7 +186,13 @@ defmodule Fathom.Shard.DropVerifyMainFileTest do
       {:ok, coordinator} = Shards.ensure(id)
       LivenessMode.assert!(coordinator, unquote(mode))
       write!(id, ["INSERT INTO t (v) VALUES ('more')"])
-      settle_wal_gone(path)
+
+      Await.until(
+        fn -> not File.exists?(path <> "-wal") end,
+        "the last close never removed the WAL",
+        4_000
+      )
+
       corrupt_page!(path)
 
       assert {:error, _} = Shard.verify_integrity(path),

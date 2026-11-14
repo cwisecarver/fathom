@@ -10,7 +10,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
 
   alias Fathom.Shard.Heartbeat
   alias Fathom.Shard.WriteFence
-  alias Fathom.Test.Env
+  alias Fathom.Test.{Await, Env}
 
   setup %{shard: shard} do
     # Idle-stop fast so the flush path runs during the test.
@@ -206,15 +206,11 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       assert_receive :renew_attempt, 5_000
 
       # The hook runs BEFORE the renew result, so the verdict may still be in flight; wait for it.
-      deadline = System.monotonic_time(:millisecond) + 2_000
-
-      verdict =
-        Stream.repeatedly(fn ->
-          Heartbeat.valid_for_write?(:sys.get_state(coordinator).acquire_gen)
-        end)
-        |> Enum.find(&(&1 == :ok or System.monotonic_time(:millisecond) > deadline))
-
-      assert verdict == :ok, "the coordinator never reconfirmed ownership after the blip"
+      Await.until(
+        fn -> Heartbeat.valid_for_write?(:sys.get_state(coordinator).acquire_gen) == :ok end,
+        "the coordinator never reconfirmed ownership after the blip",
+        2_000
+      )
 
       :ok = ShardExecutor.close(conn)
     end)

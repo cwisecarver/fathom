@@ -8,6 +8,7 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
   alias Fathom.Rebalancer
   alias Fathom.Rebalancer.{CommandPoller, Commands, Overrides}
   alias Fathom.Shards
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
 
   setup do
@@ -21,14 +22,6 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     end)
 
     %{shard: shard, node: Rebalancer.node_key()}
-  end
-
-  defp wait_until(fun, tries \\ 400) do
-    cond do
-      fun.() -> :ok
-      tries <= 0 -> flunk("condition never met")
-      true -> Process.sleep(5) && wait_until(fun, tries - 1)
-    end
   end
 
   test "a drain command releases the shard on this node and marks the command done",
@@ -373,7 +366,12 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     for pid <- children, do: Process.exit(pid, :kill)
 
     # Pre-fix: the id stayed in in_flight forever. Now the monitor's DOWN frees it.
-    wait_until(fn -> not MapSet.member?(:sys.get_state(poller).in_flight, drain_cmd.id) end)
+    Await.until(
+      fn -> not MapSet.member?(:sys.get_state(poller).in_flight, drain_cmd.id) end,
+      "condition never met",
+      2_000
+    )
+
     assert Process.alive?(poller), "the poller must survive the batch task's death"
 
     # The command never completed (complete/3 never ran) — still pending, now re-selectable.

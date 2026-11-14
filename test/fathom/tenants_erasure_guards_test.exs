@@ -9,6 +9,7 @@ defmodule Fathom.TenantsErasureGuardsTest do
   alias Fathom.{Directory, ShardExecutor, Shards, Snapshots, Tenants}
   alias Fathom.Shard.{Integrity, Storage}
   alias Fathom.Tenants.Tombstones
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Filo.Stmt
 
@@ -108,28 +109,16 @@ defmodule Fathom.TenantsErasureGuardsTest do
     assert_receive {:copying, hook_pid}, 5_000
     {:held, _owner, base} = Storage.lease_stealable_at(dst)
 
-    assert wait_advanced(dst, base, 3_000),
-           "the fork never renewed the dst lease during a long copy (stealable_at frozen)"
+    Await.until(
+      fn ->
+        match?({:held, _owner, at} when at > base, Storage.lease_stealable_at(dst))
+      end,
+      "the fork never renewed the dst lease during a long copy (stealable_at frozen)",
+      3_000
+    )
 
     send(hook_pid, :proceed)
     assert {:ok, _} = Task.await(fork, 10_000)
-  end
-
-  defp wait_advanced(shard, base, timeout) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      case Storage.lease_stealable_at(shard) do
-        {:held, _owner, at} when at > base ->
-          :advanced
-
-        _ ->
-          Process.sleep(10)
-          :waiting
-      end
-    end)
-    |> Enum.find(&(&1 == :advanced or System.monotonic_time(:millisecond) > deadline))
-    |> Kernel.==(:advanced)
   end
 
   # --- #13 ------------------------------------------------------------------------------------

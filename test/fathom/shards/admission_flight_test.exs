@@ -21,6 +21,7 @@ defmodule Fathom.Shards.AdmissionFlightTest do
 
   alias Fathom.Shards
   alias Fathom.Shards.{AdmissionFlight, Lru, NovelLimiter}
+  alias Fathom.Test.Await
   alias Fathom.Test.FaultyStorage
   alias Fathom.Test.LivenessMode
 
@@ -198,7 +199,12 @@ defmodule Fathom.Shards.AdmissionFlightTest do
       assert_receive {:joined, :leader}
       follower = Task.async(fn -> AdmissionFlight.join(id, 5_000) end)
       # The follower is registered and waiting before the leader dies.
-      wait_until(fn -> :ets.lookup(AdmissionFlight.Followers, id) != [] end)
+      Await.until(
+        fn -> :ets.lookup(AdmissionFlight.Followers, id) != [] end,
+        "condition never held",
+        2_000
+      )
+
       send(leader, :die)
 
       assert Task.await(follower) == :retry
@@ -213,7 +219,12 @@ defmodule Fathom.Shards.AdmissionFlightTest do
       id = uniq()
       assert AdmissionFlight.join(id, 10) == :leader
       followers = for _ <- 1..4, do: Task.async(fn -> AdmissionFlight.join(id, 5_000) end)
-      wait_until(fn -> length(:ets.lookup(AdmissionFlight.Followers, id)) == 4 end)
+
+      Await.until(
+        fn -> length(:ets.lookup(AdmissionFlight.Followers, id)) == 4 end,
+        "condition never held",
+        2_000
+      )
 
       AdmissionFlight.finish(id, {:error, :node_at_capacity})
 
@@ -236,10 +247,21 @@ defmodule Fathom.Shards.AdmissionFlightTest do
           {r, Process.info(self(), :message_queue_len)}
         end)
 
-      wait_until(fn -> :ets.lookup(AdmissionFlight.Followers, id) != [] end)
+      Await.until(
+        fn -> :ets.lookup(AdmissionFlight.Followers, id) != [] end,
+        "condition never held",
+        2_000
+      )
+
       # The address the leader would send to, captured while the follower is still waiting.
       [{^id, alias_ref}] = :ets.lookup(AdmissionFlight.Followers, id)
-      wait_until(fn -> :ets.lookup(AdmissionFlight.Followers, id) == [] end)
+
+      Await.until(
+        fn -> :ets.lookup(AdmissionFlight.Followers, id) == [] end,
+        "condition never held",
+        2_000
+      )
+
       # A result that lands after the follower gave up (the leader `take`s just before the
       # follower's own row delete) is dropped by the runtime, not queued in a long-lived stream.
       send(alias_ref, {AdmissionFlight, alias_ref, {:ok, self()}})
@@ -247,22 +269,6 @@ defmodule Fathom.Shards.AdmissionFlightTest do
       send(follower.pid, :check)
 
       assert {:timeout, {:message_queue_len, 0}} = Task.await(follower)
-    end
-  end
-
-  defp wait_until(fun, tries \\ 400) do
-    cond do
-      fun.() ->
-        :ok
-
-      tries == 0 ->
-        flunk("condition never held")
-
-      true ->
-        receive do
-        after
-          5 -> wait_until(fun, tries - 1)
-        end
     end
   end
 end

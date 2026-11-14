@@ -62,6 +62,7 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
   alias Fathom.Shards
   alias Fathom.Test.Env
   alias Fathom.Test.LivenessMode
+  alias Fathom.Test.ShardFlush
 
   setup do
     id = "promoteopen_#{System.unique_integer([:positive])}"
@@ -88,22 +89,6 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
   end
 
   defp stmt(sql, args \\ []), do: %Filo.Stmt{sql: sql, args: args}
-
-  defp flush!(coordinator) do
-    send(coordinator, :durability_flush)
-    settle(coordinator, 400)
-  end
-
-  defp settle(_c, 0), do: flunk("durability flush task never settled")
-
-  defp settle(c, tries) do
-    if :sys.get_state(c).flush_task == nil do
-      :ok
-    else
-      Process.sleep(10)
-      settle(c, tries - 1)
-    end
-  end
 
   defp rows(conn) do
     {:ok, %{rows: rows}} = ShardExecutor.execute(conn, stmt("SELECT a FROM t ORDER BY a"))
@@ -179,7 +164,7 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
       if i == flush_after do
         assign_ordinal!(id, coordinator)
-        flush!(coordinator)
+        ShardFlush.flush!(coordinator, 4_000)
       end
     end
 
@@ -597,7 +582,7 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     end
 
     own_lease = :sys.get_state(coordinator).lease
-    flush!(coordinator)
+    ShardFlush.flush!(coordinator, 4_000)
     tear_down_primary(id, conn, coordinator)
 
     scratch = Path.join(ctx.dir, "unstamped.db")

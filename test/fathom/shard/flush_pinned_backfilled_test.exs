@@ -39,8 +39,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
   alias Fathom.Shard.Replication.Wal
   alias Fathom.ShardExecutor
   alias Fathom.Shards
-  alias Fathom.Test.Env
-  alias Fathom.Test.LivenessMode
+  alias Fathom.Test.{Env, LivenessMode, ShardFlush}
 
   @modes [:legacy, :heartbeat]
 
@@ -102,22 +101,6 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
     receive do
     after
       ms -> :ok
-    end
-  end
-
-  defp flush!(coordinator, tries \\ 400) do
-    send(coordinator, :durability_flush)
-    settle(coordinator, tries)
-  end
-
-  defp settle(_c, 0), do: flunk("flush task never settled")
-
-  defp settle(c, tries) do
-    if :sys.get_state(c).flush_task == nil do
-      :ok
-    else
-      wait(10)
-      settle(c, tries - 1)
     end
   end
 
@@ -184,7 +167,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
         on_exit(fn -> ShardExecutor.close(conn) end)
         refute Wal.fully_backfilled?(wal), "fixture: the WAL must hold un-backfilled frames"
 
-        flush!(coordinator)
+        ShardFlush.flush!(coordinator)
 
         # THE REGRESSION: this was `:vacuum` on every periodic flush of a shard with a live stream.
         assert_received {:route, :pinned_live}
@@ -224,7 +207,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
           end
         end)
 
-        flush!(coordinator)
+        ShardFlush.flush!(coordinator)
         Application.delete_env(:fathom, :flush_after_snapshot_hook)
 
         assert_received {:route, :pinned_live}
@@ -287,7 +270,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
                 next
               end
 
-            flush!(coordinator)
+            ShardFlush.flush!(coordinator)
             if quiet?, do: send(writer, :resume)
             rows = object_rows(id)
             k = length(rows)
@@ -339,7 +322,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
         end)
 
         insert!(conn, 11..40)
-        flush!(coordinator)
+        ShardFlush.flush!(coordinator)
 
         assert_received {:route, :vacuum}
         refute_received {:route, :pinned_live}
@@ -360,7 +343,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
         refute Wal.fully_backfilled?(wal)
 
         Env.put!(:replication_enabled, true)
-        flush!(coordinator)
+        ShardFlush.flush!(coordinator)
         Application.delete_env(:fathom, :replication_enabled)
 
         assert_received {:route, :vacuum}
@@ -386,7 +369,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
         assert n > 0 and Wal.fully_backfilled?(wal) and wal_size(wal) > 0
 
         Env.put!(:replication_enabled, true)
-        flush!(coordinator)
+        ShardFlush.flush!(coordinator)
         Application.delete_env(:fathom, :replication_enabled)
 
         assert_received {:route, :pinned_live}

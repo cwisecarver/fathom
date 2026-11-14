@@ -21,7 +21,9 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
+  alias Fathom.Test.ShardFlush
 
   setup do
     id = "pinlive_#{System.unique_integer([:positive])}"
@@ -65,41 +67,12 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
     settle_close(path)
   end
 
-  defp settle_close(path, tries \\ 400) do
-    cond do
-      not File.exists?(path <> "-wal") ->
-        :ok
-
-      tries == 0 ->
-        flunk("the last close never folded the WAL")
-
-      true ->
-        wait(10)
-        settle_close(path, tries - 1)
-    end
-  end
-
-  defp wait(ms) do
-    receive do
-    after
-      ms -> :ok
-    end
-  end
-
-  defp flush!(coordinator, tries \\ 400) do
-    send(coordinator, :durability_flush)
-    settle(coordinator, tries)
-  end
-
-  defp settle(_c, 0), do: flunk("flush task never settled")
-
-  defp settle(c, tries) do
-    if :sys.get_state(c).flush_task == nil do
-      :ok
-    else
-      wait(10)
-      settle(c, tries - 1)
-    end
+  defp settle_close(path) do
+    Await.until(
+      fn -> not File.exists?(path <> "-wal") end,
+      "the last close never folded the WAL",
+      4_000
+    )
   end
 
   defp object_rows(id) do
@@ -120,7 +93,7 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
     write_then_go_idle(id, path, 1..50)
     refute File.exists?(path <> "-wal"), "fixture: the WAL must be folded"
 
-    flush!(coordinator)
+    ShardFlush.flush!(coordinator)
 
     assert_received {:route, :pinned_live}
     refute_received {:route, :vacuum}
@@ -152,7 +125,7 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
       end
     end)
 
-    flush!(coordinator)
+    ShardFlush.flush!(coordinator)
     Application.delete_env(:fathom, :flush_after_snapshot_hook)
 
     assert_received {:route, :pinned_live}
@@ -189,7 +162,7 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
 
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (1)"))
 
-    flush!(coordinator)
+    ShardFlush.flush!(coordinator)
 
     assert_received {:route, :vacuum}
     refute_received {:route, :pinned_live}
@@ -221,7 +194,7 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
     Env.put!(:flush_scan_mmap_bytes, 8 * 1_048_576)
 
     write_then_go_idle(id, path, 1..20)
-    flush!(coordinator)
+    ShardFlush.flush!(coordinator)
     assert_received {:route, :pinned_live}
     assert object_rows(id) == Enum.to_list(1..20)
 
@@ -231,7 +204,7 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
     {:ok, conn} = ShardExecutor.open(id)
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (21)"))
     on_exit(fn -> ShardExecutor.close(conn) end)
-    flush!(coordinator)
+    ShardFlush.flush!(coordinator)
     assert_received {:route, :vacuum}
     assert object_rows(id) == Enum.to_list(1..21)
   end
@@ -241,7 +214,7 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
     Env.put!(:flush_pinned_live_upload, false)
     write_then_go_idle(id, path, 1..5)
 
-    flush!(coordinator)
+    ShardFlush.flush!(coordinator)
 
     assert_received {:route, :vacuum}
     refute_received {:route, :pinned_live}

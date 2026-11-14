@@ -31,6 +31,7 @@ defmodule Fathom.Shard.ReplicationCostTest do
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shards
+  alias Fathom.Test.Await
 
   @samples 200
   @followers 3
@@ -125,21 +126,11 @@ defmodule Fathom.Shard.ReplicationCostTest do
 
     # Shippers connect in handle_continue; measuring before they are up would time a
     # :disconnected reject, not a replicated write.
-    deadline = System.monotonic_time(:millisecond) + 5_000
-
-    Stream.repeatedly(fn ->
-      if Enum.all?(Fleet.shippers(), &Shipper.connected?/1),
-        do: :up,
-        else: Process.sleep(20)
-    end)
-    |> Enum.find(fn
-      :up -> true
-      _ -> System.monotonic_time(:millisecond) > deadline
-    end)
-    |> case do
-      :up -> :ok
-      _ -> flunk("shippers never connected — this would measure nothing")
-    end
+    Await.until(
+      fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end,
+      "shippers never connected — this would measure nothing",
+      5_000
+    )
 
     followers
   end

@@ -30,6 +30,7 @@ defmodule Fathom.ShardFlushReconcileTest do
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Test.Env
+  alias Fathom.Test.ShardFlush
   alias Filo.{Stmt, StmtResult}
 
   setup do
@@ -55,24 +56,6 @@ defmodule Fathom.ShardFlushReconcileTest do
   defp local_dir, do: Shard.data_dir()
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 
-  defp flush_now(coordinator) do
-    send(coordinator, :durability_flush)
-    wait_flush_settled(coordinator, 400)
-  end
-
-  defp wait_flush_settled(_coordinator, 0), do: flunk("durability flush task never settled")
-
-  defp wait_flush_settled(coordinator, tries) do
-    case :sys.get_state(coordinator) do
-      %{flush_task: nil} ->
-        :ok
-
-      _ ->
-        Process.sleep(5)
-        wait_flush_settled(coordinator, tries - 1)
-    end
-  end
-
   # Read the stored object back — the only thing that matters. A local file is not durability.
   defp stored_rows(shard) do
     dst =
@@ -97,7 +80,7 @@ defmodule Fathom.ShardFlushReconcileTest do
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('before')"))
 
       # Establish a stored object so the drop-flush is a conditional PUT with a real etag.
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
       assert stored_rows(shard) == ["before"]
 
       # Now make the flush slow, so the task is genuinely in flight when we stop the
@@ -133,11 +116,11 @@ defmodule Fathom.ShardFlushReconcileTest do
       {:ok, coordinator} = Shards.ensure(shard)
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('a')"))
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
 
       etag_before = :sys.get_state(coordinator).etag
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('b')"))
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
       etag_after = :sys.get_state(coordinator).etag
 
       # The coordinator's fence etag tracks the object it just wrote. If the fold is dropped,
@@ -161,14 +144,14 @@ defmodule Fathom.ShardFlushReconcileTest do
       {:ok, coordinator} = Shards.ensure(shard)
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('first')"))
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
       assert stored_rows(shard) == ["first"]
 
       # Interval 1: the PUT LANDS but the response is lost. The coordinator believes the flush
       # failed, so it keeps its old fence etag and stays dirty. The object has advanced.
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('landed_silently')"))
       Env.put!(:storage_fault, :flush_lands_then_errors)
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
       Application.delete_env(:fathom, :storage_fault)
 
       assert Shard.dirty?(coordinator), "a failed-looking flush must leave the shard dirty"
@@ -177,7 +160,7 @@ defmodule Fathom.ShardFlushReconcileTest do
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('after_lost_ack')"))
 
       # Interval 2: PUT If-Match <stale etag> ⇒ 412 ⇒ lock re-check says still ours ⇒ reconcile.
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
 
       # THE ASSERTION. Pre-fix this advanced flushed_through and the shard read CLEAN, while
       # the stored object held only 'landed_silently'. An idle drop_clean then deleted
@@ -196,18 +179,18 @@ defmodule Fathom.ShardFlushReconcileTest do
       {:ok, coordinator} = Shards.ensure(shard)
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('first')"))
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
 
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('landed_silently')"))
       Env.put!(:storage_fault, :flush_lands_then_errors)
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
       Application.delete_env(:fathom, :storage_fault)
 
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('after_lost_ack')"))
 
       # Reconcile interval, then the recovery interval the fix relies on.
-      :ok = flush_now(coordinator)
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
 
       assert stored_rows(shard) == ["after_lost_ack", "first", "landed_silently"],
              "the post-reconcile re-flush did not carry every acknowledged write to storage"
@@ -225,15 +208,15 @@ defmodule Fathom.ShardFlushReconcileTest do
       {:ok, coordinator} = Shards.ensure(shard)
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('first')"))
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
 
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('landed_silently')"))
       Env.put!(:storage_fault, :flush_lands_then_errors)
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
       Application.delete_env(:fathom, :storage_fault)
 
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('after_lost_ack')"))
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
 
       # Close the connection and let the coordinator idle-stop on its OWN timer — the drop
       # decision (flush_then_drop vs drop_clean) is exactly what this test is about, so it has
@@ -256,16 +239,16 @@ defmodule Fathom.ShardFlushReconcileTest do
       {:ok, coordinator} = Shards.ensure(shard)
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('x')"))
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
 
       Env.put!(:storage_fault, :flush_lands_then_errors)
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('y')"))
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
       Application.delete_env(:fathom, :storage_fault)
 
       # Reconcile (resyncs the etag, stays dirty), then a clean interval.
-      :ok = flush_now(coordinator)
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
 
       refute Shard.dirty?(coordinator),
              "staying dirty is the safe direction, but the shard must still converge to clean"

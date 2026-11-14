@@ -16,6 +16,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
 
   setup do
@@ -365,7 +366,12 @@ defmodule Fathom.ConnectionWatchdogTest do
     # connection is idle.
     gen = :atomics.add_get(flags, 1, 1)
     _ = :erlang.start_timer(20, watchdog, {:fire, gen})
-    await_fired(flags, gen)
+
+    Await.until(
+      fn -> :atomics.get(flags, 2) == gen end,
+      "the hand-armed deadline never fired",
+      2_000
+    )
 
     # NOW start a statement, unguarded so it arms nothing of its own. The fire is still current, so
     # the watchdog's retried cancel lands on the running statement and errors it. Before the retry
@@ -403,7 +409,12 @@ defmodule Fathom.ConnectionWatchdogTest do
     send(watchdog, {:timeout, make_ref(), {:fire, gen}})
 
     # The watchdog consumed the stale fire (the queue drains; it is a high-priority process).
-    wait_queue_empty(watchdog)
+    Await.until(
+      fn -> match?({:message_queue_len, 0}, Process.info(watchdog, :message_queue_len)) end,
+      "the watchdog never drained its mailbox",
+      1_000
+    )
+
     assert :atomics.get(flags, 2) != gen, "the stale fire was acted on"
 
     slow = """
@@ -412,39 +423,6 @@ defmodule Fathom.ConnectionWatchdogTest do
     """
 
     assert {:ok, %{rows: [[3_000_000]]}} = query(conn, slow, [])
-  end
-
-  # Bounded poll without `Process.sleep`.
-  defp await_fired(flags, gen, tries \\ 200) do
-    cond do
-      :atomics.get(flags, 2) == gen ->
-        :ok
-
-      tries == 0 ->
-        flunk("the hand-armed deadline never fired")
-
-      true ->
-        receive do
-        after
-          10 -> await_fired(flags, gen, tries - 1)
-        end
-    end
-  end
-
-  defp wait_queue_empty(pid, tries \\ 200) do
-    case Process.info(pid, :message_queue_len) do
-      {:message_queue_len, 0} ->
-        :ok
-
-      _ when tries == 0 ->
-        flunk("the watchdog never drained its mailbox")
-
-      _ ->
-        receive do
-        after
-          5 -> wait_queue_empty(pid, tries - 1)
-        end
-    end
   end
 
   # The watchdog runs at `:high` priority so a saturated scheduler cannot starve its deadline

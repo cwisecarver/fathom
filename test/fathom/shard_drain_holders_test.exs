@@ -18,6 +18,7 @@ defmodule Fathom.ShardDrainHoldersTest do
 
   alias Fathom.Bench.HranaClient
   alias Fathom.{Shard, ShardExecutor, Shards}
+  alias Fathom.Test.Await
   alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
@@ -41,20 +42,6 @@ defmodule Fathom.ShardDrainHoldersTest do
 
   # Assert the coordinator for shard `id` opened in the mode asked for.
   defp assert_opened_mode!(id, mode), do: LivenessMode.assert!(coordinator(id), mode)
-
-  defp wait_until(fun, tries \\ 100) do
-    cond do
-      fun.() ->
-        :ok
-
-      tries == 0 ->
-        flunk("condition never held")
-
-      true ->
-        Process.sleep(20)
-        wait_until(fun, tries - 1)
-    end
-  end
 
   setup do
     {:ok, sup, port} = HranaClient.start_listener(streams_name: __MODULE__.Streams)
@@ -219,7 +206,12 @@ defmodule Fathom.ShardDrainHoldersTest do
         Shard.request_drain(pid, 30_000, self())
 
         # The idle holder is cut loose; the transaction holder keeps the window open.
-        wait_until(fn -> map_size(:sys.get_state(pid).conns) == 1 end)
+        Await.until(
+          fn -> map_size(:sys.get_state(pid).conns) == 1 end,
+          "condition never held",
+          2_000
+        )
+
         assert :sys.get_state(pid).draining
 
         # The idle socket got a close frame, code 1001 (going away). The test process owns both

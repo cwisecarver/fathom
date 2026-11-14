@@ -35,6 +35,7 @@ defmodule Fathom.Shard.ReplicationWriterTest do
   alias Fathom.Shard.Replication.Protocol.Push
   alias Fathom.Shard.Replication.Protocol.SeedBegin
   alias Fathom.Shard.Replication.Shipper
+  alias Fathom.Test.Await
 
   # Big enough that a handful of them exceed any default socket buffer, small enough that filling
   # the window costs milliseconds rather than seconds.
@@ -127,7 +128,7 @@ defmodule Fathom.Shard.ReplicationWriterTest do
     # right now. Read from the TEST process off the socket's own stats, so it works whether the
     # blocked party is the shipper (unfixed) or the writer (fixed). Without this the first draft
     # asserted a happy path against a link that was never stalled.
-    await_stall!(sock, 200)
+    await_stall!(sock)
 
     # Drain any rejects so they cannot be confused with the assertion below.
     flush_rejects()
@@ -142,24 +143,15 @@ defmodule Fathom.Shard.ReplicationWriterTest do
   end
 
   # Bounded poll on an OS-level condition, which is the one thing `Process.monitor` cannot express.
-  # Same shape as `flush_position_test`'s `settle/2`, and it FLUNKS rather than proceeding: a test
-  # that reaches the assertion without a stall is measuring the happy path.
-  defp await_stall!(_sock, 0) do
-    flunk(
+  # It FLUNKS rather than proceeding: a test that reaches the assertion without a stall is
+  # measuring the happy path.
+  defp await_stall!(sock) do
+    Await.until(
+      fn -> match?({:ok, [send_pend: n]} when n > 0, :inet.getstat(sock, [:send_pend])) end,
       "the socket never blocked, so nothing was head-of-line blocked and this test would pass " <>
-        "against the unfixed shipper. Raise @payload_bytes or lower the peer's recbuf."
+        "against the unfixed shipper. Raise @payload_bytes or lower the peer's recbuf.",
+      1_000
     )
-  end
-
-  defp await_stall!(sock, tries) do
-    case :inet.getstat(sock, [:send_pend]) do
-      {:ok, [send_pend: n]} when n > 0 ->
-        :ok
-
-      _ ->
-        Process.sleep(5)
-        await_stall!(sock, tries - 1)
-    end
   end
 
   # EXPERT REVIEW 2026-10-01 #17. The shipper released each push's byte reservation when it handed
@@ -183,7 +175,7 @@ defmodule Fathom.Shard.ReplicationWriterTest do
       payload = :binary.copy(<<0xCD>>, @payload_bytes)
       for i <- 1..24, do: Shipper.push(shipper, push("q#{i}", payload))
 
-      await_stall!(sock, 200)
+      await_stall!(sock)
       # Every push has left the SHIPPER's mailbox: whatever is still counted is in the writer.
       _ = :sys.get_state(shipper)
       flush_rejects()
@@ -232,8 +224,11 @@ defmodule Fathom.Shard.ReplicationWriterTest do
       # Precondition: the pushes really reached the writer (a waiter each), not a reject.
       assert map_size(:sys.get_state(shipper).waiters) == 10
 
-      assert await_budget_zero(name, 200) == 0,
-             "sent frames were never released: the budget would ratchet up on a healthy link"
+      Await.until(
+        fn -> Budget.queued(name) == 0 end,
+        "sent frames were never released: the budget would ratchet up on a healthy link",
+        1_000
+      )
     end
   end
 
@@ -270,7 +265,7 @@ defmodule Fathom.Shard.ReplicationWriterTest do
         for seq <- 0..23, do: Shipper.seed_chunk(shipper, "seedme", :db, seq, chunk)
       end)
 
-    await_stall!(sock, 200)
+    await_stall!(sock)
 
     # Unfixed: the 24 casts return at once and the task finishes with the link still stalled.
     assert Task.yield(seeder, 300) == nil,
@@ -310,7 +305,7 @@ defmodule Fathom.Shard.ReplicationWriterTest do
         for seq <- 0..23, do: Shipper.seed_chunk(shipper, "seedme", :db, seq, chunk)
       end)
 
-    await_stall!(sock, 200)
+    await_stall!(sock)
     flush_rejects()
 
     # Still the one-chunk-in-flight bound (#6): the seeder is waiting on the wire.
@@ -343,7 +338,7 @@ defmodule Fathom.Shard.ReplicationWriterTest do
         Enum.map(0..23, fn seq -> Shipper.seed_chunk(shipper, "seeddrop", :db, seq, chunk) end)
       end)
 
-    await_stall!(sock, 200)
+    await_stall!(sock)
     send(peer, :close)
 
     results = Task.await(seeder, 15_000)
@@ -439,19 +434,6 @@ defmodule Fathom.Shard.ReplicationWriterTest do
   defp drain_forever do
     receive do
       _ -> drain_forever()
-    end
-  end
-
-  defp await_budget_zero(name, 0), do: Budget.queued(name)
-
-  defp await_budget_zero(name, tries) do
-    case Budget.queued(name) do
-      0 ->
-        0
-
-      _ ->
-        Process.sleep(5)
-        await_budget_zero(name, tries - 1)
     end
   end
 

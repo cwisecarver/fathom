@@ -23,6 +23,7 @@ defmodule Fathom.Shard.FirstWriteStampTest do
   alias Fathom.Shard.Replication.{Fleet, Follower, Recovery, Session}
   alias Fathom.Shard.Storage
   alias Fathom.Test.LivenessMode
+  alias Fathom.Test.ShardFlush
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -88,18 +89,6 @@ defmodule Fathom.Shard.FirstWriteStampTest do
 
   defp run(conn, sql), do: ShardExecutor.execute(conn, %Stmt{sql: sql, args: []})
 
-  # Let the coordinator handle the write's `:became_dirty` and finish any flush it started.
-  defp settle(_pid, 0), do: flunk("the flush never settled")
-
-  defp settle(pid, tries) do
-    if :sys.get_state(pid).flush_task == nil do
-      :ok
-    else
-      Process.sleep(10)
-      settle(pid, tries - 1)
-    end
-  end
-
   for mode <- @modes do
     describe "#{mode} mode" do
       @tag mode: mode
@@ -117,7 +106,7 @@ defmodule Fathom.Shard.FirstWriteStampTest do
         {:ok, _} = run(conn, "CREATE TABLE kv (v TEXT)")
         {:ok, _} = run(conn, "INSERT INTO kv VALUES ('acked')")
         _ = :sys.get_state(pid)
-        settle(pid, 400)
+        ShardFlush.settle!(pid)
 
         assert {:ok, %{} = head} = Storage.object_head(id),
                "the first write left NO object: a crash now loses every acked write since the open"
@@ -141,7 +130,7 @@ defmodule Fathom.Shard.FirstWriteStampTest do
 
         {:ok, _} = run(conn, "CREATE TABLE kv (v TEXT)")
         _ = :sys.get_state(pid)
-        settle(pid, 400)
+        ShardFlush.settle!(pid)
 
         assert {:ok, nil} = Storage.object_head(id), "replication off must not PUT early"
         :ok = ShardExecutor.close(conn)

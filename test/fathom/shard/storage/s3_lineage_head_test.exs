@@ -22,6 +22,7 @@ defmodule Fathom.Shard.Storage.S3LineageHeadTest do
 
   alias Fathom.Shard.Storage.S3
   alias Fathom.Test.Env
+  alias Fathom.Test.ShardFlush
 
   defp counting_store(test_pid) do
     fn conn ->
@@ -156,7 +157,7 @@ defmodule Fathom.Shard.Storage.S3LineageHeadTest do
       {:ok, coordinator} = Fathom.Shards.ensure(shard)
 
       {:ok, _} = Fathom.ShardExecutor.execute(conn, stmt("CREATE TABLE t (a INTEGER)"))
-      flush!(coordinator)
+      ShardFlush.flush!(coordinator, 4_000)
 
       # The very first flush creates the object (no expected etag), so it HEADs nothing at all —
       # a brand-new object has no metadata to inherit. That is also why this counts the SECOND and
@@ -164,11 +165,11 @@ defmodule Fathom.Shard.Storage.S3LineageHeadTest do
       before_overwrites = Agent.get(heads, & &1)
 
       {:ok, _} = Fathom.ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (1)"))
-      flush!(coordinator)
+      ShardFlush.flush!(coordinator, 4_000)
       after_second = Agent.get(heads, & &1)
 
       {:ok, _} = Fathom.ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (2)"))
-      flush!(coordinator)
+      ShardFlush.flush!(coordinator, 4_000)
       after_third = Agent.get(heads, & &1)
 
       assert :sys.get_state(coordinator).carried_lineage == :none,
@@ -182,20 +183,4 @@ defmodule Fathom.Shard.Storage.S3LineageHeadTest do
   end
 
   defp stmt(sql), do: %Filo.Stmt{sql: sql, args: []}
-
-  defp flush!(coordinator) do
-    send(coordinator, :durability_flush)
-    settle(coordinator, 400)
-  end
-
-  defp settle(_coordinator, 0), do: flunk("durability flush task never settled")
-
-  defp settle(coordinator, tries) do
-    if :sys.get_state(coordinator).flush_task == nil do
-      :ok
-    else
-      Process.sleep(10)
-      settle(coordinator, tries - 1)
-    end
-  end
 end

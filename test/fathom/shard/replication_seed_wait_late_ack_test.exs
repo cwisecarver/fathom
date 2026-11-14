@@ -27,6 +27,7 @@ defmodule Fathom.Shard.ReplicationSeedWaitLateAckTest do
   alias Fathom.Shard.Replication.SeedGate
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shards
+  alias Fathom.Test.Await
   import Fathom.Test.ReplicationCase
 
   setup do
@@ -120,7 +121,14 @@ defmodule Fathom.Shard.ReplicationSeedWaitLateAckTest do
     commit = Task.async(fn -> Session.commit(id, wal, coordinator) end)
 
     # Arity 6 since expert review 2026-11-04 #5 threaded the commit's target header through.
-    await_frame!(session, {Session, :await_seed_messages, 6})
+    # Poll the Session's current function until it is `frame` — i.e. blocked in that receive.
+    frame = {Session, :await_seed_messages, 6}
+
+    Await.until(
+      fn -> Process.info(session, :current_function) == {:current_function, frame} end,
+      "the Session never entered #{inspect(frame)}",
+      3_000
+    )
 
     # The call is now blocked inside the seed wait, so this ack can only be consumed by that
     # clause (were it left to `handle_info/2` after the call, which forgets, the test would pass
@@ -134,20 +142,5 @@ defmodule Fathom.Shard.ReplicationSeedWaitLateAckTest do
     refute Map.has_key?(inflight, straggler),
            "the follower answered (a mismatched ack, consumed inside the seed wait) but is still " <>
              "recorded as owing a reply: #{inspect(inflight)}"
-  end
-
-  # Poll the Session's current function until it is `frame` — i.e. blocked in that receive.
-  defp await_frame!(pid, frame, timeout \\ 3_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        Process.info(pid, :current_function) == {:current_function, frame} -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(5) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("the Session never entered #{inspect(frame)}")
   end
 end

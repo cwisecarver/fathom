@@ -15,6 +15,7 @@ defmodule Fathom.Shard.QuorumFenceTest do
 
   alias Fathom.Shard.Replication.{Fleet, Follower, QuorumFence, Session, Shipper}
   alias Fathom.ShardExecutor
+  alias Fathom.Test.Await
   alias Fathom.Test.PausablePeer
   alias Filo.{Error, Stmt, StmtResult}
 
@@ -48,20 +49,6 @@ defmodule Fathom.Shard.QuorumFenceTest do
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
 
-  defp await!(fun, what, timeout \\ 10_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        fun.() -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(20) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("never: #{what}")
-  end
-
   test "a read after an under-quorum write is refused until the write reaches a quorum",
        %{id: id, root: root} do
     followers =
@@ -94,7 +81,12 @@ defmodule Fathom.Shard.QuorumFenceTest do
     )
 
     start_supervised!(Fleet)
-    await!(fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end, "shippers connect")
+
+    Await.until(
+      fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end,
+      "never: shippers connect",
+      10_000
+    )
 
     {:ok, h} = ShardExecutor.open(id)
     on_exit(fn -> ShardExecutor.close(h) end)
@@ -135,14 +127,15 @@ defmodule Fathom.Shard.QuorumFenceTest do
     {:ok, _} = PausablePeer.release(peer_b)
     {:ok, _} = PausablePeer.release(peer_c)
 
-    await!(
+    Await.until(
       fn ->
         match?(
           {:ok, %StmtResult{rows: [[1], [6]]}},
           ShardExecutor.execute(h, stmt("SELECT v FROM kv ORDER BY v"))
         )
       end,
-      "the read serves again once the quorum holds"
+      "never: the read serves again once the quorum holds",
+      10_000
     )
 
     assert QuorumFence.marked(id) == nil

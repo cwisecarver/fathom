@@ -21,6 +21,7 @@ defmodule Fathom.Shard.PoolShrinkTest do
   alias Fathom.Shard
   alias Fathom.Shard.{HandlePool, Storage, WriteFence}
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Await
   alias Filo.Stmt
 
   @scan "SELECT sum(length(b)) FROM big"
@@ -124,20 +125,6 @@ defmodule Fathom.Shard.PoolShrinkTest do
       n
     end
 
-    defp eventually(fun, tries \\ 300) do
-      cond do
-        fun.() ->
-          true
-
-        tries == 0 ->
-          false
-
-        true ->
-          Process.sleep(10)
-          eventually(fun, tries - 1)
-      end
-    end
-
     defp shrinking?(pid),
       do: Enum.any?(:sys.get_state(pid).pool.idle.rw, &match?({_, _, :shrinking}, &1))
 
@@ -154,10 +141,10 @@ defmodule Fathom.Shard.PoolShrinkTest do
       opts(50)
       {pid, conn} = scanned_and_pooled!(shard)
 
-      assert eventually(fn -> cache_used(conn) < 128 * 1024 end),
+      assert Await.eventually?(fn -> cache_used(conn) < 128 * 1024 end, 3_000),
              "the idle pooled handle kept #{cache_used(conn)} bytes of page cache"
 
-      assert eventually(fn -> not shrinking?(pid) end)
+      Await.until(fn -> not shrinking?(pid) end, "the pooled handle never left :shrinking", 3_000)
 
       # Checkout after the shrink: the pooled handle is lent and answers correctly.
       {:ok, h2} = ShardExecutor.open(shard)

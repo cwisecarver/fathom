@@ -18,6 +18,7 @@ defmodule Fathom.Shard.ReplicationCatchupBackoffTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Fleet, Follower, Session, Shipper}
   alias Fathom.Shards
+  alias Fathom.Test.Await
   alias Fathom.Test.PausablePeer
 
   @registry Fathom.Shard.Replication.SessionRegistry
@@ -48,20 +49,6 @@ defmodule Fathom.Shard.ReplicationCatchupBackoffTest do
     end)
 
     %{id: id, root: root}
-  end
-
-  defp await!(fun, what, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        fun.() -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(10) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("never: #{what}")
   end
 
   # N=4, Q=2: three direct followers and a fourth behind a PausablePeer, so the fourth can be made
@@ -99,7 +86,11 @@ defmodule Fathom.Shard.ReplicationCatchupBackoffTest do
     )
 
     start_supervised!(Fleet)
-    await!(fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end, "shippers connect")
+
+    Await.until(
+      fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end,
+      "never: shippers connect"
+    )
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
@@ -112,7 +103,12 @@ defmodule Fathom.Shard.ReplicationCatchupBackoffTest do
     wal = path <> "-wal"
     assert :ok = Session.commit(id, wal, coordinator)
     [{session, _}] = Registry.lookup(@registry, id)
-    await!(fn -> :sys.get_state(session).inflight == %{} end, "the first commit settles")
+
+    Await.until(
+      fn -> :sys.get_state(session).inflight == %{} end,
+      "never: the first commit settles"
+    )
+
     %{peer: peer, conn: conn, wal: wal, coordinator: coordinator, session: session}
   end
 

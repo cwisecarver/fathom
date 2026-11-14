@@ -27,6 +27,7 @@ defmodule Fathom.ShardLifecycleDeferralTest do
   alias Fathom.Shard
   alias Fathom.Shard.WriteFence
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.{Await, ShardFlush}
   alias Filo.Stmt
 
   @env [
@@ -90,20 +91,6 @@ defmodule Fathom.ShardLifecycleDeferralTest do
 
   defp closed?(conn), do: not match?({:ok, _}, Sqlite3.prepare(conn, "SELECT 1"))
 
-  defp eventually(fun, tries \\ 200) do
-    cond do
-      fun.() ->
-        true
-
-      tries == 0 ->
-        false
-
-      true ->
-        Process.sleep(10)
-        eventually(fun, tries - 1)
-    end
-  end
-
   # --- #25 ------------------------------------------------------------------------------------
 
   # Expert review 2026-10-13 #25. With a 10-minute flush interval, a `flush_now` parked behind a
@@ -121,7 +108,12 @@ defmodule Fathom.ShardLifecycleDeferralTest do
       :sys.replace_state(pid, &Map.put(&1, branch, fake_task()))
 
       flusher = Task.async(fn -> Shards.flush(shard) end)
-      assert eventually(fn -> :sys.get_state(pid).flush_waiters != [] end)
+
+      Await.until(
+        fn -> :sys.get_state(pid).flush_waiters != [] end,
+        "the flush_now waiter was never parked",
+        2_000
+      )
 
       # The :durability_flush kicked by flush_now was queued before this call: it has been handled.
       _ = :sys.get_state(pid)
@@ -270,11 +262,6 @@ defmodule Fathom.ShardLifecycleDeferralTest do
 
   # --- #30 ------------------------------------------------------------------------------------
 
-  defp flush!(pid) do
-    send(pid, :durability_flush)
-    assert eventually(fn -> :sys.get_state(pid).flush_task == nil end)
-  end
-
   # Expert review 2026-10-13 #30. The refusal logged at error level on every preflight of every dirty
   # shard (once per interval per shard on a full volume), contradicting its own "first occurrence"
   # wording. The telemetry stays per refusal; the log is once per transition into failing.
@@ -285,8 +272,8 @@ defmodule Fathom.ShardLifecycleDeferralTest do
 
     log =
       capture_log([level: :error], fn ->
-        flush!(pid)
-        flush!(pid)
+        ShardFlush.flush!(pid)
+        ShardFlush.flush!(pid)
       end)
 
     assert_receive {[:fathom, :shard, :flush, :no_space], _, %{free: 0}, %{shard_id: ^shard}},
@@ -302,7 +289,7 @@ defmodule Fathom.ShardLifecycleDeferralTest do
              "(expert review 2026-10-13 #30):\n#{log}"
 
     Measurements.put_data_free_bytes(10 * 1024 * 1024 * 1024)
-    flush!(pid)
+    ShardFlush.flush!(pid)
     :ok = ShardExecutor.close(h)
   end
 
@@ -314,11 +301,11 @@ defmodule Fathom.ShardLifecycleDeferralTest do
     Measurements.put_data_free_bytes(0)
 
     Application.put_env(:fathom, :shard_object_encoding, :none)
-    flush!(pid)
+    ShardFlush.flush!(pid)
     assert_receive {[:fathom, :shard, :flush, :no_space], _, %{need: need_none}, _}, 2_000
 
     Application.put_env(:fathom, :shard_object_encoding, :zstd)
-    flush!(pid)
+    ShardFlush.flush!(pid)
     assert_receive {[:fathom, :shard, :flush, :no_space], _, %{need: need_zstd}, _}, 2_000
 
     assert need_zstd > need_none,

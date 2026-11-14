@@ -10,7 +10,7 @@ defmodule Fathom.Admin.FleetCollectorTest do
 
   alias Fathom.Admin.FleetCollector
   alias Fathom.Directory
-  alias Fathom.Test.Env
+  alias Fathom.Test.{Await, Env}
 
   setup do
     # The collector is gated off in test (:metrics_collector false), so start it explicitly and
@@ -70,19 +70,19 @@ defmodule Fathom.Admin.FleetCollectorTest do
       send(viewer, :stop)
       assert_receive {:DOWN, ^ref, :process, ^viewer, _}
 
-      # Wait (synchronously, no sleep) until the collector has seen the viewer go and has no poll
+      # Wait until the collector has seen the viewer go and has no poll
       # in flight; from then on no new poll can start. Drop whatever landed before that.
-      assert await_idle(1_000), "the collector never went idle after its last viewer left"
+      Await.until(
+        fn ->
+          s = :sys.get_state(FleetCollector)
+          s.task == nil and map_size(s.watchers) == 0
+        end,
+        "the collector never went idle after its last viewer left"
+      )
+
       flush_fleet()
       refute_receive {:fleet, _}, 300
     end
-  end
-
-  defp await_idle(0), do: false
-
-  defp await_idle(n) do
-    s = :sys.get_state(FleetCollector)
-    if s.task == nil and map_size(s.watchers) == 0, do: true, else: await_idle(n - 1)
   end
 
   defp flush_fleet do

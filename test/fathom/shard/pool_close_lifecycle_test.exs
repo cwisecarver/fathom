@@ -21,6 +21,7 @@ defmodule Fathom.Shard.PoolCloseLifecycleTest do
   alias Fathom.Shard
   alias Fathom.Shard.WriteFence
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Filo.Stmt
 
@@ -301,9 +302,12 @@ defmodule Fathom.Shard.PoolCloseLifecycleTest do
       pref = Process.monitor(pid)
       terminator = Task.async(fn -> :sys.terminate(pid, :shutdown) end)
 
-      assert eventually(fn -> WriteFence.fenced?(shard) end),
-             "terminate waited on the stuck close without publishing the write fence first " <>
-               "(expert review 2026-10-12 #19)"
+      Await.until(
+        fn -> WriteFence.fenced?(shard) end,
+        "terminate waited on the stuck close without publishing the write fence first " <>
+          "(expert review 2026-10-12 #19)",
+        1_000
+      )
 
       assert Process.alive?(pid), "precondition: terminate is still blocked in close_pool"
 
@@ -340,19 +344,5 @@ defmodule Fathom.Shard.PoolCloseLifecycleTest do
 
     assert closed?(conn),
            "the handle checked in to a terminating coordinator was never closed (expert review 2026-10-12 #9)"
-  end
-
-  defp eventually(fun, tries \\ 100) do
-    cond do
-      fun.() ->
-        true
-
-      tries == 0 ->
-        false
-
-      true ->
-        Process.sleep(10)
-        eventually(fun, tries - 1)
-    end
   end
 end

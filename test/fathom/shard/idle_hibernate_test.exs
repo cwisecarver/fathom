@@ -15,6 +15,7 @@ defmodule Fathom.Shard.IdleHibernateTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Await
 
   describe "hibernate_after_ms/3 (pure)" do
     test "interval longer than the idle stop: half the idle stop" do
@@ -93,22 +94,6 @@ defmodule Fathom.Shard.IdleHibernateTest do
       ]
     end
 
-    defp await_hibernated(pid, deadline_ms) do
-      cond do
-        hibernated?(pid) ->
-          :ok
-
-        System.monotonic_time(:millisecond) > deadline_ms ->
-          flunk("coordinator never hibernated: #{inspect(Process.info(pid, :current_function))}")
-
-        true ->
-          receive do
-          after
-            50 -> await_hibernated(pid, deadline_ms)
-          end
-      end
-    end
-
     for mode <- [:legacy, :heartbeat] do
       test "[#{mode}] an idle clean coordinator hibernates before its idle stop", %{id: id} do
         if unquote(mode) == :heartbeat do
@@ -131,10 +116,9 @@ defmodule Fathom.Shard.IdleHibernateTest do
           else: assert(is_nil(state.acquire_gen), "legacy mode did not take")
 
         refute Shard.dirty?(pid), "fixture: an idle CLEAN coordinator"
-        started = System.monotonic_time(:millisecond)
-
         # Hibernate after 3 s; the idle stop is at 6 s. Pre-fix hibernate_after was 301 s.
-        await_hibernated(pid, started + 5_000)
+        Await.eventually?(fn -> hibernated?(pid) end, 5_000) or
+          flunk("coordinator never hibernated: #{inspect(Process.info(pid, :current_function))}")
       end
     end
   end

@@ -9,6 +9,7 @@ defmodule Fathom.Shard.Replication.FollowerLabelTest do
   use ExUnit.Case, async: true
 
   alias Fathom.Shard.Replication.Follower
+  alias Fathom.Test.Await
 
   test "a follower worker labels itself and its initial_call is the anonymous-fun one" do
     {:ok, l} = :gen_tcp.listen(0, [:binary, packet: 4, active: false])
@@ -28,19 +29,11 @@ defmodule Fathom.Shard.Replication.FollowerLabelTest do
     # The precondition that motivated the label: module-based attribution cannot see this process.
     assert {:initial_call, {:erlang, :apply, 2}} = Process.info(worker, :initial_call)
 
-    assert wait_label(worker, 10_000) == :replication_follower_worker
-  end
+    Await.until(
+      fn -> match?({:label, l} when l != :undefined, Process.info(worker, :label)) end,
+      "the follower worker never set a label"
+    )
 
-  defp wait_label(_pid, 0), do: :undefined
-
-  defp wait_label(pid, n) do
-    case Process.info(pid, :label) do
-      {:label, :undefined} ->
-        :erlang.yield()
-        wait_label(pid, n - 1)
-
-      {:label, label} ->
-        label
-    end
+    assert {:label, :replication_follower_worker} = Process.info(worker, :label)
   end
 end

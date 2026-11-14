@@ -22,6 +22,7 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
   use Fathom.ClusterShardCase, async: false
 
   alias Fathom.Shard.{Heartbeat, WriteFence}
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Fathom.Test.LivenessMode
 
@@ -91,19 +92,15 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
   # (a tick that lands while a legacy renew task is in flight is deferred, not run), then stop — so
   # nothing but the timer under test can fence afterwards.
   defp first_not_valid!(coordinator) do
-    deadline = System.monotonic_time(:millisecond) + 3_000
-
-    since =
-      Stream.repeatedly(fn ->
+    Await.until(
+      fn ->
         send(coordinator, :durability_flush)
         Process.sleep(20)
-        :sys.get_state(coordinator).not_valid_since
-      end)
-      |> Enum.find(fn since ->
-        is_integer(since) or System.monotonic_time(:millisecond) > deadline
-      end)
-
-    assert is_integer(since), "the fixture never produced a :not_valid fence verdict"
+        is_integer(:sys.get_state(coordinator).not_valid_since)
+      end,
+      "the fixture never produced a :not_valid fence verdict",
+      3_000
+    )
   end
 
   defp open_dirty!(shard) do

@@ -26,6 +26,7 @@ defmodule Fathom.HranaAuthColdFloorTest do
   alias Fathom.Directory
   alias Fathom.HranaAuth.Revocations
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Await
 
   @followers Fathom.HranaAuth.Revocations.Followers
 
@@ -150,24 +151,6 @@ defmodule Fathom.HranaAuthColdFloorTest do
     length(:ets.lookup(@followers, shard))
   rescue
     ArgumentError -> 0
-  end
-
-  # Bounded poll of the follower registry: there is no message to wait on for "N hellos are now
-  # parked behind the claimant", and a fixed sleep would be a guess.
-  defp await_followers(shard, n, tries \\ 400) do
-    cond do
-      follower_count(shard) >= n ->
-        :ok
-
-      tries == 0 ->
-        flunk("only #{follower_count(shard)} of #{n} hellos parked behind the claimant")
-
-      true ->
-        receive do
-        after
-          5 -> await_followers(shard, n, tries - 1)
-        end
-    end
   end
 
   describe "a stalled storage floor read" do
@@ -369,7 +352,13 @@ defmodule Fathom.HranaAuthColdFloorTest do
       assert_receive {:storage_read, storage_pid}, 5_000
 
       followers = for _ <- 1..5, do: Task.async(fn -> Revocations.floor_info(shard) end)
-      await_followers(shard, 5)
+
+      Await.until(
+        fn -> follower_count(shard) >= 5 end,
+        "5 hellos never parked behind the claimant",
+        2_000
+      )
+
       send(storage_pid, :go)
 
       results = Task.await_many([lead | followers], 10_000)
@@ -392,7 +381,12 @@ defmodule Fathom.HranaAuthColdFloorTest do
       assert_receive {:storage_read, _storage_pid}, 5_000
 
       followers = for _ <- 1..3, do: Task.async(fn -> Revocations.floor_info(shard) end)
-      await_followers(shard, 3)
+
+      Await.until(
+        fn -> follower_count(shard) >= 3 end,
+        "3 hellos never parked behind the claimant",
+        2_000
+      )
 
       Process.exit(lead, :kill)
 

@@ -21,6 +21,7 @@ defmodule Fathom.Shard.ReplicationSeedSharedPinTest do
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shards
+  alias Fathom.Test.Await
 
   @gates [:replication_enabled, :replication_followers, :replication_quorum]
   @followers 4
@@ -58,20 +59,6 @@ defmodule Fathom.Shard.ReplicationSeedSharedPinTest do
     end
   end
 
-  defp await!(fun, msg) do
-    deadline = System.monotonic_time(:millisecond) + 10_000
-
-    Stream.repeatedly(fn -> fun.() || Process.sleep(20) end)
-    |> Enum.find(fn
-      v when v in [nil, false, :ok] -> System.monotonic_time(:millisecond) > deadline
-      _ -> true
-    end)
-    |> case do
-      v when v in [nil, false, :ok] -> flunk(msg)
-      v -> v
-    end
-  end
-
   test "an N-follower seed batch opens ONE snapshot, and every follower still gets seeded",
        %{id: id, root: root} do
     followers = start_followers!(root)
@@ -86,9 +73,10 @@ defmodule Fathom.Shard.ReplicationSeedSharedPinTest do
 
     start_supervised!(Fleet)
 
-    await!(
+    Await.until(
       fn -> Enum.all?(Fleet.shippers(), &Shipper.connected?/1) end,
-      "shippers never connected"
+      "shippers never connected",
+      10_000
     )
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
@@ -104,13 +92,14 @@ defmodule Fathom.Shard.ReplicationSeedSharedPinTest do
     try do
       assert :ok = Session.commit(id, path <> "-wal", coordinator)
 
-      await!(
+      Await.until(
         fn ->
           Enum.all?(followers, fn {name, _} ->
             match?(%{next_offset: o} when o > 0, Follower.state_of(name, id))
           end)
         end,
-        "not every follower was seeded"
+        "not every follower was seeded",
+        10_000
       )
     after
       :erlang.trace(:all, false, [:call])

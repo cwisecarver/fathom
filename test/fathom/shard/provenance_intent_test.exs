@@ -20,6 +20,7 @@ defmodule Fathom.Shard.ProvenanceIntentTest do
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Fork, Provenance, Storage}
   alias Fathom.Test.Env
+  alias Fathom.Test.ShardFlush
   alias Filo.{Stmt, StmtResult}
 
   @md5_a String.duplicate("a", 32)
@@ -49,24 +50,6 @@ defmodule Fathom.Shard.ProvenanceIntentTest do
   defp remote_dir, do: Storage.Local.dir()
   defp local_db(shard), do: Path.join(local_dir(), "#{shard}.db")
 
-  defp flush_now(coordinator) do
-    send(coordinator, :durability_flush)
-    wait_flush_settled(coordinator, 400)
-  end
-
-  defp wait_flush_settled(_coordinator, 0), do: flunk("durability flush task never settled")
-
-  defp wait_flush_settled(coordinator, tries) do
-    case :sys.get_state(coordinator) do
-      %{flush_task: nil} ->
-        :ok
-
-      _ ->
-        Process.sleep(5)
-        wait_flush_settled(coordinator, tries - 1)
-    end
-  end
-
   defp kill_coordinator(shard, conn) do
     {:ok, coordinator} = Shards.ensure(shard)
     ref = Process.monitor(coordinator)
@@ -92,13 +75,13 @@ defmodule Fathom.Shard.ProvenanceIntentTest do
       {:ok, coordinator} = Shards.ensure(shard)
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('first')"))
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
       {:ok, e0} = Storage.object_etag(shard)
       assert {:ok, ^e0} = Provenance.read(local_db(shard)) |> normalize()
 
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('landed')"))
       Application.put_env(:fathom, :storage_fault, :flush_lands_then_errors)
-      capture_log(fn -> :ok = flush_now(coordinator) end)
+      capture_log(fn -> :ok = ShardFlush.flush!(coordinator) end)
       Application.delete_env(:fathom, :storage_fault)
 
       {:ok, e1} = Storage.object_etag(shard)
@@ -138,7 +121,7 @@ defmodule Fathom.Shard.ProvenanceIntentTest do
       assert :no_object = Provenance.read(local_db(shard))
 
       Application.put_env(:fathom, :storage_fault, :flush_lands_then_errors)
-      capture_log(fn -> :ok = flush_now(coordinator) end)
+      capture_log(fn -> :ok = ShardFlush.flush!(coordinator) end)
       Application.delete_env(:fathom, :storage_fault)
 
       assert {:ok, etag} = Storage.object_etag(shard)
@@ -162,12 +145,12 @@ defmodule Fathom.Shard.ProvenanceIntentTest do
       {:ok, coordinator} = Shards.ensure(shard)
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('first')"))
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator)
 
       # A flush that was ATTEMPTED (intent recorded) but did not land...
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('a-fork')"))
       Application.put_env(:fathom, :storage_fault, :flush)
-      capture_log(fn -> :ok = flush_now(coordinator) end)
+      capture_log(fn -> :ok = ShardFlush.flush!(coordinator) end)
       Application.delete_env(:fathom, :storage_fault)
       kill_coordinator(shard, conn)
 

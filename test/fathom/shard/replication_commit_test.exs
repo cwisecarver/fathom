@@ -17,6 +17,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shards
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   import Fathom.Test.ReplicationCase
 
@@ -63,21 +64,11 @@ defmodule Fathom.Shard.ReplicationCommitTest do
   end
 
   defp await_wal(name, id, expected, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      if File.read(Follower.wal_path(name, id)) == {:ok, expected},
-        do: :converged,
-        else: Process.sleep(10)
-    end)
-    |> Enum.find(fn
-      :converged -> true
-      _ -> System.monotonic_time(:millisecond) > deadline
-    end)
-    |> case do
-      :converged -> :ok
-      _ -> flunk("follower #{name} never converged on the primary's WAL")
-    end
+    Await.until(
+      fn -> File.read(Follower.wal_path(name, id)) == {:ok, expected} end,
+      "follower #{name} never converged on the primary's WAL",
+      timeout
+    )
   end
 
   test "a committed write reaches a follower quorum, byte-identical", ctx do

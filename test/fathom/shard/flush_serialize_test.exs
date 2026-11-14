@@ -22,7 +22,7 @@ defmodule Fathom.Shard.FlushSerializeTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
-  alias Fathom.Test.LivenessMode
+  alias Fathom.Test.{LivenessMode, ShardFlush}
   alias Filo.Stmt
 
   @env_keys [
@@ -118,24 +118,8 @@ defmodule Fathom.Shard.FlushSerializeTest do
 
   defp flush!(id) do
     {:ok, coordinator} = Shards.ensure(id)
-    send(coordinator, :durability_flush)
-    settle(coordinator)
+    ShardFlush.flush!(coordinator, 4_000)
     coordinator
-  end
-
-  defp settle(c, tries \\ 400) do
-    cond do
-      :sys.get_state(c).flush_task == nil -> :ok
-      tries == 0 -> flunk("flush task never settled")
-      true -> wait_then(10, fn -> settle(c, tries - 1) end)
-    end
-  end
-
-  defp wait_then(ms, fun) do
-    receive do
-    after
-      ms -> fun.()
-    end
   end
 
   for mode <- [:legacy, :heartbeat] do
@@ -262,8 +246,7 @@ defmodule Fathom.Shard.FlushSerializeTest do
 
       on_exit(fn -> Application.delete_env(:fathom, :flush_after_snapshot_hook) end)
 
-      send(coordinator, :durability_flush)
-      settle(coordinator)
+      ShardFlush.flush!(coordinator, 4_000)
       ShardExecutor.close(conn)
 
       assert_received {:siblings, files}
@@ -348,8 +331,7 @@ defmodule Fathom.Shard.FlushSerializeTest do
 
     {:ok, holder} = ShardExecutor.open(id)
     {:ok, coordinator} = Shards.ensure(id)
-    send(coordinator, :durability_flush)
-    settle(coordinator)
+    ShardFlush.flush!(coordinator, 4_000)
     ShardExecutor.close(holder)
     :ok = Connection.close(trusted)
 

@@ -8,6 +8,7 @@ defmodule Fathom.Admin.CollectorPanelsTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Admin.{EventRing, Measurements, MetricsCollector}
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
 
   setup do
@@ -16,18 +17,17 @@ defmodule Fathom.Admin.CollectorPanelsTest do
     for child <- Fathom.Telemetry.reporter_children(), do: start_supervised!(child)
     # The Core reporter attaches its telemetry handlers AFTER start returns, so an event emitted
     # straight away is silently dropped (this made the gauge assertions below flake). Wait for them.
-    await_handlers([[:fathom, :node, :vm_limits], [:fathom, :shard, :cold_open]])
+    events = [[:fathom, :node, :vm_limits], [:fathom, :shard, :cold_open]]
+
+    Await.until(
+      fn -> Enum.all?(events, &(:telemetry.list_handlers(&1) != [])) end,
+      "reporter never attached handlers for #{inspect(events)}",
+      2_000
+    )
+
     start_supervised!(EventRing)
     pid = start_supervised!(MetricsCollector)
     {:ok, pid: pid}
-  end
-
-  defp await_handlers(events, tries \\ 200) do
-    cond do
-      Enum.all?(events, &(:telemetry.list_handlers(&1) != [])) -> :ok
-      tries == 0 -> flunk("reporter never attached handlers for #{inspect(events)}")
-      true -> Process.sleep(10) && await_handlers(events, tries - 1)
-    end
   end
 
   defp tick(pid) do

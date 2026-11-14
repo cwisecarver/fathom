@@ -34,6 +34,7 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shards
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Fathom.Test.PausablePeer
   import Fathom.Test.ReplicationCase
@@ -111,22 +112,12 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   end
 
   defp await_no_inflight!(session, timeout \\ 3_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        :sys.get_state(session).inflight == %{} -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(10) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert(
-      "the released follower's reply never settled: " <>
-        inspect(
-          Map.take(:sys.get_state(session), [:inflight, :inflight_at, :followers, :seeding])
-        ) <> "\nshippers: " <> inspect(shipper_diag(session))
-    )
+    # `assert`'s message is built only on failure: `shipper_diag/1` reads other processes' state.
+    assert Await.eventually?(fn -> :sys.get_state(session).inflight == %{} end, timeout),
+           "the released follower's reply never settled: " <>
+             inspect(
+               Map.take(:sys.get_state(session), [:inflight, :inflight_at, :followers, :seeding])
+             ) <> "\nshippers: " <> inspect(shipper_diag(session))
   end
 
   # Unreproduced CI flake (run 41007398964, OTP 29, test #6): `a`'s entry stayed in `inflight` for
@@ -156,20 +147,6 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
 
       {shipper, diag}
     end
-  end
-
-  defp await_queue!(pid, n, timeout \\ 3_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        elem(Process.info(pid, :message_queue_len), 1) >= n -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(5) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("the callers never queued")
   end
 
   defp shipper_for(port) do
@@ -354,17 +331,8 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     Env.put!(:replication_catchup_ms, 200)
     assert :ok = Session.commit(id, wal, coordinator)
 
-    deadline = System.monotonic_time(:millisecond) + 8_000
-
     converged =
-      Stream.repeatedly(fn ->
-        cond do
-          File.read(Follower.wal_path(c, id)) == {:ok, target} -> true
-          System.monotonic_time(:millisecond) > deadline -> false
-          true -> Process.sleep(25) && nil
-        end
-      end)
-      |> Enum.find(&is_boolean/1)
+      Await.eventually?(fn -> File.read(Follower.wal_path(c, id)) == {:ok, target} end, 8_000)
 
     assert converged,
            "the laggard never caught up on a quiet shard: the commits acked without it and " <>
@@ -485,7 +453,12 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
         Task.async(fn -> Session.commit(id, wal, coordinator) end)
       end
 
-    await_queue!(session, 8)
+    Await.until(
+      fn -> elem(Process.info(session, :message_queue_len), 1) >= 8 end,
+      "the callers never queued",
+      3_000
+    )
+
     :ok = :sys.resume(session)
 
     assert Enum.all?(Task.await_many(callers, 10_000), &(&1 == :ok))
@@ -696,17 +669,11 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   defp sql!(owner, sql), do: {:ok, _} = call_owner(owner, {:sql, sql})
 
   defp await_seeds_landed!(session, timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    Stream.repeatedly(fn ->
-      cond do
-        :sys.get_state(session).seeding == %{} -> true
-        System.monotonic_time(:millisecond) > deadline -> false
-        true -> Process.sleep(10) && nil
-      end
-    end)
-    |> Enum.find(&is_boolean/1)
-    |> assert("the initial seeds never landed")
+    Await.until(
+      fn -> :sys.get_state(session).seeding == %{} end,
+      "the initial seeds never landed",
+      timeout
+    )
   end
 
   # Count the rows a follower's replica holds, on a COPY (opening the replica itself could

@@ -4,7 +4,7 @@ defmodule Fathom.ApplicationTest do
   # shared supervised process.
   use ExUnit.Case, async: false
 
-  alias Fathom.Test.Env
+  alias Fathom.Test.{Await, Env}
 
   @planes [
     Fathom.Infra.Supervisor,
@@ -45,7 +45,14 @@ defmodule Fathom.ApplicationTest do
 
     # And the control plane self-heals under its own supervisor (wait for the restart so
     # we don't hand the next test a dead child; a start has no DOWN to await).
-    assert wait_restarted(Fathom.Directory.Recorder, recorder)
+    Await.until(
+      fn ->
+        pid = Process.whereis(Fathom.Directory.Recorder)
+        is_pid(pid) and pid != recorder
+      end,
+      "the Recorder was never restarted",
+      1_000
+    )
   end
 
   # Expert review #4: supervisors stop children in reverse start order. If the heartbeat
@@ -83,13 +90,5 @@ defmodule Fathom.ApplicationTest do
           do: child
 
     assert pid in pids, "#{inspect(name)} should be a child of #{inspect(supervisor)}"
-  end
-
-  defp wait_restarted(name, old, tries \\ 200) do
-    case Process.whereis(name) do
-      pid when is_pid(pid) and pid != old -> true
-      _ when tries > 0 -> Process.sleep(5) && wait_restarted(name, old, tries - 1)
-      _ -> false
-    end
   end
 end

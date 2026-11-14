@@ -28,6 +28,7 @@ defmodule Fathom.Shard.OpenCrashSafetyTest do
   alias Fathom.Test.Env
   alias Fathom.Test.LivenessMode
   alias Fathom.Test.S3EtagStore
+  alias Fathom.Test.ShardFlush
 
   @modes [:legacy, :heartbeat]
 
@@ -99,22 +100,6 @@ defmodule Fathom.Shard.OpenCrashSafetyTest do
     result
   end
 
-  defp flush!(coordinator) do
-    send(coordinator, :durability_flush)
-    settle(coordinator, 400)
-  end
-
-  defp settle(_c, 0), do: flunk("durability flush task never settled")
-
-  defp settle(c, tries) do
-    if :sys.get_state(c).flush_task == nil do
-      :ok
-    else
-      Process.sleep(10)
-      settle(c, tries - 1)
-    end
-  end
-
   # The stored object holds rows 1..3, the shard 1..10, and a follower replica (strictly fresher
   # than the object) holds all ten. Leaves the primary dead and its disk gone: the state of a
   # survivor the LB routed a failover to.
@@ -129,7 +114,7 @@ defmodule Fathom.Shard.OpenCrashSafetyTest do
 
       if i == 3 do
         assign_ordinal!(id, coordinator)
-        flush!(coordinator)
+        ShardFlush.flush!(coordinator, 4_000)
       end
     end
 

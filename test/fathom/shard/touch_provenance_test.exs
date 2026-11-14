@@ -35,6 +35,7 @@ defmodule Fathom.Shard.TouchProvenanceTest do
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Fathom.Test.LivenessMode
   alias Fathom.Test.S3EtagStore
@@ -136,7 +137,17 @@ defmodule Fathom.Shard.TouchProvenanceTest do
           assert is_nil(:sys.get_state(b).acquire_gen), "N2 is a legacy-mode defect"
           before = :sys.get_state(b).lease.lock_etag
           send(b, :renew_lease)
-          renewed = renewed_lease!(b, before, 200)
+
+          Await.until(
+            fn ->
+              st = :sys.get_state(b)
+              st.renew_task == nil and st.lease.lock_etag != before
+            end,
+            "the renew never landed",
+            2_000
+          )
+
+          renewed = :sys.get_state(b).lease
           assert renewed[:touch_post_etag], "a renew must carry the steal's touch keys"
         end
 
@@ -218,20 +229,6 @@ defmodule Fathom.Shard.TouchProvenanceTest do
     end)
 
     assert Path.wildcard(local <> ".forked.*") != []
-  end
-
-  # Poll the coordinator until the renew task's reply has been folded into state.lease.
-  defp renewed_lease!(_b, _before, 0), do: flunk("the renew never landed")
-
-  defp renewed_lease!(b, before, n) do
-    st = :sys.get_state(b)
-
-    if st.renew_task == nil and st.lease.lock_etag != before do
-      st.lease
-    else
-      Process.sleep(10)
-      renewed_lease!(b, before, n - 1)
-    end
   end
 
   defp obj(body), do: %{body: body, form: :single, meta: %{}}

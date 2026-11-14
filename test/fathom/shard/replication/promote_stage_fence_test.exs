@@ -17,6 +17,7 @@ defmodule Fathom.Shard.Replication.PromoteStageFenceTest do
 
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Follower, Promote, Protocol}
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
 
   setup do
@@ -172,7 +173,12 @@ defmodule Fathom.Shard.Replication.PromoteStageFenceTest do
       end)
 
     on_exit(fn -> send(holder, :release) end)
-    wait_until(fn -> :ets.lookup(Follower.locks(name), id) != [] end)
+
+    Await.until(
+      fn -> :ets.lookup(Follower.locks(name), id) != [] end,
+      "condition never held",
+      1_000
+    )
 
     assert Promote.stage(name, id, temp, lineage: 5) == {:error, :replica_busy}
     refute File.exists?(temp)
@@ -230,21 +236,6 @@ defmodule Fathom.Shard.Replication.PromoteStageFenceTest do
 
       assert {:error, :replica_changed} = Follower.unfence(name, id, fence)
       assert Follower.state_of(name, id) == newer
-    end
-  end
-
-  defp wait_until(fun, tries \\ 200) do
-    cond do
-      fun.() -> :ok
-      tries == 0 -> flunk("condition never held")
-      true -> wait_until_after(fun, tries)
-    end
-  end
-
-  defp wait_until_after(fun, tries) do
-    receive do
-    after
-      5 -> wait_until(fun, tries - 1)
     end
   end
 end

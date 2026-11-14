@@ -31,6 +31,7 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
   alias Fathom.ShardExecutor
   alias Fathom.Shards
   alias Fathom.Test.Env
+  alias Fathom.Test.ShardFlush
 
   setup do
     id = "underq_#{System.unique_integer([:positive])}"
@@ -116,8 +117,7 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
     wal = Fathom.Shard.db_path(id) <> "-wal"
     assert {:ok, %{salt1: salt}} = Fathom.Shard.Replication.Wal.read(wal)
     assert Fathom.Shard.wal_ordinal(coordinator, salt) > 0
-    send(coordinator, :durability_flush)
-    settle(coordinator, 400)
+    ShardFlush.flush!(coordinator, 4_000)
 
     ref = Process.monitor(coordinator)
     Process.exit(coordinator, :kill)
@@ -136,17 +136,6 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
     # assertion below would be about nothing.
     assert {:ok, %{epoch: e, wal_ordinal: n}} = Storage.object_position(id)
     assert e > 0 and n > 0, "fixture: the stored object is not rankable"
-  end
-
-  defp settle(_c, 0), do: flunk("durability flush task never settled")
-
-  defp settle(c, tries) do
-    if :sys.get_state(c).flush_task == nil do
-      :ok
-    else
-      Process.sleep(10)
-      settle(c, tries - 1)
-    end
   end
 
   defp read_rows(id) do

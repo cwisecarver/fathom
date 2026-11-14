@@ -46,6 +46,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Test.Env
+  alias Fathom.Test.ShardFlush
   alias Filo.Stmt
 
   setup do
@@ -67,24 +68,6 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
   defp db_path(shard), do: Path.join(Shard.data_dir(), "#{shard}.db")
 
-  defp flush_now(coordinator) do
-    send(coordinator, :durability_flush)
-    wait_settled(coordinator, 400)
-  end
-
-  defp wait_settled(_c, 0), do: flunk("durability flush never settled")
-
-  defp wait_settled(c, n) do
-    case :sys.get_state(c) do
-      %{flush_task: nil} ->
-        :ok
-
-      _ ->
-        Process.sleep(5)
-        wait_settled(c, n - 1)
-    end
-  end
-
   describe "#5 — synchronous must be restored before any checkpoint or close" do
     test "the live database survives a flush with its durability setting intact", %{shard: shard} do
       Env.put!(:shard_flush_interval_ms, 60_000)
@@ -99,7 +82,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE INDEX idx_kv_v ON kv(v)"))
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1, 'a')"))
 
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator, 2_000)
 
       # The tenant's own connection must still be at FULL — the snapshot must never leave a
       # relaxed durability setting behind on anything that outlives it.
@@ -121,7 +104,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
       # An explicit index is what corrupt_index!/1 targets — see its comment.
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE INDEX idx_kv_v ON kv(v)"))
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1, 'b')"))
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator, 2_000)
       :ok = ShardExecutor.close(conn)
 
       {:ok, c} = Connection.open(db_path(shard))
@@ -143,7 +126,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
 
       for i <- 1..5 do
         {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (?, ?)", [i, "v#{i}"]))
-        :ok = flush_now(coordinator)
+        :ok = ShardFlush.flush!(coordinator, 2_000)
       end
 
       # Integrity of the live file after repeated snapshot cycles.
@@ -168,7 +151,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
       # An explicit index is what corrupt_index!/1 targets — see its comment.
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE INDEX idx_kv_v ON kv(v)"))
       seed_rows!(conn)
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator, 2_000)
       :ok = ShardExecutor.close(conn)
 
       good_etag = :sys.get_state(coordinator).etag
@@ -185,7 +168,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
       send(coordinator, :write_counter_reset)
       _ = :sys.get_state(coordinator)
 
-      log = capture_log(fn -> flush_now(coordinator) end)
+      log = capture_log(fn -> ShardFlush.flush!(coordinator, 2_000) end)
 
       # The good object must still be the stored one.
       assert {:ok, ^good_etag} = Storage.object_etag(shard),
@@ -223,7 +206,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
       # An explicit index is what corrupt_index!/1 targets — see its comment.
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE INDEX idx_kv_v ON kv(v)"))
       seed_rows!(conn)
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator, 2_000)
       :ok = ShardExecutor.close(conn)
 
       path = db_path(shard)
@@ -231,7 +214,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
       send(coordinator, :write_counter_reset)
       _ = :sys.get_state(coordinator)
 
-      capture_log(fn -> flush_now(coordinator) end)
+      capture_log(fn -> ShardFlush.flush!(coordinator, 2_000) end)
 
       assert File.exists?(path),
              "the live shard file was moved aside while its coordinator was still serving"
@@ -266,14 +249,14 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
       # An explicit index is what corrupt_index!/1 targets — see its comment.
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE INDEX idx_kv_v ON kv(v)"))
       seed_rows!(conn)
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator, 2_000)
       :ok = ShardExecutor.close(conn)
 
       corrupt_index!(db_path(shard))
       send(coordinator, :write_counter_reset)
       _ = :sys.get_state(coordinator)
 
-      capture_log(fn -> flush_now(coordinator) end)
+      capture_log(fn -> ShardFlush.flush!(coordinator, 2_000) end)
 
       assert_receive {:corrupt, %{shard_id: ^shard}}, 2_000
     end
@@ -290,11 +273,11 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
       # An explicit index is what corrupt_index!/1 targets — see its comment.
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE INDEX idx_kv_v ON kv(v)"))
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (1, 'one')"))
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator, 2_000)
       first = :sys.get_state(coordinator).etag
 
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (2, 'two')"))
-      :ok = flush_now(coordinator)
+      :ok = ShardFlush.flush!(coordinator, 2_000)
       second = :sys.get_state(coordinator).etag
 
       refute first == second, "a healthy shard must keep flushing normally"

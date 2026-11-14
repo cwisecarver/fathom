@@ -28,6 +28,7 @@ defmodule Fathom.Admin.MetricsTest do
   alias Fathom.Admin.{FlushWatermark, Measurements}
   alias Fathom.Shard.{Storage, WriteCounter}
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
   alias Filo.Stmt
 
@@ -284,19 +285,23 @@ defmodule Fathom.Admin.MetricsTest do
     assert_receive {:DOWN, ^ref, :process, ^owner, :killed}, 2_000
 
     # The supervisor restarts it with a FRESH, EMPTY table.
-    assert eventually(fn ->
-             p = Process.whereis(Fathom.Admin.FlushWatermark)
-             is_pid(p) and p != owner
-           end),
-           "the FlushWatermark owner was not restarted"
+    Await.until(
+      fn ->
+        p = Process.whereis(Fathom.Admin.FlushWatermark)
+        is_pid(p) and p != owner
+      end,
+      "the FlushWatermark owner was not restarted",
+      2_000
+    )
 
     # THE ASSERTION: the shard's row comes back without waiting for a successful flush.
-    assert eventually(fn ->
-             Enum.any?(FlushWatermark.snapshot(), &(elem(&1, 0) == id))
-           end),
-           "the watermark table stayed empty after the owner restarted, so the RPO gauge reports " <>
-             "dirty_shards: 0 for a fleet it cannot see — a shard whose flushes are failing would " <>
-             "never re-publish on its own"
+    Await.until(
+      fn -> Enum.any?(FlushWatermark.snapshot(), &(elem(&1, 0) == id)) end,
+      "the watermark table stayed empty after the owner restarted, so the RPO gauge reports " <>
+        "dirty_shards: 0 for a fleet it cannot see — a shard whose flushes are failing would " <>
+        "never re-publish on its own",
+      2_000
+    )
   end
 
   # ── #27: the O(open-shards) RPO walk is throttled, not run every tick ──
@@ -315,8 +320,11 @@ defmodule Fathom.Admin.MetricsTest do
     pid = start_supervised!(Fathom.Admin.MetricsCollector)
 
     # First tick must take a real sample, or there is nothing to throttle.
-    assert eventually(fn -> :sys.get_state(pid).rpo_walks > 0 end),
-           "the collector never took an initial RPO sample"
+    Await.until(
+      fn -> :sys.get_state(pid).rpo_walks > 0 end,
+      "the collector never took an initial RPO sample",
+      2_000
+    )
 
     first = :sys.get_state(pid).rpo_walks
 
@@ -356,8 +364,11 @@ defmodule Fathom.Admin.MetricsTest do
 
     pid = start_supervised!(Fathom.Admin.MetricsCollector)
 
-    assert eventually(fn -> :sys.get_state(pid).hot_walks > 0 end),
-           "the collector never took an initial hot-set pass"
+    Await.until(
+      fn -> :sys.get_state(pid).hot_walks > 0 end,
+      "the collector never took an initial hot-set pass",
+      2_000
+    )
 
     first = :sys.get_state(pid).hot_walks
     assert [_ | _] = :sys.get_state(pid).hot, "the first pass should find the seeded shards"
@@ -386,8 +397,11 @@ defmodule Fathom.Admin.MetricsTest do
 
     pid = start_supervised!(Fathom.Admin.MetricsCollector)
 
-    assert eventually(fn -> Fathom.Admin.MetricsCollector.current() != nil end),
-           "the collector never published a current map"
+    Await.until(
+      fn -> Fathom.Admin.MetricsCollector.current() != nil end,
+      "the collector never published a current map",
+      2_000
+    )
 
     # Left suspended: the test supervisor's shutdown signal still stops it at test exit.
     :sys.suspend(pid)
@@ -420,18 +434,6 @@ defmodule Fathom.Admin.MetricsTest do
     FlushWatermark.reset()
     FlushWatermark.record(id, 0, gen)
     assert {1, _} = Measurements.rpo_snapshot()
-  end
-
-  defp eventually(fun, remaining_ms \\ 2_000)
-  defp eventually(_fun, remaining_ms) when remaining_ms <= 0, do: false
-
-  defp eventually(fun, remaining_ms) do
-    if fun.() do
-      true
-    else
-      Process.sleep(10)
-      eventually(fun, remaining_ms - 10)
-    end
   end
 
   # ── #11: a blank/failed scrape must not reset the rate baselines (no false-recovery spike) ──

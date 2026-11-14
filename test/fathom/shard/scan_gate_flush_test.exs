@@ -7,7 +7,9 @@ defmodule Fathom.Shard.ScanGateFlushTest do
   alias Fathom.Shard.{ScanGate, Storage}
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.Await
   alias Fathom.Test.Env
+  alias Fathom.Test.ShardFlush
 
   setup do
     id = "scangate_#{System.unique_integer([:positive])}"
@@ -34,29 +36,13 @@ defmodule Fathom.Shard.ScanGateFlushTest do
     assert ScanGate.acquire(1_000) == :ok
 
     send(coordinator, :durability_flush)
-    wait_until(fn -> ScanGate.stats().waiting == 1 end)
+    Await.until(fn -> ScanGate.stats().waiting == 1 end, "condition never held", 4_000)
 
     assert :sys.get_state(coordinator).flush_task != nil
     assert {:ok, nil} = Storage.object_position(id), "flushed while the scan permit was held"
 
     ScanGate.release()
-    wait_until(fn -> :sys.get_state(coordinator).flush_task == nil end)
+    ShardFlush.settle!(coordinator, 4_000)
     assert {:ok, %{}} = Storage.object_position(id)
-  end
-
-  defp wait_until(fun, tries \\ 400) do
-    cond do
-      fun.() ->
-        :ok
-
-      tries == 0 ->
-        flunk("condition never held")
-
-      true ->
-        receive do
-        after
-          10 -> wait_until(fun, tries - 1)
-        end
-    end
   end
 end
