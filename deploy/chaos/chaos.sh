@@ -285,8 +285,6 @@ sql() { hrana "$LB" "$@"; }                      # through the LB
 rpc() { local node=$1; shift; compose exec -T "$node" /app/bin/fathom rpc "$*" 2>/dev/null | tr -d '\r'; }
 # other_node <node>: any NODES element that isn't <node>.
 other_node() { local not=$1 n; for n in "${NODES[@]}"; do [ "$n" != "$not" ] && { echo "$n"; return 0; }; done; }
-# reload_lb: apply the rendered exception map (nginx re-reads the included file).
-reload_lb() { compose exec -T lb nginx -s reload; }
 sql_direct() { local node=$1; shift; hrana "http://localhost:$(direct_port "$node")" "$@"; }
 
 # The HTTP status of one statement through the LB, and nothing else. For checks that need to know
@@ -2608,19 +2606,10 @@ cmd_tpc_fleet() {
 # repl_hist_dump <file>: the fleet-summed A2 commit / commit_stage / commit_total Prometheus series,
 # one "series value" per line (every le bucket its own line - the old ad-hoc scrape truncated the
 # `collect` stage and only 92 of 80k samples were visible). Cumulative since boot, so the report
-# diffs two dumps. Series carry whatever tags telemetry.ex defines (outcome, stage, reset, and the
-# `mode` tag once team A2a's lands) - nothing here hard-codes them.
-repl_hist_dump() {
-  local out=$1 n tmp; tmp=$(mktemp)
-  for n in "${NODES[@]}"; do
-    rpc "$n" 'Fathom.Telemetry.scrape() |> IO.iodata_to_binary() |> String.split("\n") |> Enum.filter(&String.starts_with?(&1, "fathom_replication_commit")) |> Enum.reject(&String.starts_with?(&1, "#")) |> Enum.each(&IO.puts/1)' >> "$tmp"
-  done
-  awk '
-    NF >= 2 { i = match($0, / [^ ]+$/); k = substr($0, 1, i - 1); s[k] += substr($0, i + 1) }
-    END { for (k in s) printf "%s %.10g\n", k, s[k] }
-  ' "$tmp" | sort > "$out"
-  rm -f "$tmp"
-}
+# diffs two dumps. Series carry whatever tags telemetry.ex defines (outcome, stage, reset, `mode`) -
+# nothing here hard-codes them. A fixed-prefix call of `scrape_dump` below (cleanliness audit
+# 2026-11-13 #23: it was a copy of it).
+repl_hist_dump() { scrape_dump "$1" 'fathom_replication_commit'; }
 
 # repl_hist_report <before> <after>: every series' delta on its OWN line, then one summary line per
 # histogram group (count, mean ms, p50/p99 as bucket upper bounds). Series keys contain no spaces.
