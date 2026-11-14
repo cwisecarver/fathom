@@ -18,6 +18,43 @@ defmodule Fathom.Migrator.CaptureTest do
       assert Capture.classify("SAVEPOINT sp1") == :other
       assert Capture.classify("CREATE TABLE t (x)") == :other
     end
+
+    # Cleanliness audit 2026-11-13 #2: capture used its own prefix rules instead of the executor's
+    # (`Fathom.SqlLead`). A savepoint rollback spelled with TRANSACTION was read as a FULL rollback,
+    # which deletes the buffered migration (every later statement is dropped and the COMMIT is a
+    # :noop, so the template advances and the fleet never hears the version); a comment-led BEGIN was
+    # not seen at all, so no buffer opened.
+    test "ROLLBACK [TRANSACTION] TO [SAVEPOINT] is :other in every spelling; a plain one is :rollback" do
+      for sql <- [
+            "ROLLBACK TO sp1",
+            "ROLLBACK TO SAVEPOINT sp1",
+            "ROLLBACK TRANSACTION TO SAVEPOINT sp1",
+            "rollback transaction to sp1",
+            "ROLLBACK\nTO sp1",
+            "ROLLBACK /* c */ TO sp1",
+            "-- lead\nROLLBACK TRANSACTION TO sp1"
+          ] do
+        assert Capture.classify(sql) == :other, "#{inspect(sql)} keeps the transaction open"
+      end
+
+      for sql <- [
+            "ROLLBACK",
+            "ROLLBACK;",
+            "ROLLBACK TRANSACTION",
+            "rollback transaction ;",
+            "  ROLLBACK"
+          ] do
+        assert Capture.classify(sql) == :rollback, "#{inspect(sql)} ends the transaction"
+      end
+    end
+
+    test "a leading comment or empty statement does not hide BEGIN, COMMIT or ROLLBACK" do
+      assert Capture.classify("/* migrate */ BEGIN") == :begin
+      assert Capture.classify("-- m\nBEGIN IMMEDIATE") == :begin
+      assert Capture.classify(";BEGIN") == :begin
+      assert Capture.classify("-- m\nCOMMIT") == :commit
+      assert Capture.classify("/* x */ ROLLBACK") == :rollback
+    end
   end
 
   # Django's schema editor sends introspection along with the DDL, and capture recorded it as if it

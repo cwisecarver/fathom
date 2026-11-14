@@ -33,6 +33,25 @@ defmodule Fathom.SqlLead do
     end
   end
 
+  @doc """
+  Whether `sql` is `ROLLBACK [TRANSACTION] TO [SAVEPOINT] name`: it rewinds to a savepoint and leaves
+  the transaction OPEN, unlike a plain `ROLLBACK [TRANSACTION]`, which ends it. Both the executor's
+  write-flag reset and the migration capture's buffer reset must treat the two differently, and both
+  must read them the same way (cleanliness audit 2026-11-13 #2: capture had its own prefix rules and
+  read `ROLLBACK TRANSACTION TO SAVEPOINT s` as a full rollback, discarding the buffered migration).
+
+  Reads the grammar rather than looking for a spaced ` to `: SQLite treats a newline or a comment
+  between the tokens as whitespace, so `ROLLBACK\nTO s` and `ROLLBACK /* c */ TO s` are savepoint
+  rollbacks too.
+  """
+  @spec rollback_to_savepoint?(String.t()) :: boolean()
+  def rollback_to_savepoint?(sql) when is_binary(sql) do
+    Regex.match?(
+      ~r/\Arollback(?:(?:\s|--[^\n]*(?:\n|\z)|\/\*.*?(?:\*\/|\z))+transaction)?(?:\s|--[^\n]*(?:\n|\z)|\/\*.*?(?:\*\/|\z))+to\b/is,
+      strip(sql)
+    )
+  end
+
   defp after_delim(bin, delim) do
     case :binary.match(bin, delim) do
       {i, len} -> binary_part(bin, i + len, byte_size(bin) - i - len)

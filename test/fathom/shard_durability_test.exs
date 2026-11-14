@@ -528,7 +528,15 @@ defmodule Fathom.ShardDurabilityTest do
   # The second spelling is expert review 2026-10-20 #35's pin: the statement head is only 12 bytes
   # now, so "rollback tran" cannot show the " to " that distinguishes it from a full ROLLBACK; the
   # classifier must read the long form for a rollback, or this spelling clears the write flag.
-  for rollback <- ["ROLLBACK TO s", "ROLLBACK TRANSACTION TO SAVEPOINT s"] do
+  # The newline and comment spellings are cleanliness audit 2026-11-13 #2: the check used to look for a
+  # spaced " to " in the first 40 bytes, so `ROLLBACK\nTO s` read as a full ROLLBACK (SQLite treats the
+  # newline and a comment as whitespace between tokens).
+  for rollback <- [
+        "ROLLBACK TO s",
+        "ROLLBACK TRANSACTION TO SAVEPOINT s",
+        "ROLLBACK\nTO s",
+        "ROLLBACK /* c */ TO s"
+      ] do
     @rollback rollback
     test "a #{rollback} does not discard the outer transaction's write", %{shard: shard} do
       Application.put_env(:fathom, :shard_idle_ms, 50)

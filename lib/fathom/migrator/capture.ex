@@ -157,18 +157,32 @@ defmodule Fathom.Migrator.Capture do
   @spec pending_count(GenServer.server()) :: non_neg_integer()
   def pending_count(server \\ __MODULE__), do: GenServer.call(server, :pending_count)
 
-  @doc "Classifies a statement's transaction role. Savepoints count as `:other`."
+  @doc """
+  Classifies a statement's transaction role. Savepoints count as `:other`, including
+  `ROLLBACK [TRANSACTION] TO [SAVEPOINT] s`, which leaves the transaction open.
+
+  Reads the statement through `Fathom.SqlLead`, as the executor's own classifiers do: a leading
+  comment or `;` before `BEGIN` must not hide it (cleanliness audit 2026-11-13 #2).
+  """
   @spec classify(String.t()) :: :begin | :commit | :rollback | :other
   def classify(sql) do
-    norm = sql |> String.trim() |> String.upcase()
+    head = sql |> Fathom.SqlLead.strip() |> String.downcase(:ascii)
 
     cond do
-      String.starts_with?(norm, "BEGIN") -> :begin
-      String.starts_with?(norm, "COMMIT") -> :commit
-      String.starts_with?(norm, "END") -> :commit
-      norm == "ROLLBACK" or String.starts_with?(norm, "ROLLBACK;") -> :rollback
-      String.starts_with?(norm, "ROLLBACK TRANSACTION") -> :rollback
-      true -> :other
+      String.starts_with?(head, "begin") ->
+        :begin
+
+      String.starts_with?(head, "commit") ->
+        :commit
+
+      String.starts_with?(head, "end") ->
+        :commit
+
+      String.starts_with?(head, "rollback") and not Fathom.SqlLead.rollback_to_savepoint?(sql) ->
+        :rollback
+
+      true ->
+        :other
     end
   end
 

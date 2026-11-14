@@ -1152,13 +1152,12 @@ defmodule Fathom.ShardExecutor do
   # exactly Django's nested-atomic-raises-then-outer-commit shape. When in doubt, KEEP the flag:
   # keeping over-bumps (safe), clearing loses data.
   # The 12-byte head cannot see past `rollback` far enough to tell a full ROLLBACK from `ROLLBACK
-  # [TRANSACTION] TO <savepoint>`, so only a rollback pays for the long form (the same 40 bytes the
-  # head used to carry for every statement; expert review 2026-10-20 #35).
-  @rollback_head_bytes 40
-
+  # [TRANSACTION] TO <savepoint>`, so only a rollback pays for the grammar check
+  # (`SqlLead.rollback_to_savepoint?/1`, shared with the migration capture; expert review
+  # 2026-10-20 #35). It reads the grammar, not a spaced " to ": `ROLLBACK\nTO s` is a savepoint
+  # rollback too (cleanliness audit 2026-11-13 #2).
   defp rolls_back?(sql, head) do
-    String.starts_with?(head, "rollback") and
-      not String.contains?(head(sql, @rollback_head_bytes), " to ")
+    String.starts_with?(head, "rollback") and not Fathom.SqlLead.rollback_to_savepoint?(sql)
   end
 
   # The assignment form (`pragma [db.]name = value`) of a header-writing pragma; the
@@ -2434,14 +2433,14 @@ defmodule Fathom.ShardExecutor do
   # The head must reach the end of the longest `@read_shaped` verb or that verb can never match
   # (the 2026-09-05 ROLLBACK/SAVEPOINT regression). It is the SINGLE normaliser every classifier and
   # authorization gate reads (expert review 2026-10-20 #35 shortened it from 40 to 12 bytes: the
-  # longest verb any classifier matches is 9, `savepoint`; only `rolls_back?/2` needs more, and
-  # takes it from `head/2` itself). Do not add a second normaliser.
+  # longest verb any classifier matches is 9, `savepoint`; `rolls_back?/2` needs the longer form of a
+  # rollback and reads it through `SqlLead.rollback_to_savepoint?/1`). Do not add a second normaliser.
   if @head_bytes < @read_shaped_lead,
     do: raise("@head_bytes shorter than the longest @read_shaped verb")
 
-  defp head(sql, bytes \\ @head_bytes) when is_binary(sql) do
+  defp head(sql) when is_binary(sql) do
     stripped = strip_lead_noise(sql)
-    stripped |> binary_part(0, min(byte_size(stripped), bytes)) |> String.downcase(:ascii)
+    stripped |> binary_part(0, min(byte_size(stripped), @head_bytes)) |> String.downcase(:ascii)
   end
 
   defp lead(sql, n) do
