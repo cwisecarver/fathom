@@ -122,6 +122,17 @@ defmodule Fathom.Telemetry do
   (`TelemetryMetricsPrometheus`, `TelemetryMetricsStatsd`, a `ConsoleReporter`, ...) to export.
   """
   def metrics do
+    Enum.concat([
+      shard_metrics(),
+      rebalancer_metrics(),
+      dashboard_metrics(),
+      page_worthy_metrics(),
+      unexported_sweep_metrics()
+    ])
+  end
+
+  # Shard open/flush/storage/replication/lease/migration events: everything above the rebalancer section.
+  defp shard_metrics do
     [
       distribution("fathom.shard.cold_open.duration",
         event_name: [:fathom, :shard, :cold_open],
@@ -478,8 +489,13 @@ defmodule Fathom.Telemetry do
         ],
         description:
           "Local clock minus S3's response Date at a steal-liveness check (#13) — watch for skew that would drive wrongful steals"
-      ),
+      )
+    ]
+  end
 
+  # Rebalancer (Phase-2 B1): operability for the enable runbook.
+  defp rebalancer_metrics do
+    [
       # --- Rebalancer (Phase-2 B1) — operability for the enable runbook -------------------
       # Low-cardinality only: tag by node/outcome, never shard_id (the ShardLoad cardinality
       # rule). shard_id/from_node/to_node ride in event metadata for logs/traces.
@@ -529,8 +545,13 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :rebalancer, :reconcile, :divergence],
         description:
           "A pinned node stopped BEATING but still HOLDS the shard's S3 lease — reporter/data-plane divergence; the pin was kept (fail-safe). Sustained > 0 ⇒ investigate a wedged/off Reporter"
-      ),
+      )
+    ]
+  end
 
+  # Data-path metrics read by the admin dashboard.
+  defp dashboard_metrics do
+    [
       # --- Data-path metrics for the admin dashboard (all low-cardinality; per-shard data is the
       # ShardLoad read-API, never a metric tag) ------------------------------------------------
       distribution("fathom.shard.query.duration",
@@ -844,8 +865,13 @@ defmodule Fathom.Telemetry do
         measurement: :bytes,
         unit: :byte,
         description: "Total bytes stored across shard objects"
-      ),
+      )
+    ]
+  end
 
+  # Page-worthy signals referenced by deploy/observability/alert-rules.yml.
+  defp page_worthy_metrics do
+    [
       # --- Page-worthy signals that already emit telemetry but weren't exported (review #30) ----
       # Each is referenced by a rule in deploy/observability/alert-rules.yml. Low-cardinality
       # (no shard_id tag — that's the ShardLoad read-API; shard_id rides event metadata for logs).
@@ -1026,8 +1052,13 @@ defmodule Fathom.Telemetry do
         event_name: [:fathom, :migrator, :post_migrate_unattached],
         description:
           "Django post_migrate transactions that could not be attached to their version — tenants that already crossed it lack the new model's content type/permissions"
-      ),
+      )
+    ]
+  end
 
+  # The emitted-but-unexported sweep (2026-08-06): events that had no metric.
+  defp unexported_sweep_metrics do
+    [
       # --- The rest of the emitted-but-unexported sweep (2026-08-06) --------------------------
       # `fork_fallback` above was not a one-off. A diff of every `:telemetry.execute` in lib/
       # against this list found 13 events that emitted into the void — no metric, no Prometheus
