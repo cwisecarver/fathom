@@ -253,7 +253,7 @@ defmodule Fathom.Admin.FleetCollector do
   def handle_info({ref, overview}, %{task: %{ref: ref}} = state) do
     Process.demonitor(ref, [:flush])
     overview = stamp(overview)
-    Phoenix.PubSub.broadcast(Fathom.PubSub, @topic, {:fleet, overview})
+    Phoenix.PubSub.local_broadcast(Fathom.PubSub, @topic, {:fleet, overview})
     {:noreply, schedule(%{state | current: overview, task: nil})}
   end
 

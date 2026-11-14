@@ -1115,8 +1115,8 @@ defmodule Fathom.Shard.HeartbeatTest do
     end
 
     # Expert review 2026-11-07 #80. `Phoenix.PubSub.broadcast/3` also reaches every node joined by
-    # distributed Erlang (the phx.new `DNSCluster` child is wired; `DNS_CLUSTER_QUERY` is
-    # documented). A coordinator compares the message's generation with its OWN node's `acquire_gen`
+    # distributed Erlang (the phx.new `DNSCluster` child was wired then and has since been
+    # removed; the broadcast stays local). A coordinator compares the message's generation with its OWN node's `acquire_gen`
     # and another node's generation almost always differs, so one node's store trouble armed a
     # `check_lease` GET on every coordinator of every node. The generation is node-local state, so
     # the lapse goes to this node's coordinators only.

@@ -155,7 +155,6 @@ defmodule Fathom.MixProject do
       {:gettext, "~> 1.0"},
       {:jason, "~> 1.2"},
       {:oban, "~> 2.18"},
-      {:dns_cluster, "~> 0.3.1"},
       {:bandit, "~> 1.5"},
       {:exqlite, "~> 0.27"},
       # The Hrana (libSQL) protocol server AND client — fathom serves shards through it.

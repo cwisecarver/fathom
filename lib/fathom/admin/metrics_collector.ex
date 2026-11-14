@@ -201,7 +201,7 @@ defmodule Fathom.Admin.MetricsCollector do
   def handle_info(:tick, state) do
     state = tick(state)
     :ets.insert(@current_table, {:current, state.current})
-    Phoenix.PubSub.broadcast(Fathom.PubSub, topic(), {:metrics, state.current})
+    Phoenix.PubSub.local_broadcast(Fathom.PubSub, topic(), {:metrics, state.current})
     schedule(:tick, tick_ms())
     {:noreply, state}
   end

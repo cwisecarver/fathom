@@ -1641,8 +1641,6 @@ if config_env() == :prod do
 
   host = System.get_env("PHX_HOST") || "example.com"
 
-  config :fathom, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
-
   # The Hrana data path carries no in-app credential (see docs/deploy-cluster.md): the trust
   # boundary is the network, so the port must be reachable only via the L7 LB. Pin the listener
   # to the private interface the LB reaches as defense-in-depth alongside the firewall/security
