@@ -90,7 +90,7 @@ defmodule FathomWeb.AdminDurabilityLive do
       <div id="durability-page" class="space-y-6">
         <div :if={@snap == nil} id="durability-loading" class="skeleton h-40 rounded-lg"></div>
 
-        <.panel :if={@snap} title="Durability alarms">
+        <.panel :if={@snap} id="alarm-panel" title="Durability alarms">
           <:actions>
             <span id="alarm-window" class="text-xs text-base-content/50">
               {window_label(@snap)}

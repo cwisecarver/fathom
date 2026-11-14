@@ -117,8 +117,13 @@ defmodule FathomWeb.AdminMigrationsLive do
 
       <div :if={@mig} class="space-y-6">
         <div class="grid grid-cols-2 gap-4 lg:grid-cols-5">
-          <.stat_tile label="Fleet HEAD" value={if(@mig.head, do: "v#{@mig.head}", else: "—")} />
           <.stat_tile
+            id="fleet-head-tile"
+            label="Fleet HEAD"
+            value={if(@mig.head, do: "v#{@mig.head}", else: "—")}
+          />
+          <.stat_tile
+            id="held-for-review-tile"
             label="Held for review"
             value={fmt_int(length(@mig.review_blocks))}
             accent="text-error"
@@ -149,12 +154,20 @@ defmodule FathomWeb.AdminMigrationsLive do
             <div class="mt-4 space-y-4">
               <div
                 :for={b <- @mig.review_blocks}
+                id={"review-block-v#{b.version}"}
                 class="rounded-lg border border-base-300 bg-base-100/40 p-3"
               >
                 <div class="flex flex-wrap items-center gap-2">
                   <.badge kind={:error}>v{b.version}</.badge>
-                  <span class="text-sm font-medium text-base-content/90">{b.name}</span>
-                  <.badge kind={:warn}>{b.reason}</.badge>
+                  <span
+                    id={"review-block-v#{b.version}-name"}
+                    class="text-sm font-medium text-base-content/90"
+                  >
+                    {b.name}
+                  </span>
+                  <span id={"review-block-v#{b.version}-reason"}>
+                    <.badge kind={:warn}>{b.reason}</.badge>
+                  </span>
                 </div>
 
                 <p class="mt-2 text-sm text-base-content/70">{reason_text(b.reason)}</p>
@@ -163,7 +176,7 @@ defmodule FathomWeb.AdminMigrationsLive do
                   <div class="mb-1 text-[11px] uppercase tracking-wide text-base-content/50">
                     Flagged statements
                   </div>
-                  <div class="rounded bg-base-300/40 p-2">
+                  <div id={"review-block-v#{b.version}-statements"} class="rounded bg-base-300/40 p-2">
                     <code
                       :for={s <- detail_statements(b)}
                       class="block break-words text-[11px] leading-relaxed text-base-content/80"
@@ -173,7 +186,11 @@ defmodule FathomWeb.AdminMigrationsLive do
                   </div>
                 </div>
 
-                <div :if={detail_gap(b)} class="mt-3 text-xs text-base-content/60">
+                <div
+                  :if={detail_gap(b)}
+                  id={"review-block-v#{b.version}-gap"}
+                  class="mt-3 text-xs text-base-content/60"
+                >
                   Template/fleet migration-count gap:
                   <span class="num text-base-content/80">{detail_gap(b)}</span>
                 </div>
@@ -183,7 +200,7 @@ defmodule FathomWeb.AdminMigrationsLive do
                     Options
                   </div>
                   <div class="space-y-3">
-                    <div :for={o <- b.options}>
+                    <div :for={o <- b.options} id={"review-block-v#{b.version}-option-#{o.action}"}>
                       <div class="text-xs font-medium text-base-content/90">{o.action}</div>
                       <div class="mt-1 rounded bg-base-300/40 p-2">
                         <code class="block break-words text-[11px] text-base-content/80">
@@ -200,7 +217,7 @@ defmodule FathomWeb.AdminMigrationsLive do
         </div>
 
         <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
-          <.panel title="Release history">
+          <.panel id="release-history" title="Release history">
             <div
               :if={@mig.releases == []}
               class="py-6 text-center text-sm text-base-content/40"

@@ -72,9 +72,11 @@ defmodule FathomWeb.AdminDurabilityLiveTest do
   end
 
   test "the disconnected render is the shell only", %{conn: conn} do
-    html = conn |> auth() |> get("/admin/durability") |> html_response(200)
-    assert html =~ "durability-page"
-    refute html =~ "alarm-strip"
+    static =
+      conn |> auth() |> get("/admin/durability") |> html_response(200) |> LazyHTML.from_document()
+
+    assert static |> LazyHTML.query("#durability-page") |> Enum.count() == 1
+    assert static |> LazyHTML.query("#alarm-strip") |> Enum.count() == 0
   end
 
   test "empty state: no reporter, no replication, nothing dirty, no directory", %{conn: conn} do
@@ -270,7 +272,8 @@ defmodule FathomWeb.AdminDurabilityLiveTest do
     # Drain the connected mount's own refresh first, or its result races the injected data.
     render_async(view)
     # The async task runs against the real (uncached, reporter-less) module.
-    assert render_async(view) =~ "Durability alarms"
+    render_async(view)
+    assert has_element?(view, "#alarm-panel", "Durability alarms")
     assert has_element?(view, "#alarm-strip")
   end
 end

@@ -42,10 +42,11 @@ defmodule FathomWeb.AdminDirectoryLiveTest do
 
     {:ok, view, _html} = conn |> auth() |> live("/admin/directory")
 
-    cell = view |> element("#dir-flushed-ui_rel") |> render()
-    assert cell =~ ~s(title="#{DateTime.to_iso8601(flushed)}")
-    assert cell =~ "2d ago"
-    assert cell =~ "whitespace-nowrap"
+    assert has_element?(
+             view,
+             "#dir-flushed-ui_rel[title='#{DateTime.to_iso8601(flushed)}']",
+             "2d ago"
+           )
   end
 
   test "mounts behind auth and renders directory rows", %{conn: conn} do
@@ -67,8 +68,12 @@ defmodule FathomWeb.AdminDirectoryLiveTest do
 
     # `get/2` is the static render only — no socket, so no load/1.
     html = conn |> auth() |> get("/admin/directory") |> html_response(200)
+    static = LazyHTML.from_document(html)
 
-    refute html =~ "dir-row-ui_deferred",
+    # Positive control: the shell rendered, so an absent row means "not queried", not "no page".
+    assert static |> LazyHTML.query("#directory-filter") |> Enum.count() == 1
+
+    assert static |> LazyHTML.query("#dir-row-ui_deferred") |> Enum.count() == 0,
            "the disconnected mount must not run the directory query (#32)"
 
     # The connected mount fills it in.
@@ -138,7 +143,7 @@ defmodule FathomWeb.AdminDirectoryLiveTest do
     |> element("#directory-edit-form")
     |> render_submit(%{"edit" => %{"status" => "active", "retain_until" => ""}})
 
-    assert render(view) =~ "changed state while you were editing"
+    assert has_element?(view, "#flash-error", "changed state while you were editing")
     assert {:ok, %{status: "deleted"}} = Directory.get("ui_race")
   end
 
@@ -198,12 +203,11 @@ defmodule FathomWeb.AdminDirectoryLiveTest do
     {:ok, view, _html} = conn |> auth() |> live("/admin/directory")
     view |> element("#dir-edit-ui_badtime") |> render_click()
 
-    html =
-      view
-      |> element("#directory-edit-form")
-      |> render_submit(%{"edit" => %{"status" => "retired", "retain_until" => "not-a-date"}})
+    view
+    |> element("#directory-edit-form")
+    |> render_submit(%{"edit" => %{"status" => "retired", "retain_until" => "not-a-date"}})
 
-    assert html =~ "ISO-8601"
+    assert has_element?(view, "#directory-edit-error", "ISO-8601")
     assert {:ok, row} = Directory.get("ui_badtime")
     assert row.status == "active"
   end

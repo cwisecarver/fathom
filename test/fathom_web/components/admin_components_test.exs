@@ -50,36 +50,39 @@ defmodule FathomWeb.AdminComponentsTest do
   describe "rel_time/1 and load_empty_reason/1" do
     import Phoenix.LiveViewTest
 
+    # Components render to a string with no view to ask, so parse it and query by selector.
+    defp has_el?(html, selector, text \\ nil) do
+      matches = html |> LazyHTML.from_fragment() |> LazyHTML.query(selector)
+      Enum.count(matches) > 0 and (is_nil(text) or LazyHTML.text(matches) =~ text)
+    end
+
     # Symptom (browser review 2026-10-16): raw ISO timestamps wrapped to two lines. The cell is now
     # relative + nowrap, with the full UTC timestamp kept in `title`.
     test "rel_time carries the ISO timestamp in a title" do
       at = DateTime.add(DateTime.utc_now(), -3 * 3600)
       html = render_component(&rel_time/1, id: "t", at: at)
-      assert html =~ ~s(title="#{DateTime.to_iso8601(at)}")
-      assert html =~ "whitespace-nowrap"
-      assert html =~ "3h ago"
+      assert has_el?(html, "#t[title='#{DateTime.to_iso8601(at)}']", "3h ago")
     end
 
     # Symptom: the empty state said "set SHARD_LOAD=true" even when it was already true; the
     # missing piece was the reporter. Every branch names the thing that is actually missing.
     test "load_empty_reason names what is actually missing" do
       off = render_component(&load_empty_reason/1, load: false, reporter: false)
-      assert off =~ "load-reason-load-off"
-      assert off =~ "SHARD_LOAD=true"
+      assert has_el?(off, "#load-reason-load-off", "SHARD_LOAD=true")
 
       rep = render_component(&load_empty_reason/1, load: true, reporter: false)
-      assert rep =~ "load-reason-reporter-off"
-      assert rep =~ "LOAD_REPORTER=true"
-      refute rep =~ "SHARD_LOAD=true"
+      assert has_el?(rep, "#load-reason-reporter-off", "LOAD_REPORTER=true")
+      refute has_el?(rep, "#load-reason-reporter-off", "SHARD_LOAD=true")
+      refute has_el?(rep, "#load-reason-load-off")
 
       none = render_component(&load_empty_reason/1, load: true, reporter: true)
-      assert none =~ "load-reason-no-traffic"
+      assert has_el?(none, "#load-reason-no-traffic")
 
       # Node scope does not need the reporter.
       node =
         render_component(&load_empty_reason/1, load: true, reporter: false, scope: :node)
 
-      assert node =~ "load-reason-no-traffic"
+      assert has_el?(node, "#load-reason-no-traffic")
     end
   end
 end

@@ -91,8 +91,8 @@ defmodule FathomWeb.AdminShardsLive do
               <tr class="border-b border-base-300">
                 <th class="py-2 text-left font-medium">Shard</th>
                 <th class="py-2 text-right font-medium">q/s</th>
-                <th class="py-2 text-right font-medium">p50</th>
-                <th class="py-2 text-right font-medium">p99</th>
+                <th id="hot-shards-p50-head" class="py-2 text-right font-medium">p50</th>
+                <th id="hot-shards-p99-head" class="py-2 text-right font-medium">p99</th>
                 <th class="py-2 text-right font-medium">rows read/s</th>
                 <th class="py-2 text-right font-medium">rows written/s</th>
                 <th class="py-2 text-right font-medium">queries (total)</th>
@@ -101,14 +101,25 @@ defmodule FathomWeb.AdminShardsLive do
             <tbody>
               <tr
                 :for={s <- hot(@metrics)}
+                id={"hot-shard-#{s.shard_id}"}
                 class="border-b border-base-300/50 hover:bg-base-content/5"
               >
                 <td class="num py-1.5 text-base-content/80">
                   <.link navigate={~p"/admin/shards/#{s.shard_id}"} class="link">{s.shard_id}</.link>
                 </td>
                 <td class="num py-1.5 text-right">{fmt_rate(s.q_per_s)}</td>
-                <td class="num py-1.5 text-right text-base-content/60">{fmt_ms(s.p50_ms)}</td>
-                <td class="num py-1.5 text-right text-base-content/60">{fmt_ms(s.p99_ms)}</td>
+                <td
+                  id={"hot-shard-#{s.shard_id}-p50"}
+                  class="num py-1.5 text-right text-base-content/60"
+                >
+                  {fmt_ms(s.p50_ms)}
+                </td>
+                <td
+                  id={"hot-shard-#{s.shard_id}-p99"}
+                  class="num py-1.5 text-right text-base-content/60"
+                >
+                  {fmt_ms(s.p99_ms)}
+                </td>
                 <td class="num py-1.5 text-right text-base-content/60">
                   {fmt_rate(s.rows_read_per_s)}
                 </td>

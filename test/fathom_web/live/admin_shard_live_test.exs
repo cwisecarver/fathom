@@ -137,11 +137,14 @@ defmodule FathomWeb.AdminShardLiveTest do
     {:ok, view, _} = conn |> auth() |> live("/admin/shards/shard-h1")
     render_async(view)
 
-    html = view |> element("#shard-directory") |> render()
-    assert html =~ "Last flushed"
-    refute html =~ "last_flushed_at"
-    assert html =~ ~s(title="#{DateTime.to_iso8601(flushed)}")
-    assert html =~ "3h ago"
+    assert has_element?(view, "#shard-directory-last-flushed", "Last flushed")
+    refute has_element?(view, "#shard-directory", "last_flushed_at")
+
+    assert has_element?(
+             view,
+             "#shard-directory-last-flushed-time[title='#{DateTime.to_iso8601(flushed)}']",
+             "3h ago"
+           )
   end
 
   test "empty samples state names a reason (SHARD_LOAD off in test)", %{conn: conn} do

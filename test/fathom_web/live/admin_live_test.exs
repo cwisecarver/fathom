@@ -106,9 +106,9 @@ defmodule FathomWeb.AdminLiveTest do
       # chose to assert, it is an accidental latency assertion smuggled into a functional test.
       # A Postgres round-trip on a busy machine exceeds it easily. What is under test is that the
       # async assign COMPLETES and renders, not how fast. Matches admin_query_live_test.exs.
-      html = render_async(view, 5_000)
-      assert html =~ "Total shards"
-      assert html =~ "Storage (S3)"
+      render_async(view, 5_000)
+      assert has_element?(view, "#fleet-total-shards-tile", "Total shards")
+      assert has_element?(view, "#storage-panel", "Storage (S3)")
     end
 
     # "Nodes live" counts the `rebalancer_nodes` roster, which ONLY the load reporter writes
@@ -238,7 +238,7 @@ defmodule FathomWeb.AdminLiveTest do
         %{node_key: "other@h", last_seen_at: seen, q_p99: 1.0, sample_count: 1, alive: true}
       ])
 
-      assert render(view) =~ "hot-shard p99 q/s"
+      assert has_element?(view, "#nodes-hot-shard-p99-head", "hot-shard p99 q/s")
       assert has_element?(view, "#scope-this-node", "this node")
 
       assert has_element?(
@@ -263,10 +263,9 @@ defmodule FathomWeb.AdminLiveTest do
         {:metrics, metrics(%{node_qps: 4242.0})}
       )
 
-      html = render(view)
       # node QPS rendered via fmt_rate → "4,242.0", and the hot shard row appears.
-      assert html =~ "4,242"
-      assert html =~ "acme"
+      assert has_element?(view, "#qps-tile", "4,242.0")
+      assert has_element?(view, "#hot-shard-acme", "acme")
     end
 
     # Regression (expert review 2026-07-14 #13): mount seeded @history once from the collector
@@ -309,12 +308,13 @@ defmodule FathomWeb.AdminLiveTest do
         {:metrics, metrics(%{})}
       )
 
-      html = render(view)
-      # The hot-shard row carries per-shard tail latency: p99_ms 42.0 → "42 ms".
-      assert html =~ "acme"
-      assert html =~ "p50"
-      assert html =~ "p99"
-      assert html =~ "42 ms"
+      # The hot-shard row carries per-shard tail latency: p50_ms 1.5 → "1.5 ms", p99_ms 42.0 →
+      # "42 ms".
+      assert has_element?(view, "#hot-shard-acme", "acme")
+      assert has_element?(view, "#hot-shards-p50-head", "p50")
+      assert has_element?(view, "#hot-shards-p99-head", "p99")
+      assert has_element?(view, "#hot-shard-acme-p50", "1.5 ms")
+      assert has_element?(view, "#hot-shard-acme-p99", "42 ms")
     end
 
     test "migrations page mounts and loads fleet state", %{conn: conn} do
@@ -322,9 +322,9 @@ defmodule FathomWeb.AdminLiveTest do
       # Explicit timeout for the same reason as the overview panel above — this was the most
       # frequent load-induced failure in the suite (6 of 7 full runs at load average 30-60 on
       # 2026-07-26), purely because render_async/1's default is 100ms.
-      html = render_async(view, 5_000)
-      assert html =~ "Fleet HEAD"
-      assert html =~ "Release history"
+      render_async(view, 5_000)
+      assert has_element?(view, "#fleet-head-tile", "Fleet HEAD")
+      assert has_element?(view, "#release-history", "Release history")
     end
   end
 
@@ -333,21 +333,21 @@ defmodule FathomWeb.AdminLiveTest do
   # looks at. Before this the page rendered "Fleet HEAD v1" with no hint that v2 was held, so the
   # operator saw laggards that never converged and nothing explaining why.
   describe "migrations page — review blocks" do
-    defp migrations_html(conn) do
+    defp migrations_view(conn) do
       {:ok, view, _html} = conn |> auth() |> live("/admin/migrations")
 
       # Same 5s render_async timeout as the mount test above (load-induced flake, not a real wait).
-      {view, render_async(view, 5_000)}
+      render_async(view, 5_000)
+      view
     end
 
     test "no held versions ⇒ no review panel, and the tile reads zero", %{conn: conn} do
       {:ok, _} = Migrator.release(1, "v1", ["CREATE TABLE app (id integer)"])
 
-      {_view, html} = migrations_html(conn)
+      view = migrations_view(conn)
 
-      assert html =~ "Held for review"
-      refute html =~ "Rollout held"
-      refute html =~ "attach_transform"
+      assert has_element?(view, "#held-for-review-tile", ~r/Held for review\s*0/)
+      refute has_element?(view, "#review-blocks")
     end
 
     test "a held data migration shows why it is held and BOTH options", %{conn: conn} do
@@ -360,23 +360,30 @@ defmodule FathomWeb.AdminLiveTest do
         "statements" => ["UPDATE app SET tier = 'gold'"]
       })
 
-      {_view, html} = migrations_html(conn)
+      view = migrations_view(conn)
 
       # HEAD is capped below the held version — the state the panel exists to explain.
-      assert html =~ "v1"
-      assert html =~ "Rollout held"
-      assert html =~ "0002_backfill"
-      assert html =~ "data_migration"
+      assert has_element?(view, "#fleet-head-tile", "v1")
+      assert has_element?(view, "#review-blocks", "Rollout held")
+      assert has_element?(view, "#review-block-v2-name", "0002_backfill")
+      assert has_element?(view, "#review-block-v2-reason", "data_migration")
 
       # The statement that tripped the flag, verbatim. "which statements" is the first thing an
       # operator needs and the one thing the old `pending_review: [2]` could never tell them.
-      assert html =~ "UPDATE app SET tier"
+      assert has_element?(view, "#review-block-v2-statements", "UPDATE app SET tier")
 
       # Both options, each with its runnable command. The panel is the decision, spelled out.
-      assert html =~ "attach_transform"
-      assert html =~ "Fathom.Migrator.attach_transform"
-      assert html =~ "approve_review"
-      assert html =~ "Fathom.Migrator.approve_review"
+      assert has_element?(
+               view,
+               "#review-block-v2-option-attach_transform",
+               "Fathom.Migrator.attach_transform"
+             )
+
+      assert has_element?(
+               view,
+               "#review-block-v2-option-approve_review",
+               "Fathom.Migrator.approve_review"
+             )
     end
 
     # A gap means the fleet is MISSING DDL, so `approve_review` is never the right move — advancing
@@ -390,17 +397,16 @@ defmodule FathomWeb.AdminLiveTest do
 
       Migrator.set_review_reason(2, "migration_gap", %{"gap" => "%{before: 9, last: 7}"})
 
-      {_view, html} = migrations_html(conn)
+      view = migrations_view(conn)
 
-      assert html =~ "Rollout held"
-      assert html =~ "migration_gap"
-      assert html =~ "reconcile_template"
-      assert html =~ "atomic = False"
+      assert has_element?(view, "#review-blocks", "Rollout held")
+      assert has_element?(view, "#review-block-v2-reason", "migration_gap")
+      assert has_element?(view, "#review-block-v2-option-reconcile_template", "atomic = False")
       # The gap detail itself, so the operator can see how far the template ran ahead.
-      assert html =~ "before: 9"
+      assert has_element?(view, "#review-block-v2-gap", "before: 9")
 
-      refute html =~ "approve_review"
-      refute html =~ "attach_transform"
+      refute has_element?(view, "#review-block-v2-option-approve_review")
+      refute has_element?(view, "#review-block-v2-option-attach_transform")
     end
 
     # The upgrade path: releases captured BEFORE #26 added the reason columns carry
@@ -415,12 +421,17 @@ defmodule FathomWeb.AdminLiveTest do
       # No set_review_reason/3 call — review_reason stays nil, exactly as a pre-#26 row.
       {:ok, _} = Migrator.release(2, "0002_legacy", ["INSERT INTO app VALUES (1)"], nil, true)
 
-      {_view, html} = migrations_html(conn)
+      view = migrations_view(conn)
 
-      assert html =~ "Rollout held"
-      assert html =~ "data_migration"
-      assert html =~ "INSERT INTO app VALUES (1)"
-      assert html =~ "Fathom.Migrator.approve_review"
+      assert has_element?(view, "#review-blocks", "Rollout held")
+      assert has_element?(view, "#review-block-v2-reason", "data_migration")
+      assert has_element?(view, "#review-block-v2-statements", "INSERT INTO app VALUES (1)")
+
+      assert has_element?(
+               view,
+               "#review-block-v2-option-approve_review",
+               "Fathom.Migrator.approve_review"
+             )
     end
 
     # The panel is deliberately READ-ONLY (see the LiveView's moduledoc). `attach_transform` cannot
@@ -432,9 +443,9 @@ defmodule FathomWeb.AdminLiveTest do
       {:ok, _} = Migrator.release(1, "v1", ["CREATE TABLE app (id integer)"])
       {:ok, _} = Migrator.release(2, "0002_backfill", ["UPDATE app SET tier = 'gold'"], nil, true)
 
-      {view, html} = migrations_html(conn)
+      view = migrations_view(conn)
 
-      assert html =~ "Rollout held"
+      assert has_element?(view, "#review-blocks", "Rollout held")
       refute has_element?(view, "#review-blocks [phx-click]")
     end
   end

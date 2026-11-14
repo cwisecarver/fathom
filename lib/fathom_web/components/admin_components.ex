@@ -13,10 +13,11 @@ defmodule FathomWeb.AdminComponents do
   attr :class, :any, default: nil
   slot :actions
   slot :inner_block, required: true
+  attr :rest, :global
 
   def panel(assigns) do
     ~H"""
-    <section class={["rounded-lg border border-base-300 bg-base-200/40", @class]}>
+    <section class={["rounded-lg border border-base-300 bg-base-200/40", @class]} {@rest}>
       <div
         :if={@title || @actions != []}
         class="flex items-center justify-between gap-2 px-4 py-3 border-b border-base-300"
@@ -36,10 +37,14 @@ defmodule FathomWeb.AdminComponents do
   attr :sub, :string, default: nil
   attr :accent, :string, default: "text-primary"
   slot :inner_block
+  attr :rest, :global
 
   def stat_tile(assigns) do
     ~H"""
-    <div class="rounded-lg border border-base-300 bg-base-200/40 p-4 transition-colors hover:border-base-content/25">
+    <div
+      class="rounded-lg border border-base-300 bg-base-200/40 p-4 transition-colors hover:border-base-content/25"
+      {@rest}
+    >
       <span class="text-[11px] uppercase tracking-wide text-base-content/50">{@label}</span>
       <div class="mt-1 flex items-baseline gap-1">
         <span class="num text-2xl font-medium leading-none">{@value}</span>

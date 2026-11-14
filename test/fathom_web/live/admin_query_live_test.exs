@@ -42,8 +42,8 @@ defmodule FathomWeb.AdminQueryLiveTest do
 
   test "an empty shard renders an input error without querying", %{conn: conn} do
     {:ok, view, _html} = conn |> auth() |> live("/admin/query")
-    html = view |> form("#query-form", q: %{shard: "", sql: "SELECT 1"}) |> render_submit()
-    assert html =~ "enter a shard id"
+    view |> form("#query-form", q: %{shard: "", sql: "SELECT 1"}) |> render_submit()
+    assert has_element?(view, "#query-error", "enter a shard id")
   end
 
   # Expert review 2026-07-18 #16: the console only trimmed the shard field, then QueryConsole
@@ -53,10 +53,9 @@ defmodule FathomWeb.AdminQueryLiveTest do
   test "an invalid (dotted) shard id renders an error without querying", %{conn: conn} do
     {:ok, view, _html} = conn |> auth() |> live("/admin/query")
 
-    html =
-      view |> form("#query-form", q: %{shard: "acme.other", sql: "SELECT 1"}) |> render_submit()
+    view |> form("#query-form", q: %{shard: "acme.other", sql: "SELECT 1"}) |> render_submit()
 
-    assert html =~ "invalid shard id"
+    assert has_element?(view, "#query-error", "invalid shard id")
     # It short-circuited before the async query — no result pane appears.
     refute has_element?(view, "#query-results")
   end
@@ -71,9 +70,8 @@ defmodule FathomWeb.AdminQueryLiveTest do
     |> form("#query-form", q: %{shard: id, sql: "SELECT v FROM t"})
     |> render_submit()
 
-    html = render_async(view, 5_000)
-    assert html =~ "hi"
-    assert has_element?(view, "#query-results")
+    render_async(view, 5_000)
+    assert has_element?(view, "#query-results td", "hi")
   end
 
   # Expert review 2026-10-10 #W1: console runs (arbitrary SQL, writes/DDL on any tenant) left no
@@ -178,12 +176,11 @@ defmodule FathomWeb.AdminQueryLiveTest do
 
       assert_receive {:statement_left, _}, 5_000
 
-      html =
-        view
-        |> form("#query-form", q: %{shard: id, sql: "DROP TABLE t -- the second statement"})
-        |> render_submit()
+      view
+      |> form("#query-form", q: %{shard: id, sql: "DROP TABLE t -- the second statement"})
+      |> render_submit()
 
-      assert html =~ "already running"
+      assert has_element?(view, "#query-error", "already running")
       refute_receive {:statement_left, _}, 500, "the superseding statement was sent"
 
       assert [row] = Fathom.Audit.list(shard_id: id)

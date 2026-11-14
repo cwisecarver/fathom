@@ -523,7 +523,9 @@ defmodule FathomWeb.AdminDirectoryLive do
                         <button type="button" phx-click="cancel_edit" class="btn btn-ghost btn-xs">
                           Cancel
                         </button>
-                        <span :if={@edit_error} class="text-xs text-error">{@edit_error}</span>
+                        <span :if={@edit_error} id="directory-edit-error" class="text-xs text-error">
+                          {@edit_error}
+                        </span>
                       </form>
                     </td>
                   </tr>

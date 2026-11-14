@@ -154,7 +154,11 @@ defmodule FathomWeb.AdminOverviewLive do
           <div :for={_ <- 1..4} class="skeleton h-24 rounded-lg"></div>
         </div>
         <div :if={@fleet} class="grid grid-cols-2 gap-4 lg:grid-cols-5">
-          <.stat_tile label="Total shards" value={fmt_int(@fleet.total_shards)} />
+          <.stat_tile
+            id="fleet-total-shards-tile"
+            label="Total shards"
+            value={fmt_int(@fleet.total_shards)}
+          />
           <.stat_tile label="Active" value={fmt_int(@fleet.by_status["active"] || 0)} />
           <%!-- The roster is written ONLY by the load reporter (LOAD_REPORTER, off by default), so an
                empty one is "nobody reports", not "nobody is alive": this very node is serving the
@@ -205,6 +209,7 @@ defmodule FathomWeb.AdminOverviewLive do
         <%!-- This-node KPI row (realtime) --%>
         <div class="grid grid-cols-2 gap-4 md:grid-cols-3 lg:grid-cols-6">
           <.stat_tile
+            id="qps-tile"
             label="Queries / sec"
             value={fmt_rate(m(@metrics, :node_qps))}
             accent="text-info"
@@ -312,6 +317,7 @@ defmodule FathomWeb.AdminOverviewLive do
               <tbody>
                 <tr
                   :for={s <- hot(@metrics)}
+                  id={"hot-shard-#{s.shard_id}"}
                   class="border-b border-base-300/50 hover:bg-base-content/5"
                 >
                   <td class="num py-1.5 text-left text-base-content/80">
@@ -329,7 +335,7 @@ defmodule FathomWeb.AdminOverviewLive do
             </table>
           </.panel>
 
-          <.panel title="Storage (S3)">
+          <.panel id="storage-panel" title="Storage (S3)">
             <dl class="space-y-3">
               <.stat_row label="Objects stored" value={fmt_int(m(@metrics, :storage_objects))} />
               <.stat_row label="Bytes stored" value={fmt_bytes(m(@metrics, :storage_bytes))} />
@@ -375,6 +381,7 @@ defmodule FathomWeb.AdminOverviewLive do
                   <th class="py-2 text-left font-medium">Node</th>
                   <th class="py-2 text-right font-medium">q/s</th>
                   <th
+                    id="nodes-hot-shard-p99-head"
                     class="hidden py-2 text-right font-medium sm:table-cell"
                     title="99th percentile of this node's per-shard q/s (its hottest shards), not a latency"
                   >

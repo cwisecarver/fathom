@@ -166,8 +166,16 @@ defmodule FathomWeb.AdminShardLive do
               class="grid grid-cols-2 gap-3 text-sm md:grid-cols-4"
               id="shard-directory"
             >
-              <.kv :for={{label, value} <- directory_fields(@cp.directory)} label={label}>
-                <.rel_time :if={match?({:time, _}, value)} at={elem(value, 1)} />
+              <.kv
+                :for={{label, value} <- directory_fields(@cp.directory)}
+                id={"shard-directory-#{slug(label)}"}
+                label={label}
+              >
+                <.rel_time
+                  :if={match?({:time, _}, value)}
+                  id={"shard-directory-#{slug(label)}-time"}
+                  at={elem(value, 1)}
+                />
                 <span :if={!match?({:time, _}, value)}>{value}</span>
               </.kv>
             </dl>
@@ -271,17 +279,20 @@ defmodule FathomWeb.AdminShardLive do
     """
   end
 
+  attr :id, :string, default: nil
   attr :label, :string, required: true
   slot :inner_block, required: true
 
   defp kv(assigns) do
     ~H"""
-    <div>
+    <div id={@id}>
       <dt class="text-[11px] uppercase tracking-wide text-base-content/50">{@label}</dt>
       <dd class="num mt-0.5">{render_slot(@inner_block)}</dd>
     </div>
     """
   end
+
+  defp slug(label), do: label |> String.downcase() |> String.replace(" ", "-")
 
   defp directory_fields(d) do
     [
