@@ -101,18 +101,18 @@ through node churn, warm-standby 304-promote observed). See
 
 ## Forward edge — Phase 2
 
-`docs/phase2-scoping.md` scopes it. **A1 (warm standby)** is built —
-`Fathom.Shard.WarmFollower` pre-pulls the hot set to survivors and promotes a
-freshness-validated (304) copy on failover. **B1 (dynamic rebalancing)** is built too
+`docs/phase2-scoping.md` scopes it. **A1 (warm standby)** was built and then **removed
+2026-09-14**, superseded by A2 (`Fathom.Shard.WarmFollower` no longer exists; see
+[warm-standby.md](warm-standby.md)). **B1 (dynamic rebalancing)** is built
 (`Fathom.Rebalancer.*`, 2026-07-06): a per-node load reporter → Postgres, a p99/absolute
 hot policy with anti-flap, an nginx exception-table (`map $host $fathom_target`) layered
-on the hash, and an Oban cron + handoff (warm → flip the LB → drain the source → target
+on the hash, and an Oban cron + handoff (flip the LB → drain the source → target
 acquires; the lease blocks any double-write). Proven live on the chaos rig
-(`chaos.sh rebalance`). All gated off by default. Remaining: **C** (shard locality /
-affinity), **A2** (active-shard WAL follower — **working on the `a2-quorum-replication` branch, not
-merged here** (proven end to end on the rig 2026-08-11); the "exqlite exposes no WAL seam" blocker was disproved 2026-08-09, and it ships
-frames over its own socket protocol with **no BEAM distribution**, so S3 remains the only cross-node
-*coordination*. See [a2-quorum-replication](a2-quorum-replication.md)).
+(`chaos.sh rebalance`). Rebalancing is gated off by default. **A2** (active-shard WAL follower)
+is built, merged and **on by default in prod since 2026-08-29** (the "exqlite exposes no WAL seam"
+blocker was disproved 2026-08-09): it ships frames over its own socket protocol with **no BEAM
+distribution**, so S3 remains the only cross-node *coordination*. See
+[a2-quorum-replication](a2-quorum-replication.md). Remaining: **C** (shard locality / affinity).
 
 **Data-path engine — decided 2026-07-06: exqlite.** The `Fathom.ShardRepo` /
 `Ecto.Adapters.LibSql` path (defined but never wired) was evaluated and removed. The
