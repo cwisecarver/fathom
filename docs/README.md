@@ -122,8 +122,10 @@ what actually shipped (some plan assumptions were superseded).
   opaque tenant SQL. **Built and on by default in prod since 2026-08-29** (off in
   dev/test; `REPLICATION_ENABLED` / `REPLICATION_LISTEN` override it). The doc's stated blocker — "exqlite exposes no WAL-frame API" — was
   **disproved 2026-08-09**: a loadable extension gets a live `sqlite3*` and `sqlite3_wal_hook` is in
-  the extension pointer table, so exqlite's surface was never the boundary. Current scale limit and
-  the fixed OOM: [reviews/a2-feedback-loop-fixed-2026-08-17.md](reviews/a2-feedback-loop-fixed-2026-08-17.md).
+  the extension pointer table, so exqlite's surface was never the boundary. The fixed OOM:
+  [reviews/a2-feedback-loop-fixed-2026-08-17.md](reviews/a2-feedback-loop-fixed-2026-08-17.md) (its "1024 still
+  no result" is superseded: 1024 tenants run clean with replication on). Current replication-ON ceiling:
+  [reviews/tpc-fleet-ceiling-2026-11-11.md](reviews/tpc-fleet-ceiling-2026-11-11.md).
 
 ## Benchmarking
 
@@ -156,11 +158,15 @@ what actually shipped (some plan assumptions were superseded).
   tenants or revoked tokens.
 - **[runbooks/lock-repair.md](runbooks/lock-repair.md)** — a shard whose lease lock is undecodable
   fails closed on both backends; repairing it with `mix fathom.lock.repair` (epoch never moves back).
+- **[runbooks/replication-frame-auth.md](runbooks/replication-frame-auth.md)** — the staged rollout of A2
+  replication frame authentication (HMAC signing, then requiring it): a reachable replication port is
+  otherwise write access to every shard on the node.
 - **[runbooks/rig-arms.md](runbooks/rig-arms.md)** — three opt-in chaos-rig arms (expert review
   2026-10-29 #16/#18/#2): a gp3-capped disk (`RIG_DISK_CAP`, replicas shared vs on their own capped
   device), the prod auth posture (`TPC_AUTH=required`, with a node-restart phase), and sparse tenants
   with replication on (`tpc-sparse`, `POOL_DRAIN_GRACE_MS` 250 vs 5000). Exact commands, what to read,
-  and what result falsifies each. *Built, not yet run.*
+  and what result falsifies each. *First run: [reviews/rig-arms-2026-10-31.md](reviews/rig-arms-2026-10-31.md)
+  (the gp3 and sparse arms have run; the auth arm has not).*
 
 ## Reviews & run reports
 
@@ -224,9 +230,20 @@ noted).
   across fresh VMs (the default moved from 250 to 2000 ms on 2026-10-31, Jepsen and `rpo` green). Also the
   gp3-capped disk: the cap binds at 3,000 txn/s; its low-rate ladder is confounded by an unexplained
   intermittent ~2 s tail that is independent of the grace. The auth arm has not been run.
+- **Replication-ON throughput (what a default prod node does; the only numbers to quote for a
+  replicating fleet):**
+  **[reviews/tpc-fleet-repl-on-2026-10-30.md](reviews/tpc-fleet-repl-on-2026-10-30.md)** (replication-ON
+  `tpc-fleet 1024` on the 5-node rig, ~4.3k txn/s closed loop),
+  **[reviews/tpc-fleet-repl-on-2026-10-26.md](reviews/tpc-fleet-repl-on-2026-10-26.md)**,
+  **[reviews/tpc-fleet-ceiling-2026-11-11.md](reviews/tpc-fleet-ceiling-2026-11-11.md)** (where the rig
+  saturates and what the CPU goes to),
+  **[reviews/same-region-followers-2026-11-11.md](reviews/same-region-followers-2026-11-11.md)** (followers
+  behind a same-region latency model) and
+  **[reviews/tuning-audit-2026-11-11.md](reviews/tuning-audit-2026-11-11.md)** (the measured record of
+  the 2026-11-11 tuning audit, including the replicated-WAL disk finding).
 - **[reviews/tpc-fleet-elixir-driver-2026-07-24.md](reviews/tpc-fleet-elixir-driver-2026-07-24.md)** —
-  the current multi-tenant throughput result: **4,096 concurrent tenant shards, 3,414 txn/s, zero
-  errors**, driven from one process; 7,168 tenant shards over the sweep, 5.08M queries, consistent-hash
+  the **replication-OFF baseline** (do not quote it for a replicating fleet; AGENTS.md): **4,096 concurrent
+  tenant shards, 3,414 txn/s, zero errors**, driven from one process; 7,168 tenant shards over the sweep, 5.08M queries, consistent-hash
   spread **1.15×**. Load follows the shard partition, so the horizontal axis is the even per-node
   split — absolute txn/s is single-host-bound.
 - **[reviews/tpc-fleet-2026-07-23.md](reviews/tpc-fleet-2026-07-23.md)** — the 6→1024-tenant sweep
