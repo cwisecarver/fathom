@@ -178,7 +178,7 @@ defmodule Mix.Tasks.Fathom.Shard do
           Mix.raise("pull failed: #{inspect(reason)}")
       end
     after
-      for suffix <- ["", "-wal", "-shm"], do: File.rm(tmp <> suffix)
+      Fathom.FS.rm_db(tmp)
     end
   end
 
@@ -327,7 +327,7 @@ defmodule Mix.Tasks.Fathom.Shard do
           Mix.raise("pull failed: #{inspect(reason)}")
       end
     after
-      for t <- [qtmp, ltmp], s <- ["", "-wal", "-shm"], do: File.rm(t <> s)
+      Enum.each([qtmp, ltmp], &Fathom.FS.rm_db/1)
     end
   end
 

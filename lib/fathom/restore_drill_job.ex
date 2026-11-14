@@ -434,7 +434,7 @@ defmodule Fathom.RestoreDrillJob do
       catch
         :exit, _ -> :error
       after
-        for suffix <- ["", "-wal", "-shm"], do: File.rm(tmp <> suffix)
+        Fathom.FS.rm_db(tmp)
       end
 
     if status != :ok do
@@ -492,7 +492,7 @@ defmodule Fathom.RestoreDrillJob do
         Logger.warning("restore drill: #{id} raised (#{inspect(e)})")
         :error
     after
-      for s <- ["", "-wal", "-shm"], do: File.rm(tmp <> s)
+      Fathom.FS.rm_db(tmp)
     end
   end
 
@@ -715,7 +715,7 @@ defmodule Fathom.RestoreDrillJob do
         {:error, _} -> :error
       end
     after
-      for suffix <- ["", "-wal", "-shm"], do: File.rm(tmp <> suffix)
+      Fathom.FS.rm_db(tmp)
     end
   rescue
     _ -> :error

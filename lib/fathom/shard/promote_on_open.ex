@@ -432,7 +432,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
   end
 
   defp refuse_open(path, refusal) do
-    Enum.each(["", "-wal", "-shm"], &Fathom.FS.rm(path <> &1))
+    Fathom.FS.rm_db(path)
     Fathom.FS.rm(Provenance.sidecar_path(path))
     Fathom.FS.rm(recovering_path(path))
     raise refusal
@@ -491,7 +491,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
             "discarding the unvetted pull and recovering again"
         )
 
-        Enum.each(["-wal", "-shm", ""], &Fathom.FS.rm(path <> &1))
+        Fathom.FS.rm_db(path)
         Fathom.FS.rm(Provenance.sidecar_path(path))
         Fathom.FS.rm(marker)
         true
@@ -755,7 +755,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
 
         case Fathom.FS.rename(temp, path) do
           :ok ->
-            Enum.each(["-wal", "-shm", ""], &Fathom.FS.rm(prepromote(path) <> &1))
+            Fathom.FS.rm_db(prepromote(path))
             Follower.forget(follower, shard_id)
 
             Logger.warning(
@@ -806,7 +806,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
           refuse_or_etag(Recovery.error_window(shard_id, {:promotion_failed, reason}), path, etag)
       end
     after
-      Enum.each(["", "-wal", "-shm"], &Fathom.FS.rm(temp <> &1))
+      Fathom.FS.rm_db(temp)
     end
   end
 

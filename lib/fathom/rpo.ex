@@ -285,7 +285,7 @@ defmodule Fathom.Rpo do
                   "silently bias the RPO curve."
       end
 
-    for s <- ["", "-wal", "-shm"], do: File.rm(dst <> s)
+    Fathom.FS.rm_db(dst)
     result
   end
 

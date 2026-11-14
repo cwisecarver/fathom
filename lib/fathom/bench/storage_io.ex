@@ -677,7 +677,7 @@ defmodule Fathom.Bench.StorageIO do
     Connection.exec(conn, "PRAGMA wal_checkpoint(TRUNCATE)")
     Connection.close(conn)
     :ok = Storage.flush(id, tmp)
-    Enum.each(["", "-wal", "-shm"], &File.rm(tmp <> &1))
+    Fathom.FS.rm_db(tmp)
   end
 
   # Runs `fun.(stub)` with `Storage.S3` pointed at a loopback stub AND the shard data path pointed

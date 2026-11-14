@@ -4715,7 +4715,7 @@ defmodule Fathom.Bench do
     end
   end
 
-  defp drop_db(path), do: Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1))
+  defp drop_db(path), do: Fathom.FS.rm_db(path)
 
   defp tmp_dir do
     dir = Path.join(System.tmp_dir!(), "fathom_bench")

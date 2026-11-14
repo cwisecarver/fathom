@@ -1353,5 +1353,5 @@ defmodule Fathom.Migrator.ShardMigration do
     )
   end
 
-  defp drop_temp(path), do: Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1))
+  defp drop_temp(path), do: Fathom.FS.rm_db(path)
 end

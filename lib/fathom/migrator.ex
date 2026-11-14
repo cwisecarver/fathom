@@ -1255,7 +1255,7 @@ defmodule Fathom.Migrator do
           {:error, reason}
       end
     after
-      for s <- ["", "-wal", "-shm"], do: File.rm(tmp <> s)
+      Fathom.FS.rm_db(tmp)
     end
   end
 

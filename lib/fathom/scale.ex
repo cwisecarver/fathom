@@ -956,7 +956,7 @@ defmodule Fathom.Scale do
   defp kb(n), do: round(n / 1024)
   defp round1(n), do: Float.round(n / 1, 1)
   defp round2(n), do: Float.round(n / 1, 2)
-  defp drop_db(path), do: Enum.each(["", "-wal", "-shm"], &File.rm(path <> &1))
+  defp drop_db(path), do: Fathom.FS.rm_db(path)
 
   defp storage_path(id) do
     dir = Application.get_env(:fathom, Fathom.Shard.Storage.Local, [])[:dir]

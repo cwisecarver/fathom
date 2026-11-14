@@ -396,7 +396,7 @@ defmodule Fathom.Shard.Replication.Promote do
         {:ok, %{shard_id: shard_id, epoch: lease.epoch, etag: etag, bytes: bytes}}
       end
     after
-      Enum.each(["", "-wal", "-shm"], &Fathom.FS.rm(temp <> &1))
+      Fathom.FS.rm_db(temp)
     end
   end
 

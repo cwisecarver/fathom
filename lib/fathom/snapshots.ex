@@ -154,9 +154,7 @@ defmodule Fathom.Snapshots do
       try do
         do_restore(id, snapshot_id, opts, force?, tmp)
       after
-        for base <- [tmp, check_copy(tmp)],
-            suffix <- ["", "-wal", "-shm"],
-            do: File.rm(base <> suffix)
+        Enum.each([tmp, check_copy(tmp)], &Fathom.FS.rm_db/1)
       end
     end
   end
@@ -289,7 +287,7 @@ defmodule Fathom.Snapshots do
           {:error, reason}
       end
     after
-      for suffix <- ["", "-wal", "-shm"], do: File.rm(copy <> suffix)
+      Fathom.FS.rm_db(copy)
     end
   end
 

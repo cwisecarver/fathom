@@ -318,7 +318,7 @@ defmodule Fathom.Shard.Materializer do
   # 2026-10-15). Only this shard's one pull ever writes under its pull-temp name, and every caller
   # runs after that pull has finished or been killed, so the glob cannot take a live download.
   defp rm_pull_temp(path) do
-    Enum.each(["", "-wal", "-shm"], &Fathom.FS.rm(pull_temp(path) <> &1))
+    Fathom.FS.rm_db(pull_temp(path))
     Enum.each(Fathom.Shard.Storage.S3.download_temps(pull_temp(path)), &Fathom.FS.rm/1)
   end
 end

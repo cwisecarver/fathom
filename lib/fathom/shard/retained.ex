@@ -142,19 +142,11 @@ defmodule Fathom.Shard.Retained do
     with true <- budget > 0,
          {:ok, %File.Stat{size: bytes}} when bytes <= budget and bytes >= floor <-
            Fathom.FS.stat(path),
-         true <- wal_empty?(path),
+         true <- Fathom.FS.wal_empty?(path <> "-wal"),
          true <- Fathom.FS.exists?(path <> ".etag") do
       {:ok, bytes}
     else
       _ -> :no
-    end
-  end
-
-  defp wal_empty?(path) do
-    case Fathom.FS.stat(path <> "-wal") do
-      {:error, :enoent} -> true
-      {:ok, %File.Stat{size: 0}} -> true
-      _ -> false
     end
   end
 

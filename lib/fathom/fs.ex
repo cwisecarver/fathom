@@ -70,6 +70,35 @@ defmodule Fathom.FS do
   @spec rm(Path.t()) :: :ok | {:error, File.posix()}
   def rm(path), do: :file.delete(IO.chardata_to_string(path), [:raw])
 
+  @doc """
+  Remove a database file and its companions, `-wal` and `-shm` FIRST and the main file LAST, ignoring
+  files that are absent or cannot be removed (best-effort, like the `rm` it wraps; always `:ok`).
+
+  The ORDER is the point (cleanliness audit 2026-11-13 #34, which replaced a dozen hand-rolled loops
+  that disagreed): a WAL carries no identity of the database it belongs to, so removing the main file
+  first and crashing before the `-wal` leaves a stale log that the next database created at that path
+  would try to recover from. Side files first means a crash leaves, at worst, a main file that is
+  complete without them.
+  """
+  @spec rm_db(Path.t()) :: :ok
+  def rm_db(path) do
+    Enum.each(["-wal", "-shm", ""], &rm(IO.chardata_to_string(path) <> &1))
+  end
+
+  @doc """
+  Whether the `-wal` at `wal_path` holds nothing: absent or zero-length. A WAL holding only a header
+  (restarted, nothing written) counts as NON-empty: the conservative answer. Used by the flush route and
+  the retained-file check, which each had their own copy.
+  """
+  @spec wal_empty?(Path.t()) :: boolean()
+  def wal_empty?(wal_path) do
+    case stat(wal_path) do
+      {:error, :enoent} -> true
+      {:ok, %{size: 0}} -> true
+      _ -> false
+    end
+  end
+
   @spec rename(Path.t(), Path.t()) :: :ok | {:error, File.posix()}
   def rename(src, dst) do
     src = IO.chardata_to_string(src)
