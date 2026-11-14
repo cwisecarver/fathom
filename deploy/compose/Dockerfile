@@ -6,15 +6,17 @@
 # reachable over plain HTTP on localhost; a REAL deployment builds it with the default (SSL forced,
 # terminate TLS at your LB). The chaos rig has its own rig-specific Dockerfile (deploy/chaos/).
 #
-# BUILD CONTEXT IS THE PARENT OF BOTH REPOS (e.g. ~/NotWork), because fathom depends on filo as a
-# path dep ({:filo, path: "../filo"}) and both trees must be inside the context. The compose file
-# sets `context: ../../..` + `dockerfile: fathom/deploy/compose/Dockerfile`; the .dockerignore next
-# to this file whitelists only fathom/ and filo/.
+# BUILD CONTEXT IS THE FATHOM CHECKOUT (the repo root). filo comes from Hex (mix.exs `filo_dep/0`,
+# "~> 0.4.x"), so a plain clone of fathom builds this image with no sibling repo. The compose file
+# sets `context: ../..` + `dockerfile: deploy/compose/Dockerfile`; the .dockerignore next to this
+# file whitelists only what the build needs. (Until cleanliness audit 2026-11-13 #13 the context was
+# the PARENT of fathom/ and filo/ and an unconditional `COPY filo/` meant a fathom-only clone could
+# not build it.) To build against an unreleased filo, use the chaos rig's Dockerfile (FILO_PATH).
 #
-# Standalone build (from the parent of fathom/ and filo/):
-#   docker build -f fathom/deploy/compose/Dockerfile -t fathom:latest .
+# Standalone build (from the fathom checkout):
+#   docker build -f deploy/compose/Dockerfile -t fathom:latest .
 # Eval build (plaintext localhost dashboard):
-#   docker build -f fathom/deploy/compose/Dockerfile --build-arg WEB_INSECURE_LOCAL=1 -t fathom:eval .
+#   docker build -f deploy/compose/Dockerfile --build-arg WEB_INSECURE_LOCAL=1 -t fathom:eval .
 
 ARG BUILDER_IMAGE=hexpm/elixir:1.20.4-erlang-28.5.0.7-debian-bookworm-20260918-slim
 ARG RUNNER_IMAGE=debian:bookworm-slim
@@ -39,11 +41,8 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 ENV MIX_ENV=prod
 RUN mix local.hex --force && mix local.rebar --force
 
-# The filo path dep sits NEXT TO fathom in the context.
-COPY filo/ /src/filo/
-
 WORKDIR /src/fathom
-COPY fathom/mix.exs fathom/mix.lock ./
+COPY mix.exs mix.lock ./
 RUN mix deps.get --only prod
 
 # The carried exqlite patch (expert review 2026-11-04 #1): the NIF returns BLOB cells tagged
@@ -52,7 +51,7 @@ RUN mix deps.get --only prod
 # builds the NIF from the patched source (build-essential above) instead of downloading the stock
 # precompiled one. Without it the image still works, with tagged reads silently off
 # (Fathom.Shard.Connection.tagged_reads?/0 is false) — check that on a booted node, not here.
-COPY fathom/native/exqlite_patch native/exqlite_patch
+COPY native/exqlite_patch native/exqlite_patch
 RUN cd deps/exqlite && patch -p1 < /src/fathom/native/exqlite_patch/0001-multi-step-tagged-blob.patch \
   && grep -q multi_step_tagged c_src/sqlite3_nif.c
 ENV FATHOM_EXQLITE_PATCHED=1
@@ -67,15 +66,15 @@ ENV FATHOM_EXQLITE_PATCHED=1
 ENV EXQLITE_SYSTEM_CFLAGS="-DSQLITE_DEFAULT_PCACHE_INITSZ=4"
 
 # Compile-time config first so dep compilation caches independently of app code.
-COPY fathom/config/config.exs fathom/config/prod.exs config/
+COPY config/config.exs config/prod.exs config/
 RUN mix deps.compile
 
-COPY fathom/priv priv
-COPY fathom/lib lib
-COPY fathom/assets assets
+COPY priv priv
+COPY lib lib
+COPY assets assets
 # The Rust crate `mix compile.fathom_udf` builds into priv/sqlite_ext/ (copied after deps.compile so
 # a crate edit does not bust the dependency layer cache).
-COPY fathom/native native
+COPY native native
 
 # SSL posture is compile-time (config/prod.exs reads WEB_INSECURE_LOCAL at compile). Default empty =
 # force_ssl ON (production; front with a TLS-terminating LB). The eval stack passes 1 to reach the
@@ -96,12 +95,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 RUN mix assets.setup && mix assets.deploy
 
 # Runtime config changes shouldn't bust the compile cache.
-COPY fathom/config/runtime.exs config/
+COPY config/runtime.exs config/
 # rel/vm.args.eex carries the VM capacity flags (+SDio, +Q, +IOt/+IOp — expert review 2026-07-24
 # #2). WITHOUT this COPY `mix release` silently generates a default vm.args and every one of those
 # flags is absent from the image — this is the canonical deployable image, so that omission shipped
 # ERTS defaults to every container deployment while the release was believed to be tuned.
-COPY fathom/rel rel
+COPY rel rel
 # Same cache mounts as `mix compile`: mix release re-runs the :fathom_udf compiler, which calls cargo.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -119,7 +118,7 @@ RUN apt-get update -y && \
 ENV LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8
 
 WORKDIR /app
-RUN useradd --create-home app && mkdir -p /data/shards /data/warm && chown -R app /app /data
+RUN useradd --create-home app && mkdir -p /data/shards && chown -R app /app /data
 USER app
 
 COPY --from=builder --chown=app:app /src/fathom/_build/prod/rel/fathom ./

@@ -153,7 +153,7 @@ COPY fathom/deploy/chaos/lazyfs-mount.sh /usr/local/bin/lazyfs-mount
 ENV LANG=en_US.UTF-8 LANGUAGE=en_US:en LC_ALL=en_US.UTF-8
 
 WORKDIR /app
-RUN useradd --create-home app && mkdir -p /data/shards /data/warm && chown -R app /app /data
+RUN useradd --create-home app && mkdir -p /data/shards && chown -R app /app /data
 USER app
 
 COPY --from=builder --chown=app:app /src/fathom/_build/prod/rel/fathom ./

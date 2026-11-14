@@ -1,20 +1,15 @@
-# BuildKit per-Dockerfile ignore. The build context is the PARENT directory of
-# fathom/ and filo/ (see Dockerfile) — whitelist only what the build needs.
+# BuildKit per-Dockerfile ignore. The build context is the fathom checkout (see Dockerfile) —
+# whitelist only what the build needs.
 *
-!fathom/mix.exs
-!fathom/mix.lock
-!fathom/config
-!fathom/lib
-!fathom/priv
-!fathom/assets
-!fathom/native
+!mix.exs
+!mix.lock
+!config
+!lib
+!priv
+!assets
+!native
 # The release's vm.args template. Omitting it does not fail the build — `mix release` just
 # generates a default vm.args — so the VM flags vanish silently. Keep this whitelisted.
-!fathom/rel
-!filo
-filo/_build
-filo/deps
-filo/.git
-filo/erl_crash.dump
-fathom/priv/static/assets
-fathom/native/*/target
+!rel
+priv/static/assets
+native/*/target

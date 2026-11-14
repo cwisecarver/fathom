@@ -12,8 +12,8 @@ directory. Goal: **a provisioned tenant you can query in under 30 minutes.**
 ## Prerequisites
 
 - Docker + Docker Compose.
-- The **filo** repo checked out next to fathom (`../filo`) — fathom depends on it as a path dep, and
-  the image build needs both trees. The build context is the parent of both.
+- Nothing else: filo comes from Hex, so a plain clone of fathom builds the image (the build context
+  is the fathom checkout).
 
 ## 1. Bring it up
 

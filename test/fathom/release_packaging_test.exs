@@ -18,6 +18,13 @@ defmodule Fathom.ReleasePackagingTest do
   # continuation lines (the cargo cache mounts, c152bbe) -- a plain `^RUN\s+mix` stopped matching.
   @release_run ~r/^RUN\s+(?:--mount=\S+\s*(?:\\\s*\n\s*)?)*mix\s+release/m
 
+  # `rel/` is `fathom/rel` in an image whose build context is the PARENT of fathom/ (the chaos rig,
+  # which can build a sibling filo tree in) and plain `rel` in one whose context is the fathom
+  # checkout (the canonical compose image, since cleanliness audit 2026-11-13 #13: filo comes from
+  # Hex). The invariant is the same in both layouts, so the guard accepts either spelling.
+  @rel_copy ~r/^COPY\s+(?:fathom\/)?rel\s+rel\s*$/m
+  @rel_whitelist ~r/^!(?:fathom\/)?rel\s*$/m
+
   defp release_images do
     Enum.filter(@dockerfiles, fn path -> File.read!(path) =~ @release_run end)
   end
@@ -33,19 +40,19 @@ defmodule Fathom.ReleasePackagingTest do
     for path <- release_images() do
       body = File.read!(path)
 
-      assert body =~ ~r/^COPY\s+fathom\/rel\s+rel\s*$/m,
-             "#{path} runs `mix release` without copying fathom/rel — the release will silently " <>
+      assert body =~ @rel_copy,
+             "#{path} runs `mix release` without copying rel/ — the release will silently " <>
                "generate a default vm.args and drop every flag in rel/vm.args.eex"
 
-      copy_at = index_of(body, ~r/^COPY\s+fathom\/rel\s+rel\s*$/m)
+      copy_at = index_of(body, @rel_copy)
       release_at = index_of(body, @release_run)
 
       assert copy_at < release_at,
-             "#{path} copies fathom/rel AFTER `mix release`, so the release is built without it"
+             "#{path} copies rel/ AFTER `mix release`, so the release is built without it"
     end
   end
 
-  test "every deny-all dockerignore for a release image whitelists fathom/rel" do
+  test "every deny-all dockerignore for a release image whitelists rel/" do
     for path <- release_images() do
       ignore = path <> ".dockerignore"
 
@@ -54,8 +61,8 @@ defmodule Fathom.ReleasePackagingTest do
 
         # Only a deny-all whitelist can drop rel/; an allow-by-default ignore file cannot.
         if body =~ ~r/^\*\s*$/m do
-          assert body =~ ~r/^!fathom\/rel\s*$/m,
-                 "#{ignore} denies everything by default but does not whitelist fathom/rel, so " <>
+          assert body =~ @rel_whitelist,
+                 "#{ignore} denies everything by default but does not whitelist rel/, so " <>
                    "the COPY in #{path} would fail or copy nothing"
         end
       end

@@ -107,9 +107,9 @@ services:
   migrate:
     image: fathom:eval
     build: &fathom-build
-      # The parent of BOTH repos (fathom + the ../filo path dep), relative to this file.
-      context: ../../..
-      dockerfile: fathom/deploy/compose/Dockerfile
+      # The fathom checkout (filo comes from Hex), relative to this file.
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
       args:
         WEB_INSECURE_LOCAL: "1"
     command: ["/app/bin/fathom", "eval", "Fathom.Release.migrate"]
