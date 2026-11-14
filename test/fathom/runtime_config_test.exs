@@ -639,4 +639,30 @@ defmodule Fathom.RuntimeConfigTest do
       end
     end
   end
+
+  # Cleanliness audit 2026-11-13 #1. SHARD_MAX_PAGE_COUNT was parsed twice: by `env_nonneg_int` at the
+  # top (every env) and again by a bare `parse_int!` inside the prod block, which ran later and won.
+  # In prod an empty value (the compose `X: "${X:-}"` convention) refused to boot, and a negative
+  # value was stored, which `Connection.max_page_count_sql/1` reads as "explicit opt-out": a typo
+  # silently removed the 4 GiB write brake that protects the 5 GiB single-PUT flush ceiling, in prod
+  # only, so dev/test could not reproduce it.
+  describe "SHARD_MAX_PAGE_COUNT is parsed one way in every env" do
+    for env <- [:test, :prod] do
+      test "#{env}: empty is unset, a negative is ignored (never an opt-out), 0 and N are values" do
+        cfg = fn v ->
+          overlay = %{"SHARD_MAX_PAGE_COUNT" => v}
+
+          if unquote(env) == :prod,
+            do: prod_config(overlay),
+            else: fathom_config(overlay)
+        end
+
+        refute Keyword.has_key?(cfg.(""), :shard_max_page_count)
+        refute Keyword.has_key?(cfg.(nil), :shard_max_page_count)
+        refute Keyword.has_key?(cfg.("-1"), :shard_max_page_count)
+        assert Keyword.fetch!(cfg.("0"), :shard_max_page_count) == 0
+        assert Keyword.fetch!(cfg.("262144"), :shard_max_page_count) == 262_144
+      end
+    end
+  end
 end

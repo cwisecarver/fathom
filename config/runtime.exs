@@ -699,8 +699,16 @@ if n = env_nonneg_int.("SHARD_MAX_BYTES") do
   config :fathom, :shard_max_bytes, n
 end
 
-# Pages instead of bytes. Wins over SHARD_MAX_BYTES when set: an operator who configured pages meant
-# pages, and reinterpreting their number as bytes would be its own bug.
+# Pages instead of bytes (expert review 2026-07-14 #19: pages × page_size, e.g. 262144 ≈ 1 GiB at 4 KiB).
+# Wins over SHARD_MAX_BYTES when set: an operator who configured pages meant pages, and reinterpreting
+# their number as bytes would be its own bug. Unset means the byte cap's 4 GiB default
+# (`Connection`'s `@default_max_bytes`); `0` is the documented opt-out.
+#
+# PARSED HERE ONCE, FOR EVERY ENV (cleanliness audit 2026-11-13 #1). A second read of this variable
+# with a bare `parse_int!` used to sit in the prod block below and, running later, won: in prod an
+# empty value (compose's `X: "${X:-}"`) refused to boot and a NEGATIVE value was stored, which
+# `Connection.max_page_count_sql/1` reads as the opt-out, so a typo silently removed the 4 GiB write
+# brake in prod only. `env_nonneg_int` ignores both, and `runtime_config_test.exs` pins it per env.
 if n = env_nonneg_int.("SHARD_MAX_PAGE_COUNT") do
   config :fathom, :shard_max_page_count, n
 end
@@ -1775,20 +1783,6 @@ if config_env() == :prod do
   # the cap, at least 16); 0 turns it off (inline eviction at the cap only).
   if n = env_nonneg_int.("PRE_EVICT_HEADROOM") do
     config :fathom, :pre_evict_headroom, n
-  end
-
-  # Per-shard size cap (expert review 2026-07-14 #19): the max SQLite pages a single tenant's db may
-  # grow to (size = pages × page_size, default 4096B; e.g. 262144 ≈ 1 GiB). A write past it fails
-  # SQLITE_FULL, so one runaway tenant can't inflate flush/cold-open/standby costs fleet-wide.
-  # Enforces the "limited dataset per shard" premise.
-  #
-  # DEFAULTS to 1_048_576 pages ≈ 4 GiB since expert review 2026-07-24 #37 — ~1 GiB under the 5 GiB
-  # S3 single-PUT ceiling. Unset used to mean unlimited, which made the first brake a FLUSH failure:
-  # past 5 GiB the shard kept ACKNOWLEDGING writes it could never upload, retried forever, and its
-  # RPO went unbounded with no operator remedy. A write-time cap cannot lose data (SQLITE_FULL is
-  # never acked); a flush-time one already has. Set `SHARD_MAX_PAGE_COUNT=0` to opt out.
-  if pages = System.get_env("SHARD_MAX_PAGE_COUNT") do
-    config :fathom, :shard_max_page_count, parse_int!.("SHARD_MAX_PAGE_COUNT", pages)
   end
 
   # Novel-shard creation rate limit (finding #14's churn half; see Fathom.Shards.NovelLimiter).

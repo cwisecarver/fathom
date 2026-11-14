@@ -970,7 +970,10 @@ defmodule Fathom.Shard.Connection do
   # PUT, cold-open pulls the whole body, eviction/drain/warm-standby all copy it). `max_page_count`
   # is per-connection (not persisted), so set it on every open from `:shard_max_page_count` (pages;
   # size = pages × page_size, default 4096B). A write past the cap fails `SQLITE_FULL` (mapped to the
-  # `SQLITE_FULL` Hrana code) — exactly the brake a platform wants. Unset ⇒ unlimited (no cap).
+  # `SQLITE_FULL` Hrana code) — exactly the brake a platform wants. Unset `:shard_max_page_count`
+  # falls back to the `:shard_max_bytes` cap (default 4 GiB, `@default_max_bytes`); `0` for either
+  # is the opt-out (see `max_page_count_sql/1`).
+
   # Make the per-connection page cache an explicit, tunable ceiling (expert review 2026-07-24 #29).
   # SQLite's default is -2000, i.e. "up to ~2 MiB of page cache PER CONNECTION", and fathom holds one
   # connection per Hrana stream for the stream's life. The measured density regimes (~16 KiB idle,
