@@ -318,7 +318,14 @@ defmodule Fathom.Shard.FlushSerializeTest do
                :flush_serialize_max_bytes
              )
 
-      for bad <- ["-1", "16MiB", ""] do
+      # `""` is unset like every integer knob (compose passes `X: "${X:-}"`); this list used to assert
+      # that it raises (cleanliness audit 2026-11-13 #14).
+      refute Keyword.has_key?(
+               runtime_fathom(%{"FLUSH_SERIALIZE_MAX_BYTES" => ""}),
+               :flush_serialize_max_bytes
+             )
+
+      for bad <- ["-1", "16MiB"] do
         assert_raise RuntimeError, ~r/FLUSH_SERIALIZE_MAX_BYTES/, fn ->
           runtime_fathom(%{"FLUSH_SERIALIZE_MAX_BYTES" => bad})
         end

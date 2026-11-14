@@ -480,8 +480,10 @@ defmodule Fathom.RuntimeConfigTest do
     end
   end
 
+  # `""` is NOT in this list any more: it used to raise here and now means "unset", like every other
+  # integer knob (compose passes `X: "${X:-}"`; cleanliness audit 2026-11-13 #14).
   test "a non-integer JOURNAL_SIZE_LIMIT is a clear boot error naming the variable" do
-    for bad <- ["64MiB", "1.5", "", "abc"] do
+    for bad <- ["64MiB", "1.5", "abc"] do
       error =
         assert_raise RuntimeError, fn -> fathom_config(%{"JOURNAL_SIZE_LIMIT" => bad}) end
 
@@ -506,11 +508,23 @@ defmodule Fathom.RuntimeConfigTest do
       end
 
       test "#{var}: a negative or non-integer value refuses to boot, naming the variable" do
-        for v <- ["-1", "2s", "abc", ""] do
+        for v <- ["-1", "2s", "abc"] do
           assert_raise RuntimeError, ~r/#{unquote(var)} must be a non-negative integer/, fn ->
             fathom_config(%{unquote(var) => v})
           end
         end
+      end
+
+      # Cleanliness audit 2026-11-13 #14. These two did not trim, and treated `""` as an error where
+      # `SHARD_IDLE_MS` (and every other knob) treats it as unset: `"2000\n"` from a secrets file
+      # failed the boot, and so did compose's `X: "${X:-}"` for an unset variable. The test above
+      # used to assert that `""` raises.
+      test "#{var}: surrounding whitespace is trimmed and empty is unset" do
+        opts = Keyword.fetch!(fathom_config(%{unquote(var) => "1500\n"}), :connection_pool_opts)
+        assert Keyword.fetch!(opts, unquote(key)) == 1500
+
+        cfg = fathom_config(%{unquote(var) => ""})
+        refute Keyword.has_key?(Keyword.get(cfg, :connection_pool_opts, []), unquote(key))
       end
     end
   end
@@ -648,7 +662,7 @@ defmodule Fathom.RuntimeConfigTest do
   # only, so dev/test could not reproduce it.
   describe "SHARD_MAX_PAGE_COUNT is parsed one way in every env" do
     for env <- [:test, :prod] do
-      test "#{env}: empty is unset, a negative is ignored (never an opt-out), 0 and N are values" do
+      test "#{env}: empty is unset, a negative refuses to boot (never an opt-out), 0 and N are values" do
         cfg = fn v ->
           overlay = %{"SHARD_MAX_PAGE_COUNT" => v}
 
@@ -659,7 +673,14 @@ defmodule Fathom.RuntimeConfigTest do
 
         refute Keyword.has_key?(cfg.(""), :shard_max_page_count)
         refute Keyword.has_key?(cfg.(nil), :shard_max_page_count)
-        refute Keyword.has_key?(cfg.("-1"), :shard_max_page_count)
+
+        # A negative used to be silently ignored by `env_nonneg_int` (and, in prod only, stored by the
+        # duplicate parse and read as the opt-out). Now it names the variable and refuses to boot
+        # (cleanliness audit 2026-11-13 #14, which tightened every `env_nonneg_int` knob).
+        assert_raise RuntimeError, ~r/SHARD_MAX_PAGE_COUNT must be a non-negative integer/, fn ->
+          cfg.("-1")
+        end
+
         assert Keyword.fetch!(cfg.("0"), :shard_max_page_count) == 0
         assert Keyword.fetch!(cfg.("262144"), :shard_max_page_count) == 262_144
       end
@@ -683,5 +704,54 @@ defmodule Fathom.RuntimeConfigTest do
              fathom_config(%{"REPLICATION_HMAC_SECRET" => "s3cret-value"}),
              :replication_hmac_secret
            ) == "s3cret-value"
+  end
+
+  # Cleanliness audit 2026-11-13 #14: the integer knobs share one parse rule.
+  describe "env_int_min! / env_nonneg_int" do
+    test "a negative value for a non-negative knob refuses to boot instead of being ignored" do
+      assert_raise RuntimeError, ~r/BACKGROUND_SCAN_PERMITS must be a non-negative integer/, fn ->
+        fathom_config(%{"BACKGROUND_SCAN_PERMITS" => "-1"})
+      end
+
+      assert Keyword.fetch!(
+               fathom_config(%{"BACKGROUND_SCAN_PERMITS" => "0"}),
+               :background_scan_permits
+             ) ==
+               0
+    end
+
+    test "FLUSH_SERIALIZE_MAX_BYTES, SHARD_RETAIN_MIN_BYTES: trimmed, empty is unset, a negative refuses" do
+      for {var, key} <- [
+            {"FLUSH_SERIALIZE_MAX_BYTES", :flush_serialize_max_bytes},
+            {"SHARD_RETAIN_MIN_BYTES", :shard_retain_min_bytes}
+          ] do
+        assert Keyword.fetch!(fathom_config(%{var => " 4096\n"}), key) == 4096
+        refute Keyword.has_key?(fathom_config(%{var => ""}), key)
+
+        assert_raise RuntimeError, ~r/#{var} must be a non-negative integer/, fn ->
+          fathom_config(%{var => "-1"})
+        end
+      end
+    end
+
+    test "HRANA_STORAGE_FLOOR_BUDGET_MS (prod): trimmed, must be positive, empty is unset" do
+      assert Keyword.fetch!(
+               prod_config(%{"HRANA_STORAGE_FLOOR_BUDGET_MS" => "2500\n"}),
+               :hrana_storage_floor_budget_ms
+             ) == 2500
+
+      refute Keyword.has_key?(
+               prod_config(%{"HRANA_STORAGE_FLOOR_BUDGET_MS" => ""}),
+               :hrana_storage_floor_budget_ms
+             )
+
+      for bad <- ["0", "-1", "3s"] do
+        assert_raise RuntimeError,
+                     ~r/HRANA_STORAGE_FLOOR_BUDGET_MS must be a positive integer/,
+                     fn ->
+                       prod_config(%{"HRANA_STORAGE_FLOOR_BUDGET_MS" => bad})
+                     end
+      end
+    end
   end
 end

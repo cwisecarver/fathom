@@ -62,7 +62,7 @@ defmodule Fathom.EnvReachabilityTest do
   # `Fathom.ConfigurationDocTest`, so the piped `"X" |> System.get_env("")` shape is caught too.
   # Any new helper in `config/runtime.exs` must be added to this alternation — the sibling test
   # carries the same warning, and the same drift happened there twice.
-  @read_forms ~r/(System\.(get_env|fetch_env!?)|env_int\.\(|env_nonneg_int\.\(|env_bool\.\()/
+  @read_forms ~r/(System\.(get_env|fetch_env!?)|env_int\.\(|env_nonneg_int\.\(|env_int_min!\.\(|env_bool\.\()/
 
   defp read_names do
     (Path.wildcard("config/*.exs") ++ Path.wildcard("lib/**/*.ex"))

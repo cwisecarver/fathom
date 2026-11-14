@@ -103,9 +103,40 @@ env_int = fn name ->
   end
 end
 
+# The strict integer knob with a floor (cleanliness audit 2026-11-13 #14): unset or empty is nil (compose
+# passes `X: "${X:-}"` for an unset variable), surrounding whitespace is trimmed (`"2000\n"` from a secrets
+# file), the whole string must be an integer, and a value below `min` (nil = no floor) RAISES, naming
+# the variable and what it wants. `what` is that phrase ("a non-negative integer (ms)"), so each knob keeps
+# its own message. It is the same `{n, ""}` rule as `parse_int!` above, repeated here rather than called
+# because `parse_int!` raises its own generic message and these messages are pinned per knob.
+#
+# Several knobs used to hand-roll this with `Integer.parse` and differed: some trimmed and some did not
+# (`POOL_DRAIN_GRACE_MS="2000\n"` failed the boot while `SHARD_IDLE_MS` accepted it), some treated empty as
+# an error and some as unset, and `env_nonneg_int` silently IGNORED a negative, the "typo reads as
+# configured and does nothing" failure `env_bool` fixed for booleans (2026-11-07 #81).
+#
+# NB: `Fathom.ConfigurationDocTest` and `Fathom.EnvReachabilityTest` match this helper by NAME, like the
+# others below.
+env_int_min! = fn name, min, what ->
+  case System.get_env(name) do
+    nil ->
+      nil
+
+    "" ->
+      nil
+
+    raw ->
+      case Integer.parse(String.trim(raw)) do
+        {n, ""} when min == nil or n >= min -> n
+        _ -> raise "#{name} must be #{what}, got: #{inspect(raw)}"
+      end
+  end
+end
+
 # Same, but 0 is a VALUE rather than a rejection. For knobs where zero means "disable this bound"
 # (the replication byte caps), `env_int` above would silently ignore the one setting an operator
-# reaches for in an incident — it returns nil for 0, which leaves the default in place.
+# reaches for in an incident — it returns nil for 0, which leaves the default in place. A NEGATIVE
+# raises (it used to be silently ignored; see `env_int_min!`).
 env_nonneg_int = fn name ->
   case System.get_env(name) do
     nil ->
@@ -117,7 +148,7 @@ env_nonneg_int = fn name ->
     v ->
       case parse_int!.(name, v) do
         n when n >= 0 -> n
-        _ -> nil
+        _ -> raise "#{name} must be a non-negative integer, got: #{inspect(v)}"
       end
   end
 end
@@ -572,15 +603,8 @@ end
 # The largest shard image (bytes) the periodic flush's VACUUM route snapshots with a page copy
 # (`sqlite3_serialize`) instead of `VACUUM INTO` (expert review 2026-10-22 r8 #9; default 16 MiB,
 # 0 = always VACUUM INTO). Peak memory per concurrent scan is ~2x this.
-if raw = System.get_env("FLUSH_SERIALIZE_MAX_BYTES") do
-  case Integer.parse(String.trim(raw)) do
-    {n, ""} when n >= 0 ->
-      config :fathom, :flush_serialize_max_bytes, n
-
-    _ ->
-      raise "FLUSH_SERIALIZE_MAX_BYTES must be a non-negative integer number of bytes " <>
-              "(0 = always VACUUM INTO), got: #{inspect(raw)}"
-  end
+if n = env_int_min!.("FLUSH_SERIALIZE_MAX_BYTES", 0, "a non-negative integer of bytes") do
+  config :fathom, :flush_serialize_max_bytes, n
 end
 
 # Node-wide permits for the NON-flush whole-shard scans (migration replay + verify, restore drill,
@@ -593,17 +617,11 @@ end
 # The WAL's on-disk size bound in bytes (expert review 2026-10-10 #30; default 64 MiB, see
 # `Fathom.Shard.Connection.maybe_journal_size_limit/1`). -1 turns it off. The chaos rig sets 0 to
 # make every log reset truncate, which is the A2 stress case.
-if bytes = System.get_env("JOURNAL_SIZE_LIMIT") do
-  # A clear boot error, not a `String.to_integer` ArgumentError (expert review 2026-10-12 #33).
-  # `maybe_journal_size_limit/1` would silently ignore a non-integer, so there is no later check.
-  case Integer.parse(String.trim(bytes)) do
-    {n, ""} ->
-      config :fathom, :journal_size_limit, n
-
-    _ ->
-      raise "JOURNAL_SIZE_LIMIT must be an integer number of bytes (-1 = no limit, 0 = truncate " <>
-              "on every log reset), got: #{inspect(bytes)}"
-  end
+#
+# A clear boot error, not a `String.to_integer` ArgumentError (expert review 2026-10-12 #33).
+# `maybe_journal_size_limit/1` would silently ignore a non-integer, so there is no later check.
+if n = env_int_min!.("JOURNAL_SIZE_LIMIT", nil, "an integer number of bytes (-1 = no limit)") do
+  config :fathom, :journal_size_limit, n
 end
 
 if ms = System.get_env("SHARD_IDLE_MS") do
@@ -619,11 +637,8 @@ end
 
 # Expert review 2026-10-22 r8 #26: the smallest `.db` worth retaining. Unset = 0 with replication on,
 # 1 MiB with it off (`Fathom.Shard.Retained.min_bytes/0` has the request arithmetic).
-if bytes = System.get_env("SHARD_RETAIN_MIN_BYTES") do
-  case Integer.parse(String.trim(bytes)) do
-    {n, ""} when n >= 0 -> config :fathom, :shard_retain_min_bytes, n
-    _ -> raise "SHARD_RETAIN_MIN_BYTES must be a non-negative integer, got: #{inspect(bytes)}"
-  end
+if n = env_int_min!.("SHARD_RETAIN_MIN_BYTES", 0, "a non-negative integer") do
+  config :fathom, :shard_retain_min_bytes, n
 end
 
 # Perf review 2026-10-14 #4: how long an idle shard keeps its pooled SQLite handle after its last
@@ -634,27 +649,15 @@ end
 # Validated here, not with `String.to_integer/1`: that crashed the boot with a bare ArgumentError on
 # garbage ("2s") and ACCEPTED a negative, which only failed later, per shard, when the coordinator
 # armed its grace timer (review of bef51a2a, 2026-10-31).
-if ms = System.get_env("POOL_DRAIN_GRACE_MS") do
-  case Integer.parse(ms) do
-    {n, ""} when n >= 0 ->
-      config :fathom, :connection_pool_opts, drain_grace_ms: n
-
-    _ ->
-      raise "POOL_DRAIN_GRACE_MS must be a non-negative integer (ms), got: #{inspect(ms)}"
-  end
+if n = env_int_min!.("POOL_DRAIN_GRACE_MS", 0, "a non-negative integer (ms)") do
+  config :fathom, :connection_pool_opts, drain_grace_ms: n
 end
 
 # Expert review 2026-10-21 #15: how long a POOLED idle handle sits before `PRAGMA shrink_memory`
 # releases its SQLite page cache (up to 2 MiB; nothing else returns it). Default 5000 ms; 0 = off.
 # Validated like POOL_DRAIN_GRACE_MS above, for the same reason.
-if ms = System.get_env("POOL_SHRINK_IDLE_MS") do
-  case Integer.parse(ms) do
-    {n, ""} when n >= 0 ->
-      config :fathom, :connection_pool_opts, shrink_idle_ms: n
-
-    _ ->
-      raise "POOL_SHRINK_IDLE_MS must be a non-negative integer (ms), got: #{inspect(ms)}"
-  end
+if n = env_int_min!.("POOL_SHRINK_IDLE_MS", 0, "a non-negative integer (ms)") do
+  config :fathom, :connection_pool_opts, shrink_idle_ms: n
 end
 
 # Perf review 2026-10-14 #16: node-wide cap on idle pooled handles (default 8192). Over it a checkin
@@ -1757,14 +1760,8 @@ if config_env() == :prod do
   # Fathom.HranaAuth.Revocations): ONE attempt, no retries, this many ms of wire time. Unset leaves
   # the key unwritten so the module default (3000) stands. A stall past it maps to the
   # HRANA_REVOCATION_ON_ERROR posture.
-  if ms = System.get_env("HRANA_STORAGE_FLOOR_BUDGET_MS") do
-    case Integer.parse(ms) do
-      {n, ""} when n > 0 ->
-        config :fathom, :hrana_storage_floor_budget_ms, n
-
-      _ ->
-        raise "HRANA_STORAGE_FLOOR_BUDGET_MS must be a positive integer (ms), got: #{inspect(ms)}"
-    end
+  if n = env_int_min!.("HRANA_STORAGE_FLOOR_BUDGET_MS", 1, "a positive integer (ms)") do
+    config :fathom, :hrana_storage_floor_budget_ms, n
   end
 
   # Per-node open-shard cap (finding #14). config.exs sets a conservative finite default; operators

@@ -61,7 +61,8 @@ defmodule Fathom.ConfigurationDocTest do
       # silently leaves the guard's sight. (`parse_int!` is not one: it takes the already-read
       # value, so its call sites are on the same line as the `System.get_env` that names the knob.)
       |> Enum.filter(
-        &(&1 =~ ~r/(System\.(get_env|fetch_env!)|env_int\.\(|env_nonneg_int\.\(|env_bool\.\()/)
+        &(&1 =~
+            ~r/(System\.(get_env|fetch_env!)|env_int\.\(|env_nonneg_int\.\(|env_int_min!\.\(|env_bool\.\()/)
       )
       # Pull the UPPER_SNAKE literal(s) off each such line (the "" default / lowercase values
       # never match). Handles both System.get_env("X") and the "X" |> System.get_env("") form.
