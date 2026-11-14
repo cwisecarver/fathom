@@ -5050,7 +5050,7 @@ defmodule Fathom.Shard do
     Fathom.Shard.ScanGate.with_permit(div(settle_yield_ms(), 4), fn ->
       path = state.path
 
-      if wal_empty?(path <> "-wal") do
+      if Fathom.FS.wal_empty?(path <> "-wal") do
         emit_drop_verify(state, :main_file)
         Integrity.quick_check_main_file_raw(path, &apply_scan_mmap/1)
       else
@@ -6050,7 +6050,7 @@ defmodule Fathom.Shard do
   # reports it fully backfilled (expert review 2026-10-21 #11). Meaningful as a route decision only
   # when read under the pin (see `pinned_live_upload/2`); before it, it is only a filter.
   defp wal_folded?(wal),
-    do: wal_empty?(wal) or Fathom.Shard.Replication.Wal.fully_backfilled?(wal)
+    do: Fathom.FS.wal_empty?(wal) or Fathom.Shard.Replication.Wal.fully_backfilled?(wal)
 
   # Is the file mostly freelist pages, so that a VACUUM-compacted object is much smaller than the live
   # file (expert review 2026-10-20-2027 #9)? Header-only read, no open. Defaults: free pages above
@@ -6077,16 +6077,6 @@ defmodule Fathom.Shard do
   end
 
   defp compaction_worthwhile_counts?(_count, _free, _ps), do: false
-
-  # Absent or zero-length `-wal`: no frame, committed or not, outside the main file. A WAL that
-  # holds only a header (restarted, nothing written) counts as non-empty: the conservative answer.
-  defp wal_empty?(wal) do
-    case Fathom.FS.stat(wal) do
-      {:error, :enoent} -> true
-      {:ok, %{size: 0}} -> true
-      _ -> false
-    end
-  end
 
   defp emit_flush_route(state, route) do
     Process.put(@flush_route_key, route)
