@@ -49,7 +49,7 @@ defmodule Fathom.Bench do
   (`Fathom.ShardRegistry` + `Fathom.ShardSupervisor`; `Fathom.Repo` only for the
   directory bench), never the Hrana listener, Oban, or the web endpoint. It sets
   its own runtime knobs (clean Local storage dir, durability flush off,
-  `:directory_touch`/`:lazy_migrate` off) so a bench can't touch Postgres on the
+  `:directory_touch` off, `:migrate_on_touch` `:off`) so a bench can't touch Postgres on the
   hot path or fight the periodic flush.
   """
   require Logger
@@ -4522,7 +4522,7 @@ defmodule Fathom.Bench do
     # No durability flush, no Postgres touch, no lazy migrate on the hot path.
     Application.put_env(:fathom, :shard_flush_interval_ms, 0)
     Application.put_env(:fathom, :directory_touch, false)
-    Application.put_env(:fathom, :lazy_migrate, false)
+    Application.put_env(:fathom, :migrate_on_touch, :off)
 
     # The harness boots no supervision tree, so no Heartbeat: its coordinators open LEGACY on purpose
     # (the arms that want heartbeat mode start one themselves). A node configured for the heartbeat
@@ -4600,7 +4600,7 @@ defmodule Fathom.Bench do
     Application.put_env(:fathom, Fathom.Shard.Storage.S3, s3_config_from_env())
     Application.put_env(:fathom, :shard_flush_interval_ms, 0)
     Application.put_env(:fathom, :directory_touch, false)
-    Application.put_env(:fathom, :lazy_migrate, false)
+    Application.put_env(:fathom, :migrate_on_touch, :off)
 
     # The S3 metrics (cold_open_s3, failover_rto) exercise the dedicated S3 Finch pool, but
     # `mix fathom.bench` doesn't boot the app supervision tree, so the bench has to start the pool

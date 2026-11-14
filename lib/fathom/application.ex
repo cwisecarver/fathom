@@ -1276,7 +1276,7 @@ defmodule Fathom.Application do
       Supervisor.child_spec(Fathom.Directory.Recorder, shutdown: 30_000),
       # TTL-cached fleet HEAD so the lazy-migrate checkout path never runs a
       # per-checkout `max(version)` on Postgres. Cheap when unused (polls only while
-      # :lazy_migrate is on).
+      # `:migrate_on_touch` is `:async` or `:inline`).
       Fathom.Migrator.HeadCache,
       # Read-through cache of per-shard Hrana-token revocation versions, so token
       # verification stays off the Postgres hot path (expert review #31).

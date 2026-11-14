@@ -216,7 +216,7 @@ Three pieces, split as inner measurement vs. orchestration:
   + `Fathom.ShardSupervisor`; `Fathom.Repo` only when the directory bench runs) so
   it never binds the Hrana port, never starts Oban, never starts the endpoint. Sets
   its own runtime knobs (clean Local storage dir, `:shard_flush_interval_ms` 0,
-  `:directory_touch` false, `:lazy_migrate` false). Shared by the Mix task and the
+  `:directory_touch` false, `:migrate_on_touch` `:off`). Shared by the Mix task and the
   test guards — one source of truth for "how we measure."
 - **`mix fathom.bench`** (`lib/mix/tasks/fathom.bench.ex`) — drives `Fathom.Bench`
   and emits one **complete** perf-history JSON line (the task owns the schema).

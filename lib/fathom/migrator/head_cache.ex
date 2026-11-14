@@ -1,7 +1,7 @@
 defmodule Fathom.Migrator.HeadCache do
   @moduledoc """
   A node-local, TTL-refreshed cache of the fleet **HEAD** (the highest released schema
-  version) so the `lazy_migrate` checkout path never hits Postgres per checkout.
+  version) so the migrate-on-touch checkout path never hits Postgres per checkout.
 
   `Fathom.Shards.checkout/1`'s lazy-migrate path asked `Fathom.Migrator.head/0` — a
   `SELECT max(version)` aggregate — on **every** checkout. That is exactly the
@@ -25,7 +25,7 @@ defmodule Fathom.Migrator.HeadCache do
   its cache synchronously, and other nodes can read a stale-HIGH head for up to one
   TTL — but a yanked version's `statements/1` is `nil`, so a straggler lazy migration
   targeting it errors out instead of re-applying the bad schema. `get/0` reads `:persistent_term` (lock-free, no process
-  hop); the background poll runs only while `:lazy_migrate` is enabled (nothing reads
+  hop); the background poll runs only while `:migrate_on_touch` is `:async` or `:inline` (nothing reads
   the cache otherwise — the `Fathom.ShardLoad` philosophy).
   """
   use GenServer
@@ -138,7 +138,7 @@ defmodule Fathom.Migrator.HeadCache do
 
   # Background poll only when migrate-on-touch is enabled — nothing reads the cache otherwise.
   #
-  # This gated on the LEGACY `:lazy_migrate` boolean, so setting the current `:migrate_on_touch`
+  # This gated on the legacy `:lazy_migrate` boolean (removed), so setting the current `:migrate_on_touch`
   # (`:async` | `:inline`, expert review #40) enabled the cache's only consumer without enabling the
   # poll that fills it: `get/0` returned its initial 0 forever, `Fathom.Shards`' `head > 0` guard was
   # never true, and migrate-on-touch silently did NOTHING in either mode — the documented

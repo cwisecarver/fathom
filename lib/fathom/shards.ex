@@ -495,7 +495,7 @@ defmodule Fathom.Shards do
   #   :inline — block the checkout on the full blue/green migration (drain + copy + replay + S3
   #     round-trips). Zero stale window, but multi-second first-request latency at real S3 latency.
   #
-  # `:migrate_on_touch` selects the mode; the legacy boolean `:lazy_migrate, true` maps to :inline.
+  # `:migrate_on_touch` selects the mode (the pre-#40 `:lazy_migrate` boolean is gone; unset is :off).
   defp maybe_lazy_migrate(shard_id) do
     case migrate_on_touch_mode() do
       :off -> :ok
@@ -508,7 +508,7 @@ defmodule Fathom.Shards do
   The resolved migrate-on-touch mode: `:off` | `:async` | `:inline`.
 
   Public because `Fathom.Migrator.HeadCache` has to gate its background poll on the SAME answer.
-  It used to read `:lazy_migrate` directly, so turning on the current `:migrate_on_touch` knob
+  It used to read the pre-#40 `:lazy_migrate` boolean directly, so turning on the current `:migrate_on_touch` knob
   enabled the cache's only consumer without enabling the poll that fills it — the cache stayed at
   its initial 0, `head > 0` was never true, and migrate-on-touch silently did nothing in either
   mode. One predicate, one place, so the two cannot drift again.
@@ -516,12 +516,8 @@ defmodule Fathom.Shards do
   @spec migrate_on_touch_mode() :: :off | :async | :inline
   def migrate_on_touch_mode do
     case Application.get_env(:fathom, :migrate_on_touch) do
-      mode when mode in [:off, :async, :inline] ->
-        mode
-
-      _ ->
-        # Backward compatibility: the pre-#40 `:lazy_migrate` boolean is the inline mode.
-        if Application.get_env(:fathom, :lazy_migrate, false), do: :inline, else: :off
+      mode when mode in [:off, :async, :inline] -> mode
+      _ -> :off
     end
   end
 

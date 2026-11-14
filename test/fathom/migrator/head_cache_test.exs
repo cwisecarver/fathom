@@ -29,7 +29,7 @@ defmodule Fathom.Migrator.HeadCacheTest do
   end
 
   # The BACKGROUND poll is what actually keeps the cache warm in production, and it was gated on the
-  # LEGACY `:lazy_migrate` boolean. So setting the current `:migrate_on_touch` knob (`:async` /
+  # legacy `:lazy_migrate` boolean (since removed, cleanliness audit 2026-11-13 #18). So setting the current `:migrate_on_touch` knob (`:async` /
   # `:inline`, expert review #40) enabled the cache's only consumer without enabling the poll that
   # fills it: get/0 stayed at its initial 0 forever, `Fathom.Shards`' `head > 0` guard was never
   # true, and migrate-on-touch silently did NOTHING in either mode. Found live 2026-07-30 with
@@ -40,16 +40,11 @@ defmodule Fathom.Migrator.HeadCacheTest do
   describe "the background poll's gate" do
     setup do
       prev_mode = Application.get_env(:fathom, :migrate_on_touch)
-      prev_lazy = Application.get_env(:fathom, :lazy_migrate)
 
       on_exit(fn ->
         if prev_mode == nil,
           do: Application.delete_env(:fathom, :migrate_on_touch),
           else: Application.put_env(:fathom, :migrate_on_touch, prev_mode)
-
-        if prev_lazy == nil,
-          do: Application.delete_env(:fathom, :lazy_migrate),
-          else: Application.put_env(:fathom, :lazy_migrate, prev_lazy)
       end)
 
       # A known baseline, then a release the cache has NOT seen yet.
@@ -75,15 +70,8 @@ defmodule Fathom.Migrator.HeadCacheTest do
       assert tick() == released
     end
 
-    test "the legacy :lazy_migrate boolean still enables the poll", %{released: released} do
-      Application.delete_env(:fathom, :migrate_on_touch)
-      Application.put_env(:fathom, :lazy_migrate, true)
-      assert tick() == released
-    end
-
     test ":off leaves the cache alone (nothing reads it)", %{baseline: baseline} do
       Application.put_env(:fathom, :migrate_on_touch, :off)
-      Application.delete_env(:fathom, :lazy_migrate)
       assert tick() == baseline
     end
   end

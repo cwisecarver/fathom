@@ -60,7 +60,7 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
       :shard_retain_local_bytes,
       :shard_retain_min_bytes,
       :directory_touch,
-      :lazy_migrate,
+      :migrate_on_touch,
       :replication_enabled,
       S3
     ]
@@ -86,7 +86,7 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
     Application.put_env(:fathom, :shard_flush_interval_ms, 0)
     Application.put_env(:fathom, :shard_idle_ms, @idle_ms)
     Application.put_env(:fathom, :directory_touch, false)
-    Application.put_env(:fathom, :lazy_migrate, false)
+    Application.put_env(:fathom, :migrate_on_touch, :off)
     Application.put_env(:fathom, :replication_enabled, false)
 
     test_pid = self()

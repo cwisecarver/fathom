@@ -834,7 +834,7 @@ defmodule Fathom.Scale do
     Application.put_env(:fathom, Fathom.Shard.Storage.Local, dir: store)
     Application.put_env(:fathom, :shard_flush_interval_ms, 0)
     Application.put_env(:fathom, :directory_touch, false)
-    Application.put_env(:fathom, :lazy_migrate, false)
+    Application.put_env(:fathom, :migrate_on_touch, :off)
     # This harness boots no supervision tree, hence no Heartbeat: its coordinators open LEGACY on
     # purpose (the lease-rps arm starts a heartbeat itself and then opens in heartbeat mode). A node
     # configured for the heartbeat refuses such an open (expert review 2026-11-07 #59), so say so.

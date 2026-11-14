@@ -442,7 +442,7 @@ defmodule Fathom.Rpo do
     Application.put_env(:fathom, :shard_data_dir, data)
     configure_storage(store)
     Application.put_env(:fathom, :directory_touch, false)
-    Application.put_env(:fathom, :lazy_migrate, false)
+    Application.put_env(:fathom, :migrate_on_touch, :off)
     # Hold the connection open the whole run, so a shard never idle-drops mid-
     # measurement; only the periodic flush should reach storage.
     Application.put_env(:fathom, :shard_idle_ms, 600_000)

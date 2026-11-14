@@ -22,14 +22,9 @@ defmodule Fathom.LazyMigrateTest do
 
   setup do
     shard = "lazy_#{System.unique_integer([:positive])}"
-    prev = Application.get_env(:fathom, :lazy_migrate)
     prev_mode = Application.get_env(:fathom, :migrate_on_touch)
 
     on_exit(fn ->
-      if prev == nil,
-        do: Application.delete_env(:fathom, :lazy_migrate),
-        else: Application.put_env(:fathom, :lazy_migrate, prev)
-
       if prev_mode == nil,
         do: Application.delete_env(:fathom, :migrate_on_touch),
         else: Application.put_env(:fathom, :migrate_on_touch, prev_mode)
@@ -76,7 +71,7 @@ defmodule Fathom.LazyMigrateTest do
   defp exec(conn, sql), do: ShardExecutor.execute(conn, %Stmt{sql: sql, args: []})
 
   test "checkout migrates a behind-HEAD shard before serving", %{shard: shard} do
-    Application.put_env(:fathom, :lazy_migrate, true)
+    Application.put_env(:fathom, :migrate_on_touch, :inline)
     seed_v1!(shard)
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
     # HEAD is read from the TTL cache on the checkout path; force it fresh so the test
@@ -102,7 +97,7 @@ defmodule Fathom.LazyMigrateTest do
   # its old version, which is exactly what the fleet wants it to serve.
   test "a stale-high HEAD after a yank serves the old version instead of failing checkout",
        %{shard: shard} do
-    Application.put_env(:fathom, :lazy_migrate, true)
+    Application.put_env(:fathom, :migrate_on_touch, :inline)
     seed_v1!(shard)
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
     assert :ok = Migrator.yank(2)
@@ -122,8 +117,8 @@ defmodule Fathom.LazyMigrateTest do
     ShardExecutor.close(conn)
   end
 
-  test "without lazy_migrate, checkout serves the shard as-is", %{shard: shard} do
-    # lazy_migrate stays disabled (default).
+  test "with migrate-on-touch off, checkout serves the shard as-is", %{shard: shard} do
+    # :migrate_on_touch stays unset (the :off default).
     seed_v1!(shard)
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
 

@@ -691,7 +691,7 @@ defmodule Fathom.Bench.StorageIO do
       :shard_storage,
       :shard_flush_interval_ms,
       :directory_touch,
-      :lazy_migrate
+      :migrate_on_touch
     ]
 
     prev = for k <- keys, do: {k, Application.fetch_env(:fathom, k)}
@@ -704,7 +704,7 @@ defmodule Fathom.Bench.StorageIO do
       Application.put_env(:fathom, :shard_storage, Storage.S3)
       Application.put_env(:fathom, :shard_flush_interval_ms, 0)
       Application.put_env(:fathom, :directory_touch, false)
-      Application.put_env(:fathom, :lazy_migrate, false)
+      Application.put_env(:fathom, :migrate_on_touch, :off)
 
       # No supervision tree, so no Heartbeat: legacy coordinators on purpose; a node configured for the
       # heartbeat would refuse these opens (expert review 2026-11-07 #59).
