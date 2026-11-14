@@ -15,21 +15,17 @@ defmodule Fathom.ShardFenceVerdictTelemetryTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
 
   setup do
     shard = "fenceverdict_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     on_exit(fn ->
       Application.delete_env(:fathom, :storage_fault)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
 
       Shards.drain(shard, 2_000)
 

@@ -31,6 +31,7 @@ defmodule Fathom.Shard.Storage.S3LeaseAmbiguityTest do
   alias Fathom.Shard.PromoteOnOpen
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   # The rollback-cannot-run cases log the stranded-lock error by design.
@@ -43,18 +44,6 @@ defmodule Fathom.Shard.Storage.S3LeaseAmbiguityTest do
   # A 403 is not retried by Req (500/503 are, with backoff), so this fails a read quickly. All the
   # tests need is that the read FAILS, as it does in the brownout that lost the lock PUT's reply.
   @read_fails {:status, 403}
-
-  setup do
-    prev = Application.get_env(:fathom, S3)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
-
-    :ok
-  end
 
   for hb <- [:stale_heartbeat, :no_heartbeat] do
     describe "dead owner with #{hb}" do
@@ -292,7 +281,7 @@ defmodule Fathom.Shard.Storage.S3LeaseAmbiguityTest do
 
     store = start_supervised!({Agent, fn -> S3EtagStore.initial(objects) end})
 
-    Application.put_env(:fathom, S3,
+    Env.put!(:fathom, S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",

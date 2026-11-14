@@ -8,15 +8,15 @@ defmodule Fathom.Shard.Storage.S3PrePutSpanTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   setup do
     dir = Path.join(System.tmp_dir!(), "s3preput_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    prev = Application.get_env(:fathom, S3)
     store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -39,10 +39,6 @@ defmodule Fathom.Shard.Storage.S3PrePutSpanTest do
     on_exit(fn ->
       :telemetry.detach(name)
       File.rm_rf!(dir)
-
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
     end)
 
     local = Path.join(dir, "s.db")

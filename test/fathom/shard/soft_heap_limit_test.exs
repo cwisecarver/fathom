@@ -18,17 +18,12 @@ defmodule Fathom.Shard.SoftHeapLimitTest do
 
   alias Exqlite.Sqlite3
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Env
 
   @gib 1024 * 1024 * 1024
 
   setup do
-    prev = Application.get_env(:fathom, :shard_soft_heap_limit_bytes)
-
     on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :shard_soft_heap_limit_bytes, prev),
-        else: Application.delete_env(:fathom, :shard_soft_heap_limit_bytes)
-
       set_raw(0)
     end)
 
@@ -44,13 +39,13 @@ defmodule Fathom.Shard.SoftHeapLimitTest do
   end
 
   test "0 means off: nothing is applied" do
-    Application.put_env(:fathom, :shard_soft_heap_limit_bytes, 0)
+    Env.put!(:shard_soft_heap_limit_bytes, 0)
     assert Connection.apply_soft_heap_limit() == :skipped
     assert read_fresh() == 0
   end
 
   test "a configured limit governs a connection opened AFTER it, and re-applying is idempotent" do
-    Application.put_env(:fathom, :shard_soft_heap_limit_bytes, 8 * @gib)
+    Env.put!(:shard_soft_heap_limit_bytes, 8 * @gib)
 
     assert Connection.apply_soft_heap_limit() == :ok
     assert read_fresh() == 8 * @gib
@@ -64,7 +59,7 @@ defmodule Fathom.Shard.SoftHeapLimitTest do
     {:ok, held} = Sqlite3.open(":memory:")
 
     try do
-      Application.put_env(:fathom, :shard_soft_heap_limit_bytes, 4 * @gib)
+      Env.put!(:shard_soft_heap_limit_bytes, 4 * @gib)
       assert Connection.apply_soft_heap_limit() == :ok
       assert read(held) == 4 * @gib
     after

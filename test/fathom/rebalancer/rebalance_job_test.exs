@@ -15,30 +15,19 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   }
 
   alias Fathom.Repo
+  alias Fathom.Test.Env
 
   import Ecto.Query, only: [from: 2]
 
   setup do
-    prev = for k <- config_keys(), into: %{}, do: {k, Application.get_env(:fathom, k)}
-
-    Application.put_env(:fathom, :lb_backends, %{
+    Env.put!(:lb_backends, %{
       "n1" => "n1:8080",
       "n2" => "n2:8080",
       "n3" => "n3:8080"
     })
 
-    on_exit(fn ->
-      Enum.each(prev, fn
-        {k, nil} -> Application.delete_env(:fathom, k)
-        {k, v} -> Application.put_env(:fathom, k, v)
-      end)
-    end)
-
     :ok
   end
-
-  defp config_keys,
-    do: [:rebalancer_enabled, :lb_backends, :rebalance_hot_qps_floor, :rebalance_confirm_windows]
 
   defp sample(node, shard, q, age_ms) do
     at = DateTime.add(DateTime.utc_now(), -age_ms, :millisecond)
@@ -64,7 +53,7 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   # but the migrator issues drain commands whenever COMMAND_POLLER is on, so terminal rows were never
   # pruned and stale pending ones never expired.
   test "gate off: command rows are still pruned and expired" do
-    Application.put_env(:fathom, :rebalancer_enabled, false)
+    Env.put!(:rebalancer_enabled, false)
     {:ok, old_done} = Commands.issue("s", "n", "drain")
     {:ok, _} = Commands.complete(old_done, "done", "drained")
     {:ok, old_pending} = Commands.issue("s2", "n", "drain")
@@ -83,9 +72,9 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   end
 
   test "gate on: a confirmed hot shard on an overloaded node enqueues a handoff" do
-    Application.put_env(:fathom, :rebalancer_enabled, true)
-    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
-    Application.put_env(:fathom, :rebalance_confirm_windows, 2)
+    Env.put!(:rebalancer_enabled, true)
+    Env.put!(:rebalance_hot_qps_floor, 500.0)
+    Env.put!(:rebalance_confirm_windows, 2)
 
     # n1 overloaded (hot_1 900 + filler 300, two windows of hot_1); n2/n3 cold.
     sample("n1", "hot_1", 900, 10_000)
@@ -104,9 +93,9 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   # Expert review 2026-11-07 #56, integration: the published `draining` flag and the target
   # freshness cut both reach the policy.
   test "a draining node, and a node that stopped beating a while ago, are not handoff targets (#56)" do
-    Application.put_env(:fathom, :rebalancer_enabled, true)
-    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
-    Application.put_env(:fathom, :rebalance_confirm_windows, 2)
+    Env.put!(:rebalancer_enabled, true)
+    Env.put!(:rebalance_hot_qps_floor, 500.0)
+    Env.put!(:rebalance_confirm_windows, 2)
 
     sample("n1", "hot_1", 900, 10_000)
     sample("n1", "hot_1", 900, 0)
@@ -125,9 +114,9 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   end
 
   test "a node whose last beat is older than the target freshness window is not a target (#56)" do
-    Application.put_env(:fathom, :rebalancer_enabled, true)
-    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
-    Application.put_env(:fathom, :rebalance_confirm_windows, 2)
+    Env.put!(:rebalancer_enabled, true)
+    Env.put!(:rebalance_hot_qps_floor, 500.0)
+    Env.put!(:rebalance_confirm_windows, 2)
 
     sample("n1", "hot_1", 900, 10_000)
     sample("n1", "hot_1", 900, 0)
@@ -157,20 +146,15 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   end
 
   test "an enabled tick re-renders the LB map from the override table (#10)" do
-    Application.put_env(:fathom, :rebalancer_enabled, true)
-    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+    Env.put!(:rebalancer_enabled, true)
+    Env.put!(:rebalance_hot_qps_floor, 500.0)
 
     map_path =
       Path.join(System.tmp_dir!(), "fathom_reblb_#{System.unique_integer([:positive])}.conf")
 
-    prev_map = Application.get_env(:fathom, :lb_map_path)
-    Application.put_env(:fathom, :lb_map_path, map_path)
+    Env.put!(:lb_map_path, map_path)
 
     on_exit(fn ->
-      if is_nil(prev_map),
-        do: Application.delete_env(:fathom, :lb_map_path),
-        else: Application.put_env(:fathom, :lb_map_path, prev_map)
-
       File.rm(map_path)
       for f <- Path.wildcard(map_path <> ".tmp.*"), do: File.rm(f)
     end)
@@ -185,8 +169,8 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   end
 
   test "an enabled tick sweeps the command channel: prunes terminal + expires stale (#12)" do
-    Application.put_env(:fathom, :rebalancer_enabled, true)
-    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+    Env.put!(:rebalancer_enabled, true)
+    Env.put!(:rebalance_hot_qps_floor, 500.0)
 
     {:ok, old_done} = Commands.issue("s1", "n1", "drain")
     {:ok, _} = Commands.complete(old_done, "done", "drained")
@@ -206,8 +190,8 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   end
 
   test "reconcile unpins a pin whose node is dead so the shard re-homes (#1b)" do
-    Application.put_env(:fathom, :rebalancer_enabled, true)
-    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+    Env.put!(:rebalancer_enabled, true)
+    Env.put!(:rebalance_hot_qps_floor, 500.0)
 
     # n1 is beating; dead_node is not. hot_1 is pinned to dead_node.
     :ok = Nodes.beat("n1")
@@ -218,8 +202,8 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   end
 
   test "reconcile keeps a pin whose node stopped beating but still HOLDS the S3 lease (#1)" do
-    Application.put_env(:fathom, :rebalancer_enabled, true)
-    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+    Env.put!(:rebalancer_enabled, true)
+    Env.put!(:rebalance_hot_qps_floor, 500.0)
 
     shard = "recon_held_#{System.unique_integer([:positive])}"
     lock = Path.join([Fathom.Shard.Storage.Local.dir(), shard <> ".lock"])
@@ -244,8 +228,8 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   # deploy / mid-warm target). The reconciler used to UNPIN that pin, silently undoing the
   # handoff. The in-flight-HandoffJob guard defers to the handoff.
   test "reconcile keeps a pin with an in-flight HandoffJob, even with a free lease + dead-looking target (#10)" do
-    Application.put_env(:fathom, :rebalancer_enabled, true)
-    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+    Env.put!(:rebalancer_enabled, true)
+    Env.put!(:rebalance_hot_qps_floor, 500.0)
 
     shard = "moving_#{System.unique_integer([:positive])}"
 
@@ -272,8 +256,8 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   # The complementary direction (#10): a genuinely stale-node pin with NO live handoff still
   # re-homes promptly — the guard defers to handoffs, it does not freeze every recent pin.
   test "reconcile DOES unpin a stale-node pin that has no in-flight handoff (#10)" do
-    Application.put_env(:fathom, :rebalancer_enabled, true)
-    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+    Env.put!(:rebalancer_enabled, true)
+    Env.put!(:rebalance_hot_qps_floor, 500.0)
 
     shard = "stale_#{System.unique_integer([:positive])}"
 
@@ -286,8 +270,8 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   end
 
   test "reconcile fails open: no beats ⇒ no unpins (#1b)" do
-    Application.put_env(:fathom, :rebalancer_enabled, true)
-    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+    Env.put!(:rebalancer_enabled, true)
+    Env.put!(:rebalance_hot_qps_floor, 500.0)
 
     {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
     # Nothing has beaten — the alive set is empty, so the reconciler must NOT yank pins
@@ -297,9 +281,9 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   end
 
   test "affinity: an enabled tick routes the handoff to a warm target (#C)" do
-    Application.put_env(:fathom, :rebalancer_enabled, true)
-    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
-    Application.put_env(:fathom, :rebalance_confirm_windows, 2)
+    Env.put!(:rebalancer_enabled, true)
+    Env.put!(:rebalance_hot_qps_floor, 500.0)
+    Env.put!(:rebalance_confirm_windows, 2)
 
     # n1 overloaded; n2 coldest (10), n3 warm for hot_1 and within the band (100).
     sample("n1", "hot_1", 900, 10_000)
@@ -322,9 +306,9 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   # suspended tenant, or one with a migration in flight, was handed off (pinning an LB override).
   describe "lifecycle eligibility (#27)" do
     setup do
-      Application.put_env(:fathom, :rebalancer_enabled, true)
-      Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
-      Application.put_env(:fathom, :rebalance_confirm_windows, 2)
+      Env.put!(:rebalancer_enabled, true)
+      Env.put!(:rebalance_hot_qps_floor, 500.0)
+      Env.put!(:rebalance_confirm_windows, 2)
       :ok
     end
 
@@ -364,8 +348,8 @@ defmodule Fathom.Rebalancer.RebalanceJobTest do
   end
 
   test "gate on but nothing hot: no handoffs" do
-    Application.put_env(:fathom, :rebalancer_enabled, true)
-    Application.put_env(:fathom, :rebalance_hot_qps_floor, 500.0)
+    Env.put!(:rebalancer_enabled, true)
+    Env.put!(:rebalance_hot_qps_floor, 500.0)
 
     sample("n1", "a", 50, 0)
     sample("n2", "b", 40, 0)

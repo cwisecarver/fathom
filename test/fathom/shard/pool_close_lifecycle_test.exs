@@ -21,25 +21,19 @@ defmodule Fathom.Shard.PoolCloseLifecycleTest do
   alias Fathom.Shard
   alias Fathom.Shard.WriteFence
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
-    prev_pool = Application.get_env(:fathom, :connection_pool)
-    prev_opts = Application.get_env(:fathom, :connection_pool_opts)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:shard_idle_ms, 60_000)
+    Env.put!(:connection_pool, true)
     # These tests were written against a 250 ms drain grace, and they wait 2 s for the first idle
     # transition's close to START. They pin it rather than inherit the default, which became 2000 ms
     # on 2026-10-31 (docs/reviews/rig-arms-2026-10-31.md).
-    Application.put_env(:fathom, :connection_pool_opts, drain_grace_ms: 250)
+    Env.put!(:connection_pool_opts, drain_grace_ms: 250)
     shard = "pool_close_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      restore(:connection_pool, prev_pool)
-      restore(:connection_pool_opts, prev_opts)
-      restore(:shard_idle_ms, prev_idle)
-      Application.delete_env(:fathom, :shard_pool_close_hook)
       :erlang.trace_pattern({Sqlite3, :close, 1}, false, [])
 
       # The coordinator may still be running: stop it before the files go.
@@ -57,8 +51,6 @@ defmodule Fathom.Shard.PoolCloseLifecycleTest do
     %{shard: shard}
   end
 
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, val), do: Application.put_env(:fathom, key, val)
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
   defp conn_of({_pid, _ref, conn, _id, _sc, _v, _o}), do: conn
   defp pid_of({pid, _ref, _conn, _id, _sc, _v, _o}), do: pid
@@ -99,7 +91,7 @@ defmodule Fathom.Shard.PoolCloseLifecycleTest do
   } do
     test_pid = self()
 
-    Application.put_env(:fathom, :shard_pool_close_hook, fn conn ->
+    Env.put!(:shard_pool_close_hook, fn conn ->
       send(test_pid, {:close_started, conn, System.monotonic_time(:millisecond)})
       Process.sleep(80)
     end)
@@ -256,9 +248,7 @@ defmodule Fathom.Shard.PoolCloseLifecycleTest do
   test "handles shed by the ttl sweep are closed off the coordinator (2026-10-17 #19)", %{
     shard: shard
   } do
-    prev_opts = Application.get_env(:fathom, :connection_pool_opts)
-    Application.put_env(:fathom, :connection_pool_opts, ttl_ms: 50)
-    on_exit(fn -> restore(:connection_pool_opts, prev_opts) end)
+    Env.put!(:connection_pool_opts, ttl_ms: 50)
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))

@@ -64,23 +64,15 @@ defmodule Fathom.ShardLeaseReleaseTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
 
   setup do
     shard = "lease_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-
-    # FaultyStorage models S3's lock-etag contract; plain Local identifies a lock by
-    # {owner, epoch} alone and so cannot express #9 at all (see the backend's comment).
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
 
     on_exit(fn ->
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-
       Shards.drain(shard, 2_000)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
@@ -89,6 +81,10 @@ defmodule Fathom.ShardLeaseReleaseTest do
 
       for f <- Path.wildcard(Path.join(Shard.data_dir(), "#{shard}.db.*")), do: File.rm(f)
     end)
+
+    # FaultyStorage models S3's lock-etag contract; plain Local identifies a lock by
+    # {owner, epoch} alone and so cannot express #9 at all (see the backend's comment).
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     %{shard: shard}
   end
@@ -134,24 +130,12 @@ defmodule Fathom.ShardLeaseReleaseTest do
   end
 
   defp put_fault!(fault) do
-    prev = Application.get_env(:fathom, :storage_fault)
-    Application.put_env(:fathom, :storage_fault, fault)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :storage_fault, prev),
-        else: Application.delete_env(:fathom, :storage_fault)
-    end)
-
-    :ok
+    Env.put!(:storage_fault, fault)
   end
 
   # The stored object's path in the Local backend's dir. Writing it changes the object's etag,
   # which is how a test reproduces "the object moved under us" — the lost-PUT-response case that
   # makes a fenced flush 412 without any peer being involved.
-  defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore_env(key, value), do: Application.put_env(:fathom, key, value)
-
   defp remote_db(shard), do: Path.join(Fathom.Shard.Storage.Local.dir(), "#{shard}.db")
 
   # OUR OWN PUT that landed with its response lost. Realistic only if it carries what a real one
@@ -243,14 +227,11 @@ defmodule Fathom.ShardLeaseReleaseTest do
           :counters.add(calls, 1, 1)
         end
 
-        Application.put_env(:fathom, :faulty_before, {:flush, hook})
+        Env.put!(:faulty_before, {:flush, hook})
 
-        on_exit(fn ->
-          Application.delete_env(:fathom, :faulty_before)
-          # The hook ARMS :storage_fault mid-run, so this test owns clearing it — leaving it set
-          # leaks a flush fault into every later test in the file.
-          Application.delete_env(:fathom, :storage_fault)
-        end)
+        # The hook ARMS :storage_fault mid-run, so this test owns clearing it — leaving it set
+        # leaks a flush fault into every later test in the file.
+        Env.delete!(:storage_fault)
 
         path = Path.join(Shard.data_dir(), "#{shard}.db")
         log = drain_and_wait!(shard, coordinator)
@@ -297,12 +278,8 @@ defmodule Fathom.ShardLeaseReleaseTest do
           )
         end
 
-        Application.put_env(:fathom, :faulty_before, {:flush, hook})
-
-        on_exit(fn ->
-          Application.delete_env(:fathom, :faulty_before)
-          Application.delete_env(:fathom, :faulty_check_lease_result)
-        end)
+        Env.put!(:faulty_before, {:flush, hook})
+        Env.delete!(:faulty_check_lease_result)
 
         path = Path.join(Shard.data_dir(), "#{shard}.db")
         log = drain_and_wait!(shard, coordinator)
@@ -465,13 +442,10 @@ defmodule Fathom.ShardLeaseReleaseTest do
         path = Path.join(Shard.data_dir(), "#{shard}.db")
         assert File.exists?(path), "the fixture needs a warm local copy or the open goes cold"
 
-        Application.put_env(
-          :fathom,
+        Env.put!(
           :faulty_before,
           {:object_etag, fn -> raise Req.TransportError, reason: :closed end}
         )
-
-        on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
 
         log =
           capture_log(fn ->
@@ -733,16 +707,8 @@ defmodule Fathom.ShardLeaseReleaseTest do
     # TRANSIENT error so `Fence.check/2` lands on `:skip` (`fence.ex`'s
     # `{:error, _reason} -> :skip`), which is the cut-from-storage verdict.
     test "the not-valid clock starts at the lapse even when the shard is CLEAN", %{shard: shard} do
-      prev_jitter = Application.get_env(:fathom, :lapse_revalidate_jitter_ms)
-      prev_fence = Application.get_env(:fathom, :fence_writes_when_stealable)
-      Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 1)
-      Application.put_env(:fathom, :fence_writes_when_stealable, true)
-
-      on_exit(fn ->
-        restore_env(:lapse_revalidate_jitter_ms, prev_jitter)
-        restore_env(:fence_writes_when_stealable, prev_fence)
-        Application.delete_env(:fathom, :faulty_renew_lease_result)
-      end)
+      Env.put!(:lapse_revalidate_jitter_ms, 1)
+      Env.put!(:fence_writes_when_stealable, true)
 
       seed!(shard, "read-mostly")
       {:ok, coordinator} = Shards.ensure(shard)
@@ -759,8 +725,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
 
       # Storage is unreachable: the ownership re-check fails transiently rather than reporting a
       # steal, which is the cut-from-storage shape.
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_renew_lease_result,
         {:error, {:transient, :s3_unreachable}}
       )

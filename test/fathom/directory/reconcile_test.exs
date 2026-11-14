@@ -11,6 +11,7 @@ defmodule Fathom.Directory.ReconcileTest do
   alias Fathom.Directory
   alias Fathom.Directory.Reconcile
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.Env
 
   defp uniq, do: "recon_#{System.unique_integer([:positive])}"
 
@@ -240,21 +241,12 @@ defmodule Fathom.Directory.ReconcileTest do
     test "a store error reading the copy is :unreadable and never clears the pointer" do
       shard = uniq()
       on_exit(fn -> cleanup(shard) end)
-      prev = Application.get_env(:fathom, :shard_storage)
 
       # Fully qualified: this test sits above the `defmodule StubStorage` it uses, so the bare alias
       # is not in scope here and would store the atom `StubStorage` as the backend.
-      Application.put_env(:fathom, :shard_storage, __MODULE__.StubStorage)
+      Env.put!(:shard_storage, __MODULE__.StubStorage)
 
-      on_exit(fn ->
-        Application.delete_env(:fathom, :recon_stub)
-
-        if prev,
-          do: Application.put_env(:fathom, :shard_storage, prev),
-          else: Application.delete_env(:fathom, :shard_storage)
-      end)
-
-      Application.put_env(:fathom, :recon_stub, %{
+      Env.put!(:recon_stub, %{
         {:uv, shard} => {:ok, 0},
         {:floor, shard} => {:ok, 0},
         {:retained, shard} => {:error, :timeout}
@@ -303,19 +295,10 @@ defmodule Fathom.Directory.ReconcileTest do
 
   describe "unreadable rows are reported, never silently clean (expert review 2026-10-12 #6)" do
     setup do
-      prev = Application.get_env(:fathom, :shard_storage)
-      Application.put_env(:fathom, :shard_storage, StubStorage)
-
-      on_exit(fn ->
-        Application.delete_env(:fathom, :recon_stub)
-
-        if prev,
-          do: Application.put_env(:fathom, :shard_storage, prev),
-          else: Application.delete_env(:fathom, :shard_storage)
-      end)
+      Env.put!(:shard_storage, StubStorage)
     end
 
-    defp stub(map), do: Application.put_env(:fathom, :recon_stub, map)
+    defp stub(map), do: Env.put!(:recon_stub, map)
 
     test "a storage error on one shard yields an :unreadable finding" do
       shard = uniq()
@@ -378,28 +361,13 @@ defmodule Fathom.Directory.ReconcileTest do
   describe "S3: no whole-object pull (expert review 2026-10-12 #19)" do
     alias Fathom.Shard.Storage.S3
 
-    setup do
-      prev_store = Application.get_env(:fathom, :shard_storage)
-      prev_s3 = Application.get_env(:fathom, S3)
-
-      on_exit(fn ->
-        if prev_store,
-          do: Application.put_env(:fathom, :shard_storage, prev_store),
-          else: Application.delete_env(:fathom, :shard_storage)
-
-        if prev_s3,
-          do: Application.put_env(:fathom, S3, prev_s3),
-          else: Application.delete_env(:fathom, S3)
-      end)
-    end
-
     # Expert review 2026-10-15 #24: only a 404 may read as an absent retained copy. A 500 or a
     # throttle is an error, because a reconcile that clears a pointer on a blip discards a revert
     # target that is still there.
     test "version_state: only a 404 is :absent; any other failure is an error" do
       test_pid = self()
 
-      Application.put_env(:fathom, :shard_storage, S3)
+      Env.put!(:shard_storage, S3)
 
       for {status, expected} <- [
             {200, :present},
@@ -411,7 +379,7 @@ defmodule Fathom.Directory.ReconcileTest do
           Plug.Conn.send_resp(conn, status, "")
         end
 
-        Application.put_env(:fathom, S3,
+        Env.put!(S3,
           bucket: "b",
           region: "us-east-1",
           access_key_id: "k",
@@ -461,9 +429,9 @@ defmodule Fathom.Directory.ReconcileTest do
         end
       end
 
-      Application.put_env(:fathom, :shard_storage, S3)
+      Env.put!(:shard_storage, S3)
 
-      Application.put_env(:fathom, S3,
+      Env.put!(S3,
         bucket: "b",
         region: "us-east-1",
         access_key_id: "k",

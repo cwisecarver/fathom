@@ -8,6 +8,7 @@ defmodule Fathom.Admin.CollectorErrorsTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Admin.{EventRing, MetricsCollector}
+  alias Fathom.Test.Env
 
   @events [
     [:fathom, :shard, :query, :error],
@@ -19,14 +20,7 @@ defmodule Fathom.Admin.CollectorErrorsTest do
   ]
 
   setup do
-    prev = Application.get_env(:fathom, :admin_tick_ms)
-    Application.put_env(:fathom, :admin_tick_ms, 3_600_000)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :admin_tick_ms, prev),
-        else: Application.delete_env(:fathom, :admin_tick_ms)
-    end)
+    Env.put!(:admin_tick_ms, 3_600_000)
 
     for child <- Fathom.Telemetry.reporter_children(), do: start_supervised!(child)
     await_handlers(@events)

@@ -20,19 +20,13 @@ defmodule Fathom.OwnerNodeKeyTest do
   alias Fathom.Shard.Replication.Recovery
   alias Fathom.Shard.{Heartbeat, Storage}
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   @modes [:legacy, :heartbeat]
 
   setup do
     key = "keyed-#{System.unique_integer([:positive])}"
-    prev = Application.get_env(:fathom, :node_key)
-    Application.put_env(:fathom, :node_key, key)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :node_key, prev),
-        else: Application.delete_env(:fathom, :node_key)
-    end)
+    Env.put!(:node_key, key)
 
     refute Rebalancer.node_key() == to_string(node()),
            "fixture: NODE_KEY must differ from node() or this file proves nothing"
@@ -72,13 +66,8 @@ defmodule Fathom.OwnerNodeKeyTest do
   describe "RemoteFlush" do
     for mode <- @modes do
       test "a lease held by THIS node's key is local, not a remote command (#{mode})" do
-        Application.put_env(:fathom, :command_poller, true)
-        Application.put_env(:fathom, :remote_flush_ms, 200)
-
-        on_exit(fn ->
-          Application.delete_env(:fathom, :command_poller)
-          Application.delete_env(:fathom, :remote_flush_ms)
-        end)
+        Env.put!(:command_poller, true)
+        Env.put!(:remote_flush_ms, 200)
 
         id = "ownerkey-flush-#{System.unique_integer([:positive])}"
         set_mode!(unquote(mode))
@@ -101,30 +90,13 @@ defmodule Fathom.OwnerNodeKeyTest do
       map_path =
         Path.join(System.tmp_dir!(), "fathom_lbmap_#{System.unique_integer([:positive])}.conf")
 
-      keys = [
-        :shard_idle_ms,
-        :lb_map_path,
-        :lb_backends,
-        :handoff_warm_timeout_ms,
-        :handoff_drain_timeout_ms
-      ]
+      Env.put!(:shard_idle_ms, 600_000)
+      Env.put!(:lb_map_path, map_path)
+      Env.put!(:lb_backends, %{key => "#{key}:8080"})
+      Env.put!(:handoff_warm_timeout_ms, 50)
+      Env.put!(:handoff_drain_timeout_ms, 50)
 
-      prev = Map.new(keys, &{&1, Application.get_env(:fathom, &1)})
-      Application.put_env(:fathom, :shard_idle_ms, 600_000)
-      Application.put_env(:fathom, :lb_map_path, map_path)
-      Application.put_env(:fathom, :lb_backends, %{key => "#{key}:8080"})
-      Application.put_env(:fathom, :handoff_warm_timeout_ms, 50)
-      Application.put_env(:fathom, :handoff_drain_timeout_ms, 50)
-
-      on_exit(fn ->
-        for {k, v} <- prev do
-          if v == nil,
-            do: Application.delete_env(:fathom, k),
-            else: Application.put_env(:fathom, k, v)
-        end
-
-        File.rm(map_path)
-      end)
+      on_exit(fn -> File.rm(map_path) end)
 
       :ok
     end

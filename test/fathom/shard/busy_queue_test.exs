@@ -14,6 +14,7 @@ defmodule Fathom.Shard.BusyQueueTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Env
 
   @queue Fathom.Shard.Connection.BusyQueue
 
@@ -21,12 +22,7 @@ defmodule Fathom.Shard.BusyQueueTest do
     unless Fathom.Shard.Extension.available?(),
       do: flunk("fathom_udf extension not built: these tests would measure nothing")
 
-    prev = Application.get_env(:fathom, :query_timeout_ms)
-    Application.delete_env(:fathom, :query_timeout_ms)
-
-    on_exit(fn ->
-      if prev, do: Application.put_env(:fathom, :query_timeout_ms, prev)
-    end)
+    Env.delete!(:query_timeout_ms)
 
     :ok
   end

@@ -45,14 +45,13 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
     shard = "snapint_#{System.unique_integer([:positive])}"
-    prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
 
     on_exit(fn ->
-      restore(:shard_flush_interval_ms, prev_flush)
       Shards.drain(shard, 2_000)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
@@ -64,9 +63,6 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
 
     %{shard: shard}
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
   defp db_path(shard), do: Path.join(Shard.data_dir(), "#{shard}.db")
@@ -91,7 +87,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
 
   describe "#5 — synchronous must be restored before any checkpoint or close" do
     test "the live database survives a flush with its durability setting intact", %{shard: shard} do
-      Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 60_000)
 
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, coordinator} = Shards.ensure(shard)
@@ -114,7 +110,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
     end
 
     test "a fresh connection to the flushed shard reads synchronous=FULL", %{shard: shard} do
-      Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 60_000)
 
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, coordinator} = Shards.ensure(shard)
@@ -134,7 +130,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
     end
 
     test "repeated flushes keep the database readable and intact", %{shard: shard} do
-      Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 60_000)
 
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, coordinator} = Shards.ensure(shard)
@@ -160,7 +156,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
 
   describe "#14 — the periodic flush must integrity-gate its snapshot" do
     test "a corrupt shard is not flushed over the last good stored object", %{shard: shard} do
-      Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 60_000)
 
       # Establish a good stored object.
       {:ok, conn} = ShardExecutor.open(shard)
@@ -216,7 +212,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
     test "the corrupt local copy is preserved in place while the shard is still served", %{
       shard: shard
     } do
-      Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 60_000)
 
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, coordinator} = Shards.ensure(shard)
@@ -248,7 +244,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
     end
 
     test "corrupt-flush telemetry fires from the periodic path too", %{shard: shard} do
-      Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 60_000)
       test_pid = self()
       handler = "corrupt-periodic-#{shard}"
 
@@ -283,7 +279,7 @@ defmodule Fathom.ShardSnapshotIntegrityTest do
     end
 
     test "a HEALTHY shard still flushes — the gate must not block the happy path", %{shard: shard} do
-      Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 60_000)
 
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, coordinator} = Shards.ensure(shard)

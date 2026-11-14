@@ -23,6 +23,7 @@ defmodule Fathom.ShardStorageS3Test do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
 
   @prefix "leasetest/"
 
@@ -648,14 +649,7 @@ defmodule Fathom.ShardStorageS3Test do
   # If-Match) are claims about the deployed store, so they are run against it. MinIO answers a
   # conditional DELETE 204 (ignoring If-Match), which is what the test-store escape hatch is for.
   test "the boot self-test, including the multipart fence probe, passes on the real store" do
-    prev = Application.get_env(:fathom, :allow_weak_conditional_delete)
-    Application.put_env(:fathom, :allow_weak_conditional_delete, true)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :allow_weak_conditional_delete),
-        else: Application.put_env(:fathom, :allow_weak_conditional_delete, prev)
-    end)
+    Env.put!(:allow_weak_conditional_delete, true)
 
     ExUnit.CaptureLog.capture_log(fn -> assert S3.verify_conditional_writes!() == :ok end)
   end

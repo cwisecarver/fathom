@@ -16,22 +16,16 @@ defmodule Fathom.Shard.ReplicationTransportTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Protocol.Push
   alias Fathom.Shard.Replication.Shipper
+  alias Fathom.Test.Env
 
   @payload :binary.copy(<<0xCD>>, 512)
 
   setup do
-    prev_dir = Application.get_env(:fathom, :replication_dir)
     root = Path.join(System.tmp_dir!(), "repl_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
-    Application.put_env(:fathom, :replication_dir, root)
+    Env.put!(:replication_dir, root)
 
-    on_exit(fn ->
-      if prev_dir,
-        do: Application.put_env(:fathom, :replication_dir, prev_dir),
-        else: Application.delete_env(:fathom, :replication_dir)
-
-      File.rm_rf(root)
-    end)
+    on_exit(fn -> File.rm_rf(root) end)
 
     %{root: root}
   end
@@ -509,9 +503,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       ship = start_shipper!(:overload_ship, port)
 
       # Bound it hard so the test states its own precondition rather than shipping megabytes.
-      prev = Application.get_env(:fathom, :replication_max_queue)
-      Application.put_env(:fathom, :replication_max_queue, 5)
-      on_exit(fn -> restore_max_queue(prev) end)
+      Env.put!(:replication_max_queue, 5)
 
       # Suspend the shipper so casts pile up in its mailbox deterministically — this is the
       # producer-outpaces-consumer state, made explicit instead of raced for.
@@ -541,9 +533,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       {port, hole} = black_hole!(self())
       ship = start_shipper!(:noovl_ship, port)
 
-      prev = Application.get_env(:fathom, :replication_max_queue)
-      Application.put_env(:fathom, :replication_max_queue, 0)
-      on_exit(fn -> restore_max_queue(prev) end)
+      Env.put!(:replication_max_queue, 0)
 
       :erlang.suspend_process(ship)
       for i <- 1..40, do: Shipper.push(ship, push_for("noovl_#{i}"))
@@ -559,9 +549,6 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       send(hole, :die)
     end
   end
-
-  defp restore_max_queue(nil), do: Application.delete_env(:fathom, :replication_max_queue)
-  defp restore_max_queue(v), do: Application.put_env(:fathom, :replication_max_queue, v)
 
   defp push_for(shard_id) do
     %Push{
@@ -863,14 +850,6 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       # The budget refusal is produced in the CALLER's process, not the shipper's, so it is the
       # one reply path that cannot read `state.id`. It must still name the caller's own term or
       # the refusal is counted against nobody and the quorum waits out its deadline.
-      prev = Application.get_env(:fathom, :replication_max_queue_bytes)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :replication_max_queue_bytes),
-          else: Application.put_env(:fathom, :replication_max_queue_bytes, prev)
-      end)
-
       port = start_follower_named!(:idf2)
       name = :"id_full_#{System.unique_integer([:positive])}"
 
@@ -888,7 +867,7 @@ defmodule Fathom.Shard.ReplicationTransportTest do
       on_exit(fn -> Fathom.Shard.Replication.Fleet.publish([]) end)
 
       # A cap of one byte: any payload is over budget, so `push/2` takes the local-refusal path.
-      Application.put_env(:fathom, :replication_max_queue_bytes, 1)
+      Env.put!(:replication_max_queue_bytes, 1)
 
       Shipper.push(name, %Push{
         shard_id: "acme",

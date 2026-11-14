@@ -12,6 +12,7 @@ defmodule Fathom.Shard.Storage.S3TokenFloorBudgetTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
 
   defmodule Stub do
     @moduledoc false
@@ -44,9 +45,8 @@ defmodule Fathom.Shard.Storage.S3TokenFloorBudgetTest do
       )
 
     {:ok, {_ip, port}} = ThousandIsland.listener_info(bandit)
-    prev = Application.get_env(:fathom, S3)
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -55,12 +55,6 @@ defmodule Fathom.Shard.Storage.S3TokenFloorBudgetTest do
       path_style: true,
       prefix: "shards/"
     )
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
 
     assert is_pid(Process.whereis(S3.finch_name())), "the dedicated pool must be up"
   end

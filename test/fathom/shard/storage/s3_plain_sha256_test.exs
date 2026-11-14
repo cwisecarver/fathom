@@ -10,6 +10,7 @@ defmodule Fathom.Shard.Storage.S3PlainSha256Test do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   @md5 "x-amz-meta-fathom-md5"
@@ -18,10 +19,9 @@ defmodule Fathom.Shard.Storage.S3PlainSha256Test do
   setup do
     dir = Path.join(System.tmp_dir!(), "s3sha_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    prev = for k <- [S3, :s3_plain_sha256], do: {k, Application.get_env(:fathom, k)}
     store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -31,16 +31,7 @@ defmodule Fathom.Shard.Storage.S3PlainSha256Test do
       req_plug: fn conn -> S3EtagStore.serve(conn, store) end
     )
 
-    on_exit(fn ->
-      File.rm_rf!(dir)
-
-      for {k, v} <- prev,
-          do:
-            if(is_nil(v),
-              do: Application.delete_env(:fathom, k),
-              else: Application.put_env(:fathom, k, v)
-            )
-    end)
+    on_exit(fn -> File.rm_rf!(dir) end)
 
     local = Path.join(dir, "src.db")
     plain = :binary.copy("fathom shard bytes ", 20_000)
@@ -87,7 +78,7 @@ defmodule Fathom.Shard.Storage.S3PlainSha256Test do
 
   test "an object without the SHA-256 header falls back to the MD5 check",
        %{store: store, dir: dir, local: local} do
-    Application.put_env(:fathom, :s3_plain_sha256, false)
+    Env.put!(:s3_plain_sha256, false)
     assert {:ok, _, _} = S3.flush("sha3", local, nil)
     refute Map.has_key?(S3EtagStore.meta_of(store, "sha3.db"), @sha)
 

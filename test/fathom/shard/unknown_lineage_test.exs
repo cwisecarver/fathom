@@ -26,27 +26,18 @@ defmodule Fathom.Shard.UnknownLineageTest do
 
   alias Fathom.{Shard, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Env
 
   @modes [:legacy, :heartbeat]
 
   setup do
     shard = "unklin_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_repl = Application.get_env(:fathom, :replication_enabled)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :replication_enabled, true)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:replication_enabled, true)
 
     on_exit(fn ->
       Application.delete_env(:fathom, :storage_fault)
       Shards.drain(shard, 2_000)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-
-      if is_nil(prev_repl),
-        do: Application.delete_env(:fathom, :replication_enabled),
-        else: Application.put_env(:fathom, :replication_enabled, prev_repl)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
           p <- Path.wildcard(Path.join(dir, "#{shard}*")),
@@ -134,8 +125,7 @@ defmodule Fathom.Shard.UnknownLineageTest do
         # Every HEAD for this shard now announces itself and blocks until released: a slow store.
         test_pid = self()
 
-        Application.put_env(
-          :fathom,
+        Env.put!(
           :faulty_before,
           {:object_head,
            fn id ->
@@ -150,8 +140,6 @@ defmodule Fathom.Shard.UnknownLineageTest do
              end
            end}
         )
-
-        on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
 
         # A commit's epoch read from ANOTHER process (the Session), as in production.
         commit = Task.async(fn -> Shard.epoch(pid) end)

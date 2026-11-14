@@ -22,22 +22,19 @@ defmodule Fathom.Shard.TombstonedTerminateEraseTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
 
   setup do
     shard = "tombterm_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_idle_ms, 600_000)
 
     on_exit(fn ->
       :ets.delete(Fathom.Tenants.Tombstones, shard)
       Shards.drain(shard, 2_000)
-      restore(:shard_storage, prev_storage)
-      restore(:shard_idle_ms, prev_idle)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
           p <- Path.wildcard(Path.join(dir, "#{shard}*")),
@@ -46,9 +43,6 @@ defmodule Fathom.Shard.TombstonedTerminateEraseTest do
 
     %{shard: shard}
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
   defp set_mode!(:legacy), do: refute(Heartbeat.running?())
 

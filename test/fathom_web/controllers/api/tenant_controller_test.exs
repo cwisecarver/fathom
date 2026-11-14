@@ -11,6 +11,7 @@ defmodule FathomWeb.Api.TenantControllerTest do
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shard.Storage
   alias Fathom.Tenants.{Suspensions, Tombstones}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @auth "Basic " <> Base.encode64("admin:secret")
@@ -88,14 +89,7 @@ defmodule FathomWeb.Api.TenantControllerTest do
     test "reject mode (:wildcard_tls_serving): an underscore id is refused with 422", %{
       conn: conn
     } do
-      prev = Application.get_env(:fathom, :wildcard_tls_serving)
-      Application.put_env(:fathom, :wildcard_tls_serving, true)
-
-      on_exit(fn ->
-        if prev == nil,
-          do: Application.delete_env(:fathom, :wildcard_tls_serving),
-          else: Application.put_env(:fathom, :wildcard_tls_serving, prev)
-      end)
+      Env.put!(:wildcard_tls_serving, true)
 
       id = "api_reject_#{System.unique_integer([:positive])}"
       assert (conn |> auth() |> post("/api/tenants", %{shard_id: id})).status == 422
@@ -106,14 +100,7 @@ defmodule FathomWeb.Api.TenantControllerTest do
   # caller (internal terms: module names, storage details). The body now carries a stable code only.
   test "an unexpected provision failure returns a stable code and leaks no internal term",
        %{conn: conn} do
-    prev = Application.get_env(:fathom, :fork_from_template)
-    Application.put_env(:fathom, :fork_from_template, true)
-
-    on_exit(fn ->
-      if prev == nil,
-        do: Application.delete_env(:fathom, :fork_from_template),
-        else: Application.put_env(:fathom, :fork_from_template, prev)
-    end)
+    Env.put!(:fork_from_template, true)
 
     {body, log} =
       ExUnit.CaptureLog.with_log(fn ->

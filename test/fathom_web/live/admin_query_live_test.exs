@@ -10,6 +10,7 @@ defmodule FathomWeb.AdminQueryLiveTest do
 
   alias Fathom.Bench.HranaClient
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   # config/test.exs sets admin_auth to admin/secret.
   @auth "Basic " <> Base.encode64("admin:secret")
@@ -17,15 +18,10 @@ defmodule FathomWeb.AdminQueryLiveTest do
 
   setup do
     {:ok, sup, port} = HranaClient.start_listener()
-    prev = Application.get_env(:fathom, :query_console_endpoint)
-    Application.put_env(:fathom, :query_console_endpoint, "http://127.0.0.1:#{port}")
+    Env.put!(:query_console_endpoint, "http://127.0.0.1:#{port}")
     id = "qc_live_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :query_console_endpoint, prev),
-        else: Application.delete_env(:fathom, :query_console_endpoint)
-
       Shards.drain(id, 5_000)
       rm_shard(id)
       HranaClient.stop_listener(sup)
@@ -133,7 +129,7 @@ defmodule FathomWeb.AdminQueryLiveTest do
           accept_forever(listen, parent)
         end)
 
-      Application.put_env(:fathom, :query_console_endpoint, "http://127.0.0.1:#{port}")
+      Env.put!(:query_console_endpoint, "http://127.0.0.1:#{port}")
 
       on_exit(fn ->
         Process.unlink(acceptor)
@@ -218,9 +214,7 @@ defmodule FathomWeb.AdminQueryLiveTest do
   end
 
   test "the template shard is blocked in the console and nothing reaches it", %{conn: conn} do
-    prev = Application.get_env(:fathom, :template_shard_id)
-    Application.put_env(:fathom, :template_shard_id, "tmpl-w1")
-    on_exit(fn -> restore_env(:template_shard_id, prev) end)
+    Env.put!(:template_shard_id, "tmpl-w1")
 
     assert {:error, %{code: "TEMPLATE_BLOCKED"}} =
              Fathom.QueryConsole.run("tmpl-w1", "CREATE TABLE x (a)")
@@ -231,9 +225,6 @@ defmodule FathomWeb.AdminQueryLiveTest do
     assert has_element?(view, "#query-error")
     refute has_element?(view, "#query-results")
   end
-
-  defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore_env(key, v), do: Application.put_env(:fathom, key, v)
 
   defp rm_shard(id) do
     for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],

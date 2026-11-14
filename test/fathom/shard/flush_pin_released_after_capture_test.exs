@@ -28,6 +28,7 @@ defmodule Fathom.Shard.FlushPinReleasedAfterCaptureTest do
   alias Fathom.Shard.Storage.S3
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   @modes [:legacy, :heartbeat]
@@ -46,18 +47,12 @@ defmodule Fathom.Shard.FlushPinReleasedAfterCaptureTest do
       Agent.stop(armed)
     end)
 
-    for k <- [:shard_storage, S3, :shard_idle_ms, :shard_object_encoding] do
-      prev = Application.get_env(:fathom, k)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, prev)
-      end)
-    end
+    # Registered before the teardown below so the env is restored AFTER the coordinator's and the
+    # heartbeat's stop, which still talk to the store.
+    use_s3!(store, armed, id, path)
 
     # The idle-stop would answer a pending flush with :coordinator_stopped (AGENTS.md testing note).
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_idle_ms, 600_000)
 
     test_pid = self()
     handler = "pinrel-#{id}"
@@ -75,7 +70,6 @@ defmodule Fathom.Shard.FlushPinReleasedAfterCaptureTest do
       for f <- Path.wildcard(Path.join(Fathom.Shard.data_dir(), "#{id}*")), do: File.rm_rf(f)
     end)
 
-    use_s3!(store, armed, id, path)
     %{id: id, path: path, store: store, armed: armed}
   end
 
@@ -124,7 +118,7 @@ defmodule Fathom.Shard.FlushPinReleasedAfterCaptureTest do
       S3EtagStore.serve(conn, store)
     end
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -134,7 +128,7 @@ defmodule Fathom.Shard.FlushPinReleasedAfterCaptureTest do
       req_plug: plug
     )
 
-    Application.put_env(:fathom, :shard_storage, S3)
+    Env.put!(:shard_storage, S3)
   end
 
   defp flush!(c, tries \\ 400) do
@@ -177,7 +171,7 @@ defmodule Fathom.Shard.FlushPinReleasedAfterCaptureTest do
   # which would checkpoint on close and hide the pin), then flushes with commits landing mid-PUT.
   defp flush_with_commits_during_put(ctx, mode, encoding) do
     %{id: id, store: store, armed: armed} = ctx
-    Application.put_env(:fathom, :shard_object_encoding, encoding)
+    Env.put!(:shard_object_encoding, encoding)
 
     {:ok, c} = Shards.ensure(id)
     assert_mode!(c, mode)

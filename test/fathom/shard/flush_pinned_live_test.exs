@@ -21,14 +21,14 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   setup do
     id = "pinlive_#{System.unique_integer([:positive])}"
     path = Fathom.Shard.db_path(id)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
 
     # The idle-stop would answer a pending flush with :coordinator_stopped (AGENTS.md testing note).
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_idle_ms, 600_000)
 
     test_pid = self()
     handler = "pinlive-#{id}"
@@ -42,13 +42,6 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
 
     on_exit(fn ->
       :telemetry.detach(handler)
-      Application.delete_env(:fathom, :flush_pinned_live_upload)
-      Application.delete_env(:fathom, :flush_after_snapshot_hook)
-
-      if prev_idle,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
-
       Shards.stop(id)
       for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(path <> s)
     end)
@@ -145,7 +138,7 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
     write_then_go_idle(id, path, 1..10)
     test_pid = self()
 
-    Application.put_env(:fathom, :flush_after_snapshot_hook, fn sid ->
+    Env.put!(:flush_after_snapshot_hook, fn sid ->
       if sid == id do
         before = File.read!(path)
         # A raw handle (the executor refuses tenant checkpoints). It is not the last connection
@@ -217,8 +210,7 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
     Fathom.Shard.apply_scan_mmap(conn)
     assert Connection.pragma(conn, "mmap_size") == {:ok, default}, "applied with the flag unset"
 
-    Application.put_env(:fathom, :flush_scan_mmap_bytes, 8 * 1_048_576)
-    on_exit(fn -> Application.delete_env(:fathom, :flush_scan_mmap_bytes) end)
+    Env.put!(:flush_scan_mmap_bytes, 8 * 1_048_576)
     Fathom.Shard.apply_scan_mmap(conn)
     assert {:ok, n} = Connection.pragma(conn, "mmap_size")
     assert n == 8 * 1_048_576 or n == 0, "pragma not applied (n=#{n})"
@@ -226,8 +218,7 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
 
   test "with mmap on, both flush routes still upload a complete, sound object", ctx do
     %{id: id, coordinator: coordinator, path: path} = ctx
-    Application.put_env(:fathom, :flush_scan_mmap_bytes, 8 * 1_048_576)
-    on_exit(fn -> Application.delete_env(:fathom, :flush_scan_mmap_bytes) end)
+    Env.put!(:flush_scan_mmap_bytes, 8 * 1_048_576)
 
     write_then_go_idle(id, path, 1..20)
     flush!(coordinator)
@@ -236,7 +227,7 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
 
     # The flag off forces the VACUUM route: a live stream's WAL no longer does on its own, since
     # the pre-pin PASSIVE folds it (expert review 2026-10-21 #11).
-    Application.put_env(:fathom, :flush_pinned_live_upload, false)
+    Env.put!(:flush_pinned_live_upload, false)
     {:ok, conn} = ShardExecutor.open(id)
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (21)"))
     on_exit(fn -> ShardExecutor.close(conn) end)
@@ -247,7 +238,7 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
 
   test "the flag off keeps the VACUUM INTO route for a folded shard", ctx do
     %{id: id, coordinator: coordinator, path: path} = ctx
-    Application.put_env(:fathom, :flush_pinned_live_upload, false)
+    Env.put!(:flush_pinned_live_upload, false)
     write_then_go_idle(id, path, 1..5)
 
     flush!(coordinator)

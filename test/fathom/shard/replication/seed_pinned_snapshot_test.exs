@@ -22,6 +22,7 @@ defmodule Fathom.Shard.Replication.SeedPinnedSnapshotTest do
 
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.Session
+  alias Fathom.Test.Env
 
   defmodule FakeShipper do
     @moduledoc false
@@ -88,16 +89,11 @@ defmodule Fathom.Shard.Replication.SeedPinnedSnapshotTest do
   setup do
     root = Path.join(System.tmp_dir!(), "seedpin_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
-    prev = Application.get_env(:fathom, :replication_seed_chunk_bytes)
     # Many chunks, so there IS a "rest of the stream" after the first chunk for the checkpoint to
     # land in. At the 4 MiB default this whole database is one chunk and the race cannot happen.
-    Application.put_env(:fathom, :replication_seed_chunk_bytes, 4_096)
+    Env.put!(:replication_seed_chunk_bytes, 4_096)
 
     on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :replication_seed_chunk_bytes),
-        else: Application.put_env(:fathom, :replication_seed_chunk_bytes, prev)
-
       File.rm_rf(root)
     end)
 

@@ -5,6 +5,7 @@ defmodule Fathom.Rebalancer.WarmLocationsTest do
   use Fathom.DataCase, async: false
 
   alias Fathom.Rebalancer.{WarmLocation, WarmLocations}
+  alias Fathom.Test.Env
 
   test "publish upserts, retracts, and empties; warm_nodes maps shard → nodes" do
     :ok = WarmLocations.publish("n1", ["a", "b"])
@@ -79,14 +80,6 @@ defmodule Fathom.Rebalancer.WarmLocationsTest do
   end
 
   test "a departed node's rows are reclaimed by the fleet sweep, not by the per-node prune" do
-    prev = Application.get_env(:fathom, :rebalancer_fleet_sweep_odds)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :rebalancer_fleet_sweep_odds),
-        else: Application.put_env(:fathom, :rebalancer_fleet_sweep_odds, prev)
-    end)
-
     # A node that is not this one, i.e. one that has departed the fleet.
     :ok = WarmLocations.publish("departed_node", ["a"])
 
@@ -97,7 +90,7 @@ defmodule Fathom.Rebalancer.WarmLocationsTest do
 
     # Sweep off: the node-scoped prune must NOT touch another node's rows — that disjointness is
     # the whole point, since it is what removes the cross-node lock contention.
-    Application.put_env(:fathom, :rebalancer_fleet_sweep_odds, 0)
+    Env.put!(:rebalancer_fleet_sweep_odds, 0)
     assert WarmLocations.prune(60_000) == 0
     assert WarmLocations.warm_nodes(3_600_000) != %{}, "another node's row must survive"
 

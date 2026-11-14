@@ -25,17 +25,13 @@ defmodule Fathom.Shard.TakeoverLineageClaimTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.Local
+  alias Fathom.Test.Env
 
   setup do
-    prev = Application.get_env(:fathom, :replication_enabled)
-    Application.put_env(:fathom, :replication_enabled, true)
+    Env.put!(:replication_enabled, true)
     id = "claim_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :replication_enabled),
-        else: Application.put_env(:fathom, :replication_enabled, prev)
-
       for dir <- [Local.dir(), Fathom.Shard.data_dir()],
           p <- Path.wildcard(Path.join(dir, "#{id}*")),
           do: File.rm_rf(p)

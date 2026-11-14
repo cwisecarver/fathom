@@ -36,6 +36,7 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Shards
+  alias Fathom.Test.Env
   import Fathom.Test.ReplicationCase
 
   setup do
@@ -43,28 +44,8 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     root = Path.join(System.tmp_dir!(), "replshort_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
 
-    prev = %{
-      enabled: Application.get_env(:fathom, :replication_enabled),
-      followers: Application.get_env(:fathom, :replication_followers),
-      quorum: Application.get_env(:fathom, :replication_quorum),
-      sign: Application.get_env(:fathom, :replication_sign_frames),
-      required: Application.get_env(:fathom, :replication_hmac_required)
-    }
-
     on_exit(fn ->
       Session.stop(id)
-
-      for {k, v} <- [
-            replication_enabled: prev.enabled,
-            replication_followers: prev.followers,
-            replication_quorum: prev.quorum,
-            replication_sign_frames: prev.sign,
-            replication_hmac_required: prev.required
-          ] do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
 
       Shards.drain(id, 5_000)
       for e <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(id) <> e)
@@ -151,7 +132,7 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
   # there is no `.db` or an empty WAL, and a test that landed there would prove nothing.
   defp seeded_follower!(ctx) do
     %{id: id, root: root} = ctx
-    Application.put_env(:fathom, :replication_sign_frames, true)
+    Env.put!(:replication_sign_frames, true)
 
     # TWO followers with q=1, not one with q=1: `Fleet.validate_quorum!/0` refuses Q=N, because a
     # quorum that needs every follower tolerates zero failures and inherits the slowest replica.
@@ -322,15 +303,8 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
   # writes (58 lost on shard 13). The ordinals are the follower's own evidence of the skip.
   describe "WAL ordinals at a reset" do
     setup do
-      prev = Application.get_env(:fathom, :replication_ordinal_wire)
       # The ordinal rides only the ordinal frame, so the crafted push must use prod's wire.
-      Application.put_env(:fathom, :replication_ordinal_wire, true)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :replication_ordinal_wire),
-          else: Application.put_env(:fathom, :replication_ordinal_wire, prev)
-      end)
+      Env.put!(:replication_ordinal_wire, true)
     end
 
     # The follower's position as the rig had it: holding ordinal `held`, its WAL complete as far
@@ -479,14 +453,7 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
 
     # A push states its lineage only in the ordinal frame shape; without the gate it goes out as 0
     # ("unstated") and the fence is skipped by design, so the test would measure the wrong thing.
-    prior = Application.get_env(:fathom, :replication_ordinal_wire)
-    Application.put_env(:fathom, :replication_ordinal_wire, true)
-
-    on_exit(fn ->
-      if is_nil(prior),
-        do: Application.delete_env(:fathom, :replication_ordinal_wire),
-        else: Application.put_env(:fathom, :replication_ordinal_wire, prior)
-    end)
+    Env.put!(:replication_ordinal_wire, true)
 
     assert {:ok, {:reject, ^id, :stale_epoch, _}} =
              send_frame!(port, Protocol.encode_push(deposed)),
@@ -499,8 +466,8 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     # Not a property of #11a — a statement about the reach of this file. Every frame above is
     # accepted because this node does not REQUIRE authentication; with it on, the same socket is
     # refused and the frames never reach the torn rule at all.
-    Application.put_env(:fathom, :replication_sign_frames, false)
-    Application.put_env(:fathom, :replication_hmac_required, true)
+    Env.put!(:replication_sign_frames, false)
+    Env.put!(:replication_hmac_required, true)
 
     unsigned = Protocol.encode_push(reset_push(id, state, 999_999))
     result = send_frame!(port, unsigned)

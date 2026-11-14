@@ -5,18 +5,14 @@ defmodule Fathom.TemplateCaptureTest do
   use Fathom.DataCase, async: false
 
   alias Fathom.{Migrator, ShardExecutor}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
     shard = "template_#{System.unique_integer([:positive])}"
-    prev = Application.get_env(:fathom, :template_shard_id)
-    Application.put_env(:fathom, :template_shard_id, shard)
+    Env.put!(:template_shard_id, shard)
 
     on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :template_shard_id, prev),
-        else: Application.delete_env(:fathom, :template_shard_id)
-
       for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))

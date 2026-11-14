@@ -11,6 +11,7 @@ defmodule Fathom.Tenants.RmLocalErasureTest do
 
   alias Fathom.Shard
   alias Fathom.Tenants.Tombstones
+  alias Fathom.Test.Env
 
   setup do
     id = "rmlocal#{System.unique_integer([:positive])}"
@@ -61,16 +62,9 @@ defmodule Fathom.Tenants.RmLocalErasureTest do
   test "a data-dir listing failure is reported, not counted as an erase", %{id: id, dir: dir} do
     not_a_dir = Path.join(dir, id <> "-notadir")
     File.write!(not_a_dir, "")
-    prev = Application.get_env(:fathom, :shard_data_dir)
-    Application.put_env(:fathom, :shard_data_dir, not_a_dir)
+    Env.put!(:shard_data_dir, not_a_dir)
 
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :shard_data_dir, prev),
-        else: Application.delete_env(:fathom, :shard_data_dir)
-
-      File.rm(not_a_dir)
-    end)
+    on_exit(fn -> File.rm(not_a_dir) end)
 
     test_pid = self()
     handler = "rmlocal-fail-#{id}"

@@ -30,6 +30,7 @@ defmodule Fathom.Shard.RefusedOpenProvenanceTest do
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Heartbeat, Storage}
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
   alias Filo.{Stmt, StmtResult}
 
@@ -38,7 +39,9 @@ defmodule Fathom.Shard.RefusedOpenProvenanceTest do
   setup do
     shard = "refused_#{System.unique_integer([:positive])}"
 
-    for k <- [:shard_storage, S3, :shard_idle_ms, :replication_enabled] do
+    # The S3 backend is put by `use_s3!/2` from the test body, after the drain below is registered:
+    # these two are restored AFTER that drain (the first-registered on_exit runs last).
+    for k <- [:shard_storage, S3] do
       prev = Application.get_env(:fathom, k)
 
       on_exit(fn ->
@@ -48,10 +51,10 @@ defmodule Fathom.Shard.RefusedOpenProvenanceTest do
       end)
     end
 
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_idle_ms, 600_000)
 
     # The marker and its claim exist only while replicating (d80e554, expert review 2026-10-12 #3).
-    Application.put_env(:fathom, :replication_enabled, true)
+    Env.put!(:replication_enabled, true)
 
     on_exit(fn ->
       Shards.drain(shard, 2_000)

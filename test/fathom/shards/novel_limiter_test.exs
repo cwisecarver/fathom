@@ -13,21 +13,7 @@ defmodule Fathom.Shards.NovelLimiterTest do
 
   alias Fathom.Shards.NovelLimiter
   alias Fathom.{Directory, Shards}
-
-  setup do
-    prev_rate = Application.get_env(:fathom, :novel_shard_rate)
-    prev_burst = Application.get_env(:fathom, :novel_shard_burst)
-
-    on_exit(fn ->
-      restore_env(:novel_shard_rate, prev_rate)
-      restore_env(:novel_shard_burst, prev_burst)
-    end)
-
-    :ok
-  end
-
-  defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore_env(key, value), do: Application.put_env(:fathom, key, value)
+  alias Fathom.Test.Env
 
   defp unique_shard(prefix) do
     shard = "#{prefix}_#{System.unique_integer([:positive])}"
@@ -61,7 +47,7 @@ defmodule Fathom.Shards.NovelLimiterTest do
   # refusing cleanly. The invariant: a down/saturated limiter fails CLOSED to the same
   # clean {:error, :novel_shard_rate_limited} refusal.
   test "a down limiter fails closed to a clean rate-limit refusal, not a caller crash" do
-    Application.put_env(:fathom, :novel_shard_rate, 1000)
+    Env.put!(:novel_shard_rate, 1000)
     shard = unique_shard("novel_down")
 
     # Take the app's limiter down without a restart (a supervisor terminate_child
@@ -86,15 +72,9 @@ defmodule Fathom.Shards.NovelLimiterTest do
   # CALLER and needs the DataCase sandbox connection.)
   test "at capacity, a rate-refused NOVEL open evicts no legitimate tenant (#9)" do
     Fathom.Shards.Lru.reset()
-    prev_cap = Application.get_env(:fathom, :max_open_shards)
-    prev_evict = Application.get_env(:fathom, :evict_idle_at_capacity)
-    Application.put_env(:fathom, :evict_idle_at_capacity, true)
+    Env.put!(:evict_idle_at_capacity, true)
 
-    on_exit(fn ->
-      restore_env(:max_open_shards, prev_cap)
-      restore_env(:evict_idle_at_capacity, prev_evict)
-      Fathom.Shards.Lru.reset()
-    end)
+    on_exit(fn -> Fathom.Shards.Lru.reset() end)
 
     # A legitimate, idle, evictable tenant — the only Lru candidate after the reset, so it is the
     # shard evicted_for_room? WOULD pick. Opened with the rate gate still OFF, so its own open is
@@ -106,14 +86,14 @@ defmodule Fathom.Shards.NovelLimiterTest do
     a_mon = Process.monitor(pid_a)
 
     # Enable the gate and take the limiter down → any novel open fails closed (allow/1 exits).
-    Application.put_env(:fathom, :novel_shard_rate, 1000)
+    Env.put!(:novel_shard_rate, 1000)
     :ok = Supervisor.terminate_child(Fathom.DataPlane.Supervisor, Fathom.Shards.NovelLimiter)
 
     on_exit(fn ->
       Supervisor.restart_child(Fathom.DataPlane.Supervisor, Fathom.Shards.NovelLimiter)
     end)
 
-    Application.put_env(:fathom, :max_open_shards, 1)
+    Env.put!(:max_open_shards, 1)
 
     # The novel spray shard is refused; pre-fix it evicted `legit` first (clause 1 ran before the
     # rate gate).
@@ -137,8 +117,8 @@ defmodule Fathom.Shards.NovelLimiterTest do
     end
 
     test "grants the burst, then refuses until time refills" do
-      Application.put_env(:fathom, :novel_shard_rate, 1)
-      Application.put_env(:fathom, :novel_shard_burst, 2)
+      Env.put!(:novel_shard_rate, 1)
+      Env.put!(:novel_shard_burst, 2)
       clock = start_supervised!({Agent, fn -> 0 end})
       limiter = bucket(clock)
 
@@ -153,8 +133,8 @@ defmodule Fathom.Shards.NovelLimiterTest do
     end
 
     test "refill is capped at the burst budget" do
-      Application.put_env(:fathom, :novel_shard_rate, 1)
-      Application.put_env(:fathom, :novel_shard_burst, 2)
+      Env.put!(:novel_shard_rate, 1)
+      Env.put!(:novel_shard_burst, 2)
       clock = start_supervised!({Agent, fn -> 0 end})
       limiter = bucket(clock)
 
@@ -173,8 +153,8 @@ defmodule Fathom.Shards.NovelLimiterTest do
       # Burst 1 (reset, since the node-global bucket carries state across tests) + a
       # consumed token = an empty bucket for the next novel id (refill at 1/s is < 1
       # token within this test's runtime).
-      Application.put_env(:fathom, :novel_shard_rate, 1)
-      Application.put_env(:fathom, :novel_shard_burst, 1)
+      Env.put!(:novel_shard_rate, 1)
+      Env.put!(:novel_shard_burst, 1)
       NovelLimiter.reset()
       sacrifice = unique_shard("novel_grant")
       assert :ok = checkout(sacrifice)
@@ -217,7 +197,7 @@ defmodule Fathom.Shards.NovelLimiterTest do
     end
 
     test "unset rate (the default) means the gate is off" do
-      Application.delete_env(:fathom, :novel_shard_rate)
+      Env.delete!(:novel_shard_rate)
       assert :ok = checkout(unique_shard("novel_off"))
     end
 
@@ -239,7 +219,7 @@ defmodule Fathom.Shards.NovelLimiterTest do
     # Rejecting `0` at boot was considered and not taken: `0` unambiguously means no rate
     # limiting, and a boot refusal turns a benign typo into a failed deploy.
     test "a zero rate reads as OFF, and does not kill the limiter" do
-      Application.put_env(:fathom, :novel_shard_rate, 0)
+      Env.put!(:novel_shard_rate, 0)
       refute NovelLimiter.enabled?(), "0 must read as the gate being off"
 
       limiter = Process.whereis(NovelLimiter)
@@ -259,7 +239,7 @@ defmodule Fathom.Shards.NovelLimiterTest do
     # relying on a path that no longer reaches it.
     test "a negative or non-numeric rate also reads as off" do
       for bad <- [-1, 0, "5", :on] do
-        Application.put_env(:fathom, :novel_shard_rate, bad)
+        Env.put!(:novel_shard_rate, bad)
         refute NovelLimiter.enabled?(), "#{inspect(bad)} must not enable the gate"
       end
     end

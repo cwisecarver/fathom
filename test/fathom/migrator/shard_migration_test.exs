@@ -9,6 +9,7 @@ defmodule Fathom.Migrator.ShardMigrationTest do
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.{Directory, Migrator}
   alias Fathom.Tenants.Tombstones
+  alias Fathom.Test.Env
 
   # A data transform that rewrites VALUES in place — the class of change DDL cannot express, and
   # whose revert is the leg expert review 2026-09-05 #28 found untested. Allowlisted per-test.
@@ -316,14 +317,7 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     seed_v1!(shard)
     assert %{rows: [[1, "alice"]]} = query_live!(shard, "SELECT id, name FROM app_thing")
 
-    prev = Application.get_env(:fathom, :migration_transforms)
-    Application.put_env(:fathom, :migration_transforms, [UppercaseName])
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :migration_transforms, prev),
-        else: Application.delete_env(:fathom, :migration_transforms)
-    end)
+    Env.put!(:migration_transforms, [UppercaseName])
 
     {:ok, _} = Migrator.release(2, "v2 + uppercase", @v2_statements)
     :ok = Migrator.attach_transform(2, UppercaseName)
@@ -544,16 +538,8 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     for {key, val} <- [
           migration_transforms: [UppercaseName],
           shard_storage: Fathom.Test.FaultyStorage
-        ] do
-      prev = Application.get_env(:fathom, key)
-      Application.put_env(:fathom, key, val)
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, key, prev),
-          else: Application.delete_env(:fathom, key)
-      end)
-    end
+        ],
+        do: Env.put!(key, val)
 
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
     test_pid = self()
@@ -608,8 +594,7 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
     {:ok, before} = Storage.object_etag(shard)
 
-    prev = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
     test_pid = self()
 
     Application.put_env(
@@ -622,13 +607,7 @@ defmodule Fathom.Migrator.ShardMigrationTest do
        end}
     )
 
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev,
-        do: Application.put_env(:fathom, :shard_storage, prev),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
 
     assert {:error, {:not_active, _}} = ShardMigration.run(shard, 2)
     assert {:ok, ^before} = Storage.object_etag(shard), "the object was rewritten after a suspend"
@@ -764,8 +743,7 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
     {:ok, before} = Storage.object_etag(shard)
 
-    prev = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
     test_pid = self()
 
     Application.put_env(
@@ -778,10 +756,6 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     on_exit(fn ->
       Application.delete_env(:fathom, :faulty_before)
       :ets.delete(Tombstones, shard)
-
-      if prev,
-        do: Application.put_env(:fathom, :shard_storage, prev),
-        else: Application.delete_env(:fathom, :shard_storage)
     end)
 
     assert {:error, {:not_active, "deleted"}} = ShardMigration.run(shard, 2)
@@ -1212,14 +1186,7 @@ defmodule Fathom.Migrator.ShardMigrationTest do
   # hourly, for every stranded shard (`revert_stranded`). The invariant pinned: a revert the guard
   # will refuse touches nothing - the running coordinator is not drained (same pid, still serving).
   test "an unforced revert the guard refuses does not drain the live coordinator", %{shard: shard} do
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
-
-    on_exit(fn ->
-      if is_nil(prev_idle),
-        do: Application.delete_env(:fathom, :shard_idle_ms),
-        else: Application.put_env(:fathom, :shard_idle_ms, prev_idle)
-    end)
+    Env.put!(:shard_idle_ms, 60_000)
 
     seed_v1!(shard)
     {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
@@ -1398,16 +1365,9 @@ defmodule Fathom.Migrator.ShardMigrationTest do
   # migrator, and the gate does not outlive the attempt.
   test "a request landing between the local drain and the lease acquire cannot win it",
        %{shard: shard} do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if is_nil(prev_storage),
-        do: Application.delete_env(:fathom, :shard_storage),
-        else: Application.put_env(:fathom, :shard_storage, prev_storage)
-    end)
+    on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
 
     seed_v1!(shard)
     {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
@@ -1482,17 +1442,10 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     seed_v1!(shard)
     {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
 
-    prev = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
     Application.put_env(:fathom, :faulty_before, {:retain, fn -> write_thief_lock(shard) end})
 
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev,
-        do: Application.put_env(:fathom, :shard_storage, prev),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
 
     assert {:error, :superseded} = ShardMigration.run(shard, 2)
 
@@ -1512,21 +1465,14 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     seed_v1!(shard)
     {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
 
-    prev = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     # A new owner flushes different bytes to the live object during the migrator's flush,
     # after its lock-fence passed — changing the object etag but NOT the lock.
     overwrite = fn -> File.write!(Path.join(remote_dir(), "#{shard}.db"), "new-owner-bytes") end
     Application.put_env(:fathom, :faulty_before, {:flush, overwrite})
 
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev,
-        do: Application.put_env(:fathom, :shard_storage, prev),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
 
     # Pre-fix: the unconditional PUT clobbered the object with the migrated v2.
     assert {:error, :superseded} = ShardMigration.run(shard, 2)
@@ -1551,21 +1497,14 @@ defmodule Fathom.Migrator.ShardMigrationTest do
     {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
     {:ok, _} = ShardMigration.run(shard, 2)
 
-    prev = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     # A new owner flushes different bytes to the live object during the migrator's restore, after
     # its lock-fence (and the retain backup) passed — changing the object etag but NOT the lock.
     overwrite = fn -> File.write!(Path.join(remote_dir(), "#{shard}.db"), "new-owner-bytes") end
     Application.put_env(:fathom, :faulty_before, {:restore, overwrite})
 
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev,
-        do: Application.put_env(:fathom, :shard_storage, prev),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
 
     # force: true isolates the restore fence from the write-age guard (not under test here).
     # Pre-fix: the unconditional restore clobbered the object with the reverted v1.

@@ -19,6 +19,7 @@ defmodule Fathom.Shard.ProvenanceIntentTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Fork, Provenance, Storage}
+  alias Fathom.Test.Env
   alias Filo.{Stmt, StmtResult}
 
   @md5_a String.duplicate("a", 32)
@@ -26,16 +27,11 @@ defmodule Fathom.Shard.ProvenanceIntentTest do
 
   setup do
     shard = "intent_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
-
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_flush_interval_ms, 60_000)
 
     on_exit(fn ->
       Application.delete_env(:fathom, :storage_fault)
-      restore(:shard_storage, prev_storage)
-      restore(:shard_flush_interval_ms, prev_flush)
       Shards.drain(shard, 2_000)
 
       for dir <- [local_dir(), remote_dir()],
@@ -47,9 +43,6 @@ defmodule Fathom.Shard.ProvenanceIntentTest do
 
     %{shard: shard}
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
   defp local_dir, do: Shard.data_dir()

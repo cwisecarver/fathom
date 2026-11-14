@@ -25,6 +25,7 @@ defmodule Fathom.Shard.PreTouchEtagFlushTest do
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
   alias Filo.Stmt
 
@@ -33,17 +34,11 @@ defmodule Fathom.Shard.PreTouchEtagFlushTest do
   setup do
     shard = "pretouch_#{System.unique_integer([:positive])}"
 
-    for k <- [:shard_storage, S3, :shard_idle_ms] do
-      prev = Application.get_env(:fathom, k)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, prev)
-      end)
-    end
-
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    # Tests point these at the S3 double through `use_s3!/1`; registering the restore here (not in
+    # the test body) keeps it running AFTER the drain below, which still needs that storage.
+    Env.delete!(:shard_storage)
+    Env.delete!(S3)
+    Env.put!(:shard_idle_ms, 600_000)
 
     on_exit(fn ->
       Shards.drain(shard, 2_000)

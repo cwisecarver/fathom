@@ -5,17 +5,13 @@ defmodule Fathom.DirectoryWiringTest do
 
   alias Fathom.{Directory, Shards}
   alias Fathom.Directory.Recorder
+  alias Fathom.Test.Env
 
   setup do
-    prev = Application.get_env(:fathom, :directory_touch)
-    Application.put_env(:fathom, :directory_touch, true)
+    Env.put!(:directory_touch, true)
     shard = "wire_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      if prev == nil,
-        do: Application.delete_env(:fathom, :directory_touch),
-        else: Application.put_env(:fathom, :directory_touch, prev)
-
       for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))

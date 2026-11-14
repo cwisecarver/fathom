@@ -23,14 +23,13 @@ defmodule Fathom.Shard.DropCompactionTest do
   alias Fathom.Shard.{ScanGate, Storage}
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shard.Heartbeat
+  alias Fathom.Test.Env
 
   @modes [:legacy, :heartbeat]
 
   setup do
     id = "dropcompact_#{System.unique_integer([:positive])}"
     path = Fathom.Shard.db_path(id)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
 
     test_pid = self()
     handler = "dropcompact-#{id}"
@@ -53,12 +52,6 @@ defmodule Fathom.Shard.DropCompactionTest do
 
     on_exit(fn ->
       :telemetry.detach(handler)
-      Application.delete_env(:fathom, :shard_flush_scan_permits)
-
-      if prev_idle,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
-
       Shards.stop(id)
 
       for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(path <> s)
@@ -66,6 +59,8 @@ defmodule Fathom.Shard.DropCompactionTest do
       for suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(Storage.Local.dir(), id <> suffix))
     end)
+
+    Env.put!(:shard_idle_ms, 600_000)
 
     %{id: id, path: path}
   end
@@ -309,14 +304,12 @@ defmodule Fathom.Shard.DropCompactionTest do
     path: path
   } do
     # settle_yield_ms = min(30_000, shutdown/3); the permit wait is a quarter of it.
-    prev = Application.get_env(:fathom, :shard_shutdown_ms)
-    Application.put_env(:fathom, :shard_shutdown_ms, 2_400)
-    on_exit(fn -> restore(:shard_shutdown_ms, prev) end)
+    Env.put!(:shard_shutdown_ms, 2_400)
 
     seed!(id, path, false)
 
     # Occupy the only permit from another process so the drop must wait, then time out and proceed.
-    Application.put_env(:fathom, :shard_flush_scan_permits, 1)
+    Env.put!(:shard_flush_scan_permits, 1)
     parent = self()
 
     holder =
@@ -344,7 +337,4 @@ defmodule Fathom.Shard.DropCompactionTest do
 
     send(holder, :release)
   end
-
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
 end

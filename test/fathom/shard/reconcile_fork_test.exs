@@ -29,21 +29,15 @@ defmodule Fathom.Shard.ReconcileForkTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Heartbeat, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
 
   setup do
     shard = "recfork_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
-
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
 
     on_exit(fn ->
-      restore(:shard_storage, prev_storage)
-      restore(:shard_flush_interval_ms, prev_flush)
       Shards.drain(shard, 2_000)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
@@ -51,11 +45,11 @@ defmodule Fathom.Shard.ReconcileForkTest do
           do: File.rm(f)
     end)
 
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_flush_interval_ms, 60_000)
+
     %{shard: shard}
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
 

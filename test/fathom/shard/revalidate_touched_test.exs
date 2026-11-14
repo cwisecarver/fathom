@@ -47,38 +47,27 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
   alias Filo.{Stmt, StmtResult}
 
   setup do
     shard = "reval_touched_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_s3 = Application.get_env(:fathom, S3)
-    prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
 
     # Disable the periodic durability flush so it can't re-upload (rotating the store's
     # etag) mid-test, under the branch assertions.
-    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
+    Env.put!(:shard_flush_interval_ms, 0)
     # Keep the coordinator alive (and the local copy + sidecar on disk) through the branch
     # assertions after the stream closes; the test drains explicitly at the end. Without this
     # a short idle timer could idle-flush-and-drop the file before we read the sidecar.
-    Application.put_env(:fathom, :shard_idle_ms, 300_000)
+    Env.put!(:shard_idle_ms, 300_000)
 
     on_exit(fn ->
-      restore(:shard_storage, prev_storage)
-      restore(S3, prev_s3)
-      restore(:shard_flush_interval_ms, prev_flush)
-      restore(:shard_idle_ms, prev_idle)
-
       for f <- Path.wildcard(Path.join(local_dir(), "#{shard}*")), do: File.rm_rf(f)
     end)
 
     %{shard: shard}
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, val), do: Application.put_env(:fathom, key, val)
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
 
@@ -174,7 +163,7 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
   end
 
   defp configure_s3(plug) do
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -184,7 +173,7 @@ defmodule Fathom.Shard.RevalidateTouchedTest do
       req_plug: plug
     )
 
-    Application.put_env(:fathom, :shard_storage, S3)
+    Env.put!(:shard_storage, S3)
   end
 
   # Bounded poll (never sleeps forever if the awaited state never arrives): signals the

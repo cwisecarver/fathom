@@ -11,6 +11,7 @@ defmodule Fathom.Shard.ConnectionResetForReuseTest do
 
   alias Exqlite.Sqlite3
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Env
 
   setup do
     dir = Path.join(System.tmp_dir!(), "reset_#{System.unique_integer([:positive])}")
@@ -66,14 +67,7 @@ defmodule Fathom.Shard.ConnectionResetForReuseTest do
   # it would carry a bigger size cap into the next request. The invariant: whenever a stream can
   # change it, reuse restores it.
   test "re-applies max_page_count when an operator lets tenants set it (:rw)", %{path: path} do
-    prev = Application.get_env(:fathom, :tenant_pragma_allow)
-    Application.put_env(:fathom, :tenant_pragma_allow, ["max_page_count"])
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :tenant_pragma_allow),
-        else: Application.put_env(:fathom, :tenant_pragma_allow, prev)
-    end)
+    Env.put!(:tenant_pragma_allow, ["max_page_count"])
 
     {:ok, conn} = Connection.open(path, tenant?: true, scope: :rw)
     {:ok, capped} = Connection.pragma(conn, "max_page_count")
@@ -91,8 +85,7 @@ defmodule Fathom.Shard.ConnectionResetForReuseTest do
   # engine PRAGMA guard (2026-10-08 #1, tier b) now refuses that, so the fixture widens first — the
   # one configuration in which a stream can actually leave a changed cache_size behind.
   test "re-asserts cache_size after the previous stream changed it (:rw)", %{path: path} do
-    Application.put_env(:fathom, :tenant_pragma_allow, ["cache_size"])
-    on_exit(fn -> Application.delete_env(:fathom, :tenant_pragma_allow) end)
+    Env.put!(:tenant_pragma_allow, ["cache_size"])
     {:ok, conn} = Connection.open(path, tenant?: true, scope: :rw)
     {:ok, configured} = Connection.pragma(conn, "cache_size")
     :ok = Sqlite3.execute(conn, "PRAGMA cache_size=-1")

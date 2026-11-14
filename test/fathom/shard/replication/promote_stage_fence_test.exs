@@ -17,6 +17,7 @@ defmodule Fathom.Shard.Replication.PromoteStageFenceTest do
 
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Follower, Promote, Protocol}
+  alias Fathom.Test.Env
 
   setup do
     name = :"stagefence_#{System.unique_integer([:positive])}"
@@ -81,20 +82,9 @@ defmodule Fathom.Shard.Replication.PromoteStageFenceTest do
     decoded
   end
 
-  defp put_env(key, value) do
-    prev = Application.get_env(:fathom, key)
-    Application.put_env(:fathom, key, value)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, key),
-        else: Application.put_env(:fathom, key, prev)
-    end)
-  end
-
   test "staging waits out an in-flight replica mutation and copies the pair it leaves", ctx do
     %{name: name, dir: dir, id: id, temp: temp} = ctx
-    put_env(:replication_promote_lock_wait_ms, 5_000)
+    Env.put!(:replication_promote_lock_wait_ms, 5_000)
 
     # A connection is mid-seed of a NEWER replica (rows 1 and 2): every byte streamed, not ended.
     seeded = database_with(dir, [1, 2])
@@ -170,7 +160,7 @@ defmodule Fathom.Shard.Replication.PromoteStageFenceTest do
   test "a promotion that cannot get the replica declines instead of copying under a writer",
        ctx do
     %{name: name, id: id, temp: temp} = ctx
-    put_env(:replication_promote_lock_wait_ms, 50)
+    Env.put!(:replication_promote_lock_wait_ms, 50)
 
     holder =
       spawn(fn ->

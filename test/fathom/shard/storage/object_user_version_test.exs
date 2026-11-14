@@ -12,6 +12,7 @@ defmodule Fathom.Shard.Storage.ObjectUserVersionTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.{Codec, Local, S3}
+  alias Fathom.Test.Env
 
   @range 262_144
 
@@ -31,16 +32,9 @@ defmodule Fathom.Shard.Storage.ObjectUserVersionTest do
     setup do
       dir = tmp("local")
       File.mkdir_p!(dir)
-      prev = Application.get_env(:fathom, Local)
-      Application.put_env(:fathom, Local, dir: dir)
+      Env.put!(:fathom, Local, dir: dir)
 
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, Local, prev),
-          else: Application.delete_env(:fathom, Local)
-
-        File.rm_rf(dir)
-      end)
+      on_exit(fn -> File.rm_rf(dir) end)
     end
 
     test "reads the header of a stored object; absent for a missing one; error for a non-database" do
@@ -59,17 +53,8 @@ defmodule Fathom.Shard.Storage.ObjectUserVersionTest do
   end
 
   describe "S3 (req_plug seam, encoded fixtures)" do
-    setup do
-      prev = Application.get_env(:fathom, S3)
-      on_exit(fn -> restore(prev) end)
-      %{prev: prev}
-    end
-
-    defp restore(nil), do: Application.delete_env(:fathom, S3)
-    defp restore(prev), do: Application.put_env(:fathom, S3, prev)
-
     defp put_store(plug) do
-      Application.put_env(:fathom, S3,
+      Env.put!(:fathom, S3,
         bucket: "b",
         region: "us-east-1",
         access_key_id: "k",

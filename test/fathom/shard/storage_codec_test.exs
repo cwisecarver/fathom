@@ -12,6 +12,7 @@ defmodule Fathom.Shard.Storage.CodecTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.Codec
+  alias Fathom.Test.Env
 
   defp tmp(name),
     do: Path.join(System.tmp_dir!(), "codec_#{name}_#{System.unique_integer([:positive])}")
@@ -167,7 +168,7 @@ defmodule Fathom.Shard.Storage.CodecTest do
       File.write!(src, String.duplicate("row data ", 50_000))
       on_exit(fn -> File.rm(src) end)
 
-      Application.put_env(:fathom, :codec_corrupt_hook, fn piece ->
+      Env.put!(:codec_corrupt_hook, fn piece ->
         case IO.iodata_to_binary(piece) do
           bin when byte_size(bin) < 9 ->
             bin
@@ -178,8 +179,6 @@ defmodule Fathom.Shard.Storage.CodecTest do
             <<head::binary, Bitwise.bxor(b, 0xFF), tail::binary>>
         end
       end)
-
-      on_exit(fn -> Application.delete_env(:fathom, :codec_corrupt_hook) end)
 
       assert {:error, _} = Codec.compress_to_temp_hashed(src, unquote(enc))
 
@@ -217,7 +216,7 @@ defmodule Fathom.Shard.Storage.CodecTest do
     File.write!(src, :crypto.strong_rand_bytes(600_000))
     on_exit(fn -> File.rm(src) end)
 
-    Application.put_env(:fathom, :codec_corrupt_hook, fn piece ->
+    Env.put!(:codec_corrupt_hook, fn piece ->
       bin = IO.iodata_to_binary(piece)
 
       if byte_size(bin) < 1_000 do
@@ -228,8 +227,6 @@ defmodule Fathom.Shard.Storage.CodecTest do
         <<head::binary, Bitwise.bxor(b, 0xFF), tail::binary>>
       end
     end)
-
-    on_exit(fn -> Application.delete_env(:fathom, :codec_corrupt_hook) end)
 
     assert {:error, {:zstd, msg}} = Codec.compress_to_temp_hashed(src, :zstd)
     assert msg =~ "checksum"
@@ -250,24 +247,19 @@ defmodule Fathom.Shard.Storage.CodecTest do
   end
 
   test "zstd is the default encoding" do
-    prev = Application.get_env(:fathom, :shard_object_encoding)
-    on_exit(fn -> restore(prev) end)
-    Application.delete_env(:fathom, :shard_object_encoding)
+    Env.delete!(:shard_object_encoding)
     assert Codec.encoding() == :zstd
   end
 
   # Decode-always: reading must NOT depend on this node's own encoding setting, or rolling the
   # flag back would make every object written while it was on unreadable.
   test "decoding is independent of what this node writes" do
-    prev = Application.get_env(:fathom, :shard_object_encoding)
-    on_exit(fn -> restore(prev) end)
-
-    Application.put_env(:fathom, :shard_object_encoding, :none)
+    Env.put!(:shard_object_encoding, :none)
     assert Codec.encoding() == :none
     assert Codec.decoder("zlib") == {:ok, :zlib}
     assert Codec.decoder("zstd") == {:ok, :zstd}
 
-    Application.put_env(:fathom, :shard_object_encoding, :zlib)
+    Env.put!(:shard_object_encoding, :zlib)
     assert Codec.encoding() == :zlib
     assert Codec.decoder(nil) == {:ok, :none}
   end
@@ -316,9 +308,6 @@ defmodule Fathom.Shard.Storage.CodecTest do
              "a half transfer must not decode to the whole file"
     end
   end
-
-  defp restore(nil), do: Application.delete_env(:fathom, :shard_object_encoding)
-  defp restore(v), do: Application.put_env(:fathom, :shard_object_encoding, v)
 
   # --- the steal-touch nonce (expert review 2026-10-12 N1) ---
   #

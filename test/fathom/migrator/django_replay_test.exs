@@ -31,6 +31,7 @@ defmodule Fathom.Migrator.DjangoReplayTest do
   alias Fathom.Migrator
   alias Fathom.Migrator.{Capture, Copy, ShardMigration}
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.Env
 
   @fixture "test/support/fixtures/django_migrate_capture.json"
 
@@ -335,9 +336,7 @@ defmodule Fathom.Migrator.DjangoReplayTest do
        %{capture: [v1, v2]} do
     :ok = release!(v1)
     :ok = release!(v2)
-    prev = Application.get_env(:fathom, :migration_transforms)
-    Application.put_env(:fathom, :migration_transforms, [BackfillTransform])
-    on_exit(fn -> restore_transforms(prev) end)
+    Env.put!(:migration_transforms, [BackfillTransform])
 
     chain = [
       {v1.version, pairs(v1), nil},
@@ -375,9 +374,6 @@ defmodule Fathom.Migrator.DjangoReplayTest do
            "the transform changed the database on a second run. Transform's @callback doc requires " <>
              "idempotency precisely because a retried job runs it again, and nothing checked it."
   end
-
-  defp restore_transforms(nil), do: Application.delete_env(:fathom, :migration_transforms)
-  defp restore_transforms(v), do: Application.put_env(:fathom, :migration_transforms, v)
 
   # Full value equality over every user table, the strongest comparison available here — the same
   # shape `Keystone.dump/1` uses, which until now was applied only to a ZERO-statement copy.

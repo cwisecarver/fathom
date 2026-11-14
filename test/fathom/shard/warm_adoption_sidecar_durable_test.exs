@@ -24,20 +24,19 @@ defmodule Fathom.Shard.WarmAdoptionSidecarDurableTest do
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Provenance, Storage}
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   setup do
     shard = "warm_adopt_#{System.unique_integer([:positive])}"
     prev_storage = Application.get_env(:fathom, :shard_storage)
     prev_s3 = Application.get_env(:fathom, S3)
-    prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
     prev_hook = Application.get_env(:fathom, :provenance_write_hook)
 
     # No periodic flush (it would rotate the etag under the assertions); a long idle so the coordinator
     # and its local copy survive until the test reads them.
-    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
-    Application.put_env(:fathom, :shard_idle_ms, 300_000)
+    Env.put!(:shard_flush_interval_ms, 0)
+    Env.put!(:shard_idle_ms, 300_000)
 
     on_exit(fn ->
       # Drain FIRST, while the S3 double is still configured and its Agent store is still alive
@@ -45,8 +44,6 @@ defmodule Fathom.Shard.WarmAdoptionSidecarDurableTest do
       capture_log(fn -> Shards.drain(shard, 2_000) end)
       restore(:shard_storage, prev_storage)
       restore(S3, prev_s3)
-      restore(:shard_flush_interval_ms, prev_flush)
-      restore(:shard_idle_ms, prev_idle)
       restore(:provenance_write_hook, prev_hook)
       for f <- Path.wildcard(local_path(shard) <> "*"), do: File.rm_rf(f)
     end)

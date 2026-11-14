@@ -11,6 +11,7 @@ defmodule Fathom.TenantsTest do
   alias Fathom.{Directory, ShardExecutor, Shards, Snapshots, Tenants}
   alias Fathom.Shard.Storage
   alias Fathom.Tenants.{DeleteJob, Suspensions, Tombstones}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
@@ -243,19 +244,12 @@ defmodule Fathom.TenantsTest do
       write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
       flush!(id)
 
-      prev = Application.get_env(:fathom, :shard_storage)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:snapshot, fn sid -> if sid == id, do: Tombstones.put(id) end}
       )
-
-      on_exit(fn ->
-        Application.delete_env(:fathom, :faulty_before)
-        restore_env(:shard_storage, prev)
-      end)
 
       assert {:error, :tombstoned} = Snapshots.create(id)
       assert {:ok, []} = Snapshots.list(id)
@@ -281,16 +275,9 @@ defmodule Fathom.TenantsTest do
          %{id: id} do
       not_a_dir = Path.join(System.tmp_dir!(), "#{id}-notadir")
       File.write!(not_a_dir, "")
-      prev = Application.get_env(:fathom, :shard_data_dir)
-      Application.put_env(:fathom, :shard_data_dir, not_a_dir)
+      Env.put!(:shard_data_dir, not_a_dir)
 
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, :shard_data_dir, prev),
-          else: Application.delete_env(:fathom, :shard_data_dir)
-
-        File.rm(not_a_dir)
-      end)
+      on_exit(fn -> File.rm(not_a_dir) end)
 
       assert {:error, {:local_erase, :enotdir}} = Tenants.purge(id)
     end
@@ -341,23 +328,13 @@ defmodule Fathom.TenantsTest do
       write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('secret')"])
       flush!(id)
 
-      prev = Application.get_env(:fathom, :shard_storage)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
       leaked = Path.join(remote_dir(), "#{id}@1.db")
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:put_tombstone, fn sid -> if sid == id, do: File.write!(leaked, "secret bytes") end}
       )
-
-      on_exit(fn ->
-        Application.delete_env(:fathom, :faulty_before)
-
-        if prev,
-          do: Application.put_env(:fathom, :shard_storage, prev),
-          else: Application.delete_env(:fathom, :shard_storage)
-      end)
 
       assert :ok = Tenants.purge(id)
 
@@ -398,22 +375,12 @@ defmodule Fathom.TenantsTest do
     # File.rm_rf of the 0700 export dir, leaking a tenant copy (or its partial) in the temp dir.
     # Invariant: no export path leaves a fathom_export_* directory behind.
     test "a raise during the export pull does not leak the export directory", %{id: id} do
-      prev = Application.get_env(:fathom, :shard_storage)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:pull, fn ^id -> raise "boom during pull" end}
       )
-
-      on_exit(fn ->
-        Application.delete_env(:fathom, :faulty_before)
-
-        if prev,
-          do: Application.put_env(:fathom, :shard_storage, prev),
-          else: Application.delete_env(:fathom, :shard_storage)
-      end)
 
       tmp = Fathom.Shard.TempReaper.scratch_dir()
       before = Path.wildcard(Path.join(tmp, "fathom_export_*")) |> MapSet.new()
@@ -523,15 +490,7 @@ defmodule Fathom.TenantsTest do
       write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('flushed')"])
       assert :ok = Shards.flush(id)
 
-      prev = Application.fetch_env(:fathom, :background_scan_permits)
-      Application.put_env(:fathom, :background_scan_permits, 1)
-
-      on_exit(fn ->
-        case prev do
-          {:ok, v} -> Application.put_env(:fathom, :background_scan_permits, v)
-          :error -> Application.delete_env(:fathom, :background_scan_permits)
-        end
-      end)
+      Env.put!(:background_scan_permits, 1)
 
       test_pid = self()
 
@@ -571,15 +530,8 @@ defmodule Fathom.TenantsTest do
 
     # #22 rides the #14 fix: a flush timeout must FAIL the export, not silently ship stale bytes.
     test "surfaces a flush timeout instead of exporting stale", %{id: id} do
-      prev_timeout = Application.get_env(:fathom, :flush_now_timeout_ms)
-      prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-      Application.put_env(:fathom, :flush_now_timeout_ms, 100)
-      Application.put_env(:fathom, :shard_idle_ms, 60_000)
-
-      on_exit(fn ->
-        restore_env(:flush_now_timeout_ms, prev_timeout)
-        restore_env(:shard_idle_ms, prev_idle)
-      end)
+      Env.put!(:flush_now_timeout_ms, 100)
+      Env.put!(:shard_idle_ms, 60_000)
 
       write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('x')"])
       {:ok, coordinator} = Shards.ensure(id)
@@ -668,23 +620,13 @@ defmodule Fathom.TenantsTest do
     # comes from `Storage.object_user_version/1`, so the happy path never pulls the dst object.
     test "register_fork reads the version from the header without pulling the object",
          %{id: src, dst: dst} do
-      prev = Application.get_env(:fathom, :shard_storage)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
       test = self()
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:pull, fn id -> send(test, {:pulled, id}) end}
       )
-
-      on_exit(fn ->
-        Application.delete_env(:fathom, :faulty_before)
-
-        if prev,
-          do: Application.put_env(:fathom, :shard_storage, prev),
-          else: Application.delete_env(:fathom, :shard_storage)
-      end)
 
       {:ok, _} = Directory.resolve(src)
       write!(src, ["CREATE TABLE t (v TEXT)", "PRAGMA user_version = 3"])
@@ -967,14 +909,7 @@ defmodule Fathom.TenantsTest do
     # {:ok} — a silently broken tenant the rollout then quarantines. It now fails loudly and rolls
     # the directory row back so the id is cleanly retriable.
     test "fails loudly and rolls back when the template fork fails (fork ON)", %{id: id} do
-      prev = Application.get_env(:fathom, :fork_from_template)
-      Application.put_env(:fathom, :fork_from_template, true)
-
-      on_exit(fn ->
-        if prev == nil,
-          do: Application.delete_env(:fathom, :fork_from_template),
-          else: Application.put_env(:fathom, :fork_from_template, prev)
-      end)
+      Env.put!(:fork_from_template, true)
 
       # No release and no template@HEAD snapshot exist in this test, so fork_from_template cannot
       # birth the tenant at HEAD — the born-empty failure.
@@ -1027,18 +962,6 @@ defmodule Fathom.TenantsTest do
   # serve) is warned about (default) or refused (when the deployment terminates wildcard TLS) — never
   # handed back as an un-servable URL discovered days later as a TLS failure.
   describe "provision/1 + fork/2 DNS safety (#35)" do
-    setup do
-      prev = Application.get_env(:fathom, :wildcard_tls_serving)
-
-      on_exit(fn ->
-        if prev == nil,
-          do: Application.delete_env(:fathom, :wildcard_tls_serving),
-          else: Application.put_env(:fathom, :wildcard_tls_serving, prev)
-      end)
-
-      :ok
-    end
-
     test "a DNS-safe id provisions with no warnings" do
       id = "dns-safe-#{System.unique_integer([:positive])}"
       assert {:ok, tenant} = Tenants.provision(id)
@@ -1054,7 +977,7 @@ defmodule Fathom.TenantsTest do
     end
 
     test "reject mode (:wildcard_tls_serving): an underscore id is refused and no row is created" do
-      Application.put_env(:fathom, :wildcard_tls_serving, true)
+      Env.put!(:wildcard_tls_serving, true)
       id = "dns_reject_#{System.unique_integer([:positive])}"
 
       assert {:error, :id_not_dns_safe} = Tenants.provision(id)
@@ -1062,13 +985,13 @@ defmodule Fathom.TenantsTest do
     end
 
     test "reject mode: a DNS-safe id still provisions" do
-      Application.put_env(:fathom, :wildcard_tls_serving, true)
+      Env.put!(:wildcard_tls_serving, true)
       id = "dns-ok-#{System.unique_integer([:positive])}"
       assert {:ok, %{warnings: []}} = Tenants.provision(id)
     end
 
     test "reject mode: fork refuses a non-DNS-safe DESTINATION id (before touching the source)" do
-      Application.put_env(:fathom, :wildcard_tls_serving, true)
+      Env.put!(:wildcard_tls_serving, true)
       # The dns_safety(dst) gate fires before fetch_src, so no real source is needed to prove it.
       assert {:error, :id_not_dns_safe} =
                Tenants.fork("some-src", "fork_bad_#{System.unique_integer([:positive])}")
@@ -1131,9 +1054,6 @@ defmodule Fathom.TenantsTest do
   end
 
   defp flush!(shard), do: :ok = Shards.drain(shard, 5_000)
-
-  defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore_env(key, value), do: Application.put_env(:fathom, key, value)
 
   # Read `SELECT v FROM t ORDER BY v` from an exported SQLite file.
   defp export_rows(path) do

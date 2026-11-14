@@ -13,6 +13,7 @@ defmodule Fathom.Shard.AbandonedPullTempTest do
 
   alias Fathom.Shard.Materializer
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
 
   defmodule SlowBody do
     @moduledoc false
@@ -40,10 +41,7 @@ defmodule Fathom.Shard.AbandonedPullTempTest do
     server = start_supervised!({Bandit, plug: SlowBody, port: 0, ip: :loopback})
     {:ok, {_, port}} = ThousandIsland.listener_info(server)
 
-    prev_s3 = Application.get_env(:fathom, S3)
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-
-    Application.put_env(:fathom, S3,
+    Env.put!(:fathom, S3,
       bucket: "b",
       region: "us-east-1",
       endpoint: "http://127.0.0.1:#{port}",
@@ -53,17 +51,7 @@ defmodule Fathom.Shard.AbandonedPullTempTest do
       secret_access_key: "s"
     )
 
-    Application.put_env(:fathom, :shard_storage, S3)
-
-    on_exit(fn ->
-      if prev_s3,
-        do: Application.put_env(:fathom, S3, prev_s3),
-        else: Application.delete_env(:fathom, S3)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:shard_storage, S3)
 
     dir =
       Path.join(System.tmp_dir!(), "fathom_abandon_pull_#{System.unique_integer([:positive])}")

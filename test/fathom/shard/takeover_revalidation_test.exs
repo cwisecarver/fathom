@@ -13,19 +13,13 @@ defmodule Fathom.Shard.TakeoverRevalidationTest do
 
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.Env
   alias Filo.{Stmt, StmtResult}
 
   setup do
     shard = "takeover_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-
       for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
@@ -68,7 +62,7 @@ defmodule Fathom.Shard.TakeoverRevalidationTest do
     # but BEFORE the lease confirms: the faulty hook runs inside acquire_lease, and
     # waits for the pull temp to exist (the pull captured the stale bytes) before
     # overwriting the object with the zombie's last acknowledged write.
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     test_pid = self()
     temp = Path.join(local_dir(), "#{shard}.db.pull")
@@ -87,7 +81,7 @@ defmodule Fathom.Shard.TakeoverRevalidationTest do
       :ok
     end
 
-    Application.put_env(:fathom, :faulty_before, {:acquire, zombie_flush})
+    Env.put!(:faulty_before, {:acquire, zombie_flush})
 
     capture_log(fn ->
       {:ok, conn} = ShardExecutor.open(shard)

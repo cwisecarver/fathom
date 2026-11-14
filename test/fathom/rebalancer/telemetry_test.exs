@@ -9,6 +9,7 @@ defmodule Fathom.Rebalancer.TelemetryTest do
 
   alias Fathom.Rebalancer.{CommandPoller, Commands, HandoffJob, LbApply, Overrides}
   alias Fathom.Rebalancer.{LoadSample, Nodes, RebalanceJob, WarmLocations}
+  alias Fathom.Test.Env
 
   # Named handler (telemetry warns on anonymous-fun handlers).
   def forward(event, measurements, meta, %{pid: pid}) do
@@ -28,14 +29,9 @@ defmodule Fathom.Rebalancer.TelemetryTest do
           rebalance_confirm_windows: 2,
           lb_backends: %{"n1" => "n1:8080", "n2" => "n2:8080", "n3" => "n3:8080"}
         ] do
-      prev = Application.get_env(:fathom, k)
-      Application.put_env(:fathom, k, v)
-      on_exit(fn -> restore(k, prev) end)
+      Env.put!(k, v)
     end
   end
-
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
 
   defp sample(node, shard, q, age_ms) do
     Repo.insert!(%LoadSample{
@@ -86,12 +82,8 @@ defmodule Fathom.Rebalancer.TelemetryTest do
   test "handoff.retry then handoff.stop(:reverted) fire when the drain never completes" do
     shard = "tel_ho_#{System.unique_integer([:positive])}"
     node = Fathom.Rebalancer.node_key()
-    prev_w = Application.get_env(:fathom, :handoff_warm_timeout_ms)
-    prev_d = Application.get_env(:fathom, :handoff_drain_timeout_ms)
-    Application.put_env(:fathom, :handoff_warm_timeout_ms, 50)
-    Application.put_env(:fathom, :handoff_drain_timeout_ms, 50)
-    on_exit(fn -> restore(:handoff_warm_timeout_ms, prev_w) end)
-    on_exit(fn -> restore(:handoff_drain_timeout_ms, prev_d) end)
+    Env.put!(:handoff_warm_timeout_ms, 50)
+    Env.put!(:handoff_drain_timeout_ms, 50)
 
     attach([[:fathom, :rebalancer, :handoff, :retry], [:fathom, :rebalancer, :handoff, :stop]])
     args = %{"shard_id" => shard, "from_node" => node, "to_node" => node, "q_per_s" => 500.0}
@@ -111,15 +103,11 @@ defmodule Fathom.Rebalancer.TelemetryTest do
     map_path =
       Path.join(System.tmp_dir!(), "tel_lbapply_#{System.unique_integer([:positive])}.conf")
 
-    prev_map = Application.get_env(:fathom, :lb_map_path)
-    prev_backends = Application.get_env(:fathom, :lb_backends)
-    Application.put_env(:fathom, :lb_map_path, map_path)
-    Application.put_env(:fathom, :lb_backends, %{"n1" => "n1:8080"})
-    Application.delete_env(:fathom, :lb_reload_cmd)
+    Env.put!(:lb_map_path, map_path)
+    Env.put!(:lb_backends, %{"n1" => "n1:8080"})
+    Env.delete!(:lb_reload_cmd)
 
     on_exit(fn ->
-      restore(:lb_map_path, prev_map)
-      restore(:lb_backends, prev_backends)
       File.rm(map_path)
       for f <- Path.wildcard(map_path <> ".tmp.*"), do: File.rm(f)
     end)

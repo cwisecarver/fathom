@@ -31,6 +31,7 @@ defmodule Fathom.ShardsRemoteFlushDirtyMarkerTest do
   alias Fathom.Shard.{Heartbeat, Storage}
   alias Fathom.Shard.Storage.S3
   alias Fathom.Shards.RemoteFlush
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
   alias Filo.Stmt
 
@@ -39,18 +40,7 @@ defmodule Fathom.ShardsRemoteFlushDirtyMarkerTest do
   setup do
     shard = "rfdirty_#{System.unique_integer([:positive])}"
 
-    for k <- [:shard_storage, S3, :replication_enabled] do
-      prev = Application.get_env(:fathom, k)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, prev)
-      end)
-    end
-
     on_exit(fn ->
-      Application.delete_env(:fathom, :storage_fault)
       Shards.drain(shard, 2_000)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
@@ -78,7 +68,7 @@ defmodule Fathom.ShardsRemoteFlushDirtyMarkerTest do
 
   describe "Local backend" do
     setup %{shard: shard} do
-      Application.put_env(:fathom, :shard_storage, Storage.Local)
+      Env.put!(:shard_storage, Storage.Local)
       %{lock: Path.join(Storage.Local.dir(), "#{shard}.lock")}
     end
 
@@ -104,10 +94,10 @@ defmodule Fathom.ShardsRemoteFlushDirtyMarkerTest do
 
   describe "S3 backend" do
     setup %{shard: shard} do
-      Application.put_env(:fathom, :shard_storage, S3)
+      Env.put!(:shard_storage, S3)
       store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
 
-      Application.put_env(:fathom, S3,
+      Env.put!(S3,
         bucket: "b",
         region: "us-east-1",
         access_key_id: "k",
@@ -145,7 +135,7 @@ defmodule Fathom.ShardsRemoteFlushDirtyMarkerTest do
   describe "end to end: a coordinator whose drop flush FAILS" do
     for mode <- @modes do
       test "#{mode} mode: leaves a dirty marker that RemoteFlush refuses", %{shard: shard} do
-        Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+        Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
         case unquote(mode) do
           :legacy ->
@@ -156,14 +146,14 @@ defmodule Fathom.ShardsRemoteFlushDirtyMarkerTest do
         end
 
         # Open while replicating (an integer lineage is what makes the release leave a marker).
-        Application.put_env(:fathom, :replication_enabled, true)
+        Env.put!(:replication_enabled, true)
         {:ok, a} = Shards.ensure(shard)
 
         if unquote(mode) == :heartbeat,
           do: assert(is_integer(:sys.get_state(a).acquire_gen)),
           else: assert(is_nil(:sys.get_state(a).acquire_gen))
 
-        Application.put_env(:fathom, :replication_enabled, false)
+        Env.put!(:replication_enabled, false)
         {:ok, conn} = ShardExecutor.open(shard)
         {:ok, _} = ShardExecutor.execute(conn, %Stmt{sql: "CREATE TABLE kv (v TEXT)", args: []})
 
@@ -173,7 +163,7 @@ defmodule Fathom.ShardsRemoteFlushDirtyMarkerTest do
         :ok = ShardExecutor.close(conn)
         assert Shard.dirty?(a), "the fixture must be dirty or the drop takes the clean path"
 
-        Application.put_env(:fathom, :storage_fault, :flush)
+        Env.put!(:storage_fault, :flush)
         ref = Process.monitor(a)
 
         capture_log(fn ->

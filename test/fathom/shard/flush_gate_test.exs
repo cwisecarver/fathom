@@ -5,21 +5,16 @@ defmodule Fathom.Shard.FlushGateTest do
   # back-off-when-full behavior is in shard_durability_test.exs. Not async: the counter is global.
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.Env
   alias Fathom.Test.FlushGateScope
 
   alias Fathom.Shard.FlushGate
 
   setup do
-    prev = Application.get_env(:fathom, :shard_flush_max_concurrency)
+    Env.delete!(:shard_flush_max_concurrency)
     FlushGate.reset()
 
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :shard_flush_max_concurrency, prev),
-        else: Application.delete_env(:fathom, :shard_flush_max_concurrency)
-
-      FlushGate.reset()
-    end)
+    on_exit(fn -> FlushGate.reset() end)
 
     :ok
   end
@@ -88,17 +83,10 @@ defmodule Fathom.Shard.FlushGateTest do
   # [:fathom, :shard, :flush, :failed] only fires for a flush that actually RAN.
   describe "reclaiming a slot from a dead holder (#15)" do
     setup do
-      prev = Application.get_env(:fathom, :shard_flush_max_concurrency)
-      Application.put_env(:fathom, :shard_flush_max_concurrency, 2)
+      Env.put!(:shard_flush_max_concurrency, 2)
       FlushGate.reset()
 
-      on_exit(fn ->
-        FlushGate.reset()
-
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :shard_flush_max_concurrency),
-          else: Application.put_env(:fathom, :shard_flush_max_concurrency, prev)
-      end)
+      on_exit(fn -> FlushGate.reset() end)
 
       :ok
     end
@@ -209,9 +197,7 @@ defmodule Fathom.Shard.FlushGateTest do
       # Nothing could see this before: [:fathom, :shard, :flush, :failed] only fires for a flush
       # that actually RAN, and the flush_gate gauge reported in_flight/cap — the gate being busy,
       # not anyone being turned away.
-      prev = Application.get_env(:fathom, :shard_flush_max_concurrency)
-      Application.put_env(:fathom, :shard_flush_max_concurrency, 1)
-      on_exit(fn -> restore_concurrency(prev) end)
+      Env.put!(:shard_flush_max_concurrency, 1)
 
       before = FlushGate.refusals()
 
@@ -224,9 +210,4 @@ defmodule Fathom.Shard.FlushGateTest do
              "gate refusals are not counted, so a node-wide flush backlog stays invisible"
     end
   end
-
-  defp restore_concurrency(nil), do: Application.delete_env(:fathom, :shard_flush_max_concurrency)
-
-  defp restore_concurrency(v),
-    do: Application.put_env(:fathom, :shard_flush_max_concurrency, v)
 end

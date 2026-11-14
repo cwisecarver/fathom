@@ -6,20 +6,10 @@ defmodule Fathom.ShardAdmissionTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   setup do
-    prev = Application.get_env(:fathom, :max_open_shards)
-    prev_evict = Application.get_env(:fathom, :evict_idle_at_capacity)
-
     on_exit(fn ->
-      if prev == nil,
-        do: Application.delete_env(:fathom, :max_open_shards),
-        else: Application.put_env(:fathom, :max_open_shards, prev)
-
-      if prev_evict == nil,
-        do: Application.delete_env(:fathom, :evict_idle_at_capacity),
-        else: Application.put_env(:fathom, :evict_idle_at_capacity, prev_evict)
-
       # This test's shards all share the "adm_" prefix, so a glob cleans them without
       # tracking each one (an ETS table owned by the test process dies before on_exit).
       for dir <- [local_dir(), remote_dir()],
@@ -36,14 +26,14 @@ defmodule Fathom.ShardAdmissionTest do
     # The default now SOFTENS the cap (evict an idle shard to admit — see the LRU
     # eviction suite). This pins the hard-cap path: with eviction disabled, at the cap a
     # new open is refused outright, so operators who want strict backpressure still get it.
-    Application.put_env(:fathom, :evict_idle_at_capacity, false)
+    Env.put!(:evict_idle_at_capacity, false)
 
     a = unique_shard()
     # Open + HOLD shard A (the test process is its connection, so it never idle-stops).
     # A held coordinator guarantees Registry.count >= 1, so with a cap of 1 any NEW
     # shard is refused regardless of coordinators left over from prior tests.
     assert {:ok, pid_a, _ref, _path} = Shards.checkout(a)
-    Application.put_env(:fathom, :max_open_shards, 1)
+    Env.put!(:max_open_shards, 1)
 
     assert {:error, :node_at_capacity} = Shards.checkout(unique_shard())
 
@@ -52,7 +42,7 @@ defmodule Fathom.ShardAdmissionTest do
   end
 
   test "explicitly disabling the cap (:infinity) never refuses an open" do
-    Application.delete_env(:fathom, :max_open_shards)
+    Env.delete!(:max_open_shards)
     assert {:ok, _pid, _ref, _path} = Shards.checkout(unique_shard())
   end
 

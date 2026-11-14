@@ -16,11 +16,9 @@ defmodule Fathom.ConnectionWatchdogTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Env
 
   setup do
-    prev = Application.get_env(:fathom, :query_timeout_ms)
-    on_exit(fn -> restore(:query_timeout_ms, prev) end)
-
     path = Path.join(System.tmp_dir!(), "watchdog_#{System.unique_integer([:positive])}.db")
     on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(path <> s) end)
 
@@ -36,9 +34,6 @@ defmodule Fathom.ConnectionWatchdogTest do
   # modelled the tenant path with a fixture production no longer runs it through.
   defp query(conn, sql, args), do: Connection.query(conn, sql, args, deadline: true)
 
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
-
   defp mailbox_size do
     {:message_queue_len, n} = Process.info(self(), :message_queue_len)
     n
@@ -47,7 +42,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   test "a long run of fast queries under a deadline leaves no timeout residue", %{conn: conn} do
     # A deadline short enough that the watchdog is armed and firing near the query's own
     # duration is what opens the race; the queries themselves all succeed.
-    Application.put_env(:fathom, :query_timeout_ms, 1)
+    Env.put!(:query_timeout_ms, 1)
 
     :ok = Connection.exec(conn, "CREATE TABLE t (a INTEGER)")
 
@@ -76,7 +71,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   # used an unfired watchdog and so pinned the wait for a watchdog that could not cancel anything.
   test "release_owner_state/1 returns only once a FIRED watchdog is gone (pooled handoff)",
        %{conn: conn} do
-    Application.put_env(:fathom, :query_timeout_ms, 5)
+    Env.put!(:query_timeout_ms, 5)
 
     assert {:error, :query_timeout} =
              query(
@@ -86,7 +81,7 @@ defmodule Fathom.ConnectionWatchdogTest do
                []
              )
 
-    Application.put_env(:fathom, :query_timeout_ms, 5_000)
+    Env.put!(:query_timeout_ms, 5_000)
     assert {:ok, _} = query(conn, "SELECT 1", [])
 
     {watchdog, _flags} = Process.get({Connection, :watchdog, conn})
@@ -125,7 +120,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   # a synchronous stop would block until the 1 s kill fallback, an async one returns at once.
   # Pre-fix this took ~1 s.
   test "release_owner_state/1 does not wait for a watchdog that never fired", %{conn: conn} do
-    Application.put_env(:fathom, :query_timeout_ms, 5_000)
+    Env.put!(:query_timeout_ms, 5_000)
     assert {:ok, _} = query(conn, "SELECT 1", [])
 
     {watchdog, flags} = Process.get({Connection, :watchdog, conn})
@@ -163,7 +158,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   # re-read sees the disarm and NO cancel is issued; without it the cancel lands on a handle that
   # is by now another stream's (the 09-29 #33 cross-stream SQLITE_INTERRUPT).
   test "a fire that loses the race to the owner's disarm issues no cancel", %{conn: conn} do
-    Application.put_env(:fathom, :query_timeout_ms, 5_000)
+    Env.put!(:query_timeout_ms, 5_000)
     assert {:ok, _} = query(conn, "SELECT 1", [])
 
     {watchdog, flags} = Process.get({Connection, :watchdog, conn})
@@ -219,7 +214,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   # The other half of the same invariant: once the fired mark IS set, the release must block until
   # the watchdog is gone (a cancel may be in flight).
   test "release_owner_state/1 blocks while a FIRED watchdog is frozen", %{conn: conn} do
-    Application.put_env(:fathom, :query_timeout_ms, 5_000)
+    Env.put!(:query_timeout_ms, 5_000)
     assert {:ok, _} = query(conn, "SELECT 1", [])
     {watchdog, flags} = Process.get({Connection, :watchdog, conn})
     :atomics.put(flags, 2, 1)
@@ -250,7 +245,7 @@ defmodule Fathom.ConnectionWatchdogTest do
 
   test "a genuine timeout is still reported", %{conn: conn} do
     # The reorder must not break detection: the message has to arrive before the peek.
-    Application.put_env(:fathom, :query_timeout_ms, 5)
+    Env.put!(:query_timeout_ms, 5)
     :ok = Connection.exec(conn, "CREATE TABLE big (a INTEGER)")
 
     # A recursive CTE that runs well past the deadline.
@@ -268,7 +263,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   end
 
   test "queries keep working after a timeout", %{conn: conn} do
-    Application.put_env(:fathom, :query_timeout_ms, 5)
+    Env.put!(:query_timeout_ms, 5)
     :ok = Connection.exec(conn, "CREATE TABLE t (a INTEGER)")
 
     _ =
@@ -279,7 +274,7 @@ defmodule Fathom.ConnectionWatchdogTest do
         []
       )
 
-    Application.put_env(:fathom, :query_timeout_ms, 5_000)
+    Env.put!(:query_timeout_ms, 5_000)
     assert {:ok, %{rows: [[1]]}} = query(conn, "SELECT 1", [])
     assert mailbox_size() == 0
   end
@@ -312,7 +307,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   # `multi_step` that yields a scheduler slot deterministically). Run with `mix test --include flaky`.
   @tag :flaky
   test "the per-connection watchdog re-arms across timeouts and healthy queries", %{conn: conn} do
-    Application.put_env(:fathom, :query_timeout_ms, 60)
+    Env.put!(:query_timeout_ms, 60)
 
     assert Application.get_env(:fathom, :query_timeout_ms) == 60,
            "fixture: the statement deadline is not in force, so a slow query cannot time out " <>
@@ -349,7 +344,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   # Deterministic where CI was lucky: rather than racing for a scheduler stall, arm the
   # watchdog by hand and let it fire while the connection is IDLE, which is the same state.
   test "a deadline that fires before the statement starts still bounds the query", %{conn: _} do
-    Application.put_env(:fathom, :query_timeout_ms, 60)
+    Env.put!(:query_timeout_ms, 60)
 
     # A PLAIN handle: a tenant handle also carries the extension's on-thread backstop, which would
     # stop the slow statement by itself and make this test measure nothing.
@@ -397,7 +392,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   # on a healthy query. Deterministic: deliver the stale fire by hand after the generation moved on,
   # then run a statement that a stray cancel would error.
   test "a fire for a disarmed statement does not cancel a later statement", %{conn: conn} do
-    Application.put_env(:fathom, :query_timeout_ms, 30_000)
+    Env.put!(:query_timeout_ms, 30_000)
     assert {:ok, _} = query(conn, "SELECT 1", [])
     {watchdog, flags} = Process.get({Connection, :watchdog, conn})
 
@@ -464,7 +459,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   # Deterministic where the contention is not: rather than race a slow query against a stalled
   # scheduler, assert the invariant the fix rests on. Fails against the pre-fix (`:normal`) watchdog.
   test "the per-connection watchdog runs at elevated priority", %{conn: conn} do
-    Application.put_env(:fathom, :query_timeout_ms, 60)
+    Env.put!(:query_timeout_ms, 60)
 
     # One guarded query so the per-connection watchdog is spawned and parked.
     assert {:ok, _} = query(conn, "SELECT 1", [])
@@ -490,7 +485,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   # death-during-send window the re-check additionally closes cannot be forced from a test (see the
   # comment on arm_watchdog/4).
   test "a dead watchdog in the dict does not disable the deadline", %{conn: conn} do
-    Application.put_env(:fathom, :query_timeout_ms, 60)
+    Env.put!(:query_timeout_ms, 60)
 
     # A confirmed-dead pid planted as THIS connection's watchdog.
     dead = spawn(fn -> :ok end)
@@ -525,7 +520,7 @@ defmodule Fathom.ConnectionWatchdogTest do
              "SELECT count(*) FROM c"
 
     defp backstop_conn!(ms) do
-      Application.put_env(:fathom, :query_timeout_ms, ms)
+      Env.put!(:query_timeout_ms, ms)
       path = Path.join(System.tmp_dir!(), "backstop_#{System.unique_integer([:positive])}.db")
       {:ok, conn} = Connection.open(path, tenant?: true)
 
@@ -643,7 +638,7 @@ defmodule Fathom.ConnectionWatchdogTest do
     # Two connections on ONE file: `holder` takes the write lock and keeps it, `blocked` then waits
     # on it. Both are opened after `ms` is set, so both carry the backstop.
     defp lock_pair!(ms) do
-      Application.put_env(:fathom, :query_timeout_ms, ms)
+      Env.put!(:query_timeout_ms, ms)
 
       path =
         Path.join(System.tmp_dir!(), "backstop_lock_#{System.unique_integer([:positive])}.db")
@@ -745,7 +740,7 @@ defmodule Fathom.ConnectionWatchdogTest do
   describe "owner death mid-statement" do
     @tag timeout: 30_000
     test "cancels the running statement so the connection closes promptly", %{conn: conn} do
-      Application.put_env(:fathom, :query_timeout_ms, 60_000)
+      Env.put!(:query_timeout_ms, 60_000)
       test_pid = self()
 
       owner =

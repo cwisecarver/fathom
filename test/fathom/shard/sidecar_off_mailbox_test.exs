@@ -29,24 +29,20 @@ defmodule Fathom.Shard.SidecarOffMailboxTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Provenance, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
 
   setup do
     shard = "sidecar_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
 
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
     # No periodic flush: the test sends `:durability_flush` itself.
-    Application.put_env(:fathom, :shard_flush_interval_ms, 600_000)
+    Env.put!(:shard_flush_interval_ms, 600_000)
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :provenance_write_hook)
       Application.delete_env(:fathom, :storage_fault)
-      restore(:shard_storage, prev_storage)
-      restore(:shard_flush_interval_ms, prev_flush)
       Shards.drain(shard, 2_000)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
@@ -58,9 +54,6 @@ defmodule Fathom.Shard.SidecarOffMailboxTest do
 
     %{shard: shard}
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
   defp db(shard), do: Shard.db_path(shard)
@@ -89,7 +82,7 @@ defmodule Fathom.Shard.SidecarOffMailboxTest do
     test_pid = self()
     path = db(shard)
 
-    Application.put_env(:fathom, :provenance_write_hook, fn
+    Env.put!(:provenance_write_hook, fn
       ^stage, ^path ->
         send(test_pid, {:sidecar_write, stage, self()})
 

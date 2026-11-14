@@ -15,6 +15,7 @@ defmodule Fathom.HranaTokenLedgerTest do
   alias Fathom.Directory
   alias Fathom.HranaAuth
   alias Fathom.HranaAuth.Ledger
+  alias Fathom.Test.Env
 
   defp shard(name), do: "led#{name}#{System.unique_integer([:positive])}"
 
@@ -247,14 +248,7 @@ defmodule Fathom.HranaTokenLedgerTest do
   # floor, killing every token of that shard, including ones minted after the cutoff).
   describe "the sweep selects only mints that still verify (#33)" do
     setup do
-      prev = Application.get_env(:fathom, :hrana_token_max_age)
-      Application.put_env(:fathom, :hrana_token_max_age, 3600)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :hrana_token_max_age),
-          else: Application.put_env(:fathom, :hrana_token_max_age, prev)
-      end)
+      Env.put!(:hrana_token_max_age, 3600)
 
       :ok
     end

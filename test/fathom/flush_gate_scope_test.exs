@@ -5,20 +5,14 @@ defmodule Fathom.Test.FlushGateScopeTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.FlushGate
+  alias Fathom.Test.Env
   alias Fathom.Test.FlushGateScope
 
   setup do
-    prev = Application.get_env(:fathom, :shard_flush_max_concurrency)
-    Application.put_env(:fathom, :shard_flush_max_concurrency, 4)
+    Env.put!(:shard_flush_max_concurrency, 4)
     FlushGate.reset()
 
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :shard_flush_max_concurrency, prev),
-        else: Application.delete_env(:fathom, :shard_flush_max_concurrency)
-
-      FlushGate.reset()
-    end)
+    on_exit(fn -> FlushGate.reset() end)
 
     :ok
   end

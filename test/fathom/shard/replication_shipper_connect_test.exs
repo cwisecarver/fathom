@@ -12,17 +12,11 @@ defmodule Fathom.Shard.ReplicationShipperConnectTest do
 
   alias Fathom.Shard.Replication.Protocol.Push
   alias Fathom.Shard.Replication.Shipper
+  alias Fathom.Test.Env
 
   setup do
-    prev = Application.get_env(:fathom, :replication_conn_nonce)
     # The nonce handshake is what makes a silent peer block the dialer: it waits for the hello.
-    Application.put_env(:fathom, :replication_conn_nonce, true)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :replication_conn_nonce),
-        else: Application.put_env(:fathom, :replication_conn_nonce, prev)
-    end)
+    Env.put!(:replication_conn_nonce, true)
 
     me = self()
 

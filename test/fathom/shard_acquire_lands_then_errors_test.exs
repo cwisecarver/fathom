@@ -27,28 +27,17 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
   alias Fathom.{Shard, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   @modes [:legacy, :heartbeat]
 
   setup do
     shard = "acqland_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_s3 = Application.get_env(:fathom, S3)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
 
+    # The cleanup is registered BEFORE the env writes below, so `on_exit`'s reverse order restores the
+    # env first and drains the shard after it (the order the combined callback had).
     on_exit(fn ->
-      Application.delete_env(:fathom, :storage_fault)
-      Application.delete_env(:fathom, :faulty_before)
-      restore(:shard_storage, prev_storage)
-      restore(:shard_idle_ms, prev_idle)
-
-      if prev_s3,
-        do: Application.put_env(:fathom, S3, prev_s3),
-        else: Application.delete_env(:fathom, S3)
-
       Shards.drain(shard, 2_000)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
@@ -56,11 +45,11 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
           do: File.rm(Path.join(dir, shard <> suffix))
     end)
 
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_idle_ms, 600_000)
+
     %{shard: shard}
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
   defp set_mode!(:legacy) do
     refute Heartbeat.running?(), "legacy mode needs the heartbeat OFF (config/test.exs default)"
@@ -98,7 +87,7 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
   defp watch_release!(shard) do
     test_pid = self()
 
-    Application.put_env(:fathom, :faulty_before, {
+    Env.put!(:faulty_before, {
       :release,
       fn
         ^shard -> send(test_pid, {:lock_at_release, Storage.lease_holder(shard)})
@@ -113,7 +102,7 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
 
       test "a create that LANDED with its reply lost does not strand the lock", %{shard: shard} do
         watch_release!(shard)
-        Application.put_env(:fathom, :storage_fault, :acquire_lands_then_errors)
+        Env.put!(:storage_fault, :acquire_lands_then_errors)
 
         capture_log(fn ->
           assert {:error, {:lease_unavailable, :s3_unreachable}} = Shards.checkout(shard)
@@ -138,7 +127,7 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
 
       test "an acquire that wrote NOTHING (a read blip) is left alone", %{shard: shard} do
         watch_release!(shard)
-        Application.put_env(:fathom, :storage_fault, :acquire)
+        Env.put!(:storage_fault, :acquire)
 
         capture_log(fn ->
           assert {:error, {:lease_unavailable, {:transient_lookup, :s3_unreachable}}} =
@@ -156,7 +145,7 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
         # hold acked-but-unflushed writes. The reconcile is for a COLD open only.
         watch_release!(shard)
         File.write!(Shard.db_path(shard), "")
-        Application.put_env(:fathom, :storage_fault, :acquire_lands_then_errors)
+        Env.put!(:storage_fault, :acquire_lands_then_errors)
 
         capture_log(fn ->
           assert {:error, {:lease_unavailable, _}} = Shards.checkout(shard)
@@ -193,7 +182,7 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
         # stop would otherwise call a store that is already gone.
         store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
 
-        Application.put_env(:fathom, S3,
+        Env.put!(:fathom, S3,
           bucket: "b",
           region: "us-east-1",
           access_key_id: "k",
@@ -203,7 +192,7 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
           req_plug: fn conn -> S3EtagStore.serve(conn, store) end
         )
 
-        Application.put_env(:fathom, :shard_storage, S3)
+        Env.put!(:shard_storage, S3)
         set_mode!(unquote(mode))
         %{store: store, lock_key: shard <> ".lock"}
       end

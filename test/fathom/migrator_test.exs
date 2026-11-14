@@ -11,6 +11,7 @@ defmodule Fathom.MigratorTest do
 
   alias Fathom.Migrator
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Env
 
   describe "release/2 and head/0" do
     test "head is 0 before anything is released" do
@@ -54,8 +55,7 @@ defmodule Fathom.MigratorTest do
     # stale and every novel tenant is born empty until it is refreshed. Release now warns for that
     # gap too — the fork-ON case is silent ONLY when the snapshot for the new head is present.
     test "fork ON but the template snapshot is STALE for the new head still warns (#11)" do
-      Application.put_env(:fathom, :fork_from_template, true)
-      on_exit(fn -> Application.put_env(:fathom, :fork_from_template, false) end)
+      Env.put!(:fork_from_template, true)
 
       test_pid = self()
       handler = "tmpl-stale-#{System.unique_integer([:positive])}"
@@ -86,8 +86,7 @@ defmodule Fathom.MigratorTest do
     # silent. This is the assertion the old test MEANT to make — the flag silences it — but it only
     # holds once the fork source actually exists.
     test "fork ON WITH the template snapshot present for the new head is silent (#11)" do
-      Application.put_env(:fathom, :fork_from_template, true)
-      on_exit(fn -> Application.put_env(:fathom, :fork_from_template, false) end)
+      Env.put!(:fork_from_template, true)
 
       with_template(fn ->
         # Create template@1 the way `mix fathom.snapshot template-head` would: a live template
@@ -270,15 +269,7 @@ defmodule Fathom.MigratorTest do
   # The born-empty warning only fires for a fleet that HAS a capture template, so every test
   # about it must configure one or it passes for the wrong reason.
   defp with_template(fun) do
-    prev = Application.get_env(:fathom, :template_shard_id)
-    Application.put_env(:fathom, :template_shard_id, "tmpl_warn_test")
-
-    try do
-      fun.()
-    after
-      if prev,
-        do: Application.put_env(:fathom, :template_shard_id, prev),
-        else: Application.delete_env(:fathom, :template_shard_id)
-    end
+    Env.put!(:template_shard_id, "tmpl_warn_test")
+    fun.()
   end
 end

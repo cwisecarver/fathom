@@ -19,6 +19,7 @@ defmodule Fathom.Shard.ReplicationTest do
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Protocol.Push
   alias Fathom.Shard.Replication.Quorum
+  alias Fathom.Test.Env
 
   defp push(opts \\ []) do
     %Push{
@@ -45,14 +46,7 @@ defmodule Fathom.Shard.ReplicationTest do
     end
 
     test "with the ordinal wire on, a push carries ordinal AND lineage round-trip (#4/#12)" do
-      prev = Application.get_env(:fathom, :replication_ordinal_wire)
-      Application.put_env(:fathom, :replication_ordinal_wire, true)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :replication_ordinal_wire),
-          else: Application.put_env(:fathom, :replication_ordinal_wire, prev)
-      end)
+      Env.put!(:replication_ordinal_wire, true)
 
       p = %Push{
         shard_id: "acme",

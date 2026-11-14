@@ -15,31 +15,22 @@ defmodule Fathom.ShardsHandoffHoldTest do
   alias Fathom.Rebalancer
   alias Fathom.Rebalancer.Overrides
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
     shard = "handoff_#{System.unique_integer([:positive])}"
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    prev_budget = Application.get_env(:fathom, :handoff_held_retry_budget_ms)
-    prev_crash = Application.get_env(:fathom, :crash_failover_hold_ms)
-    prev_margin = Application.get_env(:fathom, :steal_margin_ms)
-    prev_poller = Application.get_env(:fathom, :command_poller)
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     # Off by default here so the #20 (handoff) tests exercise only the pin path; the #21 tests
     # opt it back in.
-    Application.put_env(:fathom, :crash_failover_hold_ms, 0)
+    Env.put!(:crash_failover_hold_ms, 0)
     # A handoff pin can only matter on a fleet that runs the command poller (a handoff drains its
     # SOURCE through it), so the held path reads the pin only then (expert review 2026-11-07 #47).
     # These tests model an in-flight handoff, which cannot exist without it; before #47 they ran with
     # the poller off and passed because the held path read the pin unconditionally.
-    Application.put_env(:fathom, :command_poller, true)
+    Env.put!(:command_poller, true)
 
     on_exit(fn ->
-      restore(:shard_idle_ms, prev_idle)
-      restore(:handoff_held_retry_budget_ms, prev_budget)
-      restore(:crash_failover_hold_ms, prev_crash)
-      restore(:steal_margin_ms, prev_margin)
-      restore(:command_poller, prev_poller)
       Storage.clear_heartbeat("dead@node#1")
       Storage.clear_heartbeat("live@node#1")
 
@@ -50,9 +41,6 @@ defmodule Fathom.ShardsHandoffHoldTest do
 
     %{shard: shard, node: Rebalancer.node_key()}
   end
-
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
   defp lock_file(shard), do: Path.join(remote_dir(), "#{shard}.lock")
@@ -137,7 +125,7 @@ defmodule Fathom.ShardsHandoffHoldTest do
   test "a pinned handoff whose source never releases falls back to the error at budget exhaustion",
        %{shard: shard, node: node} do
     # Bounded: the hold is not indefinite. A short budget so the test is fast.
-    Application.put_env(:fathom, :handoff_held_retry_budget_ms, 300)
+    Env.put!(:handoff_held_retry_budget_ms, 300)
     seed_durable(shard)
 
     {:ok, _} = Overrides.pin(shard, node, reason: "test")
@@ -154,8 +142,8 @@ defmodule Fathom.ShardsHandoffHoldTest do
 
   test "a checkout at the tail of a crashed owner's TTL window holds + retries, then steals and serves",
        %{shard: shard} do
-    Application.put_env(:fathom, :crash_failover_hold_ms, 5_000)
-    Application.put_env(:fathom, :steal_margin_ms, 100)
+    Env.put!(:crash_failover_hold_ms, 5_000)
+    Env.put!(:steal_margin_ms, 100)
     seed_durable(shard)
 
     # A hard-crashed owner: its heartbeat OBJECT survives (not cleared) but is frozen, expiring in
@@ -196,8 +184,8 @@ defmodule Fathom.ShardsHandoffHoldTest do
   # PROBED by restoring the old wait computation (`min(backoff, remaining)`) while keeping the
   # telemetry: it emitted 5 un-aimed retries before the steal instead of 1 aimed one.
   test "a known steal instant is slept TO once, not rediscovered by polling", %{shard: shard} do
-    Application.put_env(:fathom, :crash_failover_hold_ms, 5_000)
-    Application.put_env(:fathom, :steal_margin_ms, 100)
+    Env.put!(:crash_failover_hold_ms, 5_000)
+    Env.put!(:steal_margin_ms, 100)
     seed_durable(shard)
 
     test_pid = self()
@@ -253,7 +241,7 @@ defmodule Fathom.ShardsHandoffHoldTest do
 
   test "a held lease whose owner is LIVE (heartbeat far from expiry) errors immediately, never held",
        %{shard: shard} do
-    Application.put_env(:fathom, :crash_failover_hold_ms, 5_000)
+    Env.put!(:crash_failover_hold_ms, 5_000)
     seed_durable(shard)
 
     # A genuinely-live foreign owner keeps its heartbeat ~ttl ahead of now; holder_stealable_soon?
@@ -280,8 +268,8 @@ defmodule Fathom.ShardsHandoffHoldTest do
   # when it decides to hold — cleaner than timing, and it says WHY the wait happened.
   test "a holder whose heartbeat lapses but whose lock TTL does not is NOT waited for",
        %{shard: shard} do
-    Application.put_env(:fathom, :crash_failover_hold_ms, 5_000)
-    Application.put_env(:fathom, :steal_margin_ms, 100)
+    Env.put!(:crash_failover_hold_ms, 5_000)
+    Env.put!(:steal_margin_ms, 100)
     seed_durable(shard)
 
     test_pid = self()
@@ -316,8 +304,8 @@ defmodule Fathom.ShardsHandoffHoldTest do
     # The other side: the fix must not have turned the crash-hold off entirely. This is the same
     # shape as the #21 test above, asserted through the telemetry event so the two are directly
     # comparable.
-    Application.put_env(:fathom, :crash_failover_hold_ms, 5_000)
-    Application.put_env(:fathom, :steal_margin_ms, 100)
+    Env.put!(:crash_failover_hold_ms, 5_000)
+    Env.put!(:steal_margin_ms, 100)
     seed_durable(shard)
 
     test_pid = self()
@@ -354,11 +342,9 @@ defmodule Fathom.ShardsHandoffHoldTest do
   # behaviour is identical and only the observability differs.
   test "the crash-hold uses the instant the acquire already computed, with no second read",
        %{shard: shard} do
-    Application.put_env(:fathom, :crash_failover_hold_ms, 5_000)
-    Application.put_env(:fathom, :steal_margin_ms, 100)
-    prev_backend = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    on_exit(fn -> restore(:shard_storage, prev_backend) end)
+    Env.put!(:crash_failover_hold_ms, 5_000)
+    Env.put!(:steal_margin_ms, 100)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     seed_durable(shard)
 
@@ -439,7 +425,7 @@ defmodule Fathom.ShardsHandoffHoldTest do
   # stream-open path.
   test "with the command poller off, a held checkout and its HeldCache replay read no pin (#47)",
        %{shard: shard} do
-    Application.put_env(:fathom, :command_poller, false)
+    Env.put!(:command_poller, false)
     seed_durable(shard)
     put_live_foreign_lock(shard, "source@node")
     queries = count_override_queries!()

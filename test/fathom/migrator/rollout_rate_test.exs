@@ -23,6 +23,7 @@ defmodule Fathom.Migrator.RolloutRateTest do
   alias Fathom.Directory.Shard
   alias Fathom.Migrator
   alias Fathom.Repo
+  alias Fathom.Test.Env
 
   import Ecto.Query
 
@@ -310,14 +311,7 @@ defmodule Fathom.Migrator.RolloutRateTest do
 
       assert Migrator.status().stalled == 0
 
-      prev = Application.get_env(:fathom, :migration_stall_after_ms)
-      Application.put_env(:fathom, :migration_stall_after_ms, :timer.minutes(1))
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, :migration_stall_after_ms, prev),
-          else: Application.delete_env(:fathom, :migration_stall_after_ms)
-      end)
+      Env.put!(:migration_stall_after_ms, :timer.minutes(1))
 
       assert Migrator.status().stalled == 1
     end

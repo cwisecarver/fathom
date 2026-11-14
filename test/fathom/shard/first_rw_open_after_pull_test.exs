@@ -29,6 +29,7 @@ defmodule Fathom.Shard.FirstRwOpenAfterPullTest do
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   @moduletag :bench
   @trials 30
@@ -36,11 +37,6 @@ defmodule Fathom.Shard.FirstRwOpenAfterPullTest do
   setup do
     id = "frwo_#{System.unique_integer([:positive])}"
     path = Fathom.Shard.db_path(id)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    prev_pin = Application.get_env(:fathom, :flush_pinned_live_upload)
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
-    # Force the VACUUM route deterministically (the pinned-live route would store `02 02`).
-    Application.put_env(:fathom, :flush_pinned_live_upload, false)
 
     test_pid = self()
     handler = "frwo-#{id}"
@@ -57,17 +53,14 @@ defmodule Fathom.Shard.FirstRwOpenAfterPullTest do
 
     on_exit(fn ->
       :telemetry.detach(handler)
-
-      for {k, v} <- [shard_idle_ms: prev_idle, flush_pinned_live_upload: prev_pin] do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
-
       Shards.stop(id)
       for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(path <> s)
       File.rm_rf(dir)
     end)
+
+    Env.put!(:shard_idle_ms, 600_000)
+    # Force the VACUUM route deterministically (the pinned-live route would store `02 02`).
+    Env.put!(:flush_pinned_live_upload, false)
 
     %{id: id, dir: dir}
   end

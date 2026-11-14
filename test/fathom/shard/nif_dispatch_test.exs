@@ -23,6 +23,7 @@ defmodule Fathom.Shard.NifDispatchTest do
   alias Exqlite.Sqlite3
   alias Fathom.Shard.Connection
   alias Fathom.ShardExecutor
+  alias Fathom.Test.Env
   alias Fathom.Test.NifDispatchCounter, as: Counter
   alias Filo.{Stmt, StmtResult}
 
@@ -94,14 +95,7 @@ defmodule Fathom.Shard.NifDispatchTest do
     # `Connection.autocommit?/1` (a dirty `transaction_status` NIF) before the cheap
     # `wrote? or ...` operand, so every read paid a second dispatch in prod (count was 2).
     test "a point SELECT is still exactly 1 dirty dispatch with replication ON", %{conn: conn} do
-      prev = Application.get_env(:fathom, :replication_enabled)
-      Application.put_env(:fathom, :replication_enabled, true)
-
-      on_exit(fn ->
-        if prev == nil,
-          do: Application.delete_env(:fathom, :replication_enabled),
-          else: Application.put_env(:fathom, :replication_enabled, prev)
-      end)
+      Env.put!(:replication_enabled, true)
 
       sel = stmt("SELECT v FROM kv WHERE k = ?", [1])
       assert {:ok, _} = ShardExecutor.execute(conn, sel)
@@ -343,19 +337,11 @@ defmodule Fathom.Shard.NifDispatchTest do
   # fused cached statement now. The abandoned-transaction rollback must still happen.
   describe "pooled stream close" do
     setup do
-      prev = Application.get_env(:fathom, :connection_pool)
-      prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-      Application.put_env(:fathom, :connection_pool, true)
-      Application.put_env(:fathom, :shard_idle_ms, 60_000)
+      Env.put!(:connection_pool, true)
+      Env.put!(:shard_idle_ms, 60_000)
       shard = "test_nifd_pool_#{System.unique_integer([:positive])}"
 
       on_exit(fn ->
-        for {k, v} <- [connection_pool: prev, shard_idle_ms: prev_idle] do
-          if v == nil,
-            do: Application.delete_env(:fathom, k),
-            else: Application.put_env(:fathom, k, v)
-        end
-
         for base <- [
               Path.join(Fathom.Shard.data_dir(), "#{shard}.db"),
               Path.join(Fathom.Shard.Storage.Local.dir(), "#{shard}.db")
@@ -664,14 +650,7 @@ defmodule Fathom.Shard.NifDispatchTest do
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER PRIMARY KEY, v)"))
 
       # Replication goes on only after the autocommit DDL (it would try to ship to a quorum).
-      prev = Application.get_env(:fathom, :replication_enabled)
-      Application.put_env(:fathom, :replication_enabled, true)
-
-      on_exit(fn ->
-        if prev == nil,
-          do: Application.delete_env(:fathom, :replication_enabled),
-          else: Application.put_env(:fathom, :replication_enabled, prev)
-      end)
+      Env.put!(:replication_enabled, true)
 
       {:ok, _} = ShardExecutor.execute(conn, stmt("BEGIN"))
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES (?, 'w')", [1]))
@@ -707,14 +686,7 @@ defmodule Fathom.Shard.NifDispatchTest do
 
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER PRIMARY KEY, v)"))
 
-      prev = Application.get_env(:fathom, :replication_enabled)
-      Application.put_env(:fathom, :replication_enabled, true)
-
-      on_exit(fn ->
-        if prev == nil,
-          do: Application.delete_env(:fathom, :replication_enabled),
-          else: Application.put_env(:fathom, :replication_enabled, prev)
-      end)
+      Env.put!(:replication_enabled, true)
 
       # One full transaction first, so BEGIN / INSERT / COMMIT are all in the statement cache and the
       # measured COMMIT is a cache hit.
@@ -750,8 +722,6 @@ defmodule Fathom.Shard.NifDispatchTest do
         """)
 
       on_exit(fn ->
-        Application.delete_env(:fathom, :query_max_rows)
-        Application.delete_env(:fathom, :query_timeout_ms)
         Connection.close(a)
         Connection.close(b)
         for s <- ["", "-wal", "-shm"], do: File.rm(path <> s)
@@ -810,7 +780,7 @@ defmodule Fathom.Shard.NifDispatchTest do
     test "too_many_rows abandoned mid-statement (the {:rows, _} branch)", %{a: a, b: b} do
       # 1500 rows > one 500-row multi_step chunk, so the cap trips on a {:rows, _} batch and the
       # statement is still mid-execution: only the manual reset releases it.
-      Application.put_env(:fathom, :query_max_rows, 100)
+      Env.put!(:query_max_rows, 100)
       assert {:error, {:too_many_rows, 100}} = client(a, "SELECT * FROM t")
       assert truncate_busy(b) == 0
       Application.delete_env(:fathom, :query_max_rows)
@@ -818,7 +788,7 @@ defmodule Fathom.Shard.NifDispatchTest do
     end
 
     test "too_many_rows on the final {:done, _} batch", %{a: a, b: b} do
-      Application.put_env(:fathom, :query_max_rows, 10)
+      Env.put!(:query_max_rows, 10)
       assert {:error, {:too_many_rows, 10}} = client(a, "SELECT * FROM t WHERE id <= 50")
       assert truncate_busy(b) == 0
     end
@@ -831,7 +801,7 @@ defmodule Fathom.Shard.NifDispatchTest do
     end
 
     test "query_timeout", %{a: a, b: b} do
-      Application.put_env(:fathom, :query_timeout_ms, 20)
+      Env.put!(:query_timeout_ms, 20)
 
       assert {:error, :query_timeout} =
                client(

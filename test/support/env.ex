@@ -27,4 +27,23 @@ defmodule Fathom.Test.Env do
 
     Application.put_env(app, key, value)
   end
+
+  @doc "Delete `key` from `:fathom` for the rest of this test; put back (or left absent) on exit."
+  @spec delete!(atom()) :: :ok
+  def delete!(key), do: delete!(:fathom, key)
+
+  @doc "Delete `key` from `app` for the rest of this test; put back (or left absent) on exit."
+  @spec delete!(atom(), atom()) :: :ok
+  def delete!(app, key) do
+    previous = Application.fetch_env(app, key)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, old} -> Application.put_env(app, key, old)
+        :error -> Application.delete_env(app, key)
+      end
+    end)
+
+    Application.delete_env(app, key)
+  end
 end

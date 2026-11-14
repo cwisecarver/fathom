@@ -27,11 +27,10 @@ defmodule Fathom.FlushStormTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.FlushGate
+  alias Fathom.Test.Env
 
   describe "#16 — the flush gate ships bounded" do
     setup do
-      prev = Application.fetch_env(:fathom, :shard_flush_max_concurrency)
-
       # RESET THE GLOBAL COUNTER. `FlushGate` is one ETS counter for the whole node, and the
       # enforcement test below asserts ABSOLUTE occupancy — it acquires from zero and expects the
       # (cap+1)th to be refused. Nothing here owned that precondition, so any flush still in flight
@@ -46,18 +45,11 @@ defmodule Fathom.FlushStormTest do
       # of assumed (AGENTS.md: assert the precondition inside the test).
       FlushGate.reset()
 
-      on_exit(fn ->
-        case prev do
-          {:ok, v} -> Application.put_env(:fathom, :shard_flush_max_concurrency, v)
-          :error -> Application.delete_env(:fathom, :shard_flush_max_concurrency)
-        end
-      end)
-
       :ok
     end
 
     test "an unconfigured node still has a cap" do
-      Application.delete_env(:fathom, :shard_flush_max_concurrency)
+      Env.delete!(:shard_flush_max_concurrency)
 
       cap = FlushGate.cap()
 
@@ -92,11 +84,10 @@ defmodule Fathom.FlushStormTest do
     end
 
     test "cap/0 applies that derivation to the configured pool" do
-      Application.delete_env(:fathom, :shard_flush_max_concurrency)
+      Env.delete!(:shard_flush_max_concurrency)
       prev_s3 = Application.get_env(:fathom, Fathom.Shard.Storage.S3, [])
 
-      on_exit(fn -> Application.put_env(:fathom, Fathom.Shard.Storage.S3, prev_s3) end)
-      Application.put_env(:fathom, Fathom.Shard.Storage.S3, Keyword.put(prev_s3, :pool_size, 40))
+      Env.put!(Fathom.Shard.Storage.S3, Keyword.put(prev_s3, :pool_size, 40))
 
       assert FlushGate.cap() ==
                FlushGate.default_cap(40, :erlang.system_info(:dirty_io_schedulers))
@@ -109,10 +100,9 @@ defmodule Fathom.FlushStormTest do
     # flushes: enough to occupy every dirty-IO thread and park every tenant's query on the node.
     # The test above asserted `schedulers_online` until this fix; it pinned the defect.
     test "the default cap never exceeds the dirty-IO scheduler count" do
-      Application.delete_env(:fathom, :shard_flush_max_concurrency)
+      Env.delete!(:shard_flush_max_concurrency)
       prev_s3 = Application.get_env(:fathom, Fathom.Shard.Storage.S3, [])
-      on_exit(fn -> Application.put_env(:fathom, Fathom.Shard.Storage.S3, prev_s3) end)
-      Application.put_env(:fathom, Fathom.Shard.Storage.S3, Keyword.put(prev_s3, :pool_size, 400))
+      Env.put!(Fathom.Shard.Storage.S3, Keyword.put(prev_s3, :pool_size, 400))
 
       dirty_io = :erlang.system_info(:dirty_io_schedulers)
 
@@ -122,18 +112,18 @@ defmodule Fathom.FlushStormTest do
     end
 
     test "an explicit integer still wins" do
-      Application.put_env(:fathom, :shard_flush_max_concurrency, 7)
+      Env.put!(:shard_flush_max_concurrency, 7)
       assert FlushGate.cap() == 7
     end
 
     test "unbounded remains reachable for an operator who wants it" do
-      Application.put_env(:fathom, :shard_flush_max_concurrency, 0)
+      Env.put!(:shard_flush_max_concurrency, 0)
       assert FlushGate.cap() == nil
       assert FlushGate.try_acquire() == :disabled
     end
 
     test "the cap is actually enforced — the (cap + 1)th concurrent flush is refused" do
-      Application.put_env(:fathom, :shard_flush_max_concurrency, 3)
+      Env.put!(:shard_flush_max_concurrency, 3)
       # Reserve up to the cap.
       assert FlushGate.try_acquire() == :ok
       assert FlushGate.try_acquire() == :ok
@@ -161,25 +151,19 @@ defmodule Fathom.FlushStormTest do
     end
 
     test "the drain can be turned off for an operator who drains out of band" do
-      prev = Application.get_env(:fathom, :drain_on_shutdown)
-      on_exit(fn -> restore(:drain_on_shutdown, prev) end)
-
-      Application.put_env(:fathom, :drain_on_shutdown, false)
+      Env.put!(:drain_on_shutdown, false)
       # With no shards open this is a no-op either way; the assertion is that the knob is read
       # and prep_stop stays total.
       assert Fathom.Application.prep_stop(:state) == :state
     end
 
     test "prep_stop never blocks shutdown, even if the drain raises" do
-      prev = Application.get_env(:fathom, :drain_on_shutdown)
-      on_exit(fn -> restore(:drain_on_shutdown, prev) end)
-
       # `prep_stop/1` runs the REAL `drain_all/1`, which flips the node-global draining flag and never
       # clears it. Since expert review 2026-11-07 #46 a draining node refuses every cold open, so a
       # leaked flag fails every later test that opens a shard.
       on_exit(fn -> Fathom.Shards.undrain() end)
 
-      Application.put_env(:fathom, :drain_on_shutdown, true)
+      Env.put!(:drain_on_shutdown, true)
       assert Fathom.Application.prep_stop(:whatever) == :whatever
     end
   end
@@ -218,9 +202,6 @@ defmodule Fathom.FlushStormTest do
     end
   end
 
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
-
   # A `:flush_now` WAITER IS ALWAYS ANSWERED (expert review 2026-08-20 #28).
   #
   # `handle_call(:flush_now, ...)` parks the caller in `flush_waiters` and self-sends
@@ -234,31 +215,13 @@ defmodule Fathom.FlushStormTest do
   # and #11 fixed it in `flush_then_drop/1`; these two branches were missed.
   describe "#28 — a flush_now waiter is never abandoned" do
     setup do
-      prev = [
-        timeout: Application.get_env(:fathom, :flush_now_timeout_ms),
-        backoff: Application.get_env(:fathom, :shard_flush_backoff_ms),
-        cap: Application.get_env(:fathom, :shard_flush_max_concurrency)
-      ]
-
       # Short, so an UNFIXED run fails as a timeout in a second rather than in a minute. Still far
       # longer than the whole bounded backoff below, so a fixed run is never cut off by it.
-      Application.put_env(:fathom, :flush_now_timeout_ms, 3_000)
-      Application.put_env(:fathom, :shard_flush_backoff_ms, 20)
+      Env.put!(:flush_now_timeout_ms, 3_000)
+      Env.put!(:shard_flush_backoff_ms, 20)
       FlushGate.reset()
 
-      on_exit(fn ->
-        FlushGate.reset()
-
-        for {k, v} <- [
-              flush_now_timeout_ms: prev[:timeout],
-              shard_flush_backoff_ms: prev[:backoff],
-              shard_flush_max_concurrency: prev[:cap]
-            ] do
-          if is_nil(v),
-            do: Application.delete_env(:fathom, k),
-            else: Application.put_env(:fathom, k, v)
-        end
-      end)
+      on_exit(fn -> FlushGate.reset() end)
 
       :ok
     end
@@ -290,7 +253,7 @@ defmodule Fathom.FlushStormTest do
     end
 
     test "a saturated flush gate answers the waiter instead of backing off forever" do
-      Application.put_env(:fathom, :shard_flush_max_concurrency, 1)
+      Env.put!(:shard_flush_max_concurrency, 1)
       FlushGate.reset()
 
       id = "flushgatefull_#{System.unique_integer([:positive])}"

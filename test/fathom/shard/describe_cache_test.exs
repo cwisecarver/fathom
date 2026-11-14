@@ -18,6 +18,7 @@ defmodule Fathom.Shard.DescribeCacheTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Env
   alias Fathom.Test.NifDispatchCounter, as: Counter
 
   @sel "SELECT id, x FROM t WHERE id = ?"
@@ -105,14 +106,7 @@ defmodule Fathom.Shard.DescribeCacheTest do
   end
 
   test "a describe over the byte budget evicts like an execute (the entry still caches)", %{b: b} do
-    prev = Application.get_env(:fathom, :stmt_cache_bytes)
-    Application.put_env(:fathom, :stmt_cache_bytes, 1)
-
-    on_exit(fn ->
-      if prev == nil,
-        do: Application.delete_env(:fathom, :stmt_cache_bytes),
-        else: Application.put_env(:fathom, :stmt_cache_bytes, prev)
-    end)
+    Env.put!(:stmt_cache_bytes, 1)
 
     # A statement wider than the budget still caches (the just-prepared one is never evicted), and
     # the next distinct statement evicts it rather than growing the cache.

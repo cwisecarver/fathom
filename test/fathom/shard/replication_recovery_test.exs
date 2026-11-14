@@ -31,6 +31,7 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Protocol.SeedBegin
   alias Fathom.Shard.Replication.Recovery
+  alias Fathom.Test.Env
 
   # A position as a peer reports it (the `FollowerLog.t()` shape), and as the stored object stamps
   # it (`Storage.position/0`) — deliberately different key names, which is exactly the mismatch
@@ -312,25 +313,13 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     # The cross-fleet path only ranks when the lineage travels, and it travels only with the wire
     # gate on — off, a peer reports lineage 0 and `Promote.fresher?/2` refuses to rank it, so
     # recovery is INERT rather than wrong. These tests are about the ranking, so turn it on.
-    prev_wire = Application.get_env(:fathom, :replication_lineage_wire)
-    Application.put_env(:fathom, :replication_lineage_wire, true)
+    Env.put!(:replication_lineage_wire, true)
 
     # …and the ORDINAL likewise (expert review 2026-08-26 #2, step 3b). It rides its own gate, off
     # by default, because it adds a frame type code an un-upgraded peer answers `:malformed` to.
     # Off, a peer offers ordinal 0, `fresher?/2` refuses to rank it, and the cross-fleet path is
     # INERT rather than wrong — the same trade the lineage gate above makes.
-    prev_ord = Application.get_env(:fathom, :replication_ordinal_wire)
-    Application.put_env(:fathom, :replication_ordinal_wire, true)
-
-    on_exit(fn ->
-      if is_nil(prev_wire),
-        do: Application.delete_env(:fathom, :replication_lineage_wire),
-        else: Application.put_env(:fathom, :replication_lineage_wire, prev_wire)
-
-      if is_nil(prev_ord),
-        do: Application.delete_env(:fathom, :replication_ordinal_wire),
-        else: Application.put_env(:fathom, :replication_ordinal_wire, prev_ord)
-    end)
+    Env.put!(:replication_ordinal_wire, true)
 
     %{id: id}
   end
@@ -394,28 +383,15 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
     plant_replica(source, id, 9, 5, 0xDEADBEEF, db, wal)
     assert is_nil(Follower.state_of(survivor, id))
 
-    prev_followers = Application.get_env(:fathom, :replication_followers)
-    prev_recovery = Application.get_env(:fathom, :replication_recovery_peers)
     prev_running = Fathom.Shard.Replication.Fleet.running()
 
-    on_exit(fn ->
-      Fathom.Shard.Replication.Fleet.publish(prev_running)
-
-      for {k, v} <- [
-            replication_followers: prev_followers,
-            replication_recovery_peers: prev_recovery
-          ] do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
-    end)
+    on_exit(fn -> Fathom.Shard.Replication.Fleet.publish(prev_running) end)
 
     Fathom.Shard.Replication.Fleet.publish([])
 
     # This node's own followers: one that holds nothing, two that are down. Over them the floor is
     # N - Q + 1 = 2, and this node plus the empty one meet it.
-    Application.put_env(:fathom, :replication_followers, [
+    Env.put!(:replication_followers, [
       {"empty", "127.0.0.1", empty_port},
       {"gone1", "127.0.0.1", 1},
       {"gone2", "127.0.0.1", 2}
@@ -426,7 +402,7 @@ defmodule Fathom.Shard.ReplicationRecoveryTest do
 
     # Every OTHER node: the holder, the empty one, and two that are down. N = 4, floor 3: this node,
     # the empty peer and the holder answer.
-    Application.put_env(:fathom, :replication_recovery_peers, [
+    Env.put!(:replication_recovery_peers, [
       {"src", "127.0.0.1", source_port},
       {"empty", "127.0.0.1", empty_port},
       {"gone1", "127.0.0.1", 1},

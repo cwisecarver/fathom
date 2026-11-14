@@ -25,6 +25,7 @@ defmodule Fathom.Shard.Storage.S3LockPutStatusTest do
 
   alias Fathom.Shard.Fence
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   @shard "shard_lockput"
@@ -32,10 +33,9 @@ defmodule Fathom.Shard.Storage.S3LockPutStatusTest do
   @owner "a@node#1"
 
   setup do
-    prev = Application.get_env(:fathom, S3)
     store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -44,12 +44,6 @@ defmodule Fathom.Shard.Storage.S3LockPutStatusTest do
       path_style: true,
       req_plug: fn conn -> S3EtagStore.serve(conn, store) end
     )
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
 
     %{store: store}
   end

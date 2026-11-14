@@ -12,6 +12,7 @@ defmodule Fathom.SnapshotsSchemaGuardTest do
 
   alias Fathom.{Directory, Snapshots}
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.Env
 
   defp uniq, do: "snapguard_#{System.unique_integer([:positive])}"
 
@@ -88,12 +89,10 @@ defmodule Fathom.SnapshotsSchemaGuardTest do
     seed_object(shard, 0)
     {:ok, snap} = Snapshots.create(shard)
 
-    prev_backend = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
     test_pid = self()
 
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :faulty_before,
       {:object_etag,
        fn ->
@@ -106,14 +105,6 @@ defmodule Fathom.SnapshotsSchemaGuardTest do
          :ok
        end}
     )
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if is_nil(prev_backend),
-        do: Application.delete_env(:fathom, :shard_storage),
-        else: Application.put_env(:fathom, :shard_storage, prev_backend)
-    end)
 
     result = Snapshots.restore(shard, snap)
 

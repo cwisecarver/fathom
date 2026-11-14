@@ -12,6 +12,7 @@ defmodule Fathom.Shard.Storage.S3StealSingleHeadTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   @shard "shard_x"
@@ -19,29 +20,10 @@ defmodule Fathom.Shard.Storage.S3StealSingleHeadTest do
   @lock_key "shard_x.lock"
 
   setup do
-    prev = Application.get_env(:fathom, S3)
-    prev_repl = Application.get_env(:fathom, :replication_enabled)
-    prev_storage = Application.get_env(:fathom, :shard_storage)
     # `Storage.takeover_claim` reads through the Storage DISPATCH, which is `FaultyStorage` in the
     # suite: without this the pre-fix claim HEAD went to the double, not to this plug, and the count
     # could not see it (the probe against the unfixed code caught exactly that).
-    Application.put_env(:fathom, :shard_storage, S3)
-
-    on_exit(fn ->
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-
-      if is_nil(prev_repl),
-        do: Application.delete_env(:fathom, :replication_enabled),
-        else: Application.put_env(:fathom, :replication_enabled, prev_repl)
-    end)
-
-    :ok
+    Env.put!(:shard_storage, S3)
   end
 
   defp dead_lock do
@@ -63,7 +45,7 @@ defmodule Fathom.Shard.Storage.S3StealSingleHeadTest do
     test = self()
     fired = :counters.new(1, [])
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -100,7 +82,7 @@ defmodule Fathom.Shard.Storage.S3StealSingleHeadTest do
   end
 
   test "a replicating steal HEADs the data object once for the claim and the touch" do
-    Application.put_env(:fathom, :replication_enabled, true)
+    Env.put!(:replication_enabled, true)
     store = start_store!()
     before = S3EtagStore.etag_of(store, @data_key)
 
@@ -115,7 +97,7 @@ defmodule Fathom.Shard.Storage.S3StealSingleHeadTest do
   end
 
   test "not replicating: no claim, and the touch still HEADs for itself (once)" do
-    Application.put_env(:fathom, :replication_enabled, false)
+    Env.put!(:replication_enabled, false)
     _store = start_store!()
 
     assert {:ok, lease} = S3.acquire_lease(@shard, "new@node#inc2", 30_000)
@@ -124,7 +106,7 @@ defmodule Fathom.Shard.Storage.S3StealSingleHeadTest do
   end
 
   test "a zombie flush landing after the shared HEAD is caught: the touch re-reads and rotates it" do
-    Application.put_env(:fathom, :replication_enabled, true)
+    Env.put!(:replication_enabled, true)
 
     # Between our HEAD and the touch — on the steal's lock PUT — the dead owner's stalled flush lands.
     store = start_store!(fn store -> S3EtagStore.set_body(store, @data_key, "zombie-bytes") end)

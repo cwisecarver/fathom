@@ -22,6 +22,7 @@ defmodule Fathom.ShardFlushRenewGuardTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.Heartbeat
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
@@ -30,19 +31,7 @@ defmodule Fathom.ShardFlushRenewGuardTest do
 
     shard = "flushrenew_#{System.unique_integer([:positive])}"
 
-    prev = %{
-      idle: Application.get_env(:fathom, :shard_idle_ms),
-      interval: Application.get_env(:fathom, :shard_flush_interval_ms)
-    }
-
-    # High idle + high flush interval so the coordinator neither idle-stops nor fires an automatic
-    # durability flush under the assertions — the only flush we want to observe is the one we send.
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
-    Application.put_env(:fathom, :shard_flush_interval_ms, 600_000)
-
     on_exit(fn ->
-      restore(:shard_idle_ms, prev.idle)
-      restore(:shard_flush_interval_ms, prev.interval)
       Shards.drain(shard, 2_000)
 
       for dir <- [Shard.data_dir(), Shard.Storage.Local.dir()],
@@ -50,11 +39,13 @@ defmodule Fathom.ShardFlushRenewGuardTest do
           do: File.rm(path)
     end)
 
+    # High idle + high flush interval so the coordinator neither idle-stops nor fires an automatic
+    # durability flush under the assertions — the only flush we want to observe is the one we send.
+    Env.put!(:shard_idle_ms, 60_000)
+    Env.put!(:shard_flush_interval_ms, 600_000)
+
     %{shard: shard}
   end
-
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
 

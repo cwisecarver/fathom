@@ -37,37 +37,21 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
   alias Fathom.Shard.Replication.Shipper
   alias Fathom.Shard.Storage
   alias Fathom.Shards
-
-  @gates [
-    :replication_enabled,
-    :replication_followers,
-    :replication_quorum,
-    :replication_lineage_wire,
-    :replication_ordinal_wire,
-    :replication_reseed
-  ]
+  alias Fathom.Test.Env
 
   setup do
     id = "repl_reseed_#{System.unique_integer([:positive])}"
     root = Path.join(System.tmp_dir!(), "replreseed_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
-    prev = Map.new(@gates, &{&1, Application.get_env(:fathom, &1)})
 
     # Both wire gates ON: the lineage rides the seed only with the lineage gate and the push only in
     # the ordinal frame shape. Off, every lineage is 0 ("unstated") and the rule falls back to the
     # lock epoch, which a clean reopen RESETS — the tests would be measuring the wrong clause.
-    Application.put_env(:fathom, :replication_lineage_wire, true)
-    Application.put_env(:fathom, :replication_ordinal_wire, true)
+    Env.put!(:replication_lineage_wire, true)
+    Env.put!(:replication_ordinal_wire, true)
 
     on_exit(fn ->
       Session.stop(id)
-
-      for {k, v} <- prev do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
-
       Shards.drain(id, 5_000)
       for e <- ["", "-wal", "-shm", ".etag"], do: File.rm(Fathom.Shard.db_path(id) <> e)
       File.rm_rf(root)
@@ -123,11 +107,10 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
   end
 
   defp enable!(followers, q) do
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, q)
+    Env.put!(:replication_enabled, true)
+    Env.put!(:replication_quorum, q)
 
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :replication_followers,
       for({_n, port} <- followers, do: {~c"127.0.0.1", port})
     )
@@ -276,7 +259,7 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
   test "with :replication_reseed OFF an ownership change still never absorbs — it stays torn",
        ctx do
     %{name: name, port: port, state: state, id: id} = seeded_follower!(ctx)
-    Application.put_env(:fathom, :replication_reseed, false)
+    Env.put!(:replication_reseed, false)
     {db_before, _wal} = files(name, id)
 
     # The switch restores "accept and replicate while torn", NOT the hybrid: the old WAL is not

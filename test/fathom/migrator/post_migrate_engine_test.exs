@@ -29,6 +29,7 @@ defmodule Fathom.Migrator.PostMigrateEngineTest do
   alias Fathom.{Directory, Migrator, ShardExecutor}
   alias Fathom.Migrator.{PostMigrate, ShardMigration}
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @moduletag :capture_log
@@ -51,8 +52,6 @@ defmodule Fathom.Migrator.PostMigrateEngineTest do
 
   setup do
     template = "pmtemplate#{System.unique_integer([:positive])}"
-    prev = Application.get_env(:fathom, :template_shard_id)
-    Application.put_env(:fathom, :template_shard_id, template)
 
     me = self()
     handler = "pm-engine-#{System.unique_integer([:positive])}"
@@ -70,13 +69,10 @@ defmodule Fathom.Migrator.PostMigrateEngineTest do
 
     on_exit(fn ->
       :telemetry.detach(handler)
-
-      if prev,
-        do: Application.put_env(:fathom, :template_shard_id, prev),
-        else: Application.delete_env(:fathom, :template_shard_id)
-
       cleanup(template)
     end)
+
+    Env.put!(:template_shard_id, template)
 
     fixture = @fixture |> File.read!() |> Jason.decode!()
     %{template: template, fixture: fixture}

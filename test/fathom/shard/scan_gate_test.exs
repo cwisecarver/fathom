@@ -6,16 +6,10 @@ defmodule Fathom.Shard.ScanGateTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.ScanGate
+  alias Fathom.Test.Env
 
   setup do
-    prev = Application.get_env(:fathom, :shard_flush_scan_permits, :unset)
-    Application.put_env(:fathom, :shard_flush_scan_permits, 2)
-
-    on_exit(fn ->
-      if prev == :unset,
-        do: Application.delete_env(:fathom, :shard_flush_scan_permits),
-        else: Application.put_env(:fathom, :shard_flush_scan_permits, prev)
-    end)
+    Env.put!(:shard_flush_scan_permits, 2)
 
     gate = start_supervised!({ScanGate, name: :scan_gate_under_test})
     %{gate: gate}

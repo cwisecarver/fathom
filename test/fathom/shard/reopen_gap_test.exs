@@ -8,11 +8,10 @@ defmodule Fathom.Shard.ReopenGapTest do
 
   alias Fathom.Shard.ReopenGap
   alias Fathom.ShardExecutor
+  alias Fathom.Test.Env
 
   setup do
     shard = "reopen_gap_#{System.unique_integer([:positive])}"
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-
     test = self()
     handler = "reopen-gap-#{shard}"
 
@@ -27,10 +26,6 @@ defmodule Fathom.Shard.ReopenGapTest do
 
     on_exit(fn ->
       :telemetry.detach(handler)
-
-      if prev_idle,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
 
       for base <- [
             Path.join([Fathom.Shard.data_dir(), "#{shard}.db"]),
@@ -56,7 +51,7 @@ defmodule Fathom.Shard.ReopenGapTest do
   end
 
   test "a cold open after an idle drop reports the gap; the first open does not", %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 20)
+    Env.put!(:shard_idle_ms, 20)
 
     pid = open_and_close(shard)
     refute_received {:reopen, _}, "a first-ever open has no previous drop to measure from"
@@ -65,7 +60,7 @@ defmodule Fathom.Shard.ReopenGapTest do
     assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 5_000
 
     Process.sleep(30)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    Env.put!(:shard_idle_ms, 60_000)
     {:ok, h} = ShardExecutor.open(shard)
 
     assert_receive {:reopen, gap_ms}, 1_000
@@ -79,7 +74,7 @@ defmodule Fathom.Shard.ReopenGapTest do
   end
 
   test "a stop that is not an idle drop is not recorded", %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    Env.put!(:shard_idle_ms, 60_000)
     pid = open_and_close(shard)
 
     ref = Process.monitor(pid)

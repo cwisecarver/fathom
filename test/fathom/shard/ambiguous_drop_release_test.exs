@@ -25,28 +25,23 @@ defmodule Fathom.Shard.AmbiguousDropReleaseTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
 
   setup do
     shard = "ambrel_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :storage_fault)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-
       Shards.drain(shard, 2_000)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
           f <- Path.wildcard(Path.join(dir, shard <> ".*")),
           do: File.rm(f)
     end)
+
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     %{shard: shard}
   end
@@ -77,7 +72,7 @@ defmodule Fathom.Shard.AmbiguousDropReleaseTest do
   end
 
   defp stop_with_fault!(shard, pid, fault) do
-    Application.put_env(:fathom, :storage_fault, fault)
+    Env.put!(:storage_fault, fault)
     ref = Process.monitor(pid)
     capture_log(fn -> Shards.drain(shard, 5_000) end)
     assert_receive {:DOWN, ^ref, :process, ^pid, _}, 5_000

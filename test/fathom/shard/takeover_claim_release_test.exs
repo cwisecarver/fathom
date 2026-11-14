@@ -29,6 +29,7 @@ defmodule Fathom.Shard.TakeoverClaimReleaseTest do
 
   alias Fathom.{Shard, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Env
 
   @modes [:legacy, :heartbeat]
   # X's lineage: shipped under, never stamped. The object carries @stamped, so a fresh create would
@@ -38,23 +39,11 @@ defmodule Fathom.Shard.TakeoverClaimReleaseTest do
 
   setup do
     shard = "tkclaim_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_repl = Application.get_env(:fathom, :replication_enabled)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :replication_enabled, true)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:replication_enabled, true)
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :storage_fault)
-      Application.delete_env(:fathom, :faulty_before)
       Shards.drain(shard, 2_000)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-
-      if is_nil(prev_repl),
-        do: Application.delete_env(:fathom, :replication_enabled),
-        else: Application.put_env(:fathom, :replication_enabled, prev_repl)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
           p <- Path.wildcard(Path.join(dir, "#{shard}*")),
@@ -141,7 +130,7 @@ defmodule Fathom.Shard.TakeoverClaimReleaseTest do
 
       test "the successor's PULL fails: the release keeps the takeover claim", %{shard: shard} do
         dead_x!(shard)
-        Application.put_env(:fathom, :storage_fault, :pull)
+        Env.put!(:storage_fault, :pull)
 
         capture_log(fn -> open_fails!(shard) end)
 
@@ -160,8 +149,7 @@ defmodule Fathom.Shard.TakeoverClaimReleaseTest do
         # The takeover re-check's HEAD raises INSIDE THE COORDINATOR (the only process registered
         # under the shard id), never in the pull task — so this pins abandon_open/5's release, the
         # one A2 recovery relies on, distinct from the pull-failure release above.
-        Application.put_env(
-          :fathom,
+        Env.put!(
           :faulty_before,
           {:object_etag,
            fn id ->

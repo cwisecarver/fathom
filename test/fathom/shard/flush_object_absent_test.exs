@@ -25,29 +25,20 @@ defmodule Fathom.Shard.FlushObjectAbsentTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
 
   setup do
     shard = "objabs_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
     # Not racing the idle-stop: the assertions talk to the coordinator after the last checkin.
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_idle_ms, 600_000)
 
     on_exit(fn ->
       :ets.delete(Fathom.Tenants.Tombstones, shard)
       Shards.drain(shard, 2_000)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-
-      if prev_idle,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
           p <- Path.wildcard(Path.join(dir, "#{shard}*")),

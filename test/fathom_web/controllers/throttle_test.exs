@@ -9,23 +9,15 @@ defmodule FathomWeb.ThrottleTest do
   use FathomWeb.ConnCase, async: false
 
   alias Fathom.RateLimiter
+  alias Fathom.Test.Env
 
   setup do
     RateLimiter.reset()
-    prev_admin = Application.get_env(:fathom, :admin_auth_max_failures)
-    prev_api = Application.get_env(:fathom, :api_rate_limit)
 
-    on_exit(fn ->
-      restore(:admin_auth_max_failures, prev_admin)
-      restore(:api_rate_limit, prev_api)
-      RateLimiter.reset()
-    end)
+    on_exit(fn -> RateLimiter.reset() end)
 
     :ok
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, val), do: Application.put_env(:fathom, key, val)
 
   defp basic(conn, user, pass),
     do:
@@ -36,7 +28,7 @@ defmodule FathomWeb.ThrottleTest do
       )
 
   test "admin BasicAuth locks out a source IP after the failure threshold (429)", %{conn: conn} do
-    Application.put_env(:fathom, :admin_auth_max_failures, 3)
+    Env.put!(:admin_auth_max_failures, 3)
 
     # Three bad-password attempts each get the ordinary 401 challenge ...
     for _ <- 1..3 do
@@ -54,7 +46,7 @@ defmodule FathomWeb.ThrottleTest do
   # Expert review 2026-10-08 #29: keyed per FULL IPv6 address, one attacker holding a /64 (what an
   # IPv6 end site is routinely handed) got a fresh failure budget from every address in it.
   test "the admin lockout counts an IPv6 /64 as one source", %{conn: conn} do
-    Application.put_env(:fathom, :admin_auth_max_failures, 3)
+    Env.put!(:admin_auth_max_failures, 3)
     from = fn last -> %{conn | remote_ip: {0x2001, 0xDB8, 0xA, 0xB, 0, 0, 0, last}} end
 
     for last <- 1..3 do
@@ -74,7 +66,7 @@ defmodule FathomWeb.ThrottleTest do
   # Expert review 2026-10-10 #W8: only BasicAuth failures were counted; a Bearer key-guessing flood
   # got unlimited 401s (a Postgres lookup each). Bad Bearer keys now lock the source IP out too.
   test "bad Bearer API keys lock out a source IP after the failure threshold (429)", %{conn: conn} do
-    Application.put_env(:fathom, :admin_auth_max_failures, 3)
+    Env.put!(:admin_auth_max_failures, 3)
     bearer = fn c, t -> Plug.Conn.put_req_header(c, "authorization", "Bearer " <> t) end
 
     for _ <- 1..3 do
@@ -92,7 +84,7 @@ defmodule FathomWeb.ThrottleTest do
   end
 
   test "a successful admin auth clears the failure count", %{conn: conn} do
-    Application.put_env(:fathom, :admin_auth_max_failures, 3)
+    Env.put!(:admin_auth_max_failures, 3)
 
     # Two failures (below the 3-threshold) ...
     for _ <- 1..2 do
@@ -114,7 +106,7 @@ defmodule FathomWeb.ThrottleTest do
   test "/admin/metrics has its own bucket: dashboard failures do not lock the scrape", %{
     conn: conn
   } do
-    Application.put_env(:fathom, :admin_auth_max_failures, 3)
+    Env.put!(:admin_auth_max_failures, 3)
 
     for _ <- 1..3 do
       assert conn |> basic("admin", "wrong") |> get("/admin/shards") |> Map.get(:status) == 401
@@ -127,7 +119,7 @@ defmodule FathomWeb.ThrottleTest do
   end
 
   test "/admin/metrics failures do not lock the dashboard", %{conn: conn} do
-    Application.put_env(:fathom, :admin_auth_max_failures, 3)
+    Env.put!(:admin_auth_max_failures, 3)
 
     for _ <- 1..3 do
       assert conn |> basic("admin", "wrong") |> get("/admin/metrics") |> Map.get(:status) == 401
@@ -140,7 +132,7 @@ defmodule FathomWeb.ThrottleTest do
   end
 
   test "the lockout transition is audited exactly once (#9), never per-attempt", %{conn: conn} do
-    Application.put_env(:fathom, :admin_auth_max_failures, 2)
+    Env.put!(:admin_auth_max_failures, 2)
 
     # Four bad attempts: #2 crosses the threshold (audited), #3/#4 are already-locked-out 429s.
     for _ <- 1..4, do: conn |> basic("admin", "wrong") |> get("/admin/metrics")
@@ -156,7 +148,7 @@ defmodule FathomWeb.ThrottleTest do
   end
 
   test "the /api control plane rate-limits per IP (429 over budget), before auth", %{conn: conn} do
-    Application.put_env(:fathom, :api_rate_limit, 3)
+    Env.put!(:api_rate_limit, 3)
 
     # Three requests pass the rate gate (they 401 for lack of a credential, but still count) ...
     for _ <- 1..3 do
@@ -176,16 +168,8 @@ defmodule FathomWeb.ThrottleTest do
     #
     # These drive the real router, so they fail on the pre-fix client_ip/1.
     setup do
-      prev = Application.get_env(:fathom, :trusted_proxies)
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, :trusted_proxies, prev),
-          else: Application.delete_env(:fathom, :trusted_proxies)
-      end)
-
       # ConnTest dispatches with remote_ip {127,0,0,1}; trust it so the header is honoured.
-      Application.put_env(:fathom, :trusted_proxies, ["127.0.0.1"])
+      Env.put!(:trusted_proxies, ["127.0.0.1"])
       :ok
     end
 
@@ -193,7 +177,7 @@ defmodule FathomWeb.ThrottleTest do
       do: Plug.Conn.put_req_header(conn, "x-forwarded-for", client)
 
     test "one client's lockout does not lock out another behind the same proxy", %{conn: conn} do
-      Application.put_env(:fathom, :admin_auth_max_failures, 3)
+      Env.put!(:admin_auth_max_failures, 3)
 
       for _ <- 1..3 do
         assert conn
@@ -221,7 +205,7 @@ defmodule FathomWeb.ThrottleTest do
     end
 
     test "the /api limit is per client, not a fleet-wide cap", %{conn: conn} do
-      Application.put_env(:fathom, :api_rate_limit, 3)
+      Env.put!(:api_rate_limit, 3)
 
       for _ <- 1..3 do
         assert conn |> via_proxy("203.0.113.9") |> get("/api/tenants") |> Map.get(:status) == 401
@@ -238,8 +222,8 @@ defmodule FathomWeb.ThrottleTest do
     test "a spoofed header from an UNTRUSTED peer cannot escape the bucket", %{conn: conn} do
       # With the proxy list not covering the peer, the header is ignored — otherwise an attacker
       # would simply rotate X-Forwarded-For to get an unlimited number of fresh budgets.
-      Application.delete_env(:fathom, :trusted_proxies)
-      Application.put_env(:fathom, :api_rate_limit, 3)
+      Env.delete!(:trusted_proxies)
+      Env.put!(:api_rate_limit, 3)
 
       for i <- 1..3 do
         assert conn |> via_proxy("203.0.113.#{i}") |> get("/api/tenants") |> Map.get(:status) ==

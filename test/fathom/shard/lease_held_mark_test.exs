@@ -24,23 +24,17 @@ defmodule Fathom.Shard.LeaseHeldMarkTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
 
   setup do
     shard = "leasemark_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-      Application.delete_env(:fathom, :storage_fault)
       Shards.drain(shard, 2_000)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
           p <- Path.wildcard(Path.join(dir, "#{shard}*")),
@@ -68,8 +62,7 @@ defmodule Fathom.Shard.LeaseHeldMarkTest do
   defp observe_release!(shard) do
     test = self()
 
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :faulty_before,
       {:release,
        fn
@@ -112,7 +105,7 @@ defmodule Fathom.Shard.LeaseHeldMarkTest do
         :ok = ShardExecutor.close(conn)
         assert Shard.dirty?(pid)
 
-        Application.put_env(:fathom, :storage_fault, :flush)
+        Env.put!(:storage_fault, :flush)
         observe_release!(shard)
         log = stop!(shard, pid)
         assert log =~ "keeping local copy", "the drop did not take the failed-flush release path"

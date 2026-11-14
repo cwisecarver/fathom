@@ -21,6 +21,7 @@ defmodule Fathom.Shard.Storage.S3LineageHeadTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
 
   defp counting_store(test_pid) do
     fn conn ->
@@ -40,10 +41,9 @@ defmodule Fathom.Shard.Storage.S3LineageHeadTest do
   end
 
   setup do
-    prev = Application.get_env(:fathom, S3)
     test_pid = self()
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -52,12 +52,6 @@ defmodule Fathom.Shard.Storage.S3LineageHeadTest do
       path_style: true,
       req_plug: counting_store(test_pid)
     )
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
 
     path = Path.join(System.tmp_dir!(), "lineagehead_#{System.unique_integer([:positive])}.db")
     File.write!(path, "not-really-sqlite-but-the-bytes-do-not-matter-here")
@@ -123,22 +117,13 @@ defmodule Fathom.Shard.Storage.S3LineageHeadTest do
   describe "through the coordinator" do
     setup do
       shard = "lhcoord_#{System.unique_integer([:positive])}"
-      prev_storage = Application.get_env(:fathom, :shard_storage)
-      prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-      Application.put_env(:fathom, :shard_idle_ms, 60_000)
 
       on_exit(fn ->
-        if prev_storage,
-          do: Application.put_env(:fathom, :shard_storage, prev_storage),
-          else: Application.delete_env(:fathom, :shard_storage)
-
-        if prev_idle,
-          do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-          else: Application.delete_env(:fathom, :shard_idle_ms)
-
         Fathom.Shards.stop(shard)
         for f <- Path.wildcard(Path.join(Fathom.Shard.data_dir(), "#{shard}*")), do: File.rm_rf(f)
       end)
+
+      Env.put!(:shard_idle_ms, 60_000)
 
       %{shard: shard}
     end
@@ -154,7 +139,7 @@ defmodule Fathom.Shard.Storage.S3LineageHeadTest do
         Fathom.Test.S3EtagStore.serve(conn, store)
       end
 
-      Application.put_env(:fathom, S3,
+      Env.put!(S3,
         bucket: "b",
         region: "us-east-1",
         access_key_id: "k",
@@ -164,7 +149,7 @@ defmodule Fathom.Shard.Storage.S3LineageHeadTest do
         req_plug: plug
       )
 
-      Application.put_env(:fathom, :shard_storage, S3)
+      Env.put!(:shard_storage, S3)
 
       {:ok, conn} = Fathom.ShardExecutor.open(shard)
       on_exit(fn -> Fathom.ShardExecutor.close(conn) end)

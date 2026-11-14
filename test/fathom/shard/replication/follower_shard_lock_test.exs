@@ -19,6 +19,7 @@ defmodule Fathom.Shard.Replication.FollowerShardLockTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Replication.{Follower, Protocol}
+  alias Fathom.Test.Env
 
   setup do
     name = :"shardlock_#{System.unique_integer([:positive])}"
@@ -138,14 +139,7 @@ defmodule Fathom.Shard.Replication.FollowerShardLockTest do
 
     # Force the age takeover, so B's seed genuinely overlaps A's still-live one: this is the case
     # the lock alone cannot cover, and what unique per-seed temp names exist for.
-    prev = Application.get_env(:fathom, :replication_shard_lock_max_ms)
-    Application.put_env(:fathom, :replication_shard_lock_max_ms, 0)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :replication_shard_lock_max_ms, prev),
-        else: Application.delete_env(:fathom, :replication_shard_lock_max_ms)
-    end)
+    Env.put!(:replication_shard_lock_max_ms, 0)
 
     a = connection(name, 11)
     b = connection(name, 22)

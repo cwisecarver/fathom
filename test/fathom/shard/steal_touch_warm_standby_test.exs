@@ -26,23 +26,14 @@ defmodule Fathom.Shard.StealTouchWarmStandbyTest do
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
   alias Filo.{Stmt, StmtResult}
 
   setup do
     shard = "steal_warm_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_s3 = Application.get_env(:fathom, S3)
 
     on_exit(fn ->
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-
-      if prev_s3,
-        do: Application.put_env(:fathom, S3, prev_s3),
-        else: Application.delete_env(:fathom, S3)
-
       for f <- Path.wildcard(Path.join(local_dir(), "#{shard}*")), do: File.rm_rf(f)
     end)
 
@@ -129,7 +120,7 @@ defmodule Fathom.Shard.StealTouchWarmStandbyTest do
       end
     end
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -139,7 +130,7 @@ defmodule Fathom.Shard.StealTouchWarmStandbyTest do
       req_plug: plug
     )
 
-    Application.put_env(:fathom, :shard_storage, S3)
+    Env.put!(:shard_storage, S3)
 
     capture_log(fn ->
       {:ok, conn} = ShardExecutor.open(shard)

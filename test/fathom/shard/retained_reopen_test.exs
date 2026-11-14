@@ -24,34 +24,26 @@ defmodule Fathom.Shard.RetainedReopenTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Provenance, Retained, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
     id = "retreopen_#{System.unique_integer([:positive])}"
-    keys = [:shard_retain_local_bytes, :shard_retain_min_bytes, :shard_idle_ms, :shard_storage]
-    prev = for k <- keys, do: {k, Application.fetch_env(:fathom, k)}
-    Application.put_env(:fathom, :shard_retain_local_bytes, 64 * 1024 * 1024)
-    Application.put_env(:fathom, :shard_retain_min_bytes, 0)
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Retained.reconcile([], Shard.data_dir())
-    _ = Retained.stats()
-
+    # Registered before the env below, so the env is put back FIRST on exit and the drain runs
+    # against the real storage.
     on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_object_etag)
-
-      for {k, v} <- prev do
-        case v do
-          {:ok, val} -> Application.put_env(:fathom, k, val)
-          :error -> Application.delete_env(:fathom, k)
-        end
-      end
-
       Shards.drain(id, 2_000)
       Storage.purge_shard(id)
       for f <- Path.wildcard(Path.join(Shard.data_dir(), "#{id}.db*")), do: File.rm(f)
       Retained.reconcile([], Shard.data_dir())
     end)
+
+    Env.put!(:shard_retain_local_bytes, 64 * 1024 * 1024)
+    Env.put!(:shard_retain_min_bytes, 0)
+    Env.put!(:shard_idle_ms, 600_000)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Retained.reconcile([], Shard.data_dir())
+    _ = Retained.stats()
 
     %{id: id, path: Shard.db_path(id)}
   end
@@ -99,8 +91,7 @@ defmodule Fathom.Shard.RetainedReopenTest do
   defp count_reads!(id) do
     reads = :counters.new(1, [])
 
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :faulty_object_etag,
       {id,
        fn ->
@@ -198,17 +189,8 @@ defmodule Fathom.Shard.RetainedReopenTest do
     end
 
     test "unset: 1 MiB with replication off, 0 with it on; an explicit value wins" do
-      prev = Application.fetch_env(:fathom, :replication_enabled)
-
-      on_exit(fn ->
-        case prev do
-          {:ok, v} -> Application.put_env(:fathom, :replication_enabled, v)
-          :error -> Application.delete_env(:fathom, :replication_enabled)
-        end
-      end)
-
       Application.delete_env(:fathom, :shard_retain_min_bytes)
-      Application.put_env(:fathom, :replication_enabled, false)
+      Env.put!(:replication_enabled, false)
       assert Retained.min_bytes() == 1_048_576
       Application.put_env(:fathom, :replication_enabled, true)
       assert Retained.min_bytes() == 0

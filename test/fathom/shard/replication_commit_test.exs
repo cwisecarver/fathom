@@ -17,6 +17,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shards
+  alias Fathom.Test.Env
   import Fathom.Test.ReplicationCase
 
   setup do
@@ -24,25 +25,8 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     root = Path.join(System.tmp_dir!(), "replcommit_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
 
-    prev = [
-      enabled: Application.get_env(:fathom, :replication_enabled),
-      followers: Application.get_env(:fathom, :replication_followers),
-      quorum: Application.get_env(:fathom, :replication_quorum)
-    ]
-
     on_exit(fn ->
       Session.stop(id)
-
-      for {k, v} <- [
-            replication_enabled: prev[:enabled],
-            replication_followers: prev[:followers],
-            replication_quorum: prev[:quorum]
-          ] do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
-
       File.rm_rf(root)
       for s <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(id) <> s)
     end)
@@ -311,8 +295,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     @tag timeout: 60_000
     test "an unreachable coordinator on revalidate refuses the ack, it does not read as legacy",
          ctx do
-      Application.put_env(:fathom, :replication_timeout_ms, 15_000)
-      on_exit(fn -> Application.delete_env(:fathom, :replication_timeout_ms) end)
+      Env.put!(:replication_timeout_ms, 15_000)
 
       %{id: id, coordinator: coordinator, conn: conn, wal: wal, hb: hb, gen: gen} =
         heartbeat_session!(ctx)
@@ -395,8 +378,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     # retryably and the Session pid must survive, caching nothing.
     @tag timeout: 60_000
     test "an epoch call that times out refuses the commit and the Session survives", ctx do
-      Application.put_env(:fathom, :replication_timeout_ms, 15_000)
-      on_exit(fn -> Application.delete_env(:fathom, :replication_timeout_ms) end)
+      Env.put!(:replication_timeout_ms, 15_000)
 
       %{id: id, coordinator: coordinator, conn: conn, wal: wal} = heartbeat_session!(ctx)
       # Drop the Session heartbeat_session! warmed, so the next commit has no cached epoch.
@@ -592,11 +574,11 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     %{id: id, root: root} = ctx
     [{name, port} | _] = start_followers!(root, 1, "rc")
 
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
+    Env.put!(:replication_enabled, true)
+    Env.put!(:replication_quorum, 2)
     # One real follower, one pointed at a closed port: a quorum of 2 can never form.
     # One live follower, two pointed at a closed port: a quorum of 2 can never form.
-    Application.put_env(:fathom, :replication_followers, [
+    Env.put!(:replication_followers, [
       {~c"127.0.0.1", port},
       {~c"127.0.0.1", 1},
       {~c"127.0.0.1", 2}
@@ -631,12 +613,12 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     %{id: id, root: root} = ctx
     [{name, port} | _] = start_followers!(root, 1, "rc")
 
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
+    Env.put!(:replication_enabled, true)
+    Env.put!(:replication_quorum, 2)
 
     # Two live followers would both ack and clear their own entries via `advance/2`, proving
     # nothing. The closed ports reject `:disconnected` — a reason `reconcile/2` used to ignore.
-    Application.put_env(:fathom, :replication_followers, [
+    Env.put!(:replication_followers, [
       {~c"127.0.0.1", port},
       {~c"127.0.0.1", 1},
       {~c"127.0.0.1", 2}
@@ -725,14 +707,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     %{id: id, root: root} = ctx
     followers = start_followers!(root, 3, "rc")
 
-    prev_cap = Application.get_env(:fathom, :replication_max_push_bytes)
-    Application.put_env(:fathom, :replication_max_push_bytes, @small_cap)
-
-    on_exit(fn ->
-      if prev_cap,
-        do: Application.put_env(:fathom, :replication_max_push_bytes, prev_cap),
-        else: Application.delete_env(:fathom, :replication_max_push_bytes)
-    end)
+    Env.put!(:replication_max_push_bytes, @small_cap)
 
     enable_replication!(followers)
 
@@ -949,21 +924,8 @@ defmodule Fathom.Shard.ReplicationCommitTest do
   # observing wall-clock timer intervals -- is the flaky shape AGENTS.md warns about.
   describe "the catch-up retry backs off (#25)" do
     setup do
-      prev_catchup = Application.get_env(:fathom, :replication_catchup_ms)
-      prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
-      Application.put_env(:fathom, :replication_catchup_ms, 1_000)
-      Application.put_env(:fathom, :shard_flush_interval_ms, 30_000)
-
-      on_exit(fn ->
-        restore = fn k, v ->
-          if is_nil(v),
-            do: Application.delete_env(:fathom, k),
-            else: Application.put_env(:fathom, k, v)
-        end
-
-        restore.(:replication_catchup_ms, prev_catchup)
-        restore.(:shard_flush_interval_ms, prev_flush)
-      end)
+      Env.put!(:replication_catchup_ms, 1_000)
+      Env.put!(:shard_flush_interval_ms, 30_000)
 
       :ok
     end
@@ -1114,11 +1076,10 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       live = start_followers!(root, 2, "rc")
       bh_port = seed_black_hole!()
 
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_quorum, 1)
+      Env.put!(:replication_enabled, true)
+      Env.put!(:replication_quorum, 1)
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :replication_followers,
         for({_n, p} <- live, do: {~c"127.0.0.1", p}) ++ [{~c"127.0.0.1", bh_port}]
       )
@@ -1188,22 +1149,13 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       # of the Session just as surely as with a dead task, only with no DOWN to notice it by.
       %{id: id, root: root} = ctx
 
-      prev = Application.get_env(:fathom, :replication_seed_expiry_ms)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :replication_seed_expiry_ms),
-          else: Application.put_env(:fathom, :replication_seed_expiry_ms, prev)
-      end)
-
       live = start_followers!(root, 2, "rc")
       bh_port = seed_black_hole!()
 
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_quorum, 1)
+      Env.put!(:replication_enabled, true)
+      Env.put!(:replication_quorum, 1)
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :replication_followers,
         for({_n, p} <- live, do: {~c"127.0.0.1", p}) ++ [{~c"127.0.0.1", bh_port}]
       )
@@ -1233,7 +1185,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
 
       # Anything already outstanding is now past its expiry. Nothing about the task changed --
       # it is still alive and still stuck, which is the whole point.
-      Application.put_env(:fathom, :replication_seed_expiry_ms, 0)
+      Env.put!(:replication_seed_expiry_ms, 0)
 
       send(session, {:repl_reply, bh, {:reject, id, :unknown_shard, 0}})
 
@@ -1282,11 +1234,10 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       live = start_followers!(root, 2, "rc")
       bh_port = seed_black_hole!()
 
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_quorum, 1)
+      Env.put!(:replication_enabled, true)
+      Env.put!(:replication_quorum, 1)
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :replication_followers,
         for({_n, p} <- live, do: {~c"127.0.0.1", p}) ++ [{~c"127.0.0.1", bh_port}]
       )
@@ -1333,18 +1284,9 @@ defmodule Fathom.Shard.ReplicationCommitTest do
          ctx do
       %{id: id, root: root} = ctx
 
-      Application.put_env(:fathom, :replication_timeout_ms, 4_000)
-      Application.put_env(:fathom, :replication_seed_max_concurrency, 1)
-      Application.put_env(:fathom, :replication_seed_gate_wait_ms, :bogus)
-
-      on_exit(fn ->
-        for k <- [
-              :replication_timeout_ms,
-              :replication_seed_max_concurrency,
-              :replication_seed_gate_wait_ms
-            ],
-            do: Application.delete_env(:fathom, k)
-      end)
+      Env.put!(:replication_timeout_ms, 4_000)
+      Env.put!(:replication_seed_max_concurrency, 1)
+      Env.put!(:replication_seed_gate_wait_ms, :bogus)
 
       followers = start_followers!(root, 3, "rc")
 
@@ -1382,8 +1324,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     test "a wedged predecessor Session is replaced within the commit budget (expert review 2026-10-13 #34)",
          ctx do
       %{id: id, root: root} = ctx
-      Application.put_env(:fathom, :replication_timeout_ms, 4_000)
-      on_exit(fn -> Application.delete_env(:fathom, :replication_timeout_ms) end)
+      Env.put!(:replication_timeout_ms, 4_000)
 
       followers = start_followers!(root, 3, "rc")
 
@@ -1438,11 +1379,10 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       live = start_followers!(root, 2, "rc")
       bh_port = seed_black_hole!()
 
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_quorum, 1)
+      Env.put!(:replication_enabled, true)
+      Env.put!(:replication_quorum, 1)
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :replication_followers,
         for({_n, p} <- live, do: {~c"127.0.0.1", p}) ++ [{~c"127.0.0.1", bh_port}]
       )
@@ -1487,11 +1427,10 @@ defmodule Fathom.Shard.ReplicationCommitTest do
       live = start_followers!(root, 2, "rc")
       bh_port = seed_black_hole!()
 
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_quorum, 1)
+      Env.put!(:replication_enabled, true)
+      Env.put!(:replication_quorum, 1)
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :replication_followers,
         for({_n, p} <- live, do: {~c"127.0.0.1", p}) ++ [{~c"127.0.0.1", bh_port}]
       )

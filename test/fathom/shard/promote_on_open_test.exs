@@ -60,35 +60,20 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
   alias Fathom.Shard.Storage
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   setup do
     id = "promoteopen_#{System.unique_integer([:positive])}"
     dir = Path.join(System.tmp_dir!(), "promoteopen_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
 
-    prev = Application.get_env(:fathom, :replication_promote_on_open)
-    prev_recover = Application.get_env(:fathom, :replication_recover_from_peers)
-    prev_fault = Application.get_env(:fathom, :storage_fault)
-    prev_backend = Application.get_env(:fathom, :shard_storage)
+    Env.delete!(:replication_promote_on_open)
+    Env.delete!(:replication_recover_from_peers)
+    Env.delete!(:storage_fault)
+    Env.delete!(:shard_storage)
 
     on_exit(fn ->
       Shards.stop(id)
-
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :replication_promote_on_open),
-        else: Application.put_env(:fathom, :replication_promote_on_open, prev)
-
-      if is_nil(prev_recover),
-        do: Application.delete_env(:fathom, :replication_recover_from_peers),
-        else: Application.put_env(:fathom, :replication_recover_from_peers, prev_recover)
-
-      if is_nil(prev_fault),
-        do: Application.delete_env(:fathom, :storage_fault),
-        else: Application.put_env(:fathom, :storage_fault, prev_fault)
-
-      if is_nil(prev_backend),
-        do: Application.delete_env(:fathom, :shard_storage),
-        else: Application.put_env(:fathom, :shard_storage, prev_backend)
 
       File.rm_rf(dir)
       for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(Fathom.Shard.db_path(id) <> s)
@@ -323,8 +308,7 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     tear_down_primary(id, conn, coordinator)
 
     # The node dies after the promoted object is PUBLISHED, between the sidecar and the rename.
-    Application.put_env(:fathom, :promote_replica_crash_hook, fn _ -> raise "node died here" end)
-    on_exit(fn -> Application.delete_env(:fathom, :promote_replica_crash_hook) end)
+    Env.put!(:promote_replica_crash_hook, fn _ -> raise "node died here" end)
 
     assert {:error, _} = ShardExecutor.open(id),
            "precondition: the crashed promotion failed the open"
@@ -687,31 +671,14 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
   # N = Q = 1 the local replica alone satisfies it, so the decision reaches the re-read.
   describe "a failed re-read of the object head (N3)" do
     setup ctx do
-      keys = [
-        :replication_followers,
-        :replication_quorum,
-        :replication_recovery_underquorum_window_ms,
-        :replication_recovery_refusal_ttl_ms
-      ]
-
-      prev = Map.new(keys, &{&1, Application.get_env(:fathom, &1)})
       prev_running = Fleet.running()
-
-      on_exit(fn ->
-        Fleet.publish(prev_running)
-
-        for {k, v} <- prev do
-          if is_nil(v),
-            do: Application.delete_env(:fathom, k),
-            else: Application.put_env(:fathom, k, v)
-        end
-      end)
+      on_exit(fn -> Fleet.publish(prev_running) end)
 
       Recovery.init_table()
       Fleet.publish([])
-      Application.put_env(:fathom, :replication_quorum, 1)
-      Application.put_env(:fathom, :replication_recovery_underquorum_window_ms, 60_000)
-      Application.put_env(:fathom, :replication_recovery_refusal_ttl_ms, 0)
+      Env.put!(:replication_quorum, 1)
+      Env.put!(:replication_recovery_underquorum_window_ms, 60_000)
+      Env.put!(:replication_recovery_refusal_ttl_ms, 0)
       Application.put_env(:fathom, :replication_promote_on_open, true)
       Application.put_env(:fathom, :replication_recover_from_peers, true)
       Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
@@ -732,7 +699,7 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
       # Peers are configured only NOW: with them present the fixture's own flush would run as a
       # replicating shard and stamp a different position than the replica installed above.
-      Application.put_env(:fathom, :replication_followers, [{"dead1", "127.0.0.1", 1}])
+      Env.put!(:replication_followers, [{"dead1", "127.0.0.1", 1}])
       Application.put_env(:fathom, :storage_fault, :object_head_reread_fails)
       :ok
     end
@@ -781,17 +748,9 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
 
     prev_running = Fleet.running()
-    prev_followers = Application.get_env(:fathom, :replication_followers)
     Fleet.publish([])
-    Application.put_env(:fathom, :replication_followers, [])
-
-    on_exit(fn ->
-      Fleet.publish(prev_running)
-
-      if is_nil(prev_followers),
-        do: Application.delete_env(:fathom, :replication_followers),
-        else: Application.put_env(:fathom, :replication_followers, prev_followers)
-    end)
+    Env.put!(:replication_followers, [])
+    on_exit(fn -> Fleet.publish(prev_running) end)
 
     # Assert the precondition rather than assuming it — the whole point of the block above.
     refute Recovery.fleet_reachable?(), "the peer set was not actually empty"
@@ -801,13 +760,11 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
     # Deliberately NO install_replica/2 — this node holds nothing to promote.
     test_pid = self()
-    on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
 
     # SHARD-SCOPED. `:faulty_before` is global Application env and coordinators from earlier tests
     # are still alive and still flushing, so an unfiltered hook reports their `object_head` reads as
     # ours — which is exactly how this test failed on its first full-suite run while passing alone.
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :faulty_before,
       {:object_head, fn read_id -> if read_id == id, do: send(test_pid, :object_head_read) end}
     )
@@ -1020,10 +977,8 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
     reads = :counters.new(1, [])
     on_exit(fn -> File.rm(Path.join([Storage.Local.dir(), "tombstones", id])) end)
-    on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
 
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :faulty_before,
       {:tombstone_present,
        fn
@@ -1074,30 +1029,12 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     # alone (needed = max(N - Q + 1, 1) = 1), so the decision is reached without a socket and the
     # promotion runs, while `error_window/3` still sees a peer set and so has a window to refuse
     # in. With NO peers it answers `:none` by design, and the test would measure nothing.
-    keys = [
-      :replication_followers,
-      :replication_quorum,
-      :replication_recovery_underquorum_window_ms,
-      :replication_recovery_refusal_ttl_ms
-    ]
+    on_exit(fn -> Fleet.publish([]) end)
 
-    prev = Map.new(keys, &{&1, Application.get_env(:fathom, &1)})
-
-    on_exit(fn ->
-      for {k, v} <- prev,
-          do:
-            if(is_nil(v),
-              do: Application.delete_env(:fathom, k),
-              else: Application.put_env(:fathom, k, v)
-            )
-
-      Fleet.publish([])
-    end)
-
-    Application.put_env(:fathom, :replication_followers, [{"dead1", "127.0.0.1", 1}])
-    Application.put_env(:fathom, :replication_quorum, 2)
-    Application.put_env(:fathom, :replication_recovery_underquorum_window_ms, 60_000)
-    Application.put_env(:fathom, :replication_recovery_refusal_ttl_ms, 0)
+    Env.put!(:replication_followers, [{"dead1", "127.0.0.1", 1}])
+    Env.put!(:replication_quorum, 2)
+    Env.put!(:replication_recovery_underquorum_window_ms, 60_000)
+    Env.put!(:replication_recovery_refusal_ttl_ms, 0)
     Fleet.publish([])
     refute Recovery.peers() == [], "fixture: the peer set is what gives the refusal a window"
 
@@ -1152,25 +1089,8 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     alias Fathom.Shard.Heartbeat
 
     setup do
-      keys = [
-        :replication_followers,
-        :replication_quorum,
-        :replication_recovery_underquorum_window_ms,
-        :replication_recovery_refusal_ttl_ms
-      ]
-
-      prev = Map.new(keys, &{&1, Application.get_env(:fathom, &1)})
       prev_running = Fleet.running()
-
-      on_exit(fn ->
-        Fleet.publish(prev_running)
-
-        for {k, v} <- prev do
-          if is_nil(v),
-            do: Application.delete_env(:fathom, k),
-            else: Application.put_env(:fathom, k, v)
-        end
-      end)
+      on_exit(fn -> Fleet.publish(prev_running) end)
 
       Application.put_env(:fathom, :replication_promote_on_open, true)
       Application.put_env(:fathom, :replication_recover_from_peers, true)
@@ -1199,20 +1119,20 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     # Peers are configured only AFTER the fixture is built: with them present the fixture's own
     # flush would run as a replicating shard and stamp a different position than the replica.
     defp configure_peers!(id, followers) do
-      Application.put_env(:fathom, :replication_followers, followers)
-      Application.put_env(:fathom, :replication_quorum, 2)
-      Application.put_env(:fathom, :replication_recovery_underquorum_window_ms, 60_000)
-      Application.put_env(:fathom, :replication_recovery_refusal_ttl_ms, 0)
+      Env.put!(:replication_followers, followers)
+      Env.put!(:replication_quorum, 2)
+      Env.put!(:replication_recovery_underquorum_window_ms, 60_000)
+      Env.put!(:replication_recovery_refusal_ttl_ms, 0)
       # A NUMERIC LINEAGE. With replication off the open claims none (`open_lineage/2` answers
       # `:disabled`), so the fence would raise nothing and "the replica is fenced at the NEW
       # lineage" would not be a state these tests could reach. On only after the fixture is built,
       # like the peers: its own flush must not run as a replicating shard.
-      Fathom.Test.Env.put!(:replication_enabled, true)
+      Env.put!(:replication_enabled, true)
 
       # A peer's offer ranks only with lineage AND ordinal on the wire (off by default in test, and
       # off an offer reads unrankable, so recovery would never pull anything).
-      Fathom.Test.Env.put!(:replication_lineage_wire, true)
-      Fathom.Test.Env.put!(:replication_ordinal_wire, true)
+      Env.put!(:replication_lineage_wire, true)
+      Env.put!(:replication_ordinal_wire, true)
       Fleet.publish([])
       refute Recovery.peers() == [], "fixture: the peer set is what gives the refusal a window"
       # Owned by the `Fleet` supervisor in production; without it a refusal fails OPEN.
@@ -1373,21 +1293,11 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
     # Shipping on for the REOPEN only: it is what makes `open_lineage` read the head at all, and
     # turning it on earlier would route the fixture's own commits through a session with no peers.
-    prev_enabled = Application.get_env(:fathom, :replication_enabled)
-    Application.put_env(:fathom, :replication_enabled, true)
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if is_nil(prev_enabled),
-        do: Application.delete_env(:fathom, :replication_enabled),
-        else: Application.put_env(:fathom, :replication_enabled, prev_enabled)
-    end)
+    Env.put!(:replication_enabled, true)
 
     test_pid = self()
 
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :faulty_before,
       {:object_head, fn read_id -> if read_id == id, do: send(test_pid, :object_head_read) end}
     )
@@ -1466,7 +1376,6 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     %{id: id} = ctx
     Application.put_env(:fathom, :replication_promote_on_open, true)
     Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
 
     {conn, coordinator} = build_shard(id, 7, 3)
     assert {:ok, stamp} = Storage.object_position(id)
@@ -1494,8 +1403,7 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     # the object before the post-lease re-check reads it.
     calls = :counters.new(1, [])
 
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :faulty_before,
       {:object_etag,
        fn sid ->

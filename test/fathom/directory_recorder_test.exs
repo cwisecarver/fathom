@@ -5,6 +5,7 @@ defmodule Fathom.Directory.RecorderTest do
 
   alias Fathom.Directory
   alias Fathom.Directory.Recorder
+  alias Fathom.Test.Env
 
   setup do
     # Drain any buffer leftover from a prior test so flush counts are deterministic.
@@ -509,15 +510,7 @@ defmodule Fathom.Directory.RecorderTest do
     # node that just went down.
 
     setup do
-      prev = Application.get_env(:fathom, :directory_recorder_shutdown_budget_ms)
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, :directory_recorder_shutdown_budget_ms, prev),
-          else: Application.delete_env(:fathom, :directory_recorder_shutdown_budget_ms)
-
-        Recorder.flush()
-      end)
+      on_exit(fn -> Recorder.flush() end)
 
       :ok
     end
@@ -540,7 +533,7 @@ defmodule Fathom.Directory.RecorderTest do
     test "an exhausted budget gives up loudly and leaves the rows buffered" do
       import ExUnit.CaptureLog
 
-      Application.put_env(:fathom, :directory_recorder_shutdown_budget_ms, 0)
+      Env.put!(:directory_recorder_shutdown_budget_ms, 0)
       assert :ok = Recorder.record_flush(uniq())
       assert :ok = Recorder.record_flush(uniq())
 
@@ -556,7 +549,7 @@ defmodule Fathom.Directory.RecorderTest do
     test "a sufficient budget drains everything and logs nothing" do
       import ExUnit.CaptureLog
 
-      Application.put_env(:fathom, :directory_recorder_shutdown_budget_ms, 25_000)
+      Env.put!(:directory_recorder_shutdown_budget_ms, 25_000)
       id = uniq()
       assert :ok = Recorder.record_flush(id)
 

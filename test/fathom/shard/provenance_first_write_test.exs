@@ -23,22 +23,20 @@ defmodule Fathom.Shard.ProvenanceFirstWriteTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
     id = "provfw_#{System.unique_integer([:positive])}"
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
     # No flush and no idle drop inside the test window — only the first-write sync can write it.
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
-    Application.put_env(:fathom, :shard_flush_interval_ms, 600_000)
+    Env.put!(:shard_idle_ms, 60_000)
+    Env.put!(:shard_flush_interval_ms, 600_000)
 
     on_exit(fn ->
       :erlang.trace(:all, false, [:call])
       :erlang.trace_pattern({Storage, :atomic_write, 2}, false, [:local])
       :erlang.trace_pattern({:file, :open, 2}, false, [:local])
-      restore(:shard_idle_ms, prev_idle)
-      restore(:shard_flush_interval_ms, prev_flush)
+
       Shards.stop(id)
 
       for dir <- [Fathom.Shard.data_dir(), Storage.Local.dir()],
@@ -48,9 +46,6 @@ defmodule Fathom.Shard.ProvenanceFirstWriteTest do
 
     %{id: id}
   end
-
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
 
   defp trace_atomic_writes! do
     :erlang.trace_pattern({Storage, :atomic_write, 2}, true, [:local])

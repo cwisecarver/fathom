@@ -20,22 +20,13 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
   alias Fathom.Snapshots
   alias Fathom.Snapshots.RetentionJob
   alias Fathom.Snapshots.ScheduleJob
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
-    prev = %{
-      sample: Application.get_env(:fathom, :snapshot_schedule_sample),
-      retention: Application.get_env(:fathom, :snapshot_retention),
-      retention_sample: Application.get_env(:fathom, :snapshot_retention_sample)
-    }
-
     ids = ["snapsched_#{System.unique_integer([:positive])}"]
 
     on_exit(fn ->
-      restore(:snapshot_schedule_sample, prev.sample)
-      restore(:snapshot_retention, prev.retention)
-      restore(:snapshot_retention_sample, prev.retention_sample)
-
       for id <- ids do
         Shards.drain(id, 2_000)
 
@@ -47,9 +38,6 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
 
     %{id: hd(ids)}
   end
-
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
 
   defp remote_dir do
     Application.get_env(:fathom, Fathom.Shard.Storage.Local, [])
@@ -145,12 +133,7 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
     test "a run snapshots its sample concurrently, not one shard at a time" do
       ids = for i <- 1..6, do: "snapschedc#{i}_#{System.unique_integer([:positive])}"
 
-      prev_backend = Application.get_env(:fathom, :shard_storage)
-
       on_exit(fn ->
-        Application.delete_env(:fathom, :faulty_before)
-        restore(:shard_storage, prev_backend)
-
         for id <- ids do
           Shards.drain(id, 2_000)
 
@@ -166,10 +149,9 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
       # copies need >= 1.8 s; concurrent ones finish in roughly one copy's time.
       mine = MapSet.new(ids)
       # The suite's default backend is `Local`, which has no hook; the double delegates to it.
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:snapshot, fn id -> if MapSet.member?(mine, id), do: Process.sleep(300) end}
       )
@@ -187,12 +169,8 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
     # scheduler creates.
     test "a retention run sweeps its sample concurrently, not one shard at a time" do
       ids = for i <- 1..6, do: "snapretc#{i}_#{System.unique_integer([:positive])}"
-      prev_backend = Application.get_env(:fathom, :shard_storage)
 
       on_exit(fn ->
-        Application.delete_env(:fathom, :faulty_before)
-        restore(:shard_storage, prev_backend)
-
         for id <- ids do
           Shards.drain(id, 2_000)
           _ = Fathom.Shard.Storage.Local.purge_shard(id)
@@ -209,10 +187,9 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
 
       # Each of OUR retention LISTs takes 300 ms. Six serial sweeps need >= 1.8 s.
       mine = MapSet.new(ids)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:list_snapshots, fn id -> if MapSet.member?(mine, id), do: Process.sleep(300) end}
       )
@@ -244,23 +221,13 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
         1 = Directory.record_snapshot(id, DateTime.add(now, -age_h * 3600, :second))
       end
 
-      prev_storage = Application.get_env(:fathom, :shard_storage)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
       test_pid = self()
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:list_snapshots, fn id -> send(test_pid, {:swept, id}) end}
       )
-
-      on_exit(fn ->
-        Application.delete_env(:fathom, :faulty_before)
-
-        if prev_storage,
-          do: Application.put_env(:fathom, :shard_storage, prev_storage),
-          else: Application.delete_env(:fathom, :shard_storage)
-      end)
 
       # 5 snapshotted shards, 2 per run: three runs must reach all of them.
       for _ <- 1..3, do: {:ok, _} = RetentionJob.run(2, %{weekly: 1})
@@ -368,7 +335,7 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
       flushed_at = row(id).last_flushed_at
       assert flushed_at
 
-      Application.put_env(:fathom, :snapshot_schedule_sample, 50)
+      Env.put!(:snapshot_schedule_sample, 50)
       assert {:ok, counts} = ScheduleJob.run(50)
       assert Map.get(counts, :ok, 0) >= 1
 
@@ -441,7 +408,7 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
   describe "gating" do
     test "perform/1 is inert with no sample size configured", %{id: id} do
       seed(id, ["CREATE TABLE t (v INTEGER)"])
-      Application.delete_env(:fathom, :snapshot_schedule_sample)
+      Env.delete!(:snapshot_schedule_sample)
 
       assert :ok = perform_job(ScheduleJob, %{})
       assert {:ok, []} = Snapshots.list(id)
@@ -450,7 +417,7 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
 
     test "perform/1 runs when sized", %{id: id} do
       seed(id, ["CREATE TABLE t (v INTEGER)"])
-      Application.put_env(:fathom, :snapshot_schedule_sample, 50)
+      Env.put!(:snapshot_schedule_sample, 50)
 
       assert :ok = perform_job(ScheduleJob, %{})
       assert {:ok, [_ | _]} = Snapshots.list(id)
@@ -505,14 +472,14 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
 
       # A sample size with no policy would be a delete sweep with no rule — the one
       # half-configuration here that destroys data.
-      Application.put_env(:fathom, :snapshot_retention_sample, 50)
-      Application.delete_env(:fathom, :snapshot_retention)
+      Env.put!(:snapshot_retention_sample, 50)
+      Env.delete!(:snapshot_retention)
       assert :ok = perform_job(RetentionJob, %{})
       assert {:ok, [_]} = Snapshots.list(id)
 
       # And a policy with no sample size does nothing rather than looking enabled.
-      Application.put_env(:fathom, :snapshot_retention, %{hourly: 0})
-      Application.delete_env(:fathom, :snapshot_retention_sample)
+      Env.put!(:snapshot_retention, %{hourly: 0})
+      Env.delete!(:snapshot_retention_sample)
       assert :ok = perform_job(RetentionJob, %{})
       assert {:ok, [_]} = Snapshots.list(id)
     end
@@ -524,7 +491,7 @@ defmodule Fathom.Snapshots.ScheduleJobTest do
       # durable seconds later. Without a schedule there is nothing to go back to.
       seed(id, ["CREATE TABLE t (v INTEGER)", "INSERT INTO t VALUES (1), (2), (3)"])
 
-      Application.put_env(:fathom, :snapshot_schedule_sample, 50)
+      Env.put!(:snapshot_schedule_sample, 50)
       {:ok, _} = ScheduleJob.run(50)
       {:ok, [snap]} = Snapshots.list(id)
 

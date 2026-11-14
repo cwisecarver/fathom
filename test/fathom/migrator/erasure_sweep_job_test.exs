@@ -20,30 +20,8 @@ defmodule Fathom.Migrator.ErasureSweepJobTest do
   alias Fathom.Directory
   alias Fathom.Migrator.{ErasureSweepJob, ReconcileJob}
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Env
   alias Fathom.Tenants.DeleteJob
-
-  setup do
-    prev = for k <- [:shard_storage, :faulty_before], do: {k, Application.get_env(:fathom, k)}
-
-    keys = [
-      :erasure_sweep_page,
-      :erasure_sweep_budget_ms,
-      :erasure_sweep_probe_timeout_ms,
-      :erasure_sweep_clock
-    ]
-
-    prev_cfg = for k <- keys, do: {k, Application.get_env(:fathom, k)}
-
-    on_exit(fn ->
-      for {k, v} <- prev ++ prev_cfg do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
-    end)
-
-    :ok
-  end
 
   defp insert_deleted!(count, prefix) do
     now = DateTime.utc_now()
@@ -73,10 +51,9 @@ defmodule Fathom.Migrator.ErasureSweepJobTest do
   end
 
   defp slow_store!(ms) do
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :faulty_before,
       {:any_shard_object, fn _id -> Process.sleep(ms) end}
     )
@@ -110,7 +87,7 @@ defmodule Fathom.Migrator.ErasureSweepJobTest do
     test "stops after consecutive probe timeouts, well inside the job budget" do
       insert_deleted!(40, "stuck")
       slow_store!(30_000)
-      Application.put_env(:fathom, :erasure_sweep_probe_timeout_ms, 100)
+      Env.put!(:erasure_sweep_probe_timeout_ms, 100)
 
       {elapsed, result} = ms(fn -> perform_job(ErasureSweepJob, %{}) end)
 
@@ -142,9 +119,9 @@ defmodule Fathom.Migrator.ErasureSweepJobTest do
     test "an exhausted budget hands a cursor to a continuation that finishes the walk" do
       insert_deleted!(600, "kc")
       put_object!("kc_600")
-      Application.put_env(:fathom, :erasure_sweep_page, 100)
+      Env.put!(:erasure_sweep_page, 100)
       # Budget of 0: every run stops after ONE page and enqueues a continuation.
-      Application.put_env(:fathom, :erasure_sweep_budget_ms, 0)
+      Env.put!(:erasure_sweep_budget_ms, 0)
 
       assert :ok = perform_job(ErasureSweepJob, %{})
       refute_enqueued(worker: DeleteJob, args: %{shard_id: "kc_600"})
@@ -176,15 +153,14 @@ defmodule Fathom.Migrator.ErasureSweepJobTest do
     setup do
       t0 = DateTime.utc_now()
       clock = start_supervised!({Agent, fn -> DateTime.add(t0, 60, :second) end})
-      Application.put_env(:fathom, :erasure_sweep_clock, fn -> Agent.get(clock, & &1) end)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:erasure_sweep_clock, fn -> Agent.get(clock, & &1) end)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
       {:ok, t0: t0, clock: clock}
     end
 
     # Counts LISTs per shard: the hook runs inside the probe's Task, so it reports by message.
     defp count_lists!(test_pid) do
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:any_shard_object, fn id -> send(test_pid, {:list, id}) end}
       )
@@ -260,8 +236,7 @@ defmodule Fathom.Migrator.ErasureSweepJobTest do
       insert_one!("ds_err", t0)
       test_pid = self()
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:any_shard_object,
          fn id ->

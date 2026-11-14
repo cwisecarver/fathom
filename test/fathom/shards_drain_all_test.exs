@@ -7,16 +7,13 @@ defmodule Fathom.ShardsDrainAllTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{HealthPlug, ShardExecutor, Shards}
+  alias Fathom.Test.Env
 
   setup do
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    # High idle so a just-opened coordinator doesn't idle-stop before drain_all runs.
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
     ids = for i <- 1..3, do: "drainall_#{System.unique_integer([:positive])}_#{i}"
 
     on_exit(fn ->
       Shards.undrain()
-      restore(:shard_idle_ms, prev_idle)
 
       for id <- ids, do: Shards.drain(id, 2_000)
 
@@ -26,11 +23,11 @@ defmodule Fathom.ShardsDrainAllTest do
           do: File.rm(Path.join(dir, id <> s))
     end)
 
+    # High idle so a just-opened coordinator doesn't idle-stop before drain_all runs.
+    Env.put!(:shard_idle_ms, 60_000)
+
     %{ids: ids}
   end
-
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
 
   defp open_idle!(id) do
     {:ok, conn} = ShardExecutor.open(id)
@@ -74,21 +71,14 @@ defmodule Fathom.ShardsDrainAllTest do
   test "a busy shard does not consume the whole budget and strand the shards behind it", %{
     ids: ids
   } do
-    prev_conc = Application.get_env(:fathom, :drain_all_concurrency)
-    prev_grace = Application.get_env(:fathom, :drain_all_flush_grace_ms)
-    Application.put_env(:fathom, :drain_all_concurrency, 1)
+    Env.put!(:drain_all_concurrency, 1)
 
     # A SMALL grace, not zero. At the 5 s default a test-sized budget makes `remaining - grace`
     # negative for every shard, so they all abort instantly and nothing is consumed (draft two of
     # this test passed against the unfixed code for that reason). At exactly zero the drain window
     # equals the exit wait, so the coordinator's abort races the await's timeout and everything
     # reports :timed_out (draft three failed BOTH ways for that reason). It has to sit between.
-    Application.put_env(:fathom, :drain_all_flush_grace_ms, 200)
-
-    on_exit(fn ->
-      restore(:drain_all_concurrency, prev_conc)
-      restore(:drain_all_flush_grace_ms, prev_grace)
-    end)
+    Env.put!(:drain_all_flush_grace_ms, 200)
 
     conns =
       for id <- ids do
@@ -169,9 +159,7 @@ defmodule Fathom.ShardsDrainAllTest do
   test "a drain task that stops making progress is cut at budget + grace, not left to block", %{
     ids: [id | _]
   } do
-    prev_grace = Application.get_env(:fathom, :drain_all_flush_grace_ms)
-    Application.put_env(:fathom, :drain_all_flush_grace_ms, 50)
-    on_exit(fn -> restore(:drain_all_flush_grace_ms, prev_grace) end)
+    Env.put!(:drain_all_flush_grace_ms, 50)
 
     _pid = open_idle!(id)
 

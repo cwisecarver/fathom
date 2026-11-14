@@ -29,6 +29,7 @@ defmodule Fathom.Shard.Storage.IncarnationQuiescenceTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Env
 
   @probe 10_000
   @owner "nonode@nohost#deadbeef"
@@ -171,13 +172,7 @@ defmodule Fathom.Shard.Storage.IncarnationQuiescenceTest do
       Storage.reset_quiescence()
       Storage.reset_incarnation_deaths()
 
-      prev = Application.get_env(:fathom, :lease_dead_mark_ttl_ms)
-
       on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :lease_dead_mark_ttl_ms),
-          else: Application.put_env(:fathom, :lease_dead_mark_ttl_ms, prev)
-
         Storage.reset_quiescence()
         Storage.reset_incarnation_deaths()
       end)
@@ -192,7 +187,7 @@ defmodule Fathom.Shard.Storage.IncarnationQuiescenceTest do
     end
 
     test "an aged-out mark stops permitting the steal, and a re-proof is re-probed" do
-      Application.put_env(:fathom, :lease_dead_mark_ttl_ms, 60_000)
+      Env.put!(:lease_dead_mark_ttl_ms, 60_000)
       Storage.mark_incarnation_dead(@owner)
 
       refute Storage.fast_steal_ok?(@owner, "acme", 5_000, 100)

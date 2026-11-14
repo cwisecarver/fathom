@@ -34,6 +34,7 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shards
+  alias Fathom.Test.Env
   alias Fathom.Test.PausablePeer
   import Fathom.Test.ReplicationCase
 
@@ -44,26 +45,8 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     root = Path.join(System.tmp_dir!(), "replcollapse_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
 
-    keys = [
-      :replication_enabled,
-      :replication_followers,
-      :replication_quorum,
-      :replication_max_push_bytes,
-      :replication_timeout_ms,
-      :replication_catchup_ms
-    ]
-
-    prev = for k <- keys, do: {k, Application.get_env(:fathom, k)}
-
     on_exit(fn ->
       Session.stop(id)
-
-      for {k, v} <- prev do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
-
       File.rm_rf(root)
       for s <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(id) <> s)
     end)
@@ -368,7 +351,7 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     # One commit with nothing new: the other two plan nothing, the laggard gets ONE capped push
     # without a reply anyone waits for, and no follower refuses. Before #3 the commit itself looped
     # the laggard current; now `arm_if_short/1` must schedule the rest.
-    Application.put_env(:fathom, :replication_catchup_ms, 200)
+    Env.put!(:replication_catchup_ms, 200)
     assert :ok = Session.commit(id, wal, coordinator)
 
     deadline = System.monotonic_time(:millisecond) + 8_000
@@ -550,7 +533,7 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     # backfill everything (no reader holds a mark) and write, which restarts the log in place.
     fired = :counters.new(1, [])
 
-    Application.put_env(:fathom, :replication_build_hook, fn ->
+    Env.put!(:replication_build_hook, fn ->
       if :counters.get(fired, 1) == 0 do
         :counters.add(fired, 1, 1)
         {:ok, c} = Connection.open(path)
@@ -560,7 +543,6 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
       end
     end)
 
-    on_exit(fn -> Application.delete_env(:fathom, :replication_build_hook) end)
     {:ok, %{salt1: salt_before}} = Fathom.Shard.Replication.Wal.read(wal)
 
     reply = Session.commit(id, wal, coordinator)
@@ -630,7 +612,7 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     # Fires ONCE, inside the Session, after the round read its payloads and before the recheck:
     # close the shard's only connection (SQLite checkpoints and unlinks -wal and -shm), then reopen
     # and write, which creates a NEW -wal/-shm pair.
-    Application.put_env(:fathom, :replication_build_hook, fn ->
+    Env.put!(:replication_build_hook, fn ->
       if :counters.get(fired, 1) == 0 do
         :counters.add(fired, 1, 1)
         :ok = call_owner(owner, :reopen)
@@ -638,8 +620,6 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
         sql!(owner, "INSERT INTO t VALUES (100)")
       end
     end)
-
-    on_exit(fn -> Application.delete_env(:fathom, :replication_build_hook) end)
 
     assert :ok = Session.commit(id, wal, coordinator)
     assert :counters.get(fired, 1) == 1, "PRECONDITION: the recreate hook never ran"
@@ -781,14 +761,7 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
     enable_replication!([pa, 1, pc], timeout: 1_000, catchup: 0, connected: 2)
 
     # Hold the node's only seed slot, so the seed this commit starts cannot make progress.
-    prev_cap = Application.get_env(:fathom, :replication_seed_max_concurrency)
-    Application.put_env(:fathom, :replication_seed_max_concurrency, 1)
-
-    on_exit(fn ->
-      if is_nil(prev_cap),
-        do: Application.delete_env(:fathom, :replication_seed_max_concurrency),
-        else: Application.put_env(:fathom, :replication_seed_max_concurrency, prev_cap)
-    end)
+    Env.put!(:replication_seed_max_concurrency, 1)
 
     test_pid = self()
 

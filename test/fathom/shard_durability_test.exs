@@ -5,6 +5,7 @@ defmodule Fathom.ShardDurabilityTest do
   # like the idle flush. Not async: shards are global.
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.Env
   alias Fathom.Test.FlushGateScope
 
   import ExUnit.CaptureLog
@@ -15,13 +16,8 @@ defmodule Fathom.ShardDurabilityTest do
 
   setup do
     shard = "dur_#{System.unique_integer([:positive])}"
-    prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
 
     on_exit(fn ->
-      restore(:shard_flush_interval_ms, prev_flush)
-      restore(:shard_idle_ms, prev_idle)
-
       for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
@@ -32,9 +28,6 @@ defmodule Fathom.ShardDurabilityTest do
 
     %{shard: shard}
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
   # Block until the Registry has processed the monitor DOWNs it owes, so `Registry.lookup/2` no
   # longer reports a process that has already died.
@@ -55,11 +48,6 @@ defmodule Fathom.ShardDurabilityTest do
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
 
-  # Put a config key back exactly as it was — including "was not set at all", which
-  # `Application.put_env(k, nil)` does NOT restore (a `nil` value is not absence, and every
-  # reader here has a non-nil default that `nil` would shadow).
-  defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore_env(key, value), do: Application.put_env(:fathom, key, value)
   defp now_ms, do: System.system_time(:millisecond)
   defp local_db(shard), do: Path.join(local_dir(), "#{shard}.db")
   defp remote_db(shard), do: Path.join(remote_dir(), "#{shard}.db")
@@ -187,7 +175,7 @@ defmodule Fathom.ShardDurabilityTest do
   # this closes the 0-row-tail residual.)
   test "a committed transaction ending on a 0-row write, straddling a flush, is not lost on drop",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
@@ -355,14 +343,7 @@ defmodule Fathom.ShardDurabilityTest do
   # journal_mode): IF an operator allows it via :tenant_pragma_allow, `PRAGMA auto_vacuum = <mode>`
   # rewrites the header flag and must dirty the shard, not be dropped on idle (#20).
   test "auto_vacuum = <mode>, when allowed via config, dirties the shard", %{shard: shard} do
-    prev = Application.get_env(:fathom, :tenant_pragma_allow)
-    Application.put_env(:fathom, :tenant_pragma_allow, ["auto_vacuum"])
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :tenant_pragma_allow, prev),
-        else: Application.delete_env(:fathom, :tenant_pragma_allow)
-    end)
+    Env.put!(:tenant_pragma_allow, ["auto_vacuum"])
 
     {:ok, setup_conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(setup_conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
@@ -425,7 +406,7 @@ defmodule Fathom.ShardDurabilityTest do
   test "a CTE-prefixed INSERT ... RETURNING dirties the shard and survives an idle drop", %{
     shard: shard
   } do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
 
     {:ok, conn} = ShardExecutor.open(shard)
 
@@ -487,7 +468,7 @@ defmodule Fathom.ShardDurabilityTest do
   # re-dirty the shard, and the idle drop deleted it. RELEASE is now a commit boundary. Same
   # end-to-end probe as the 0-row-straddle test above: drop, cold-pull, assert the row survived.
   test "a savepoint released across a flush is not lost on drop", %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
@@ -539,7 +520,7 @@ defmodule Fathom.ShardDurabilityTest do
       ] do
     @rollback rollback
     test "a #{rollback} does not discard the outer transaction's write", %{shard: shard} do
-      Application.put_env(:fathom, :shard_idle_ms, 50)
+      Env.put!(:shard_idle_ms, 50)
 
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (k INTEGER, v TEXT)"))
@@ -783,8 +764,7 @@ defmodule Fathom.ShardDurabilityTest do
   # clause must reply an explicit error to any pending flush_now waiter.
   test "a flush_now caller pending at a force-stop gets an explicit error, not a false :ok",
        %{shard: shard} do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     test_pid = self()
 
@@ -804,15 +784,7 @@ defmodule Fathom.ShardDurabilityTest do
         :ok
     end
 
-    Application.put_env(:fathom, :faulty_before, {:flush, blocker})
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:faulty_before, {:flush, blocker})
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -858,21 +830,13 @@ defmodule Fathom.ShardDurabilityTest do
   # ~12 s the default 250 ms × 8 re-kicks plus flush work took. It also widens the gap the test is
   # measuring, since the pre-fix path ignores this knob entirely and uses the interval.
   test "a shard that will not converge reports it, instead of timing out", %{shard: shard} do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_backoff = Application.get_env(:fathom, :shard_flush_backoff_ms)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :shard_flush_backoff_ms, 5)
-    on_exit(fn -> restore_env(:shard_flush_backoff_ms, prev_backoff) end)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_flush_backoff_ms, 5)
 
     # Dirty the shard again from inside every flush, so `unflushed?/1` is true when the waiters are
     # settled and the re-kick branch runs — up to @max_flush_rekicks, then it must give up.
     never_converges = fn -> Fathom.Shard.WriteCounter.bump(shard) end
-    Application.put_env(:fathom, :faulty_before, {:flush, never_converges})
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-      restore_env(:shard_storage, prev_storage)
-    end)
+    Env.put!(:faulty_before, {:flush, never_converges})
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -909,8 +873,7 @@ defmodule Fathom.ShardDurabilityTest do
   # Asserted on `renew_task`, which is the observable for "did this tick fire a PUT at all".
   test "a :renew_lease tick during an in-flight flush does not fire a competing renew",
        %{shard: shard} do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     test_pid = self()
 
@@ -933,12 +896,7 @@ defmodule Fathom.ShardDurabilityTest do
         :ok
     end
 
-    Application.put_env(:fathom, :faulty_before, {:flush, blocker})
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-      restore_env(:shard_storage, prev_storage)
-    end)
+    Env.put!(:faulty_before, {:flush, blocker})
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -985,15 +943,8 @@ defmodule Fathom.ShardDurabilityTest do
   # test so a real expiry can never be what makes it pass.
   test "repeated :became_dirty from new streams does not restart the flush countdown",
        %{shard: shard} do
-    prev_interval = Application.get_env(:fathom, :shard_flush_interval_ms)
-    prev_jitter = Application.get_env(:fathom, :shard_flush_jitter_ratio)
-    Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
-    Application.put_env(:fathom, :shard_flush_jitter_ratio, 0)
-
-    on_exit(fn ->
-      restore_env(:shard_flush_interval_ms, prev_interval)
-      restore_env(:shard_flush_jitter_ratio, prev_jitter)
-    end)
+    Env.put!(:shard_flush_interval_ms, 60_000)
+    Env.put!(:shard_flush_jitter_ratio, 0)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -1035,15 +986,8 @@ defmodule Fathom.ShardDurabilityTest do
   # the obvious way to fix #7 (never re-arm on `:became_dirty`) would silently undo #42.
   test "a clean served shard's first write still restores the full-rate flush timer",
        %{shard: shard} do
-    prev_interval = Application.get_env(:fathom, :shard_flush_interval_ms)
-    prev_jitter = Application.get_env(:fathom, :shard_flush_jitter_ratio)
-    Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
-    Application.put_env(:fathom, :shard_flush_jitter_ratio, 0)
-
-    on_exit(fn ->
-      restore_env(:shard_flush_interval_ms, prev_interval)
-      restore_env(:shard_flush_jitter_ratio, prev_jitter)
-    end)
+    Env.put!(:shard_flush_interval_ms, 60_000)
+    Env.put!(:shard_flush_jitter_ratio, 0)
 
     {:ok, setup_conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(setup_conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -1100,8 +1044,7 @@ defmodule Fathom.ShardDurabilityTest do
   # observes it from inside the backend's own flush call.
   test "the write fence stays UP for the whole shutdown flush, not just the bookkeeping",
        %{shard: shard} do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     test_pid = self()
 
@@ -1109,16 +1052,9 @@ defmodule Fathom.ShardDurabilityTest do
     # racing the snapshot. This is the assertion.
     probe = fn -> send(test_pid, {:fenced_during_flush, WriteFence.fenced?(shard)}) end
 
-    Application.put_env(:fathom, :faulty_before, {:flush, probe})
+    Env.put!(:faulty_before, {:flush, probe})
 
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-      WriteFence.unfence(shard)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    on_exit(fn -> WriteFence.unfence(shard) end)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -1170,10 +1106,8 @@ defmodule Fathom.ShardDurabilityTest do
   # (the safe direction, the flush just waits), then flushes once a slot frees.
   test "over the node-wide flush cap a coordinator backs off (stays dirty), then flushes when a slot frees",
        %{shard: shard} do
-    prev_cap = Application.get_env(:fathom, :shard_flush_max_concurrency)
-    Application.put_env(:fathom, :shard_flush_max_concurrency, 1)
+    Env.put!(:shard_flush_max_concurrency, 1)
     FlushGate.reset()
-    on_exit(fn -> restore(:shard_flush_max_concurrency, prev_cap) end)
     on_exit(fn -> FlushGate.reset() end)
 
     {:ok, conn} = ShardExecutor.open(shard)
@@ -1348,9 +1282,6 @@ defmodule Fathom.ShardDurabilityTest do
   # apart instead of firing in lockstep. Pin that the first scheduled delay stays within the
   # interval (bounded, never 0/negative) and actually varies across coordinators.
   test "the first periodic flush timer is jittered within the interval and varies across coordinators" do
-    prev_jitter = Application.get_env(:fathom, :shard_flush_jitter_ratio)
-    prev_interval = Application.get_env(:fathom, :shard_flush_interval_ms)
-
     # An HOUR, not seconds: the first arm is drawn uniform over (0, interval], so with a 4 s interval
     # a coordinator whose draw was a few ms FIRED its first tick before this test read the timer
     # (~0.5% of runs, seen at 20-38 s "left"). That tick found a clean, held-open shard and re-armed
@@ -1358,15 +1289,12 @@ defmodule Fathom.ShardDurabilityTest do
     # test then read as a first-arm delay far above the interval. Correct behaviour, wrong sample;
     # at an hour the draw landing inside the open+read window is ~1e-5.
     interval = 3_600_000
-    Application.put_env(:fathom, :shard_flush_jitter_ratio, 0.5)
-    Application.put_env(:fathom, :shard_flush_interval_ms, interval)
+    Env.put!(:shard_flush_jitter_ratio, 0.5)
+    Env.put!(:shard_flush_interval_ms, interval)
 
     ids = for i <- 1..6, do: "jit_#{System.unique_integer([:positive])}_#{i}"
 
     on_exit(fn ->
-      restore(:shard_flush_jitter_ratio, prev_jitter)
-      restore(:shard_flush_interval_ms, prev_interval)
-
       for id <- ids, do: _ = Shards.drain(id)
 
       for id <- ids,
@@ -1436,12 +1364,10 @@ defmodule Fathom.ShardDurabilityTest do
   # legitimately went away.
   test "a hung coordinator makes Shards.flush return {:error, :flush_timeout}, not a false :ok",
        %{shard: shard} do
-    prev_timeout = Application.get_env(:fathom, :flush_now_timeout_ms)
     # A short flush_now timeout so a suspended coordinator times out fast (not the 60s default);
     # a high idle so the coordinator can't idle-drop out from under the test.
-    Application.put_env(:fathom, :flush_now_timeout_ms, 100)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
-    on_exit(fn -> restore(:flush_now_timeout_ms, prev_timeout) end)
+    Env.put!(:flush_now_timeout_ms, 100)
+    Env.put!(:shard_idle_ms, 60_000)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -1514,8 +1440,7 @@ defmodule Fathom.ShardDurabilityTest do
   # the flush call (FaultyStorage :faulty_before hook), after the fence check has passed.
   test "the durability flush is etag-fenced: an object stolen mid-flush self-fences, no clobber",
        %{shard: shard} do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     # During the flush PUT, a REAL stealer takes the lock (a new owner/epoch) AND
     # overwrites the shard object. Both matter now (expert review #2): a 412 with the
@@ -1526,15 +1451,7 @@ defmodule Fathom.ShardDurabilityTest do
       File.write!(remote_db(shard), "stolen-by-a-newer-owner")
     end
 
-    Application.put_env(:fathom, :faulty_before, {:flush, steal})
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:faulty_before, {:flush, steal})
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -1560,21 +1477,12 @@ defmodule Fathom.ShardDurabilityTest do
   # invariant: a 412 with the LOCK still ours must NOT self-fence off a shard we own.
   # Simulated by changing the object etag mid-flush WITHOUT taking the lock.
   test "a durability-flush 412 with the lock still ours does not self-fence", %{shard: shard} do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     # Our own PUT landed (lost response): the object etag changes under us so the fenced
     # flush 412s — but NO stealer took the lock; it is still ours.
     own_put = fn -> own_landed_put!(shard, "our-own-landed-snapshot") end
-    Application.put_env(:fathom, :faulty_before, {:flush, own_put})
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:faulty_before, {:flush, own_put})
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -1605,22 +1513,12 @@ defmodule Fathom.ShardDurabilityTest do
   # that write. Here the write is simulated by bumping the counter from inside the flush call.
   test "a write landing during a flush keeps the shard dirty (watermark, not a boolean)",
        %{shard: shard} do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :faulty_before,
       {:flush, fn -> Fathom.Shard.WriteCounter.bump(shard) end}
     )
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -1641,10 +1539,8 @@ defmodule Fathom.ShardDurabilityTest do
   # exactly the hot (write-active) shards. The invariant: the coordinator keeps
   # serving checkouts while a flush's upload is in flight.
   test "a checkout is served while a durability flush is in flight", %{shard: shard} do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_timeout = Application.get_env(:fathom, :shard_checkout_timeout_ms)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :shard_checkout_timeout_ms, 500)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_checkout_timeout_ms, 500)
 
     test_pid = self()
 
@@ -1665,16 +1561,7 @@ defmodule Fathom.ShardDurabilityTest do
         :ok
     end
 
-    Application.put_env(:fathom, :faulty_before, {:flush, blocker})
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-      restore(:shard_checkout_timeout_ms, prev_timeout)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:faulty_before, {:flush, blocker})
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -1715,10 +1602,8 @@ defmodule Fathom.ShardDurabilityTest do
   # keep serving) is preserved.
   test "a checkout is served while a durability-flush 412 reconcile is in flight",
        %{shard: shard} do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_timeout = Application.get_env(:fathom, :shard_checkout_timeout_ms)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :shard_checkout_timeout_ms, 500)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_checkout_timeout_ms, 500)
 
     test_pid = self()
 
@@ -1739,16 +1624,6 @@ defmodule Fathom.ShardDurabilityTest do
       end
     end
 
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-      Application.delete_env(:fathom, :faulty_check_lease)
-      restore(:shard_checkout_timeout_ms, prev_timeout)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
-
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
@@ -1756,8 +1631,8 @@ defmodule Fathom.ShardDurabilityTest do
     {:ok, coordinator} = Shards.ensure(shard)
     ref = Process.monitor(coordinator)
 
-    Application.put_env(:fathom, :faulty_before, {:flush, own_put})
-    Application.put_env(:fathom, :faulty_check_lease, reconcile_block)
+    Env.put!(:faulty_before, {:flush, own_put})
+    Env.put!(:faulty_check_lease, reconcile_block)
     send(coordinator, :durability_flush)
 
     # The task has uploaded (412) and is now blocked IN the reconcile's lock re-check —
@@ -1785,7 +1660,7 @@ defmodule Fathom.ShardDurabilityTest do
   end
 
   test "a zero interval disables the periodic flush timer", %{shard: shard} do
-    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
+    Env.put!(:shard_flush_interval_ms, 0)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, coordinator} = Shards.ensure(shard)
@@ -1798,7 +1673,7 @@ defmodule Fathom.ShardDurabilityTest do
   # --- dirty-flag / durability-storm fix ---
 
   test "a read leaves the shard clean; a write dirties it", %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     {:ok, conn} = ShardExecutor.open(shard)
 
     {:ok, _} = ShardExecutor.execute(conn, stmt("SELECT 1"))
@@ -1816,7 +1691,7 @@ defmodule Fathom.ShardDurabilityTest do
     # tested columns before num_changes — so a RETURNING insert looked like a read, the
     # shard never went dirty, and idle-drop deleted the only copy. Django emits
     # `INSERT ... RETURNING "id"` on every object save, so this lost data on the common path.
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, coordinator} = Shards.ensure(shard)
@@ -1852,7 +1727,7 @@ defmodule Fathom.ShardDurabilityTest do
 
   test "a dirty durability flush uploads and clears the flag; a clean one skips",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('a')"))
@@ -1876,17 +1751,8 @@ defmodule Fathom.ShardDurabilityTest do
     # Regression: the periodic flush cleared `dirty` unconditionally, even when the
     # snapshot/upload failed (the error was only logged). A transient storage blip then
     # left the shard "clean" with un-flushed writes, and idle-drop deleted the only copy.
-    Application.put_env(:fathom, :shard_idle_ms, 50)
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :storage_fault)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:shard_idle_ms, 50)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -1896,7 +1762,7 @@ defmodule Fathom.ShardDurabilityTest do
     {:ok, coordinator} = Shards.ensure(shard)
 
     # The upload fails: the shard MUST stay dirty (retry next interval, flush before drop).
-    Application.put_env(:fathom, :storage_fault, :flush)
+    Env.put!(:storage_fault, :flush)
 
     capture_log(fn -> flush_now(coordinator) end)
 
@@ -1924,12 +1790,10 @@ defmodule Fathom.ShardDurabilityTest do
   # count on a durable flush. Pre-fix there was no telemetry, no escalation, and no counter.
   test "consecutive flush failures emit escalating telemetry and reset on recovery",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_threshold = Application.get_env(:fathom, :flush_failure_alert_threshold)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_idle_ms, 60_000)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
     # Threshold 2 keeps the test short: escalation fires on the 2nd consecutive failure.
-    Application.put_env(:fathom, :flush_failure_alert_threshold, 2)
+    Env.put!(:flush_failure_alert_threshold, 2)
 
     test_pid = self()
     handler = "flushfail-#{System.unique_integer([:positive])}"
@@ -1941,22 +1805,14 @@ defmodule Fathom.ShardDurabilityTest do
       nil
     )
 
-    on_exit(fn ->
-      :telemetry.detach(handler)
-      Application.delete_env(:fathom, :storage_fault)
-      restore(:flush_failure_alert_threshold, prev_threshold)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    on_exit(fn -> :telemetry.detach(handler) end)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('alice')"))
     {:ok, coordinator} = Shards.ensure(shard)
 
-    Application.put_env(:fathom, :storage_fault, :flush)
+    Env.put!(:storage_fault, :flush)
 
     # First failure: consecutive == 1, below threshold (no error escalation).
     capture_log(fn -> flush_now(coordinator) end)
@@ -1979,7 +1835,7 @@ defmodule Fathom.ShardDurabilityTest do
 
     # A fresh write + failure starts the count over at 1 — proving the reset.
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('bob')"))
-    Application.put_env(:fathom, :storage_fault, :flush)
+    Env.put!(:storage_fault, :flush)
     capture_log(fn -> flush_now(coordinator) end)
     assert_receive {:flush_failed, %{consecutive: 1}, %{shard_id: ^shard}}
 
@@ -1996,12 +1852,10 @@ defmodule Fathom.ShardDurabilityTest do
   # sibling test covers.
   test "an ownership-unconfirmed flush skip feeds the RPO-alerting telemetry and escalates (#8)",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_threshold = Application.get_env(:fathom, :flush_failure_alert_threshold)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :flush_failure_alert_threshold, 2)
+    Env.put!(:shard_flush_interval_ms, 60_000)
+    Env.put!(:shard_idle_ms, 60_000)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:flush_failure_alert_threshold, 2)
 
     test_pid = self()
     handler = "skipfail-#{System.unique_integer([:positive])}"
@@ -2013,15 +1867,7 @@ defmodule Fathom.ShardDurabilityTest do
       nil
     )
 
-    on_exit(fn ->
-      :telemetry.detach(handler)
-      Application.delete_env(:fathom, :storage_fault)
-      restore(:flush_failure_alert_threshold, prev_threshold)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    on_exit(fn -> :telemetry.detach(handler) end)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -2030,7 +1876,7 @@ defmodule Fathom.ShardDurabilityTest do
 
     # Fault the lease RENEW (not the flush PUT): in legacy mode the fence renews the lease as its
     # ownership proof, so a transient renew error makes Fence.check return :skip before any write.
-    Application.put_env(:fathom, :storage_fault, :renew)
+    Env.put!(:storage_fault, :renew)
 
     # First skip: consecutive == 1 (pre-fix: no telemetry at all — assert_receive would time out).
     capture_log(fn -> flush_now(coordinator) end)
@@ -2072,19 +1918,10 @@ defmodule Fathom.ShardDurabilityTest do
   # coordinator free to serve other messages.
   test "a slow legacy-mode fence renew does not block the coordinator mailbox (#18)",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :storage_renew_delay_ms, 500)
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :storage_renew_delay_ms)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:shard_flush_interval_ms, 60_000)
+    Env.put!(:shard_idle_ms, 60_000)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:storage_renew_delay_ms, 500)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -2139,8 +1976,8 @@ defmodule Fathom.ShardDurabilityTest do
     # rolling deploy) killed it WITHOUT running terminate/2 — the final flush never ran and
     # writes since the last periodic flush were lost. Disable the periodic flush and use a
     # long idle window so ONLY terminate/2 can push the write to storage.
-    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    Env.put!(:shard_flush_interval_ms, 0)
+    Env.put!(:shard_idle_ms, 60_000)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -2176,8 +2013,8 @@ defmodule Fathom.ShardDurabilityTest do
   # or not a connection is still checked out.
   test "a supervisor shutdown flushes a dirty shard even with a connection still checked out (#2)",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    Env.put!(:shard_flush_interval_ms, 0)
+    Env.put!(:shard_idle_ms, 60_000)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -2219,8 +2056,8 @@ defmodule Fathom.ShardDurabilityTest do
   # The sibling `lease_lost` clause already reasons about exactly this hazard and RENAMES for it;
   # this path was added later and unlinked instead.
   test "a busy stop must NOT unlink the shard file under its live streams (#9)", %{shard: shard} do
-    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    Env.put!(:shard_flush_interval_ms, 0)
+    Env.put!(:shard_idle_ms, 60_000)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -2260,8 +2097,8 @@ defmodule Fathom.ShardDurabilityTest do
   # Pins that the #2 flush is gated on the tombstone so the delete path is unchanged.
   test "a busy stop of a TOMBSTONED shard skips the flush (delete path unchanged) (#2)",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    Env.put!(:shard_flush_interval_ms, 0)
+    Env.put!(:shard_idle_ms, 60_000)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -2300,7 +2137,7 @@ defmodule Fathom.ShardDurabilityTest do
   # acknowledged write (snapshot fallback).
   test "an idle flush with a blocked checkpoint still captures WAL-resident writes",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -2352,7 +2189,7 @@ defmodule Fathom.ShardDurabilityTest do
   # checkpointed image; stale sidecars must never survive its promotion.
   test "a cold open onto an orphaned stale WAL does not contaminate the pulled object",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
 
     # Build a WAL from a PREVIOUS generation of this shard: write through a raw
     # connection (frames live in -wal), snapshot the -wal aside before close
@@ -2400,7 +2237,7 @@ defmodule Fathom.ShardDurabilityTest do
   # dirty the shard; the bare read form and connection-local assignments stay clean.
   test "PRAGMA user_version assignment dirties the shard and survives an idle drop",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, coordinator} = Shards.ensure(shard)
@@ -2443,7 +2280,7 @@ defmodule Fathom.ShardDurabilityTest do
   # flush time) decides — a mismatched lineage is quarantined and re-pulled, never
   # served or flushed.
   test "a warm restart cannot adopt a newer lineage and clobber it", %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     on_exit(fn -> Enum.each(Path.wildcard(local_db(shard) <> ".forked*"), &File.rm_rf/1) end)
 
     # The shard's original lineage in storage.
@@ -2516,7 +2353,7 @@ defmodule Fathom.ShardDurabilityTest do
   # an empty/unreadable one is unknown provenance and must quarantine.
   test "a torn-to-empty sidecar quarantines the local copy instead of adopting the store's lineage",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     on_exit(fn -> Enum.each(Path.wildcard(local_db(shard) <> ".forked*"), &File.rm_rf/1) end)
 
     # Node "A": open a brand-new shard, write locally, then CRASH — local file left.
@@ -2580,7 +2417,7 @@ defmodule Fathom.ShardDurabilityTest do
   # invariant: every quarantine gets a unique name; a later fork never deletes an
   # earlier fork's recovery copy.
   test "a second fork does not destroy the first fork's recovery copy", %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     on_exit(fn -> Enum.each(Path.wildcard(local_db(shard) <> ".forked*"), &File.rm_rf/1) end)
 
     # The stored lineage.
@@ -2643,18 +2480,9 @@ defmodule Fathom.ShardDurabilityTest do
   # after the lease is held; a moved lineage quarantines and re-pulls.
   test "a full owner cycle in the fork-check-to-acquire gap cannot serve the stale warm file",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_idle_ms, 50)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
     on_exit(fn -> Enum.each(Path.wildcard(local_db(shard) <> ".forked*"), &File.rm_rf/1) end)
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
 
     # The stored lineage E1, and a warm local copy honestly derived from it.
     seed = Path.join(System.tmp_dir!(), "seed19_#{shard}.db")
@@ -2686,7 +2514,7 @@ defmodule Fathom.ShardDurabilityTest do
       File.rm(Path.join(remote_dir(), "#{shard}.lock"))
     end
 
-    Application.put_env(:fathom, :faulty_before, {:acquire, cycle})
+    Env.put!(:faulty_before, {:acquire, cycle})
 
     capture_log(fn ->
       {:ok, conn} = ShardExecutor.open(shard)
@@ -2711,17 +2539,8 @@ defmodule Fathom.ShardDurabilityTest do
   # brand-new contract — fence with nil and let the first flush RECREATE it.
   test "a takeover whose object vanished mid-open recreates it instead of self-fencing",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:shard_idle_ms, 50)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     # The old owner's lineage in storage, and its long-dead lock (no heartbeat, TTL
     # far expired) — this open is a TAKEOVER (took_over: true).
@@ -2751,7 +2570,7 @@ defmodule Fathom.ShardDurabilityTest do
       File.rm(remote_db(shard))
     end
 
-    Application.put_env(:fathom, :faulty_before, {:acquire, vanish})
+    Env.put!(:faulty_before, {:acquire, vanish})
 
     capture_log(fn ->
       {:ok, conn} = ShardExecutor.open(shard)
@@ -2791,7 +2610,7 @@ defmodule Fathom.ShardDurabilityTest do
   # exactly — never missing, never the ambiguous adopt-current fallback.
   test "a cold-open promote establishes the provenance sidecar matching the pulled object",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
 
     # Seed the shard's object in storage so opening is a cold PULL + promote.
     seed = Path.join(System.tmp_dir!(), "seed5_#{shard}.db")
@@ -2834,7 +2653,7 @@ defmodule Fathom.ShardDurabilityTest do
   # pins the pre-fix residue: a STALE-etag sidecar over identical bytes spuriously forks.
   test "a stale-etag sidecar over identical bytes false-quarantines a fork (the #21 residue)",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     on_exit(fn -> Enum.each(Path.wildcard(local_db(shard) <> ".forked*"), &File.rm_rf/1) end)
 
     # The flushed bytes B: what BOTH the local `.db` and the object hold after the upload.
@@ -2882,7 +2701,7 @@ defmodule Fathom.ShardDurabilityTest do
   # restart: no fork telemetry, no quarantine, the bytes served warm.
   test "a fresh-etag sidecar (the #21 fix's residue) restarts clean with no fork",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     on_exit(fn -> Enum.each(Path.wildcard(local_db(shard) <> ".forked*"), &File.rm_rf/1) end)
 
     path = local_db(shard)
@@ -2989,7 +2808,7 @@ defmodule Fathom.ShardDurabilityTest do
   # deleted WITHOUT an upload, all in-flight unflushed writes silently lost. The
   # invariant: a counter reset is unknown state, and unknown state must flush.
   test "a WriteCounter restart cannot reclassify dirty shards as clean", %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -3034,9 +2853,8 @@ defmodule Fathom.ShardDurabilityTest do
   # (unflushed?/1 compares the WriteCounter generation; any mismatch ⇒ dirty).
   test "a WriteCounter restart during an in-flight flush cannot mark the shard clean",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_idle_ms, 50)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     test_pid = self()
 
@@ -3057,15 +2875,7 @@ defmodule Fathom.ShardDurabilityTest do
         :ok
     end
 
-    Application.put_env(:fathom, :faulty_before, {:flush, blocker})
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:faulty_before, {:flush, blocker})
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -3134,35 +2944,31 @@ defmodule Fathom.ShardDurabilityTest do
   # settle wait is derived from the configured budget and leaves at least two
   # thirds of it for the drop-flush.
   test "the settle yield leaves at least two thirds of the shutdown budget for the drop-flush" do
-    prev = Application.get_env(:fathom, :shard_shutdown_ms)
-    on_exit(fn -> restore(:shard_shutdown_ms, prev) end)
-
     # Default budget (60 s): settle caps at 20 s, leaving 40 s for the drop-flush.
-    Application.delete_env(:fathom, :shard_shutdown_ms)
+    Env.delete!(:shard_shutdown_ms)
     assert Shard.settle_yield_ms() == 20_000
 
     # A tightened budget scales the settle down with it.
-    Application.put_env(:fathom, :shard_shutdown_ms, 9_000)
+    Env.put!(:shard_shutdown_ms, 9_000)
     assert Shard.settle_yield_ms() == 3_000
 
     # A huge budget still caps the settle at 30 s — anything the task hasn't
     # finished by then the drop-flush re-uploads itself anyway.
-    Application.put_env(:fathom, :shard_shutdown_ms, 300_000)
+    Env.put!(:shard_shutdown_ms, 300_000)
     assert Shard.settle_yield_ms() == 30_000
   end
 
   test "the coordinator child spec carries an explicit shutdown budget for the terminate flush" do
     assert %{shutdown: 60_000} = Fathom.Shard.child_spec("any_shard")
 
-    Application.put_env(:fathom, :shard_shutdown_ms, 120_000)
-    on_exit(fn -> Application.delete_env(:fathom, :shard_shutdown_ms) end)
+    Env.put!(:shard_shutdown_ms, 120_000)
 
     assert %{shutdown: 120_000} = Fathom.Shard.child_spec("any_shard"),
            "the budget must be config-tunable via :shard_shutdown_ms"
   end
 
   test "a warm restart (local file present) opens dirty", %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     # A valid empty local db stands in for un-flushed local state from a prior boot. It carries
     # the "born against no stored object" sentinel, which is what a real brand-new shard's
     # local file has (expert review 2026-08-01 #2) — there is no stored object here. Without
@@ -3182,7 +2988,7 @@ defmodule Fathom.ShardDurabilityTest do
   end
 
   test "a clean cold-pulled shard idle-stops without re-uploading", %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     # Seed the object so opening is a cold PULL (local == storage ⇒ clean).
     seed = Path.join(System.tmp_dir!(), "seed_#{shard}.db")
     {:ok, c} = Connection.open(seed)
@@ -3259,13 +3065,7 @@ defmodule Fathom.ShardDurabilityTest do
   test "an over-ceiling flush emits a distinct event and escalates on the FIRST failure", %{
     shard: shard
   } do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-
-    on_exit(fn ->
-      restore(:shard_storage, prev_storage)
-      Application.delete_env(:fathom, :storage_fault)
-    end)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     test_pid = self()
 
@@ -3282,7 +3082,7 @@ defmodule Fathom.ShardDurabilityTest do
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (v TEXT)"))
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES ('x')"))
 
-    Application.put_env(:fathom, :storage_fault, :flush_too_large)
+    Env.put!(:storage_fault, :flush_too_large)
     {:ok, pid} = Shards.ensure(shard)
 
     # The flush runs in a Task, so its failure is reported asynchronously — the telemetry event is
@@ -3325,11 +3125,8 @@ defmodule Fathom.ShardDurabilityTest do
     path = Path.join(System.tmp_dir!(), "fathom_over_#{System.unique_integer([:positive])}.db")
     on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(path <> s) end)
 
-    prev = Application.get_env(:fathom, :shard_max_page_count)
-    on_exit(fn -> restore(:shard_max_page_count, prev) end)
-
     # Grow it past a small cap first.
-    Application.put_env(:fathom, :shard_max_page_count, 200)
+    Env.put!(:shard_max_page_count, 200)
     {:ok, conn} = Connection.open(path)
     :ok = Connection.exec(conn, "CREATE TABLE t (v TEXT)")
 
@@ -3342,7 +3139,7 @@ defmodule Fathom.ShardDurabilityTest do
     assert pages > 20, "the fixture didn't actually grow the db"
 
     # Now re-open under a cap BELOW its current size.
-    Application.put_env(:fathom, :shard_max_page_count, 20)
+    Env.put!(:shard_max_page_count, 20)
     assert {:ok, conn2} = Connection.open(path)
 
     assert {:ok, %{rows: [[_]]}} = Connection.query(conn2, "SELECT count(*) FROM t", []),

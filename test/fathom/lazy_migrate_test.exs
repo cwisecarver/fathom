@@ -13,6 +13,7 @@ defmodule Fathom.LazyMigrateTest do
   alias Fathom.{Directory, Migrator, ShardExecutor}
   alias Fathom.Migrator.ShardMigrationJob
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.Env
   alias Filo.{Stmt, StmtResult}
 
   @v2_statements [
@@ -22,13 +23,9 @@ defmodule Fathom.LazyMigrateTest do
 
   setup do
     shard = "lazy_#{System.unique_integer([:positive])}"
-    prev_mode = Application.get_env(:fathom, :migrate_on_touch)
+    Env.delete!(:migrate_on_touch)
 
     on_exit(fn ->
-      if prev_mode == nil,
-        do: Application.delete_env(:fathom, :migrate_on_touch),
-        else: Application.put_env(:fathom, :migrate_on_touch, prev_mode)
-
       for path <- Path.wildcard(Path.join(remote_dir(), "#{shard}*")), do: File.rm(path)
 
       for path <- Path.wildcard(Path.join([Fathom.Shard.data_dir(), "#{shard}*"])),
@@ -273,14 +270,7 @@ defmodule Fathom.LazyMigrateTest do
   # Both modes are pinned because they take different branches (:inline migrates in-band, :async
   # enqueues a job), and both were broken.
   defp as_template(shard) do
-    prev = Application.get_env(:fathom, :template_shard_id)
-    Application.put_env(:fathom, :template_shard_id, shard)
-
-    on_exit(fn ->
-      if prev == nil,
-        do: Application.delete_env(:fathom, :template_shard_id),
-        else: Application.put_env(:fathom, :template_shard_id, prev)
-    end)
+    Env.put!(:template_shard_id, shard)
   end
 
   test "migrate_on_touch: :inline never migrates the capture template", %{shard: shard} do
@@ -391,15 +381,7 @@ defmodule Fathom.LazyMigrateTest do
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
     Migrator.HeadCache.refresh()
 
-    prev = Application.fetch_env(:fathom, :background_scan_permits)
-    Application.put_env(:fathom, :background_scan_permits, 1)
-
-    on_exit(fn ->
-      case prev do
-        {:ok, v} -> Application.put_env(:fathom, :background_scan_permits, v)
-        :error -> Application.delete_env(:fathom, :background_scan_permits)
-      end
-    end)
+    Env.put!(:background_scan_permits, 1)
 
     test_pid = self()
 
@@ -539,8 +521,7 @@ defmodule Fathom.LazyMigrateTest do
 
   test "a shard settled at head N is re-checked after the recheck TTL", %{shard: shard} do
     Application.put_env(:fathom, :migrate_on_touch, :async)
-    Application.put_env(:fathom, :migrate_on_touch_recheck_ms, 0)
-    on_exit(fn -> Application.delete_env(:fathom, :migrate_on_touch_recheck_ms) end)
+    Env.put!(:migrate_on_touch_recheck_ms, 0)
     seed_v1!(shard)
     {:ok, _} = Migrator.release(2, "v2", @v2_statements)
     Migrator.HeadCache.refresh()

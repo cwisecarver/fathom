@@ -11,6 +11,7 @@ defmodule Fathom.Host.FsyncProbeTest do
   alias Fathom.Host.FsyncProbe
   alias Fathom.Shard
   alias Fathom.Shard.{Storage, TempReaper}
+  alias Fathom.Test.Env
 
   setup do
     dir =
@@ -101,14 +102,7 @@ defmodule Fathom.Host.FsyncProbeTest do
     test "a stale probe file survives a real temp-reaper sweep that does reap a stale temp", %{
       dir: dir
     } do
-      prev = Application.get_env(:fathom, :shard_data_dir)
-      Application.put_env(:fathom, :shard_data_dir, dir)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :shard_data_dir),
-          else: Application.put_env(:fathom, :shard_data_dir, prev)
-      end)
+      Env.put!(:shard_data_dir, dir)
 
       probe = FsyncProbe.probe_path(dir)
 

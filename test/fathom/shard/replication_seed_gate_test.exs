@@ -9,16 +9,10 @@ defmodule Fathom.Shard.ReplicationSeedGateTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Replication.SeedGate
+  alias Fathom.Test.Env
 
   setup do
-    prev = Application.get_env(:fathom, :replication_seed_max_concurrency)
-    Application.put_env(:fathom, :replication_seed_max_concurrency, 2)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :replication_seed_max_concurrency),
-        else: Application.put_env(:fathom, :replication_seed_max_concurrency, prev)
-    end)
+    Env.put!(:replication_seed_max_concurrency, 2)
 
     name = :"seed_gate_#{System.unique_integer([:positive])}"
     gate = start_supervised!({SeedGate, name: name})

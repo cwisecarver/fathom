@@ -9,6 +9,7 @@ defmodule Fathom.Shard.Storage.S3ReleaseFenceTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
 
   @etag "\"lock-etag-v1\""
 
@@ -32,9 +33,7 @@ defmodule Fathom.Shard.Storage.S3ReleaseFenceTest do
       end
     end
 
-    prev = Application.get_env(:fathom, S3)
-
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -43,12 +42,6 @@ defmodule Fathom.Shard.Storage.S3ReleaseFenceTest do
       path_style: true,
       req_plug: plug
     )
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
 
     :ok
   end

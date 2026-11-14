@@ -10,6 +10,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
 
   alias Fathom.Shard.Heartbeat
   alias Fathom.Shard.WriteFence
+  alias Fathom.Test.Env
 
   setup %{shard: shard} do
     # Idle-stop fast so the flush path runs during the test.
@@ -96,8 +97,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
   # off-process (review 2026-07-14 #8); this is the third inline round trip in the module, after the
   # flush fence (#18) and the legacy renew PUT (#29).
   test "a lapse revalidation does not block the coordinator mailbox", %{shard: shard, hb: hb} do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -124,15 +124,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
     # The revalidation RENEWS the lock now (a write, Jepsen 2026-10-24 `RevalidateCasTest`); it
     # used to be a read-only `check_lease`, which this test originally held open. The invariant is
     # the same: the coordinator stays responsive while the lapse re-check is in flight.
-    Application.put_env(:fathom, :faulty_renew_lease, blocker)
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_renew_lease)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:faulty_renew_lease, blocker)
 
     # Bump the generation so the fence takes :revalidate (the branch that does the GET). A lapse at
     # the SAME generation would take :ok and never reach check_lease — AGENTS.md records that
@@ -180,19 +172,9 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
     shard: shard,
     hb: hb
   } do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
     # The setup's 50 ms idle-stop would end the coordinator mid-test; this one must stay open.
     Application.put_env(:fathom, :shard_idle_ms, 60_000)
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_renew_lease)
-      Application.delete_env(:fathom, :faulty_renew_lease_result)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
 
     capture_log(fn ->
       {:ok, conn} = ShardExecutor.open(shard)
@@ -205,8 +187,8 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
              "fixture: the coordinator must be in HEARTBEAT mode"
 
       test_pid = self()
-      Application.put_env(:fathom, :faulty_renew_lease, fn -> send(test_pid, :renew_attempt) end)
-      Application.put_env(:fathom, :faulty_renew_lease_result, {:error, {:transient, :blip}})
+      Env.put!(:faulty_renew_lease, fn -> send(test_pid, :renew_attempt) end)
+      Env.put!(:faulty_renew_lease_result, {:error, {:transient, :blip}})
 
       # A closed episode: the generation moved, and the heartbeat is VALID again (not lapsed).
       :sys.replace_state(hb, fn st ->
@@ -257,14 +239,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
   # `{:noreply, state}` makes this test time out in the default run.
   test "a lapse broadcast proactively self-fences a stolen shard without waiting for a flush",
        %{shard: shard, hb: hb} do
-    prev_jitter = Application.get_env(:fathom, :lapse_revalidate_jitter_ms)
-    Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 1)
-
-    on_exit(fn ->
-      if prev_jitter,
-        do: Application.put_env(:fathom, :lapse_revalidate_jitter_ms, prev_jitter),
-        else: Application.delete_env(:fathom, :lapse_revalidate_jitter_ms)
-    end)
+    Env.put!(:lapse_revalidate_jitter_ms, 1)
 
     capture_log(fn ->
       {:ok, conn} = ShardExecutor.open(shard)
@@ -312,8 +287,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
     shard: shard,
     hb: hb
   } do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     lapse = fn ->
       :sys.replace_state(hb, fn s ->
@@ -325,7 +299,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       :ok
     end
 
-    Application.put_env(:fathom, :faulty_before, {:acquire, lapse})
+    Env.put!(:faulty_before, {:acquire, lapse})
 
     # Hold the PROACTIVE lapse revalidation (expert review 2026-10-10 #12) past the flush. Its
     # jitter scales with the number of open shards (`Shard.lapse_spread_ms/1`), so with this test's
@@ -336,20 +310,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
     # every time it ran alone and whenever few shards were open (CI, 2026-10-13, both OTPs), and
     # pass in a busy suite where the jitter was longer. Pinning the jitter keeps the scenario this
     # test is about: the lazy flush-path fence with a stale baseline.
-    prev_jitter = Application.get_env(:fathom, :lapse_revalidate_jitter_ms)
-    Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 60_000)
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_jitter,
-        do: Application.put_env(:fathom, :lapse_revalidate_jitter_ms, prev_jitter),
-        else: Application.delete_env(:fathom, :lapse_revalidate_jitter_ms)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:lapse_revalidate_jitter_ms, 60_000)
 
     capture_log(fn ->
       {:ok, conn} = ShardExecutor.open(shard)
@@ -389,8 +350,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
   # FILO_STALE_LEASE while READS still serve from the local copy, and a reconfirmed fence lifts it.
   test "a provably-stealable node fences writes (reads continue) and lifts it on recovery (#3)",
        %{shard: shard, hb: hb} do
-    Application.put_env(:fathom, :fence_writes_when_stealable, true)
-    on_exit(fn -> Application.delete_env(:fathom, :fence_writes_when_stealable) end)
+    Env.put!(:fence_writes_when_stealable, true)
 
     test_pid = self()
     handler = "writefence-#{System.unique_integer([:positive])}"
@@ -531,8 +491,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
   # coordinator lifts it. Fails against unfixed lib/ at the final write.
   test "a write fence left behind by a killed coordinator is lifted by the next open (#6)",
        %{shard: shard, hb: hb} do
-    Application.put_env(:fathom, :fence_writes_when_stealable, true)
-    on_exit(fn -> Application.delete_env(:fathom, :fence_writes_when_stealable) end)
+    Env.put!(:fence_writes_when_stealable, true)
 
     # The fence is published from the flush verdict, which arrives from an off-process Task — so
     # :sys.get_state on the coordinator is NOT a sync point for it (the first draft used one and
@@ -683,14 +642,9 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       # resolved it. The 50 ms exists for the tests in this file that exercise the IDLE flush path;
       # this one is about the legacy-mode flush and does not care when idle fires. Pin it long
       # enough that only the explicit flush can happen, and restore for the rest of the file.
-      prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-      Application.put_env(:fathom, :shard_idle_ms, 600_000)
+      Env.put!(:shard_idle_ms, 600_000)
 
       on_exit(fn ->
-        if prev_idle,
-          do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-          else: Application.delete_env(:fathom, :shard_idle_ms)
-
         Shards.drain(id, 5_000)
 
         for s <- ["", "-wal", "-shm", ".etag", ".lock"],
@@ -754,8 +708,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
   # ...})`. So a `:sys.get_state` right after the send syncs only the spawn, not the decision —
   # the telemetry event is the real signal, which is why the test above uses it too.
   defp assert_fence_at(shard, hb, age_ms, expected) do
-    Application.put_env(:fathom, :fence_writes_when_stealable, true)
-    on_exit(fn -> Application.delete_env(:fathom, :fence_writes_when_stealable) end)
+    Env.put!(:fence_writes_when_stealable, true)
 
     test_pid = self()
     handler = "fencetiming-#{System.unique_integer([:positive])}"
@@ -830,14 +783,7 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       # the spread population-derived, which at test scale is a few milliseconds — so
       # `lapse_revalidate_pending` would race from `true` to a `%Task{}` to `false` before it could
       # be observed. This is the operator override existing for exactly this reason.
-      prev = Application.get_env(:fathom, :lapse_revalidate_jitter_ms)
-      Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 60_000)
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, :lapse_revalidate_jitter_ms, prev),
-          else: Application.delete_env(:fathom, :lapse_revalidate_jitter_ms)
-      end)
+      Env.put!(:lapse_revalidate_jitter_ms, 60_000)
 
       :ok
     end

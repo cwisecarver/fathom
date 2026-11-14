@@ -13,19 +13,8 @@ defmodule FathomWeb.ClientIpTest do
   """
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.Env
   alias FathomWeb.ClientIp
-
-  setup do
-    prev = Application.get_env(:fathom, :trusted_proxies)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :trusted_proxies, prev),
-        else: Application.delete_env(:fathom, :trusted_proxies)
-    end)
-
-    :ok
-  end
 
   defp conn(remote_ip, xff \\ []) do
     %Plug.Conn{
@@ -34,11 +23,11 @@ defmodule FathomWeb.ClientIpTest do
     }
   end
 
-  defp trust(list), do: Application.put_env(:fathom, :trusted_proxies, list)
+  defp trust(list), do: Env.put!(:trusted_proxies, list)
 
   describe "fails closed" do
     test "no :trusted_proxies configured ⇒ conn.remote_ip, header ignored entirely" do
-      Application.delete_env(:fathom, :trusted_proxies)
+      Env.delete!(:trusted_proxies)
 
       assert ClientIp.resolve(conn({10, 0, 0, 1}, ["203.0.113.9"])) == {10, 0, 0, 1}
     end

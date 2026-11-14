@@ -20,6 +20,7 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Storage
   alias Fathom.Shards
+  alias Fathom.Test.Env
   import Fathom.Test.ReplicationCase
 
   setup do
@@ -27,24 +28,8 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
     root = Path.join(System.tmp_dir!(), "replpromote_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
 
-    prev = %{
-      enabled: Application.get_env(:fathom, :replication_enabled),
-      followers: Application.get_env(:fathom, :replication_followers),
-      quorum: Application.get_env(:fathom, :replication_quorum)
-    }
-
     on_exit(fn ->
       Session.stop(id)
-
-      for {k, v} <- [
-            replication_enabled: prev.enabled,
-            replication_followers: prev.followers,
-            replication_quorum: prev.quorum
-          ] do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
 
       File.rm_rf(root)
       for s <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(id) <> s)
@@ -472,11 +457,9 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
       {:ok, _} = Fathom.Shard.Connection.query(c, "CREATE TABLE usurper (x)", [])
       :ok = Fathom.Shard.Connection.close(c)
 
-      prev_backend = Application.get_env(:fathom, :shard_storage)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:flush,
          fn ->
@@ -484,14 +467,6 @@ defmodule Fathom.Shard.ReplicationPromoteTest do
            Fathom.Test.FaultyStorage.flush(id, usurper)
          end}
       )
-
-      on_exit(fn ->
-        Application.delete_env(:fathom, :faulty_before)
-
-        if is_nil(prev_backend),
-          do: Application.delete_env(:fathom, :shard_storage),
-          else: Application.put_env(:fathom, :shard_storage, prev_backend)
-      end)
 
       assert {:error, _} = Promote.promote(id, follower: name),
              "the promotion published UNCONDITIONALLY over an object that changed under it — " <>

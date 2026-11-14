@@ -15,6 +15,7 @@ defmodule Fathom.Shard.ConnectionLimitsTest do
 
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Extension
+  alias Fathom.Test.Env
 
   setup do
     assert Extension.available?(), "the fathom_udf extension is not built"
@@ -99,14 +100,12 @@ defmodule Fathom.Shard.ConnectionLimitsTest do
     # non-template shard, so a statement that evades the text gate still dies in SQLite. The
     # handle's own conn is queried directly to skip the (parser) text gate.
     test "ShardExecutor.open sets it from :block_tenant_ddl for a non-template shard" do
-      prev = Application.get_env(:fathom, :block_tenant_ddl, false)
-      Application.put_env(:fathom, :block_tenant_ddl, true)
+      Env.put!(:block_tenant_ddl, true)
       id = "test_uvlimit_#{System.unique_integer([:positive])}"
       {:ok, h} = Fathom.ShardExecutor.open(id)
 
       on_exit(fn ->
         Fathom.ShardExecutor.close(h)
-        Application.put_env(:fathom, :block_tenant_ddl, prev)
 
         for base <- [
               Path.join(Fathom.Shard.data_dir(), "#{id}.db"),

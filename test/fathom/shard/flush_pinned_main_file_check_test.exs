@@ -28,16 +28,13 @@ defmodule Fathom.Shard.FlushPinnedMainFileCheckTest do
   alias Fathom.Shard.Replication.Wal
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   @modes [:legacy, :heartbeat]
 
   setup do
     id = "pinmf_#{System.unique_integer([:positive])}"
     path = Fathom.Shard.db_path(id)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-
-    # The idle-stop would answer a pending flush with :coordinator_stopped (AGENTS.md testing note).
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
 
     test_pid = self()
     handler = "pinmf-#{id}"
@@ -51,15 +48,12 @@ defmodule Fathom.Shard.FlushPinnedMainFileCheckTest do
 
     on_exit(fn ->
       :telemetry.detach(handler)
-      Application.delete_env(:fathom, :flush_pin_held_hook)
-
-      if prev_idle,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
-
       Shards.stop(id)
       for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(path <> s)
     end)
+
+    # The idle-stop would answer a pending flush with :coordinator_stopped (AGENTS.md testing note).
+    Env.put!(:shard_idle_ms, 600_000)
 
     %{id: id, path: path, wal: path <> "-wal"}
   end
@@ -160,7 +154,7 @@ defmodule Fathom.Shard.FlushPinnedMainFileCheckTest do
 
         test_pid = self()
 
-        Application.put_env(:fathom, :flush_pin_held_hook, fn sid ->
+        Env.put!(:flush_pin_held_hook, fn sid ->
           if sid == id do
             pinned_unbackfilled = not Wal.fully_backfilled?(wal)
             _ = Connection.rollback_if_open(reader)

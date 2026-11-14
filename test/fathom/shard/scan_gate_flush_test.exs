@@ -7,17 +7,13 @@ defmodule Fathom.Shard.ScanGateFlushTest do
   alias Fathom.Shard.{ScanGate, Storage}
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   setup do
     id = "scangate_#{System.unique_integer([:positive])}"
-    prev = Application.get_env(:fathom, :shard_flush_scan_permits, :unset)
-    Application.put_env(:fathom, :shard_flush_scan_permits, 1)
+    Env.put!(:shard_flush_scan_permits, 1)
 
     on_exit(fn ->
-      if prev == :unset,
-        do: Application.delete_env(:fathom, :shard_flush_scan_permits),
-        else: Application.put_env(:fathom, :shard_flush_scan_permits, prev)
-
       Shards.stop(id)
       for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(Fathom.Shard.db_path(id) <> s)
     end)

@@ -8,6 +8,7 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
   alias Fathom.Rebalancer
   alias Fathom.Rebalancer.{CommandPoller, Commands, Overrides}
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   setup do
     shard = "poll_#{System.unique_integer([:positive])}"
@@ -21,9 +22,6 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
 
     %{shard: shard, node: Rebalancer.node_key()}
   end
-
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
 
   defp wait_until(fun, tries \\ 400) do
     cond do
@@ -153,15 +151,8 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
   test "a command killed by the task timeout is marked failed, not re-selected (#34)",
        %{shard: shard, node: node} do
     {:ok, _} = Overrides.pin(shard, node, reason: "test")
-    prev_t = Application.get_env(:fathom, :command_task_timeout_ms)
-    prev_d = Application.get_env(:fathom, :command_drain_ms)
-    Application.put_env(:fathom, :command_task_timeout_ms, 300)
-    Application.put_env(:fathom, :command_drain_ms, 5_000)
-
-    on_exit(fn ->
-      restore(:command_task_timeout_ms, prev_t)
-      restore(:command_drain_ms, prev_d)
-    end)
+    Env.put!(:command_task_timeout_ms, 300)
+    Env.put!(:command_drain_ms, 5_000)
 
     # Hold a checkout open so the drain blocks on the busy connection for its whole 5 s budget;
     # the 300 ms task timeout kills the execute long before that.
@@ -284,15 +275,8 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     # on_timeout: :kill_task is only meaningful with a FINITE timeout, and it must exceed the
     # poller's worst-case drain (command_drain_ms + Shards.drain's +30s net) so a slow-but-
     # succeeding drain isn't killed mid-flight — only a genuinely wedged command hits it.
-    prev = Application.get_env(:fathom, :command_drain_ms)
-    prev_t = Application.get_env(:fathom, :command_task_timeout_ms)
-    Application.put_env(:fathom, :command_drain_ms, 10_000)
-    Application.delete_env(:fathom, :command_task_timeout_ms)
-
-    on_exit(fn ->
-      restore(:command_drain_ms, prev)
-      restore(:command_task_timeout_ms, prev_t)
-    end)
+    Env.put!(:command_drain_ms, 10_000)
+    Env.delete!(:command_task_timeout_ms)
 
     assert CommandPoller.task_timeout() >= 10_000 + 30_000
 
@@ -310,15 +294,10 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     slow_shard = "poll11d_#{System.unique_integer([:positive])}"
     fast_shard = "poll11f_#{System.unique_integer([:positive])}"
 
-    prev_poll = Application.get_env(:fathom, :command_poll_ms)
-    prev_drain = Application.get_env(:fathom, :command_drain_ms)
-    Application.put_env(:fathom, :command_poll_ms, 60_000)
-    Application.put_env(:fathom, :command_drain_ms, 5_000)
+    Env.put!(:command_poll_ms, 60_000)
+    Env.put!(:command_drain_ms, 5_000)
 
     on_exit(fn ->
-      restore(:command_poll_ms, prev_poll)
-      restore(:command_drain_ms, prev_drain)
-
       for id <- [slow_shard, fast_shard],
           dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
           s <- ["", "-wal", "-shm"] do
@@ -364,17 +343,12 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     # MONITOR is the guaranteed cleanup — DOWN frees the ids regardless.
     drain_shard = "poll19_#{System.unique_integer([:positive])}"
 
-    prev_poll = Application.get_env(:fathom, :command_poll_ms)
-    prev_drain = Application.get_env(:fathom, :command_drain_ms)
     # High auto-poll interval (deterministic manual dispatch) + long drain so the batch blocks,
     # giving us a live task to kill.
-    Application.put_env(:fathom, :command_poll_ms, 60_000)
-    Application.put_env(:fathom, :command_drain_ms, 30_000)
+    Env.put!(:command_poll_ms, 60_000)
+    Env.put!(:command_drain_ms, 30_000)
 
     on_exit(fn ->
-      restore(:command_poll_ms, prev_poll)
-      restore(:command_drain_ms, prev_drain)
-
       for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
           s <- ["", "-wal", "-shm"] do
         File.rm(Path.join([dir, "#{drain_shard}.db"]) <> s)

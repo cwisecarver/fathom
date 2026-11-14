@@ -12,6 +12,7 @@ defmodule Fathom.Shard.TempReaperListingTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.TempReaper
+  alias Fathom.Test.Env
 
   test "interesting/1 keeps temps, quarantine copies and retained markers, drops the rest" do
     keep = [
@@ -47,18 +48,11 @@ defmodule Fathom.Shard.TempReaperListingTest do
   end
 
   test "a sweep over many unrelated entries leaves the reaper with a small heap" do
-    prev = Application.get_env(:fathom, :shard_data_dir)
     dir = Path.join(System.tmp_dir!(), "fathom_reaper_heap_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    Application.put_env(:fathom, :shard_data_dir, dir)
+    Env.put!(:shard_data_dir, dir)
 
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :shard_data_dir),
-        else: Application.put_env(:fathom, :shard_data_dir, prev)
-
-      File.rm_rf(dir)
-    end)
+    on_exit(fn -> File.rm_rf(dir) end)
 
     pid = start_supervised!(TempReaper)
     _ = TempReaper.sweep()

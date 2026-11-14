@@ -4,19 +4,15 @@ defmodule Fathom.ShardStorageTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Env
   alias Filo.{Stmt, StmtResult}
 
   setup do
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
 
     shard = "store_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      if prev_idle,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
-
       for base <- [Path.join(local_dir(), "#{shard}.db"), Path.join(remote_dir(), "#{shard}.db")],
           suffix <- ["", "-wal", "-shm"],
           do: File.rm(base <> suffix)

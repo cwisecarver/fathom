@@ -9,27 +9,16 @@ defmodule Mix.Tasks.Fathom.Lock.RepairTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.Local
+  alias Fathom.Test.Env
   alias Mix.Tasks.Fathom.Lock.Repair
 
   setup do
     dir = Path.join(System.tmp_dir!(), "lockrepair_#{System.unique_integer([:positive])}")
-    prev = Application.get_env(:fathom, Local)
-    prev_backend = Application.get_env(:fathom, :shard_storage)
     File.mkdir_p!(dir)
-    Application.put_env(:fathom, Local, dir: dir)
-    Application.put_env(:fathom, :shard_storage, Local)
+    Env.put!(Local, dir: dir)
+    Env.put!(:shard_storage, Local)
 
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, Local, prev),
-        else: Application.delete_env(:fathom, Local)
-
-      if prev_backend,
-        do: Application.put_env(:fathom, :shard_storage, prev_backend),
-        else: Application.delete_env(:fathom, :shard_storage)
-
-      File.rm_rf(dir)
-    end)
+    on_exit(fn -> File.rm_rf(dir) end)
 
     %{dir: dir, id: "lr_#{System.unique_integer([:positive])}"}
   end

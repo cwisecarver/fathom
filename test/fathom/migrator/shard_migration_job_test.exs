@@ -8,6 +8,7 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
   alias Fathom.Migrator.{RetirementJob, RevertJob, ShardMigrationJob}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Directory
+  alias Fathom.Test.Env
 
   @v2_statements [
     "ALTER TABLE app_thing ADD COLUMN created_at TEXT",
@@ -1117,10 +1118,9 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
       {:ok, _} = Migrator.release(2, "v2", @v2_statements)
       put_remote_lock(shard)
       # The remote drain is only attempted when the fleet runs the CommandPoller (R3-1).
-      Application.put_env(:fathom, :command_poller, true)
+      Env.put!(:command_poller, true)
 
       on_exit(fn ->
-        Application.delete_env(:fathom, :command_poller)
         File.rm(Path.join([remote_dir(), "heartbeats", URI.encode_www_form(@remote_owner)]))
       end)
 
@@ -1190,8 +1190,7 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
 
     test "an unresponsive remote node (poller off) times out, cancels its command, and snoozes",
          %{shard: shard} do
-      Application.put_env(:fathom, :migration_remote_drain_ms, 150)
-      on_exit(fn -> Application.delete_env(:fathom, :migration_remote_drain_ms) end)
+      Env.put!(:migration_remote_drain_ms, 150)
 
       assert {:snooze, _} = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
 
@@ -1204,9 +1203,8 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     # Invariant: no poller => snooze immediately, nothing issued.
     test "with the command poller off no command is issued and the job snoozes at once",
          %{shard: shard} do
-      Application.delete_env(:fathom, :command_poller)
-      Application.put_env(:fathom, :migration_remote_drain_ms, 60_000)
-      on_exit(fn -> Application.delete_env(:fathom, :migration_remote_drain_ms) end)
+      Env.delete!(:command_poller)
+      Env.put!(:migration_remote_drain_ms, 60_000)
 
       {us, result} =
         :timer.tc(fn -> perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2}) end)
@@ -1226,8 +1224,7 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
         })
       )
 
-      Application.put_env(:fathom, :migration_remote_drain_ms, 60_000)
-      on_exit(fn -> Application.delete_env(:fathom, :migration_remote_drain_ms) end)
+      Env.put!(:migration_remote_drain_ms, 60_000)
 
       {us, result} =
         :timer.tc(fn -> perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2}) end)

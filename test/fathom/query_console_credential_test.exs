@@ -28,14 +28,12 @@ defmodule Fathom.QueryConsoleCredentialTest do
   alias Fathom.HranaAuth
   alias Fathom.HranaAuth.Ledger
   alias Fathom.{QueryConsole, Shards}
+  alias Fathom.Test.Env
 
   setup do
-    prev_auth = Application.get_env(:fathom, :hrana_auth)
-    prev_age = Application.get_env(:fathom, :hrana_token_max_age)
-
     # The console only mints when auth is ON; with `:disabled` it sends no header at all.
-    Application.put_env(:fathom, :hrana_auth, :required)
-    Application.put_env(:fathom, :hrana_token_max_age, 86_400)
+    Env.put!(:hrana_auth, :required)
+    Env.put!(:hrana_token_max_age, 86_400)
 
     {:ok, sup, port} = HranaClient.start_listener()
     id = "qcc_#{System.unique_integer([:positive])}"
@@ -47,12 +45,6 @@ defmodule Fathom.QueryConsoleCredentialTest do
       for e <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(id) <> e)
 
       HranaClient.stop_listener(sup)
-
-      for {k, v} <- [hrana_auth: prev_auth, hrana_token_max_age: prev_age] do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
     end)
 
     %{endpoint: "http://127.0.0.1:#{port}", id: id}
@@ -134,9 +126,7 @@ defmodule Fathom.QueryConsoleCredentialTest do
     end
 
     test "a ttl is inert when nothing expires anyway" do
-      prev = Application.get_env(:fathom, :hrana_token_max_age)
-      Application.delete_env(:fathom, :hrana_token_max_age)
-      on_exit(fn -> if prev, do: Application.put_env(:fathom, :hrana_token_max_age, prev) end)
+      Env.delete!(:hrana_token_max_age)
 
       id = "qcinf_#{System.unique_integer([:positive])}"
       {:ok, _} = Directory.resolve(id)

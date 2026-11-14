@@ -7,6 +7,7 @@ defmodule Fathom.Migrator.HeadCacheTest do
 
   alias Fathom.Migrator
   alias Fathom.Migrator.HeadCache
+  alias Fathom.Test.Env
 
   test "get/0 serves the cached HEAD; a new release is invisible until refresh" do
     {:ok, _} = Migrator.release(10, "v10")
@@ -39,14 +40,6 @@ defmodule Fathom.Migrator.HeadCacheTest do
   # never saw this. These drive the real `:refresh` tick instead.
   describe "the background poll's gate" do
     setup do
-      prev_mode = Application.get_env(:fathom, :migrate_on_touch)
-
-      on_exit(fn ->
-        if prev_mode == nil,
-          do: Application.delete_env(:fathom, :migrate_on_touch),
-          else: Application.put_env(:fathom, :migrate_on_touch, prev_mode)
-      end)
-
       # A known baseline, then a release the cache has NOT seen yet.
       baseline = HeadCache.refresh()
       {:ok, _} = Migrator.release(baseline + 5, "v#{baseline + 5}")
@@ -61,17 +54,17 @@ defmodule Fathom.Migrator.HeadCacheTest do
     end
 
     test ":inline makes the background poll keep the cache warm", %{released: released} do
-      Application.put_env(:fathom, :migrate_on_touch, :inline)
+      Env.put!(:migrate_on_touch, :inline)
       assert tick() == released
     end
 
     test ":async makes the background poll keep the cache warm", %{released: released} do
-      Application.put_env(:fathom, :migrate_on_touch, :async)
+      Env.put!(:migrate_on_touch, :async)
       assert tick() == released
     end
 
     test ":off leaves the cache alone (nothing reads it)", %{baseline: baseline} do
-      Application.put_env(:fathom, :migrate_on_touch, :off)
+      Env.put!(:migrate_on_touch, :off)
       assert tick() == baseline
     end
   end

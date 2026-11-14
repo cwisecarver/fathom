@@ -22,25 +22,15 @@ defmodule Fathom.Tenants.TokenLifecycleTest do
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Storage.{Local, S3}
   alias Fathom.Tenants.Tombstones
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   defp configure(:local), do: :ok
 
   defp configure(:s3) do
-    prev = for k <- [:shard_storage, S3], do: {k, Application.get_env(:fathom, k)}
-
-    on_exit(fn ->
-      for {k, v} <- prev,
-          do:
-            if(is_nil(v),
-              do: Application.delete_env(:fathom, k),
-              else: Application.put_env(:fathom, k, v)
-            )
-    end)
-
     store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -50,7 +40,7 @@ defmodule Fathom.Tenants.TokenLifecycleTest do
       req_plug: fn conn -> S3EtagStore.serve(conn, store) end
     )
 
-    Application.put_env(:fathom, :shard_storage, S3)
+    Env.put!(:shard_storage, S3)
     :ok
   end
 
@@ -78,20 +68,15 @@ defmodule Fathom.Tenants.TokenLifecycleTest do
   for backend <- [:local, :s3] do
     describe "#{backend}: a deleted tenant's credentials die with it, and a reused id starts clean" do
       setup do
-        prev_mode = Application.get_env(:fathom, :hrana_auth, :disabled)
-        prev_age = Application.get_env(:fathom, :hrana_token_max_age, :infinity)
-        Application.put_env(:fathom, :hrana_auth, :required)
+        Env.put!(:hrana_auth, :required)
         # Prod under :required mandates a finite max age; the reuse hole is bounded by it.
-        Application.put_env(:fathom, :hrana_token_max_age, 3_600)
+        Env.put!(:hrana_token_max_age, 3_600)
         :ok = configure(unquote(backend))
 
         id = new_id("reuse")
         neighbour = id <> "2"
 
         on_exit(fn ->
-          Application.put_env(:fathom, :hrana_auth, prev_mode)
-          Application.put_env(:fathom, :hrana_token_max_age, prev_age)
-
           for shard <- [id, neighbour] do
             :ets.delete(Tombstones, shard)
             :ets.delete(Revocations, shard)

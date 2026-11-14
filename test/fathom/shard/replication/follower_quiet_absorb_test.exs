@@ -26,6 +26,7 @@ defmodule Fathom.Shard.Replication.FollowerQuietAbsorbTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Wal
+  alias Fathom.Test.Env
 
   @lineage 3
   @ordinal 5
@@ -36,29 +37,12 @@ defmodule Fathom.Shard.Replication.FollowerQuietAbsorbTest do
     root = Path.join(System.tmp_dir!(), "quiet_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
 
-    keys = [
-      :replication_lineage_wire,
-      :replication_ordinal_wire,
-      :replication_row_idle_ms,
-      :replication_quiet_absorb_ms,
-      :replication_quiet_boot_retry_ms
-    ]
+    Env.put!(:replication_lineage_wire, true)
+    Env.put!(:replication_ordinal_wire, true)
+    Env.put!(:replication_row_idle_ms, 7_200_000)
+    Env.put!(:replication_quiet_absorb_ms, @quiet_ms)
 
-    prev = for k <- keys, do: {k, Application.get_env(:fathom, k)}
-    Application.put_env(:fathom, :replication_lineage_wire, true)
-    Application.put_env(:fathom, :replication_ordinal_wire, true)
-    Application.put_env(:fathom, :replication_row_idle_ms, 7_200_000)
-    Application.put_env(:fathom, :replication_quiet_absorb_ms, @quiet_ms)
-
-    on_exit(fn ->
-      for {k, v} <- prev do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
-
-      File.rm_rf(root)
-    end)
+    on_exit(fn -> File.rm_rf(root) end)
 
     name = :"quiet_f_#{System.unique_integer([:positive])}"
     pid = start_supervised!({Follower, name: name, port: 0, dir: Path.join(root, "f")})
@@ -352,7 +336,7 @@ defmodule Fathom.Shard.Replication.FollowerQuietAbsorbTest do
     age!(name, id)
     :ets.delete(Follower.table(name), id)
     :ets.delete(Follower.touches(name), id)
-    Application.put_env(:fathom, :replication_quiet_boot_retry_ms, 10)
+    Env.put!(:replication_quiet_boot_retry_ms, 10)
 
     test = self()
     handler = "quiet-boot-retry-#{System.unique_integer([:positive])}"

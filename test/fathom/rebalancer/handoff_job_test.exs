@@ -11,6 +11,7 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
   alias Fathom.Rebalancer
   alias Fathom.Rebalancer.{CommandPoller, Commands, HandoffJob, Overrides}
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   setup do
     shard = "handoff_#{System.unique_integer([:positive])}"
@@ -20,22 +21,13 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
 
     node = Rebalancer.node_key()
 
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    prev_poll = Application.get_env(:fathom, :command_poll_ms)
-    prev_map = Application.get_env(:fathom, :lb_map_path)
-    prev_backends = Application.get_env(:fathom, :lb_backends)
-
     # Keep the coordinator alive through the test; poll fast; render the map to a temp file.
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
-    Application.put_env(:fathom, :command_poll_ms, 50)
-    Application.put_env(:fathom, :lb_map_path, map_path)
-    Application.put_env(:fathom, :lb_backends, %{node => "#{node}:8080"})
+    Env.put!(:shard_idle_ms, 600_000)
+    Env.put!(:command_poll_ms, 50)
+    Env.put!(:lb_map_path, map_path)
+    Env.put!(:lb_backends, %{node => "#{node}:8080"})
 
     on_exit(fn ->
-      restore(:shard_idle_ms, prev_idle)
-      restore(:command_poll_ms, prev_poll)
-      restore(:lb_map_path, prev_map)
-      restore(:lb_backends, prev_backends)
       File.rm(map_path)
 
       for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
@@ -46,9 +38,6 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
 
     %{shard: shard, node: node, map_path: map_path}
   end
-
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
 
   test "runs warm → pin + write LB map → drain, and completes", %{
     shard: shard,
@@ -80,15 +69,8 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
     # complete, so on the final attempt the handoff reverts. It must RETAIN the override
     # (stamped failed_at) as a cooldown record — deleting it (the old unpin) left the still
     # hot shard with no cooldown → re-proposed every tick (thrash).
-    prev_warm = Application.get_env(:fathom, :handoff_warm_timeout_ms)
-    prev_drain = Application.get_env(:fathom, :handoff_drain_timeout_ms)
-    Application.put_env(:fathom, :handoff_warm_timeout_ms, 50)
-    Application.put_env(:fathom, :handoff_drain_timeout_ms, 50)
-
-    on_exit(fn ->
-      restore(:handoff_warm_timeout_ms, prev_warm)
-      restore(:handoff_drain_timeout_ms, prev_drain)
-    end)
+    Env.put!(:handoff_warm_timeout_ms, 50)
+    Env.put!(:handoff_drain_timeout_ms, 50)
 
     args = %{"shard_id" => shard, "from_node" => node, "to_node" => node, "q_per_s" => 500.0}
     # attempt == max_attempts (3) so drain failure takes the revert branch, not a retry.
@@ -108,20 +90,13 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
     # (coordinator shutdown). If the handoff's await were shorter, a slow-but-succeeding
     # drain would be mislabeled a timeout → premature retry (duplicate drain) / spurious
     # revert. The default must exceed command_drain_ms + 30s.
-    prev = Application.get_env(:fathom, :command_drain_ms)
-    prev_h = Application.get_env(:fathom, :handoff_drain_timeout_ms)
-    Application.put_env(:fathom, :command_drain_ms, 10_000)
-    Application.delete_env(:fathom, :handoff_drain_timeout_ms)
-
-    on_exit(fn ->
-      restore(:command_drain_ms, prev)
-      restore(:handoff_drain_timeout_ms, prev_h)
-    end)
+    Env.put!(:command_drain_ms, 10_000)
+    Env.delete!(:handoff_drain_timeout_ms)
 
     assert HandoffJob.drain_timeout() >= 10_000 + 30_000
 
     # An explicit override wins (operator owns the ordering).
-    Application.put_env(:fathom, :handoff_drain_timeout_ms, 12_345)
+    Env.put!(:handoff_drain_timeout_ms, 12_345)
     assert HandoffJob.drain_timeout() == 12_345
   end
 
@@ -129,15 +104,8 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
     node: node
   } do
     shard = "drain_sup_#{System.unique_integer([:positive])}"
-    prev_warm = Application.get_env(:fathom, :handoff_warm_timeout_ms)
-    prev_drain = Application.get_env(:fathom, :handoff_drain_timeout_ms)
-    Application.put_env(:fathom, :handoff_warm_timeout_ms, 50)
-    Application.put_env(:fathom, :handoff_drain_timeout_ms, 50)
-
-    on_exit(fn ->
-      restore(:handoff_warm_timeout_ms, prev_warm)
-      restore(:handoff_drain_timeout_ms, prev_drain)
-    end)
+    Env.put!(:handoff_warm_timeout_ms, 50)
+    Env.put!(:handoff_drain_timeout_ms, 50)
 
     # A prior attempt's drain left pending (await timed out, poller lagging).
     {:ok, stale} = Commands.issue(shard, node, "drain")
@@ -158,9 +126,7 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
   test "an invalid shard_id doesn't crash the handoff (#14)", %{node: node} do
     # Regression for #14: pin_and_flip hard-matched {:ok, _}, so a rejected pin (invalid
     # shard_id) would MatchError-crash the job. It must handle the error and revert instead.
-    prev_warm = Application.get_env(:fathom, :handoff_warm_timeout_ms)
-    Application.put_env(:fathom, :handoff_warm_timeout_ms, 50)
-    on_exit(fn -> restore(:handoff_warm_timeout_ms, prev_warm) end)
+    Env.put!(:handoff_warm_timeout_ms, 50)
 
     args = %{
       "shard_id" => "evil; } server { #",
@@ -180,15 +146,8 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
     # Regression for #11: if the LB flip isn't live (reload command fails), draining the
     # source while traffic still routes to it would strand the shard. pin_and_flip surfaces
     # the failure, so drain is SKIPPED — no drain command is issued and the source stays up.
-    prev_reload = Application.get_env(:fathom, :lb_reload_cmd)
-    prev_warm = Application.get_env(:fathom, :handoff_warm_timeout_ms)
-    Application.put_env(:fathom, :lb_reload_cmd, "false")
-    Application.put_env(:fathom, :handoff_warm_timeout_ms, 50)
-
-    on_exit(fn ->
-      restore(:lb_reload_cmd, prev_reload)
-      restore(:handoff_warm_timeout_ms, prev_warm)
-    end)
+    Env.put!(:lb_reload_cmd, "false")
+    Env.put!(:handoff_warm_timeout_ms, 50)
 
     {:ok, pid, ref, _path} = Shards.checkout(shard)
     Fathom.Shard.checkin(pid, ref)
@@ -244,15 +203,8 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
   # degenerate and distinguishes nothing, which is exactly why the code refuses to act on it.
   describe "a drain timeout consults the data plane before reverting (#20)" do
     setup do
-      prev_warm = Application.get_env(:fathom, :handoff_warm_timeout_ms)
-      prev_drain = Application.get_env(:fathom, :handoff_drain_timeout_ms)
-      Application.put_env(:fathom, :handoff_warm_timeout_ms, 50)
-      Application.put_env(:fathom, :handoff_drain_timeout_ms, 50)
-
-      on_exit(fn ->
-        restore(:handoff_warm_timeout_ms, prev_warm)
-        restore(:handoff_drain_timeout_ms, prev_drain)
-      end)
+      Env.put!(:handoff_warm_timeout_ms, 50)
+      Env.put!(:handoff_drain_timeout_ms, 50)
 
       :ok
     end
@@ -329,9 +281,7 @@ defmodule Fathom.Rebalancer.HandoffJobTest do
 
       # The poller is running, so the unfixed job's drain DOES run and the job completes; a drain
       # timeout this short only bounds the pre-fix wait if the poller were slow.
-      prev_drain = Application.get_env(:fathom, :handoff_drain_timeout_ms)
-      Application.put_env(:fathom, :handoff_drain_timeout_ms, 2_000)
-      on_exit(fn -> restore(:handoff_drain_timeout_ms, prev_drain) end)
+      Env.put!(:handoff_drain_timeout_ms, 2_000)
 
       args = %{"shard_id" => shard, "from_node" => node, "to_node" => node, "q_per_s" => 500.0}
       assert {:error, :lb_map_path_unset} = perform_job(HandoffJob, args)

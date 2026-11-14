@@ -9,6 +9,7 @@ defmodule Fathom.SnapshotsTest do
 
   alias Fathom.{ShardExecutor, Shards, Snapshots}
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
@@ -97,12 +98,9 @@ defmodule Fathom.SnapshotsTest do
     write!(shard, ["UPDATE t SET v = 'v2'"])
     flush!(shard)
 
-    prev_ttl = Application.get_env(:fathom, :shard_lease_ttl_ms)
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-
     # Small TTL so the renew interval (ttl/3 ≈ 100 ms) is short and renews before the lock lapses.
-    Application.put_env(:fathom, :shard_lease_ttl_ms, 300)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_lease_ttl_ms, 300)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     test = self()
 
@@ -115,19 +113,7 @@ defmodule Fathom.SnapshotsTest do
       :ok
     end
 
-    Application.put_env(:fathom, :faulty_before, {:restore_snapshot, hook})
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_ttl,
-        do: Application.put_env(:fathom, :shard_lease_ttl_ms, prev_ttl),
-        else: Application.delete_env(:fathom, :shard_lease_ttl_ms)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:faulty_before, {:restore_snapshot, hook})
 
     restore = Task.async(fn -> Snapshots.restore(shard, snap_id) end)
 
@@ -157,28 +143,13 @@ defmodule Fathom.SnapshotsTest do
     write!(shard, ["UPDATE t SET v = 'v2'"])
     flush!(shard)
 
-    prev =
-      for k <- [:shard_lease_ttl_ms, :shard_storage], do: {k, Application.get_env(:fathom, k)}
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-      Application.delete_env(:fathom, :storage_fault)
-
-      for {k, v} <- prev,
-          do:
-            if(v,
-              do: Application.put_env(:fathom, k, v),
-              else: Application.delete_env(:fathom, k)
-            )
-    end)
-
-    Application.put_env(:fathom, :shard_lease_ttl_ms, 300)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_lease_ttl_ms, 300)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
     # Every renew fails, and the copy-back blocks for good.
-    Application.put_env(:fathom, :storage_fault, :renew)
+    Env.put!(:storage_fault, :renew)
 
     hook = fn id -> if id == shard, do: Process.sleep(:infinity) end
-    Application.put_env(:fathom, :faulty_before, {:restore_snapshot, hook})
+    Env.put!(:faulty_before, {:restore_snapshot, hook})
 
     restore = Task.async(fn -> Snapshots.restore(shard, snap_id) end)
 
@@ -272,8 +243,7 @@ defmodule Fathom.SnapshotsTest do
     write!(shard, ["UPDATE t SET v = 'live'"])
     flush!(shard)
 
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     # Fires once the promotion begins — after the version check has already read the snapshot.
     # Filtered on the shard id: `:faulty_before` is global Application env and other tests'
@@ -286,15 +256,9 @@ defmodule Fathom.SnapshotsTest do
       :ok
     end
 
-    Application.put_env(:fathom, :faulty_before, {:restore_snapshot, swap})
+    Env.put!(:faulty_before, {:restore_snapshot, swap})
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-
       for suffix <- ["", "-wal", "-shm"], do: File.rm(swapped <> suffix)
     end)
 

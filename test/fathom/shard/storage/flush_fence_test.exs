@@ -7,6 +7,7 @@ defmodule Fathom.Shard.Storage.FlushFenceTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.{Local, S3}
+  alias Fathom.Test.Env
 
   describe "Local flush/3, pull, object_etag" do
     setup do
@@ -14,16 +15,9 @@ defmodule Fathom.Shard.Storage.FlushFenceTest do
         Path.join(System.tmp_dir!(), "fathom_flushfence_#{System.unique_integer([:positive])}")
 
       File.mkdir_p!(dir)
-      prev = Application.get_env(:fathom, Local)
-      Application.put_env(:fathom, Local, dir: dir)
+      Env.put!(Local, dir: dir)
 
-      on_exit(fn ->
-        File.rm_rf!(dir)
-
-        if prev,
-          do: Application.put_env(:fathom, Local, prev),
-          else: Application.delete_env(:fathom, Local)
-      end)
+      on_exit(fn -> File.rm_rf!(dir) end)
 
       %{
         dir: dir,
@@ -96,14 +90,7 @@ defmodule Fathom.Shard.Storage.FlushFenceTest do
     setup do
       # These pin the If-Match / If-None-Match headers; the body assertion is incidental, so store
       # raw bytes rather than the zstd default (2026-10-05). Encoding has its own suites.
-      prev_enc = Application.get_env(:fathom, :shard_object_encoding)
-      Application.put_env(:fathom, :shard_object_encoding, :none)
-
-      on_exit(fn ->
-        if prev_enc,
-          do: Application.put_env(:fathom, :shard_object_encoding, prev_enc),
-          else: Application.delete_env(:fathom, :shard_object_encoding)
-      end)
+      Env.put!(:shard_object_encoding, :none)
 
       test = self()
 
@@ -119,9 +106,7 @@ defmodule Fathom.Shard.Storage.FlushFenceTest do
         conn |> Plug.Conn.put_resp_header("etag", "\"new\"") |> Plug.Conn.send_resp(200, "")
       end
 
-      prev = Application.get_env(:fathom, S3)
-
-      Application.put_env(:fathom, S3,
+      Env.put!(S3,
         bucket: "b",
         region: "us-east-1",
         access_key_id: "k",
@@ -130,12 +115,6 @@ defmodule Fathom.Shard.Storage.FlushFenceTest do
         path_style: true,
         req_plug: plug
       )
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, S3, prev),
-          else: Application.delete_env(:fathom, S3)
-      end)
 
       tmp = Path.join(System.tmp_dir!(), "s3flush_#{System.unique_integer([:positive])}.db")
       File.write!(tmp, "body")

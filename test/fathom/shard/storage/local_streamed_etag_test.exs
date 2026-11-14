@@ -13,19 +13,13 @@ defmodule Fathom.Shard.Storage.LocalStreamedEtagTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.Local
+  alias Fathom.Test.Env
 
   setup do
     dir = Path.join(System.tmp_dir!(), "fathom_etag_#{System.unique_integer([:positive])}")
-    prev = Application.get_env(:fathom, Local)
-    Application.put_env(:fathom, Local, dir: dir)
+    Env.put!(Local, dir: dir)
 
-    on_exit(fn ->
-      File.rm_rf!(dir)
-
-      if prev,
-        do: Application.put_env(:fathom, Local, prev),
-        else: Application.delete_env(:fathom, Local)
-    end)
+    on_exit(fn -> File.rm_rf!(dir) end)
 
     %{dir: dir, shard: "etag_#{System.unique_integer([:positive])}"}
   end

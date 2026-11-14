@@ -7,6 +7,7 @@ defmodule Fathom.Rebalancer.LbApplyTest do
   use Fathom.DataCase, async: false
 
   alias Fathom.Rebalancer.{LbApply, Overrides}
+  alias Fathom.Test.Env
 
   setup do
     # A per-test DIRECTORY, removed whole, rather than a bare file path with a hand-maintained
@@ -25,36 +26,20 @@ defmodule Fathom.Rebalancer.LbApplyTest do
     File.mkdir_p!(dir)
     map_path = Path.join(dir, "map.conf")
 
-    prev = %{
-      map: Application.get_env(:fathom, :lb_map_path),
-      test: Application.get_env(:fathom, :lb_test_cmd),
-      reload: Application.get_env(:fathom, :lb_reload_cmd),
-      backends: Application.get_env(:fathom, :lb_backends)
-    }
-
-    Application.put_env(:fathom, :lb_map_path, map_path)
-    Application.put_env(:fathom, :lb_backends, %{"n1" => "n1:8080", "n2" => "n2:8080"})
+    Env.put!(:lb_map_path, map_path)
+    Env.put!(:lb_backends, %{"n1" => "n1:8080", "n2" => "n2:8080"})
     # Never actually reload nginx in tests.
-    Application.delete_env(:fathom, :lb_reload_cmd)
+    Env.delete!(:lb_reload_cmd)
 
-    on_exit(fn ->
-      restore(:lb_map_path, prev.map)
-      restore(:lb_test_cmd, prev.test)
-      restore(:lb_reload_cmd, prev.reload)
-      restore(:lb_backends, prev.backends)
-      # The whole directory: the map, the `.applied` marker, and any stray `.tmp.*` candidate
-      # from an aborted promotion.
-      File.rm_rf(dir)
-    end)
+    # The whole directory: the map, the `.applied` marker, and any stray `.tmp.*` candidate
+    # from an aborted promotion.
+    on_exit(fn -> File.rm_rf(dir) end)
 
     %{map_path: map_path}
   end
 
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
-
   test "unset :lb_map_path is a no-op", %{map_path: map_path} do
-    Application.delete_env(:fathom, :lb_map_path)
+    Env.delete!(:lb_map_path)
     assert LbApply.apply!() == :ok
     refute File.exists?(map_path)
   end
@@ -76,7 +61,7 @@ defmodule Fathom.Rebalancer.LbApplyTest do
     # fails nginx's NEXT cold start — a fleet-wide outage decoupled from the change).
     File.write!(map_path, "# last-good map\n")
     # `false` exits non-zero — stand-in for `nginx -t` rejecting the candidate.
-    Application.put_env(:fathom, :lb_test_cmd, "false")
+    Env.put!(:lb_test_cmd, "false")
 
     {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
 
@@ -92,9 +77,8 @@ defmodule Fathom.Rebalancer.LbApplyTest do
     # Regression for #2: System.shell had no timeout, so a wedged reload blocked forever while
     # (pre-restructure) holding the pooled connection + fleet advisory lock. Now it's killed at
     # the deadline and surfaced as {:reload_timeout, _}.
-    Application.put_env(:fathom, :lb_reload_cmd, "sleep 30")
-    Application.put_env(:fathom, :lb_reload_timeout_ms, 200)
-    on_exit(fn -> Application.delete_env(:fathom, :lb_reload_timeout_ms) end)
+    Env.put!(:lb_reload_cmd, "sleep 30")
+    Env.put!(:lb_reload_timeout_ms, 200)
     {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
 
     {elapsed_us, result} = :timer.tc(fn -> LbApply.apply!() end)
@@ -111,9 +95,8 @@ defmodule Fathom.Rebalancer.LbApplyTest do
     # The config-test runs inside the advisory lock, so a hang would freeze fleet-wide LB
     # updates — it must be hard-timeout-bounded. On timeout the candidate is not promoted.
     File.write!(map_path, "# last-good\n")
-    Application.put_env(:fathom, :lb_test_cmd, "sleep 30")
-    Application.put_env(:fathom, :lb_test_timeout_ms, 200)
-    on_exit(fn -> Application.delete_env(:fathom, :lb_test_timeout_ms) end)
+    Env.put!(:lb_test_cmd, "sleep 30")
+    Env.put!(:lb_test_timeout_ms, 200)
     {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
 
     {elapsed_us, result} = :timer.tc(fn -> LbApply.apply!() end)
@@ -130,14 +113,14 @@ defmodule Fathom.Rebalancer.LbApplyTest do
   } do
     # Regression for #10: the leader re-renders every tick, so an unchanged render whose
     # content the LB already has must skip the write + reload.
-    Application.put_env(:fathom, :lb_reload_cmd, "true")
+    Env.put!(:lb_reload_cmd, "true")
     {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
 
     assert LbApply.apply!() == :ok
     mtime = File.stat!(map_path).mtime
 
     # Identical render, and the running LB already has it → genuine no-op.
-    Application.put_env(:fathom, :lb_reload_cmd, "false")
+    Env.put!(:lb_reload_cmd, "false")
     assert LbApply.apply!() == :ok
     assert File.stat!(map_path).mtime == mtime
   end
@@ -151,7 +134,7 @@ defmodule Fathom.Rebalancer.LbApplyTest do
     # retry then reported :ok — so HandoffJob believed the flip was live and drained the source
     # while nginx still routed every request for that shard to it. It also made the documented
     # per-tick self-heal permanent-no-op, so a failed reload never recovered.
-    Application.put_env(:fathom, :lb_reload_cmd, "false")
+    Env.put!(:lb_reload_cmd, "false")
     {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
 
     # First apply promotes the file; the reload fails and is surfaced.
@@ -163,11 +146,11 @@ defmodule Fathom.Rebalancer.LbApplyTest do
            "a promoted-but-never-loaded map was reported as applied"
 
     # And once the reload can succeed, the self-heal actually heals.
-    Application.put_env(:fathom, :lb_reload_cmd, "true")
+    Env.put!(:lb_reload_cmd, "true")
     assert LbApply.apply!() == :ok
 
     # Now it is genuinely applied, so further ticks are no-ops again.
-    Application.put_env(:fathom, :lb_reload_cmd, "false")
+    Env.put!(:lb_reload_cmd, "false")
     assert LbApply.apply!() == :ok
   end
 
@@ -176,7 +159,7 @@ defmodule Fathom.Rebalancer.LbApplyTest do
     # Regression for #11: apply! must surface a reload failure (not swallow it as :ok) so the
     # handoff won't drain against a flip that may not be live. The map is still promoted (it
     # passed any config test) — valid on disk for the next cold start.
-    Application.put_env(:fathom, :lb_reload_cmd, "false")
+    Env.put!(:lb_reload_cmd, "false")
     {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
 
     assert {:error, {:reload_failed, _code}} = LbApply.apply!()
@@ -187,7 +170,7 @@ defmodule Fathom.Rebalancer.LbApplyTest do
     map_path: map_path
   } do
     # The candidate must exist and be non-empty when the test runs (proves temp-first order).
-    Application.put_env(:fathom, :lb_test_cmd, "test -s {} && test -n \"$LB_MAP_CANDIDATE\"")
+    Env.put!(:lb_test_cmd, "test -s {} && test -n \"$LB_MAP_CANDIDATE\"")
 
     {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
 
@@ -216,7 +199,7 @@ defmodule Fathom.Rebalancer.LbApplyTest do
 
   test "a rejected candidate records the failure and its error", %{map_path: map_path} do
     File.write!(map_path, "# last-good map\n")
-    Application.put_env(:fathom, :lb_test_cmd, "false")
+    Env.put!(:lb_test_cmd, "false")
     {:ok, _} = Overrides.pin("hot_1", "n2", reason: "test")
     assert {:error, _} = LbApply.apply!()
 

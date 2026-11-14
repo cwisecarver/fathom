@@ -9,19 +9,14 @@ defmodule Fathom.TenantsErasureGuardsTest do
   alias Fathom.{Directory, ShardExecutor, Shards, Snapshots, Tenants}
   alias Fathom.Shard.{Integrity, Storage}
   alias Fathom.Tenants.Tombstones
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
     id = "eg_#{System.unique_integer([:positive])}"
     dst = id <> "fork"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_ttl = Application.get_env(:fathom, :shard_lease_ttl_ms)
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-      restore_env(:shard_storage, prev_storage)
-      restore_env(:shard_lease_ttl_ms, prev_ttl)
-
       for sid <- [id, dst] do
         :ets.delete(Tombstones, sid)
         Shards.drain(sid, 2_000)
@@ -34,9 +29,6 @@ defmodule Fathom.TenantsErasureGuardsTest do
 
     %{id: id, dst: dst}
   end
-
-  defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore_env(key, value), do: Application.put_env(:fathom, key, value)
 
   defp write!(shard, sqls) do
     {:ok, handle} = ShardExecutor.open(shard)
@@ -95,12 +87,11 @@ defmodule Fathom.TenantsErasureGuardsTest do
     write!(src, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('a')"])
     flush!(src)
 
-    Application.put_env(:fathom, :shard_lease_ttl_ms, 300)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_lease_ttl_ms, 300)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
     test = self()
 
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :faulty_before,
       {:fork_shard,
        fn id ->
@@ -164,10 +155,9 @@ defmodule Fathom.TenantsErasureGuardsTest do
       flush!(id)
       {:ok, snap} = Snapshots.create(id)
 
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
       # The delete's tombstone arrives while the copy-back is in flight.
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:restore_snapshot, fn _ -> :ets.insert(Tombstones, {id}) end}
       )

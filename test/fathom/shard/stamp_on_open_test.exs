@@ -24,27 +24,22 @@ defmodule Fathom.Shard.StampOnOpenTest do
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Heartbeat, Storage}
   alias Fathom.Shard.Replication.Recovery
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
-  @env [:replication_enabled, :replication_promote_on_open, :shard_flush_interval_ms]
 
   setup do
     shard = "stampopen_#{System.unique_integer([:positive])}"
-    prev = Map.new(@env, &{&1, Application.get_env(:fathom, &1)})
 
-    Application.put_env(:fathom, :replication_promote_on_open, false)
-    Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+    # Registered before the on_exit below, so the restore runs AFTER the drain: the tests flip
+    # :replication_enabled via `replicating!/1`, and the drain must see the value they left.
+    Env.put!(:replication_enabled, false)
+    Env.put!(:replication_promote_on_open, false)
+    Env.put!(:shard_flush_interval_ms, 60_000)
 
     on_exit(fn ->
       Shards.drain(shard, 2_000)
-
-      for {k, v} <- prev,
-          do:
-            if(is_nil(v),
-              do: Application.delete_env(:fathom, k),
-              else: Application.put_env(:fathom, k, v)
-            )
 
       for f <- Path.wildcard(Path.join(Shard.data_dir(), "#{shard}*")), do: File.rm_rf(f)
       Storage.Local.purge_shard(shard)

@@ -12,15 +12,7 @@ defmodule Fathom.AuditClientIpTest do
   import Plug.Conn
 
   alias Fathom.Audit
-
-  setup do
-    prev = Application.get_env(:fathom, :trusted_proxies)
-    on_exit(fn -> restore(prev) end)
-    :ok
-  end
-
-  defp restore(nil), do: Application.delete_env(:fathom, :trusted_proxies)
-  defp restore(v), do: Application.put_env(:fathom, :trusted_proxies, v)
+  alias Fathom.Test.Env
 
   defp conn_from(peer, xff) do
     conn = Plug.Test.conn(:get, "/api/tenants") |> Map.put(:remote_ip, peer)
@@ -28,7 +20,7 @@ defmodule Fathom.AuditClientIpTest do
   end
 
   test "behind a trusted proxy the audit row records the forwarded client, not the proxy" do
-    Application.put_env(:fathom, :trusted_proxies, ["10.0.0.0/8"])
+    Env.put!(:trusted_proxies, ["10.0.0.0/8"])
 
     :ok = Audit.log(conn_from({10, 0, 0, 5}, "203.0.113.9"), :delete, "acme", "ok")
 
@@ -36,7 +28,7 @@ defmodule Fathom.AuditClientIpTest do
   end
 
   test "from an untrusted peer the forwarded header is ignored and remote_ip is recorded" do
-    Application.put_env(:fathom, :trusted_proxies, ["10.0.0.0/8"])
+    Env.put!(:trusted_proxies, ["10.0.0.0/8"])
 
     :ok = Audit.log(conn_from({192, 0, 2, 1}, "203.0.113.9"), :delete, "forged", "ok")
 
@@ -44,7 +36,7 @@ defmodule Fathom.AuditClientIpTest do
   end
 
   test "with no trusted proxies configured, remote_ip is recorded as before" do
-    Application.delete_env(:fathom, :trusted_proxies)
+    Env.delete!(:trusted_proxies)
 
     :ok = Audit.log(conn_from({198, 51, 100, 7}, "203.0.113.9"), :export, "direct", "ok")
 

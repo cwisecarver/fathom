@@ -10,6 +10,7 @@ defmodule Mix.Tasks.Fathom.ShardVersionTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
 
   @plain "SQLite format 3\0 pretend this is a database page"
   # Characters real S3 version ids carry (`+`, `/`, `=`) that a hand-spliced query string would
@@ -22,26 +23,19 @@ defmodule Mix.Tasks.Fathom.ShardVersionTest do
 
     prev_shell = Mix.shell()
     Mix.shell(Mix.Shell.Process)
-    prev_backend = Application.get_env(:fathom, :shard_storage)
-    prev_s3 = Application.get_env(:fathom, S3)
 
     on_exit(fn ->
       Mix.shell(prev_shell)
-      restore_env(:shard_storage, prev_backend)
-      restore_env(S3, prev_s3)
       File.rm_rf!(dir)
     end)
 
     %{dir: dir}
   end
 
-  defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore_env(key, v), do: Application.put_env(:fathom, key, v)
-
   defp use_s3(plug) do
-    Application.put_env(:fathom, :shard_storage, S3)
+    Env.put!(:shard_storage, S3)
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -146,7 +140,7 @@ defmodule Mix.Tasks.Fathom.ShardVersionTest do
   end
 
   test "a non-S3 backend fails clearly", %{dir: dir} do
-    Application.put_env(:fathom, :shard_storage, Storage.Local)
+    Env.put!(:shard_storage, Storage.Local)
     out = Path.join(dir, "local.db")
 
     assert {:error, {:object_versions_unsupported, Storage.Local}} =

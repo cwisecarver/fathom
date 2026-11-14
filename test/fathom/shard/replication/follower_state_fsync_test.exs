@@ -16,21 +16,15 @@ defmodule Fathom.Shard.Replication.FollowerStateFsyncTest do
 
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Protocol
+  alias Fathom.Test.Env
 
   setup do
     id = "fsyncst_#{System.unique_integer([:positive])}"
     name = :"fsyncst_f_#{System.unique_integer([:positive])}"
     dir = Path.join(System.tmp_dir!(), to_string(name))
     File.mkdir_p!(dir)
-    prev = Application.get_env(:fathom, :replication_fsync)
 
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :replication_fsync),
-        else: Application.put_env(:fathom, :replication_fsync, prev)
-
-      File.rm_rf(dir)
-    end)
+    on_exit(fn -> File.rm_rf(dir) end)
 
     start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
 
@@ -66,7 +60,7 @@ defmodule Fathom.Shard.Replication.FollowerStateFsyncTest do
   end
 
   test "with REPLICATION_FSYNC on, the seed temps, lineage and ordinal are synced", ctx do
-    Application.put_env(:fathom, :replication_fsync, true)
+    Env.put!(:replication_fsync, true)
     seed!(ctx.name, ctx.id)
 
     assert_received {:synced, :seed}, "the seed temps were renamed into place without a datasync"
@@ -82,7 +76,7 @@ defmodule Fathom.Shard.Replication.FollowerStateFsyncTest do
 
   test "with it off (the RAM-ack default) nothing is synced, and the files are still written",
        ctx do
-    Application.put_env(:fathom, :replication_fsync, false)
+    Env.put!(:replication_fsync, false)
     seed!(ctx.name, ctx.id)
 
     refute_received {:synced, _}

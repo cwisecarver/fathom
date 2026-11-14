@@ -27,6 +27,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Shards
+  alias Fathom.Test.Env
   import Fathom.Test.ReplicationCase
 
   setup do
@@ -34,26 +35,8 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     root = Path.join(System.tmp_dir!(), "replseed_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
 
-    prev = %{
-      enabled: Application.get_env(:fathom, :replication_enabled),
-      followers: Application.get_env(:fathom, :replication_followers),
-      quorum: Application.get_env(:fathom, :replication_quorum),
-      chunk: Application.get_env(:fathom, :replication_seed_chunk_bytes)
-    }
-
     on_exit(fn ->
       Session.stop(id)
-
-      for {k, v} <- [
-            replication_enabled: prev.enabled,
-            replication_followers: prev.followers,
-            replication_quorum: prev.quorum,
-            replication_seed_chunk_bytes: prev.chunk
-          ] do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
 
       File.rm_rf(root)
       for s <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(id) <> s)
@@ -506,7 +489,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     enable_replication!(followers, quorum: 2, connected: :all)
     # Small chunks stretch the seed across many frames, so it is still streaming when the next
     # commits arrive — the window the race needs.
-    Application.put_env(:fathom, :replication_seed_chunk_bytes, 4 * 1024)
+    Env.put!(:replication_seed_chunk_bytes, 4 * 1024)
 
     {coordinator, conn, path} = open_shard!(id)
     wal = path <> "-wal"
@@ -590,18 +573,13 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     for {name, _} <- followers,
         do: await_seeded(name, id, fn -> Session.commit(id, wal, coordinator) end)
 
-    prev_timeout = Application.get_env(:fathom, :replication_timeout_ms)
-    Application.put_env(:fathom, :replication_timeout_ms, 1_000)
+    Env.put!(:replication_timeout_ms, 1_000)
 
     [a, b, _c] = Fleet.shippers()
     pids = Enum.map([a, b], &GenServer.whereis/1)
 
     on_exit(fn ->
       for p <- pids, Process.alive?(p), do: :sys.resume(p)
-
-      if is_nil(prev_timeout),
-        do: Application.delete_env(:fathom, :replication_timeout_ms),
-        else: Application.put_env(:fathom, :replication_timeout_ms, prev_timeout)
     end)
 
     Enum.each(pids, &:sys.suspend/1)
@@ -1007,14 +985,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
     %{id: id, root: root} = ctx
     [{a, pa}, {b, pb}, {laggard, plag}] = start_followers!(root, 3, "seed")
 
-    prev_catchup = Application.get_env(:fathom, :replication_catchup_ms)
-    Application.put_env(:fathom, :replication_catchup_ms, 0)
-
-    on_exit(fn ->
-      if is_nil(prev_catchup),
-        do: Application.delete_env(:fathom, :replication_catchup_ms),
-        else: Application.put_env(:fathom, :replication_catchup_ms, prev_catchup)
-    end)
+    Env.put!(:replication_catchup_ms, 0)
 
     peer = start_supervised!({Fathom.Test.PausablePeer, upstream_port: plag, notify: self()})
 
@@ -1286,7 +1257,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   test "a real shard seeds across many chunks and lands byte-identical", ctx do
     %{id: id, root: root} = ctx
     followers = start_followers!(root, 3, "seed")
-    Application.put_env(:fathom, :replication_seed_chunk_bytes, 4_096)
+    Env.put!(:replication_seed_chunk_bytes, 4_096)
     enable_replication!(followers, quorum: 2, connected: :all)
 
     {coordinator, conn, path} = open_shard!(id)
@@ -1645,18 +1616,6 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # which is the pre-A2 behaviour and always correct. What to SHED once already full is a policy
   # question and is deliberately parked.
   describe "the replica store refuses to grow past its free-space floor (#23)" do
-    setup do
-      prev = Application.get_env(:fathom, :replication_disk_free_floor_bytes)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :replication_disk_free_floor_bytes),
-          else: Application.put_env(:fathom, :replication_disk_free_floor_bytes, prev)
-      end)
-
-      :ok
-    end
-
     test "a seed is refused when the volume is below the floor, and the listener stays up", ctx do
       %{root: root} = ctx
       dir = Path.join(root, "pressure")
@@ -1666,7 +1625,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
       # A floor no real volume can clear. This is the same shape as the warm cache's
       # :warm_disk_free_floor_bytes, which is the bound this store never had.
-      Application.put_env(:fathom, :replication_disk_free_floor_bytes, 1_000_000_000_000_000)
+      Env.put!(:replication_disk_free_floor_bytes, 1_000_000_000_000_000)
 
       {:ok, sock} =
         :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 2_000)
@@ -1714,7 +1673,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
 
       # One byte: any real volume clears it. Proves the refusal above is the FLOOR talking and not
       # the seed path being broken.
-      Application.put_env(:fathom, :replication_disk_free_floor_bytes, 1)
+      Env.put!(:replication_disk_free_floor_bytes, 1)
 
       {:ok, sock} =
         :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 2_000)
@@ -1760,17 +1719,9 @@ defmodule Fathom.Shard.ReplicationSeedTest do
       assert {:ok, %{free_inodes: free_inodes}} = Fathom.Admin.Measurements.inode_info(dir),
              "precondition: this host's df reports inodes, or the floor has nothing to compare"
 
-      prev = Application.get_env(:fathom, :replication_disk_free_floor_inodes)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :replication_disk_free_floor_inodes),
-          else: Application.put_env(:fathom, :replication_disk_free_floor_inodes, prev)
-      end)
-
       # Bytes clear their floor; inodes cannot clear theirs.
-      Application.put_env(:fathom, :replication_disk_free_floor_bytes, 1)
-      Application.put_env(:fathom, :replication_disk_free_floor_inodes, free_inodes * 2 + 1)
+      Env.put!(:replication_disk_free_floor_bytes, 1)
+      Env.put!(:replication_disk_free_floor_inodes, free_inodes * 2 + 1)
 
       begin = %Protocol.SeedBegin{
         shard_id: "inode_starved",
@@ -1786,7 +1737,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
              "the follower opened a seed on a volume below its inode floor"
 
       # And the same begin passes once the inode floor is clearable (past the 1 s volume cache).
-      Application.put_env(:fathom, :replication_disk_free_floor_inodes, 1)
+      Env.put!(:replication_disk_free_floor_inodes, 1)
       :ets.match_delete(Follower.locks(name), {{:disk, :_}, :_, :_})
 
       assert %{failed: false} = Follower.begin_seed(name, %{}, begin)["inode_starved"]
@@ -1799,14 +1750,6 @@ defmodule Fathom.Shard.ReplicationSeedTest do
   # live reservations.
   describe "concurrent seeds reserve headroom (expert review 2026-10-12 #18)" do
     setup ctx do
-      prev = Application.get_env(:fathom, :replication_disk_free_floor_bytes)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :replication_disk_free_floor_bytes),
-          else: Application.put_env(:fathom, :replication_disk_free_floor_bytes, prev)
-      end)
-
       name = :"resv_f#{System.unique_integer([:positive])}"
       dir = Path.join(ctx.root, "reserve")
       start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
@@ -1815,7 +1758,7 @@ defmodule Fathom.Shard.ReplicationSeedTest do
       # Each seed claims a third of the volume; the floor leaves room for 1.5 of them. One passes,
       # two together cannot. (Sizes are claims in the begin header: nothing is allocated.)
       size = div(free, 3)
-      Application.put_env(:fathom, :replication_disk_free_floor_bytes, free - div(size * 3, 2))
+      Env.put!(:replication_disk_free_floor_bytes, free - div(size * 3, 2))
 
       begin = fn id ->
         %Protocol.SeedBegin{

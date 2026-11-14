@@ -12,6 +12,7 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
 
   alias Fathom.Shard.Storage.Local
   alias Fathom.Shard.WriteCounter
+  alias Fathom.Test.Env
 
   # Expert review 2026-08-26 #4: a long-lived WRITING stream silently got 10x the advertised RPO.
   #
@@ -26,25 +27,14 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
   # the configuration the suite and the chaos rig use.
   describe "the durability cadence under a long-lived writing stream (#4)" do
     setup do
-      prev = %{
-        interval: Application.get_env(:fathom, :shard_flush_interval_ms),
-        idle: Application.get_env(:fathom, :shard_idle_ms)
-      }
-
       # Short interval so a flush boundary is crossable in a test; high idle so the coordinator
       # does not stop underneath us.
-      Application.put_env(:fathom, :shard_flush_interval_ms, 100)
-      Application.put_env(:fathom, :shard_idle_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 100)
+      Env.put!(:shard_idle_ms, 60_000)
 
       id = "rpo10x_#{System.unique_integer([:positive])}"
 
       on_exit(fn ->
-        for {k, v} <- [shard_flush_interval_ms: prev.interval, shard_idle_ms: prev.idle] do
-          if is_nil(v),
-            do: Application.delete_env(:fathom, k),
-            else: Application.put_env(:fathom, k, v)
-        end
-
         Fathom.Shards.drain(id, 2_000)
 
         for dir <- [Fathom.Shard.data_dir(), Local.dir()],
@@ -214,17 +204,10 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
   describe "#44 — Local.flush/3 returns the STORED object's etag" do
     setup do
       dir = Path.join(System.tmp_dir!(), "flushetag_#{System.unique_integer([:positive])}")
-      prev = Application.get_env(:fathom, Local)
       File.mkdir_p!(dir)
-      Application.put_env(:fathom, Local, dir: dir)
+      Env.put!(Local, dir: dir)
 
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, Local, prev),
-          else: Application.delete_env(:fathom, Local)
-
-        File.rm_rf(dir)
-      end)
+      on_exit(fn -> File.rm_rf(dir) end)
 
       :ok
     end
@@ -258,24 +241,12 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
   end
 
   describe "#40 — the heartbeat memo TTL tracks the steal margin" do
-    setup do
-      prev = Application.get_env(:fathom, :steal_margin_ms)
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, :steal_margin_ms, prev),
-          else: Application.delete_env(:fathom, :steal_margin_ms)
-      end)
-
-      :ok
-    end
-
     test "turning the margin down shrinks the memo window with it" do
       # The safety condition ("the TTL must stay well inside steal_margin_ms") was documented and
       # enforced nowhere, against a knob an operator can set to 500ms. Deriving it makes the
       # condition structural — which is the assertion here: the relationship, not a constant.
       for margin <- [5_000, 2_500, 500, 100] do
-        Application.put_env(:fathom, :steal_margin_ms, margin)
+        Env.put!(:steal_margin_ms, margin)
         ttl = ttl_ms()
 
         assert ttl < margin,
@@ -285,12 +256,12 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
     end
 
     test "the default is unchanged, so this is not a behaviour change at default config" do
-      Application.put_env(:fathom, :steal_margin_ms, 5_000)
+      Env.put!(:steal_margin_ms, 5_000)
       assert ttl_ms() == 1_000
     end
 
     test "a zero/absent margin disables the memo rather than caching forever" do
-      Application.put_env(:fathom, :steal_margin_ms, 0)
+      Env.put!(:steal_margin_ms, 0)
       assert ttl_ms() == 0
     end
 
@@ -324,7 +295,7 @@ defmodule Fathom.Shard.DurabilityEdgesTest do
     # acked writes.
     test "the memo window never OUTLIVES the margin, not merely tracks it" do
       for margin <- [50, 500, 1_000, 5_000, 30_000, 600_000] do
-        Application.put_env(:fathom, :steal_margin_ms, margin)
+        Env.put!(:steal_margin_ms, margin)
 
         assert ttl_ms() <= margin,
                "the heartbeat memo TTL is #{ttl_ms()}ms against a #{margin}ms steal margin — a " <>

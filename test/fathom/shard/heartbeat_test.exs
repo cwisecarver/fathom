@@ -10,22 +10,15 @@ defmodule Fathom.Shard.HeartbeatTest do
   import ExUnit.CaptureLog
 
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Env
 
   @ttl 30_000
 
   setup do
     # Each test gets its own remote dir so heartbeat objects never collide.
     dir = Path.join(System.tmp_dir!(), "fathom_hbproc_#{System.unique_integer([:positive])}")
-    prev = Application.get_env(:fathom, Fathom.Shard.Storage.Local)
-    Application.put_env(:fathom, Fathom.Shard.Storage.Local, dir: dir)
-
-    on_exit(fn ->
-      File.rm_rf!(dir)
-
-      if prev,
-        do: Application.put_env(:fathom, Fathom.Shard.Storage.Local, prev),
-        else: Application.delete_env(:fathom, Fathom.Shard.Storage.Local)
-    end)
+    Env.put!(Fathom.Shard.Storage.Local, dir: dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
 
     owner = "node_#{System.unique_integer([:positive])}@test"
     pid = start_supervised!({Heartbeat, ttl_ms: @ttl, owner: owner})
@@ -126,8 +119,7 @@ defmodule Fathom.Shard.HeartbeatTest do
     prev_owner = "prev_#{System.unique_integer([:positive])}@test"
     test = self()
 
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     hook = fn owner ->
       if owner == prev_owner do
@@ -138,15 +130,7 @@ defmodule Fathom.Shard.HeartbeatTest do
       :ok
     end
 
-    Application.put_env(:fathom, :faulty_before, {:read_heartbeat, hook})
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:faulty_before, {:read_heartbeat, hook})
 
     send(pid, {:clear_previous_incarnation, prev_owner, 123_456})
 
@@ -190,20 +174,11 @@ defmodule Fathom.Shard.HeartbeatTest do
       _ = :sys.get_state(pid)
       assert Heartbeat.valid_for_write?(gen) == :ok
 
-      prev_storage = Application.get_env(:fathom, :shard_storage)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
       # Store clock reads 60 s ahead of the owner's — far past the 15 s bound (ttl 30 / renew 10 /
       # margin 5).
-      Application.put_env(:fathom, :heartbeat_skew_ms, 60_000)
-
-      on_exit(fn ->
-        Application.delete_env(:fathom, :heartbeat_skew_ms)
-
-        if prev_storage,
-          do: Application.put_env(:fathom, :shard_storage, prev_storage),
-          else: Application.delete_env(:fathom, :shard_storage)
-      end)
+      Env.put!(:heartbeat_skew_ms, 60_000)
 
       send(pid, :renew)
       _ = :sys.get_state(pid)
@@ -338,22 +313,13 @@ defmodule Fathom.Shard.HeartbeatTest do
   # the `acquire_gen` a heartbeat-mode coordinator would carry — never nil).
   describe "an episode's end revalidates coordinators opened during it (#8)" do
     setup do
-      prev_storage = Application.get_env(:fathom, :shard_storage)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-
-      on_exit(fn ->
-        Application.delete_env(:fathom, :faulty_renew_heartbeat)
-
-        if prev_storage,
-          do: Application.put_env(:fathom, :shard_storage, prev_storage),
-          else: Application.delete_env(:fathom, :shard_storage)
-      end)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
       :ok
     end
 
     test "acquired while lapsed: revalidates after recovery", %{pid: pid} do
-      Application.put_env(:fathom, :faulty_renew_heartbeat, fn _opts -> {:error, :store_down} end)
+      Env.put!(:faulty_renew_heartbeat, fn _opts -> {:error, :store_down} end)
 
       # The deadline passed unnoticed; the next tick edge-detects the lapse, and its renewal FAILS,
       # so the episode stays open.
@@ -387,7 +353,7 @@ defmodule Fathom.Shard.HeartbeatTest do
 
     test "acquired before the first-ever renewal: revalidates once it lands" do
       :ok = stop_supervised(Fathom.Shard.Heartbeat)
-      Application.put_env(:fathom, :faulty_renew_heartbeat, fn _opts -> {:error, :store_down} end)
+      Env.put!(:faulty_renew_heartbeat, fn _opts -> {:error, :store_down} end)
 
       owner = "firstboot_#{System.unique_integer([:positive])}@test"
 
@@ -469,30 +435,21 @@ defmodule Fathom.Shard.HeartbeatTest do
   # For the write breaker (expert review 2026-10-15 #22): the last measured owner-behind-store skew.
   describe "measured_skew_ms/0" do
     setup do
-      prev_storage = Application.get_env(:fathom, :shard_storage)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-
-      on_exit(fn ->
-        Application.delete_env(:fathom, :heartbeat_skew_ms)
-
-        if prev_storage,
-          do: Application.put_env(:fathom, :shard_storage, prev_storage),
-          else: Application.delete_env(:fathom, :shard_storage)
-      end)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
       :ok
     end
 
     test "publishes the owner-behind-store skew, clamped to >= 0", %{pid: pid} do
       # Below the 15 s self-lapse bound, so the renewal is accepted and the skew recorded.
-      Application.put_env(:fathom, :heartbeat_skew_ms, 7_000)
+      Env.put!(:heartbeat_skew_ms, 7_000)
       send(pid, :renew)
       _ = :sys.get_state(pid)
       skew = Heartbeat.measured_skew_ms()
       assert skew >= 6_900 and skew <= 7_500
 
       # Owner AHEAD of the store is not the steal direction: clamped to 0.
-      Application.put_env(:fathom, :heartbeat_skew_ms, -9_000)
+      Env.put!(:heartbeat_skew_ms, -9_000)
       send(pid, :renew)
       _ = :sys.get_state(pid)
       assert Heartbeat.measured_skew_ms() == 0
@@ -673,14 +630,7 @@ defmodule Fathom.Shard.HeartbeatTest do
     # Second observation, past the probe window, expiry unchanged. Driven by moving the window to
     # zero rather than by sleeping — the state machine takes the clock as an argument precisely so
     # no test has to wait out a real renewal cadence.
-    prev_probe = Application.get_env(:fathom, :lease_quiescence_probe_ms)
-    Application.put_env(:fathom, :lease_quiescence_probe_ms, 0)
-
-    on_exit(fn ->
-      if is_nil(prev_probe),
-        do: Application.delete_env(:fathom, :lease_quiescence_probe_ms),
-        else: Application.put_env(:fathom, :lease_quiescence_probe_ms, prev_probe)
-    end)
+    Env.put!(:lease_quiescence_probe_ms, 0)
 
     assert {:ok, %{epoch: 2, took_over: true}} =
              Storage.acquire_lease("sh34", "contender@node", 30_000),
@@ -698,7 +648,7 @@ defmodule Fathom.Shard.HeartbeatTest do
   # test and code agreed and both disagreed with prod. These two use a key that is not `node()`.
   describe "with NODE_KEY set (expert review 2026-11-07 #31)" do
     setup do
-      Fathom.Test.Env.put!(:node_key, "fathomx")
+      Env.put!(:node_key, "fathomx")
 
       inc_file = Path.join(Path.dirname(Fathom.Shard.db_path("x")), ".incarnation")
       prev_content = File.read(inc_file)
@@ -840,16 +790,7 @@ defmodule Fathom.Shard.HeartbeatTest do
   # healthy and serving. The trigger is ordinary pool contention, not a partition.
   describe "renewal is bounded and retried within its cycle (#14)" do
     setup do
-      prev_storage = Application.get_env(:fathom, :shard_storage)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-
-      on_exit(fn ->
-        Application.delete_env(:fathom, :faulty_renew_heartbeat)
-
-        if prev_storage,
-          do: Application.put_env(:fathom, :shard_storage, prev_storage),
-          else: Application.delete_env(:fathom, :shard_storage)
-      end)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
       :ok
     end
@@ -860,7 +801,7 @@ defmodule Fathom.Shard.HeartbeatTest do
       attempts = :counters.new(1, [])
 
       # Fail the first attempt, pass the second — the (a) shape exactly.
-      Application.put_env(:fathom, :faulty_renew_heartbeat, fn _opts ->
+      Env.put!(:faulty_renew_heartbeat, fn _opts ->
         n = :counters.get(attempts, 1) + 1
         :counters.add(attempts, 1, 1)
         send(test_pid, {:renew_attempt, n})
@@ -891,7 +832,7 @@ defmodule Fathom.Shard.HeartbeatTest do
     test "each attempt carries a budget well under the renewal cadence", %{pid: pid} do
       test_pid = self()
 
-      Application.put_env(:fathom, :faulty_renew_heartbeat, fn opts ->
+      Env.put!(:faulty_renew_heartbeat, fn opts ->
         send(test_pid, {:renew_opts, opts})
         :pass
       end)
@@ -917,7 +858,7 @@ defmodule Fathom.Shard.HeartbeatTest do
          %{pid: pid} do
       attempts = :counters.new(1, [])
 
-      Application.put_env(:fathom, :faulty_renew_heartbeat, fn _opts ->
+      Env.put!(:faulty_renew_heartbeat, fn _opts ->
         :counters.add(attempts, 1, 1)
         {:error, {:transient, :s3_unreachable}}
       end)

@@ -15,21 +15,15 @@ defmodule Fathom.Tenants.LocalEraserTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard
+  alias Fathom.Test.Env
   alias Fathom.Tenants.Tombstones
 
   setup do
-    prev = Application.get_env(:fathom, :shard_data_dir)
     dir = Path.join(System.tmp_dir!(), "fathom_eraser_test_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    Application.put_env(:fathom, :shard_data_dir, dir)
+    Env.put!(:shard_data_dir, dir)
 
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :shard_data_dir),
-        else: Application.put_env(:fathom, :shard_data_dir, prev)
-
-      File.rm_rf(dir)
-    end)
+    on_exit(fn -> File.rm_rf(dir) end)
 
     %{dir: dir}
   end
@@ -120,7 +114,7 @@ defmodule Fathom.Tenants.LocalEraserTest do
 
     not_a_dir = Path.join(dir, "notadir")
     File.write!(not_a_dir, "")
-    Application.put_env(:fathom, :shard_data_dir, not_a_dir)
+    Env.put!(:shard_data_dir, not_a_dir)
 
     me = self()
 

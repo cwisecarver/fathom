@@ -22,6 +22,7 @@ defmodule Fathom.Shard.LineageTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Env
 
   describe "next_lineage/1 — the seed arithmetic" do
     test "a shard nothing has ever flushed starts at 1" do
@@ -81,14 +82,9 @@ defmodule Fathom.Shard.LineageTest do
     setup do
       root = Path.join(System.tmp_dir!(), "lineage_#{System.unique_integer([:positive])}")
       File.mkdir_p!(root)
-      prev = Application.get_env(:fathom, Fathom.Shard.Storage.Local)
-      Application.put_env(:fathom, Fathom.Shard.Storage.Local, dir: root)
+      Env.put!(:fathom, Fathom.Shard.Storage.Local, dir: root)
 
       on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, Fathom.Shard.Storage.Local),
-          else: Application.put_env(:fathom, Fathom.Shard.Storage.Local, prev)
-
         File.rm_rf(root)
       end)
 

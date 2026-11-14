@@ -37,6 +37,7 @@ defmodule Fathom.ShardKillCleanupTest do
   """
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.Env
   alias Fathom.Test.FlushGateScope
 
   alias Fathom.Shard.FlushGate
@@ -129,9 +130,7 @@ defmodule Fathom.ShardKillCleanupTest do
   #
   # NOT HELD PAST DEATH: the walk itself now validates liveness and forgets the row.
   test "an LRU row for a killed coordinator does not survive the next eviction walk", %{id: id} do
-    prev_cap = Application.get_env(:fathom, :max_open_shards)
-    on_exit(fn -> restore(:max_open_shards, prev_cap) end)
-    Application.put_env(:fathom, :max_open_shards, 10_000)
+    Env.put!(:max_open_shards, 10_000)
 
     Lru.reset()
     _ = open_and_kill!(id)
@@ -159,11 +158,8 @@ defmodule Fathom.ShardKillCleanupTest do
   # calling it directly rather than waiting out the sweep interval — the timer firing is not the
   # property under test, reclaiming from a dead holder is.
   test "a flush slot held by a dead process is reclaimed", %{id: _id} do
-    prev = Application.get_env(:fathom, :shard_flush_max_concurrency)
-    on_exit(fn -> restore(:shard_flush_max_concurrency, prev) end)
-
     FlushGate.reset()
-    Application.put_env(:fathom, :shard_flush_max_concurrency, 1)
+    Env.put!(:shard_flush_max_concurrency, 1)
 
     # A holder that dies without releasing — exactly what a killed coordinator is. The acquire has
     # to happen INSIDE the doomed process, because `try_acquire/0` records the CALLER as the
@@ -226,9 +222,7 @@ defmodule Fathom.ShardKillCleanupTest do
   # call in `open_with_lease/8`.
   test "a killed coordinator's ShardLoad row survives, and is cleared by the next graceful stop",
        %{id: id} do
-    prev = Application.get_env(:fathom, :shard_load)
-    on_exit(fn -> restore(:shard_load, prev) end)
-    Application.put_env(:fathom, :shard_load, true)
+    Env.put!(:shard_load, true)
 
     Fathom.ShardLoad.reset()
     _ = open_and_kill!(id)
@@ -250,7 +244,4 @@ defmodule Fathom.ShardKillCleanupTest do
     refute Fathom.ShardLoad.get(id),
            "a graceful stop must clear the row — it is the only thing that bounds the leak"
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, val), do: Application.put_env(:fathom, key, val)
 end

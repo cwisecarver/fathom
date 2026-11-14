@@ -30,23 +30,17 @@ defmodule Fathom.Shard.Replication.FollowerRebootTornTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Test.Await
+  alias Fathom.Test.Env
 
   @lineage 7
 
   setup do
     root = Path.join(System.tmp_dir!(), "reboottorn_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
-    prev = Application.get_env(:fathom, :replication_boot_id_path)
     boot_file = Path.join(root, "boot_id")
-    Application.put_env(:fathom, :replication_boot_id_path, boot_file)
+    Env.put!(:replication_boot_id_path, boot_file)
 
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :replication_boot_id_path),
-        else: Application.put_env(:fathom, :replication_boot_id_path, prev)
-
-      File.rm_rf(root)
-    end)
+    on_exit(fn -> File.rm_rf(root) end)
 
     src = Path.join(root, "src.db")
     {:ok, conn} = Connection.open(src)
@@ -178,18 +172,7 @@ defmodule Fathom.Shard.Replication.FollowerRebootTornTest do
   describe "the marker pass is off the init path (#72)" do
     setup ctx do
       test_pid = self()
-      keys = [:replication_reboot_mark_hook, :replication_reboot_pass_retry_ms]
-      prev = for k <- keys, do: {k, Application.get_env(:fathom, k)}
-
-      on_exit(fn ->
-        for {k, v} <- prev do
-          if is_nil(v),
-            do: Application.delete_env(:fathom, k),
-            else: Application.put_env(:fathom, k, v)
-        end
-      end)
-
-      Application.put_env(:fathom, :replication_reboot_pass_retry_ms, 10)
+      Env.put!(:replication_reboot_pass_retry_ms, 10)
 
       # Blocks the pass on every replica until the test releases it. `:release` is re-queued to the
       # pass's own mailbox so one message frees every later replica too.
@@ -210,7 +193,7 @@ defmodule Fathom.Shard.Replication.FollowerRebootTornTest do
     end
 
     test "init returns before any marker is written; every replica reads torn meanwhile", ctx do
-      Application.put_env(:fathom, :replication_reboot_mark_hook, ctx.gate)
+      Env.put!(:replication_reboot_mark_hook, ctx.gate)
       {name, _pid} = start!(ctx)
 
       # The pass is stopped at its first replica: `start!/1` returned, so init did not wait for it.
@@ -237,7 +220,7 @@ defmodule Fathom.Shard.Replication.FollowerRebootTornTest do
     end
 
     test "a replica seeded while the pass is pending stays whole and is never marked", ctx do
-      Application.put_env(:fathom, :replication_reboot_mark_hook, ctx.gate)
+      Env.put!(:replication_reboot_mark_hook, ctx.gate)
       {name, _pid} = start!(ctx)
       assert_receive {:marking, pass, _}, 5_000
 
@@ -260,7 +243,7 @@ defmodule Fathom.Shard.Replication.FollowerRebootTornTest do
 
     test "a follower stopped mid-pass does not record the boot, so the next start holds again",
          ctx do
-      Application.put_env(:fathom, :replication_reboot_mark_hook, ctx.gate)
+      Env.put!(:replication_reboot_mark_hook, ctx.gate)
       {name, _pid} = start!(ctx)
       assert_receive {:marking, pass, _}, 5_000
       ref = Process.monitor(pass)
@@ -288,7 +271,7 @@ defmodule Fathom.Shard.Replication.FollowerRebootTornTest do
         end
       end
 
-      Application.put_env(:fathom, :replication_reboot_mark_hook, flaky)
+      Env.put!(:replication_reboot_mark_hook, flaky)
       {name, pid} = start!(ctx)
       ref = Process.monitor(pid)
 

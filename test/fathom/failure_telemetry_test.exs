@@ -10,6 +10,7 @@ defmodule Fathom.FailureTelemetryTest do
   @moduletag :capture_log
 
   alias Fathom.{HranaAuth, ShardExecutor, Shards}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   defp attach(event) do
@@ -33,7 +34,6 @@ defmodule Fathom.FailureTelemetryTest do
       shard = "ft_#{System.unique_integer([:positive])}"
 
       on_exit(fn ->
-        for key <- [:query_timeout_ms, :query_max_rows], do: Application.delete_env(:fathom, key)
         Shards.drain(shard, 2_000)
 
         for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
@@ -55,7 +55,7 @@ defmodule Fathom.FailureTelemetryTest do
     end
 
     test "timeout", %{h: h} do
-      Application.put_env(:fathom, :query_timeout_ms, 50)
+      Env.put!(:query_timeout_ms, 50)
 
       slow =
         "WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM r WHERE x < 100000000) " <>
@@ -73,7 +73,7 @@ defmodule Fathom.FailureTelemetryTest do
       for i <- 1..5,
           do: {:ok, _} = ShardExecutor.execute(h, stmt("INSERT INTO t VALUES (?)", [i]))
 
-      Application.put_env(:fathom, :query_max_rows, 2)
+      Env.put!(:query_max_rows, 2)
 
       assert {:error, %Filo.Error{code: "FILO_RESULT_TOO_LARGE"}} =
                ShardExecutor.execute(h, stmt("SELECT v FROM t"))
@@ -108,14 +108,7 @@ defmodule Fathom.FailureTelemetryTest do
 
   describe "hrana auth rejection" do
     setup do
-      prev = Application.get_env(:fathom, :hrana_auth, :disabled)
-      prev_age = Application.get_env(:fathom, :hrana_token_max_age, :infinity)
-      Application.put_env(:fathom, :hrana_auth, :required)
-
-      on_exit(fn ->
-        Application.put_env(:fathom, :hrana_auth, prev)
-        Application.put_env(:fathom, :hrana_token_max_age, prev_age)
-      end)
+      Env.put!(:hrana_auth, :required)
 
       attach([:fathom, :hrana, :auth, :rejected])
       :ok
@@ -134,7 +127,7 @@ defmodule Fathom.FailureTelemetryTest do
     end
 
     test "each denial is classified, and every wire error is the same 401 code" do
-      Application.put_env(:fathom, :hrana_token_max_age, 60)
+      Env.put!(:hrana_token_max_age, 60)
       expired = token!("acme", signed_at: System.system_time(:second) - 3600)
       other_shard = token!("globex")
       revoked_shard = "ft-revoked-#{System.unique_integer([:positive])}"

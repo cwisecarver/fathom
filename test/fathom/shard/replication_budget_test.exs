@@ -23,12 +23,12 @@ defmodule Fathom.Shard.ReplicationBudgetTest do
 
   alias Fathom.Shard.Replication.Budget
   alias Fathom.Shard.Replication.Fleet
+  alias Fathom.Test.Env
 
   @cap 10_000
 
   setup do
-    prev_cap = Application.get_env(:fathom, :replication_max_queue_bytes)
-    Application.put_env(:fathom, :replication_max_queue_bytes, @cap)
+    Env.put!(:replication_max_queue_bytes, @cap)
 
     # `Budget.queued/0` sums over the shippers Fleet publishes, so the fleet view IS part of the
     # unit under test — a name with a counter that Fleet does not publish must not count.
@@ -40,12 +40,6 @@ defmodule Fathom.Shard.ReplicationBudgetTest do
     on_exit(fn ->
       for n <- names, do: Budget.forget(n)
       Fleet.publish([])
-
-      if prev_cap do
-        Application.put_env(:fathom, :replication_max_queue_bytes, prev_cap)
-      else
-        Application.delete_env(:fathom, :replication_max_queue_bytes)
-      end
     end)
 
     %{names: names, a: Enum.at(names, 0), b: Enum.at(names, 1), c: Enum.at(names, 2)}
@@ -114,7 +108,7 @@ defmodule Fathom.Shard.ReplicationBudgetTest do
 
   describe "the bound can be switched off" do
     test "cap 0 disables it and reserves nothing", %{a: a} do
-      Application.put_env(:fathom, :replication_max_queue_bytes, 0)
+      Env.put!(:replication_max_queue_bytes, 0)
 
       assert {:ok, 0} = Budget.reserve(a, 5_000_000)
       assert Budget.queued(a) == 0

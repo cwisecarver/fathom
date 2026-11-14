@@ -16,25 +16,23 @@ defmodule Fathom.ShardIdleOnOpenTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   setup do
-    prev = Application.get_env(:fathom, :shard_idle_ms)
-    # Low idle so the open-armed timer fires quickly. Per AGENTS.md this is the deterministic knob
-    # for idle-timing tests, not a Process.sleep.
-    Application.put_env(:fathom, :shard_idle_ms, 50)
     id = "idleopen_#{System.unique_integer([:positive])}"
 
+    # Registered BEFORE the env write below, so the env is restored first and the drain runs after.
     on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
-
       Shards.drain(id, 2_000)
 
       for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
           path <- Path.wildcard(Path.join(dir, "#{id}*")),
           do: File.rm(path)
     end)
+
+    # Low idle so the open-armed timer fires quickly. Per AGENTS.md this is the deterministic knob
+    # for idle-timing tests, not a Process.sleep.
+    Env.put!(:shard_idle_ms, 50)
 
     %{id: id}
   end

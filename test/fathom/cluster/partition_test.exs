@@ -6,19 +6,13 @@ defmodule Fathom.Cluster.PartitionTest do
   # Fault injected via Fathom.Test.FaultyStorage. Helpers + setup from Fathom.ClusterShardCase.
   use Fathom.ClusterShardCase
 
+  alias Fathom.Test.Env
   alias Fathom.Test.FaultyStorage
 
   setup do
-    prev = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, FaultyStorage)
+    Env.put!(:shard_storage, FaultyStorage)
 
-    on_exit(fn ->
-      Application.delete_env(:fathom, :storage_fault)
-
-      if prev,
-        do: Application.put_env(:fathom, :shard_storage, prev),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    on_exit(fn -> Application.delete_env(:fathom, :storage_fault) end)
 
     :ok
   end
@@ -37,9 +31,9 @@ defmodule Fathom.Cluster.PartitionTest do
 
   test "a TRANSIENT renew failure does not fence a serving shard (a blip is not loss of ownership)",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     # Short TTL so renewal fires several times inside the window below.
-    Application.put_env(:fathom, :shard_lease_ttl_ms, 60)
+    Env.put!(:shard_lease_ttl_ms, 60)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, coordinator} = Shards.ensure(shard)

@@ -10,22 +10,16 @@ defmodule Fathom.Shard.TempReaperMemoryBenchTest do
   @moduletag timeout: 600_000
 
   alias Fathom.Shard.TempReaper
+  alias Fathom.Test.Env
 
   @stubs 400_000
 
   test "reaper memory after sweeping #{@stubs} entries" do
-    prev = Application.get_env(:fathom, :shard_data_dir)
     dir = Path.join(System.tmp_dir!(), "fathom_reaper_mem_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    Application.put_env(:fathom, :shard_data_dir, dir)
+    Env.put!(:shard_data_dir, dir)
 
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :shard_data_dir),
-        else: Application.put_env(:fathom, :shard_data_dir, prev)
-
-      File.rm_rf(dir)
-    end)
+    on_exit(fn -> File.rm_rf(dir) end)
 
     start_supervised!(TempReaper)
     _ = TempReaper.sweep()

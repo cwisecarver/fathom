@@ -12,19 +12,17 @@ defmodule Fathom.Shard.Storage.S3CorruptLockTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Mix.Tasks.Fathom.Lock.Repair
 
   @shard "s23corrupt"
   @garbage ~s({"owner": "node_x", "epoch": 7, "expires_at_)
 
   setup do
-    prev = Application.get_env(:fathom, S3)
-    prev_backend = Application.get_env(:fathom, :shard_storage)
-
     store =
       start_supervised!({Agent, fn -> %{lock: %{body: @garbage, etag: ~s("c1")}, puts: 0} end})
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -34,17 +32,7 @@ defmodule Fathom.Shard.Storage.S3CorruptLockTest do
       req_plug: fn conn -> serve(conn, store) end
     )
 
-    Application.put_env(:fathom, :shard_storage, S3)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-
-      if prev_backend,
-        do: Application.put_env(:fathom, :shard_storage, prev_backend),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:shard_storage, S3)
 
     %{store: store}
   end

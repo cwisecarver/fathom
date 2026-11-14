@@ -19,27 +19,22 @@ defmodule Fathom.Shard.RetainedTest do
   alias Fathom.{Shard, ShardExecutor, Shards, Tenants}
   alias Fathom.Shard.{Heartbeat, Provenance, Retained, Storage, WriteCounter}
   alias Fathom.Tenants.Tombstones
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
 
   setup do
     id = "retain_#{System.unique_integer([:positive])}"
-    prev_budget = Application.get_env(:fathom, :shard_retain_local_bytes)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_retain_local_bytes, 64 * 1024 * 1024)
+    Env.put!(:shard_retain_local_bytes, 64 * 1024 * 1024)
     # These fixtures are KiB-sized; the replication-off default floor (1 MiB, expert review
     # 2026-10-22 r8 #26) would refuse them. The floor has its own tests (retained_reopen_test).
-    prev_floor = Application.get_env(:fathom, :shard_retain_min_bytes)
-    Application.put_env(:fathom, :shard_retain_min_bytes, 0)
-    on_exit(fn -> restore_env(:shard_retain_min_bytes, prev_floor) end)
+    Env.put!(:shard_retain_min_bytes, 0)
     # Pin the idle timer high: an idle stop racing an assertion would answer for the coordinator.
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_idle_ms, 600_000)
     forget_index!()
 
     on_exit(fn ->
-      restore_env(:shard_retain_local_bytes, prev_budget)
-      restore_env(:shard_idle_ms, prev_idle)
       :ets.delete(Tombstones, id)
 
       for shard <- [id, id <> "dst"] do
@@ -59,9 +54,6 @@ defmodule Fathom.Shard.RetainedTest do
     Retained.reconcile([], Shard.data_dir())
     _ = Retained.stats()
   end
-
-  defp restore_env(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore_env(key, value), do: Application.put_env(:fathom, key, value)
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
 
@@ -232,15 +224,8 @@ defmodule Fathom.Shard.RetainedTest do
   end
 
   defp faulty_storage!(id, etag_fault) do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :faulty_object_etag, {id, etag_fault})
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_object_etag)
-      Application.delete_env(:fathom, :storage_fault)
-      restore_env(:shard_storage, prev_storage)
-    end)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:faulty_object_etag, {id, etag_fault})
   end
 
   defp assert_opened_mode!(id, mode) do
@@ -295,7 +280,7 @@ defmodule Fathom.Shard.RetainedTest do
       set_mode!(unquote(mode))
       stage_moved_lineage!(id, path)
       faulty_storage!(id, {:error, :timeout})
-      Application.put_env(:fathom, :storage_fault, :pull)
+      Env.put!(:storage_fault, :pull)
 
       assert {:error, _} = ShardExecutor.open(id),
              "an open served a retained copy it could not verify against the store"

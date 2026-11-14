@@ -30,37 +30,29 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
   alias Fathom.Shard.Storage
   alias Fathom.ShardExecutor
   alias Fathom.Shards
-
-  @env [
-    :replication_promote_on_open,
-    :replication_recover_from_peers,
-    :replication_followers,
-    :replication_recovery_peers,
-    :replication_quorum,
-    :replication_recovery_underquorum_window_ms,
-    :replication_recovery_refusal_ttl_ms,
-    :replication_lineage_wire,
-    :replication_ordinal_wire
-  ]
+  alias Fathom.Test.Env
 
   setup do
     id = "underq_#{System.unique_integer([:positive])}"
     dir = Path.join(System.tmp_dir!(), "underq_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
 
-    prev = Map.new(@env, &{&1, Application.get_env(:fathom, &1)})
     prev_running = Fleet.running()
+
+    Env.put!(:replication_promote_on_open, true)
+    Env.put!(:replication_recover_from_peers, true)
+    Env.put!(:replication_quorum, 2)
+    Env.put!(:replication_recovery_underquorum_window_ms, 60_000)
+    # These tests retry a refusal to watch each attempt reach the floor, so the checkout negative
+    # cache (expert review 2026-10-13 #11, `Recovery.recent_refusal/2`) is off here; it is covered
+    # in `open_crash_safety_test.exs`.
+    Env.put!(:replication_recovery_refusal_ttl_ms, 0)
+    Env.put!(:replication_lineage_wire, true)
+    Env.put!(:replication_ordinal_wire, true)
 
     on_exit(fn ->
       Shards.stop(id)
       Fleet.publish(prev_running)
-
-      for {k, v} <- prev do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
-
       File.rm_rf(dir)
       for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(Fathom.Shard.db_path(id) <> s)
     end)
@@ -69,17 +61,6 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
 
     # The default-named follower, because that is the one a coordinator looks for.
     start_supervised!({Follower, name: Follower, port: 0, dir: dir})
-
-    Application.put_env(:fathom, :replication_promote_on_open, true)
-    Application.put_env(:fathom, :replication_recover_from_peers, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-    Application.put_env(:fathom, :replication_recovery_underquorum_window_ms, 60_000)
-    # These tests retry a refusal to watch each attempt reach the floor, so the checkout negative
-    # cache (expert review 2026-10-13 #11, `Recovery.recent_refusal/2`) is off here; it is covered
-    # in `open_crash_safety_test.exs`.
-    Application.put_env(:fathom, :replication_recovery_refusal_ttl_ms, 0)
-    Application.put_env(:fathom, :replication_lineage_wire, true)
-    Application.put_env(:fathom, :replication_ordinal_wire, true)
 
     # The peer set comes from config, never from a shipper set an earlier test left published.
     Fleet.publish([])
@@ -103,7 +84,7 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
     {"live_#{name}", "127.0.0.1", port}
   end
 
-  defp peers!(peers), do: Application.put_env(:fathom, :replication_followers, peers)
+  defp peers!(peers), do: Env.put!(:replication_followers, peers)
 
   # A real peer whose replica of `id` is TORN: seeded, then fenced for a promotion, which is the
   # same `torn: true` row a checkpoint-reset leaves behind.
@@ -407,7 +388,7 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
       # the object. Over every other node it needs 3, and 2 is not enough.
       peers!([live(), dead(1), dead(2)])
 
-      Application.put_env(:fathom, :replication_recovery_peers, [
+      Env.put!(:replication_recovery_peers, [
         live(),
         dead(3),
         dead(4),
@@ -421,7 +402,7 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
     test "unset, recovery asks this node's own followers, as before", %{id: id} do
       peers = [live(), dead(1), dead(2)]
       peers!(peers)
-      Application.delete_env(:fathom, :replication_recovery_peers)
+      Env.delete!(:replication_recovery_peers)
 
       assert Recovery.peers() == peers
       assert :none = Recovery.best_replica(id, @stamp, quorum: 2)
@@ -461,17 +442,8 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
 
   describe "a failed decision HEAD does not fail open (try_promote_from_fleet)" do
     setup %{id: id} do
-      prev_storage = Application.get_env(:fathom, :shard_storage)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-      Application.put_env(:fathom, :storage_fault, :object_head)
-
-      on_exit(fn ->
-        Application.delete_env(:fathom, :storage_fault)
-
-        if prev_storage,
-          do: Application.put_env(:fathom, :shard_storage, prev_storage),
-          else: Application.delete_env(:fathom, :shard_storage)
-      end)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:storage_fault, :object_head)
 
       path = Path.join(System.tmp_dir!(), "headerr_#{id}.db")
       File.write!(path, "stand-in for the cold-pulled object")
@@ -575,7 +547,7 @@ defmodule Fathom.Shard.RecoveryUnderquorumTest do
     build_and_lose_primary(id)
     attach_telemetry(id)
     peers!([dead(1), dead(2), dead(3), dead(4)])
-    Application.put_env(:fathom, :replication_recover_from_peers, false)
+    Env.put!(:replication_recover_from_peers, false)
 
     assert read_rows(id) == [1, 2, 3]
     refute_received {:underquorum, _, _}

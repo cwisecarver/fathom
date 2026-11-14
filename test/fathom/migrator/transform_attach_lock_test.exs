@@ -29,6 +29,7 @@ defmodule Fathom.Migrator.TransformAttachLockTest do
   alias Fathom.Migrator
   alias Fathom.Migrator.Release
   alias Fathom.Repo
+  alias Fathom.Test.Env
 
   defmodule Backfill do
     @moduledoc false
@@ -39,8 +40,7 @@ defmodule Fathom.Migrator.TransformAttachLockTest do
 
   setup do
     real_conn!()
-    prev = Application.get_env(:fathom, :migration_transforms)
-    Application.put_env(:fathom, :migration_transforms, [Backfill])
+    Env.put!(:migration_transforms, [Backfill])
 
     # Far above anything another test creates, and unique per run.
     version = 900_000 + System.unique_integer([:positive])
@@ -52,10 +52,6 @@ defmodule Fathom.Migrator.TransformAttachLockTest do
       real_conn!()
       Repo.delete_all(from(r in Release, where: r.version == ^version))
       Repo.delete_all(from(s in Shard, where: s.shard_id == ^shard_id))
-
-      if prev,
-        do: Application.put_env(:fathom, :migration_transforms, prev),
-        else: Application.delete_env(:fathom, :migration_transforms)
 
       try do
         Fathom.Migrator.HeadCache.refresh()

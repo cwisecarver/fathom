@@ -8,6 +8,7 @@ defmodule Fathom.Shard.Storage.S3ReleaseClaimTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   @shard "shard_rc"
@@ -15,10 +16,8 @@ defmodule Fathom.Shard.Storage.S3ReleaseClaimTest do
 
   setup do
     store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{"shard_rc.db" => "bytes"}) end})
-    prev = Application.get_env(:fathom, S3)
-    prev_repl = Application.get_env(:fathom, :replication_enabled)
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -27,16 +26,6 @@ defmodule Fathom.Shard.Storage.S3ReleaseClaimTest do
       path_style: true,
       req_plug: fn conn -> S3EtagStore.serve(conn, store) end
     )
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-
-      if is_nil(prev_repl),
-        do: Application.delete_env(:fathom, :replication_enabled),
-        else: Application.put_env(:fathom, :replication_enabled, prev_repl)
-    end)
 
     %{store: store}
   end
@@ -65,7 +54,7 @@ defmodule Fathom.Shard.Storage.S3ReleaseClaimTest do
     assert S3.lease_holder(@shard) == :free
     assert S3.check_lease(@shard, a) == {:error, :superseded}
 
-    Application.put_env(:fathom, :replication_enabled, true)
+    Env.put!(:replication_enabled, true)
     assert {:ok, b} = S3.acquire_lease(@shard, "b@node#2", 30_000)
     assert b.took_over
     assert b.claim > 5, "the next owner must claim above the released holder's lineage"

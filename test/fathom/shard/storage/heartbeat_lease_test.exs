@@ -20,22 +20,16 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.Local
+  alias Fathom.Test.Env
 
   @ttl 30_000
 
   setup do
     # Isolate each test in its own remote dir so locks/heartbeats never collide.
     dir = Path.join(System.tmp_dir!(), "fathom_hb_#{System.unique_integer([:positive])}")
-    prev = Application.get_env(:fathom, Fathom.Shard.Storage.Local)
-    Application.put_env(:fathom, Fathom.Shard.Storage.Local, dir: dir)
+    Env.put!(Local, dir: dir)
 
-    on_exit(fn ->
-      File.rm_rf!(dir)
-
-      if prev,
-        do: Application.put_env(:fathom, Fathom.Shard.Storage.Local, prev),
-        else: Application.delete_env(:fathom, Fathom.Shard.Storage.Local)
-    end)
+    on_exit(fn -> File.rm_rf!(dir) end)
 
     %{dir: dir, shard: "s_#{System.unique_integer([:positive])}", a: "node_a", b: "node_b"}
   end
@@ -277,17 +271,8 @@ defmodule Fathom.Shard.Storage.HeartbeatLeaseTest do
 
     # b's node is partitioned from the store and can't read a's heartbeat. It must
     # NOT steal on uncertainty (that would create two owners) — it fails closed.
-    prev = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :storage_fault, :read_heartbeat)
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :storage_fault)
-
-      if prev,
-        do: Application.put_env(:fathom, :shard_storage, prev),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:storage_fault, :read_heartbeat)
 
     assert {:error, {:transient_lookup, _}} = Storage.acquire_lease(shard, b, @ttl)
     # No steal happened: a still holds {a, epoch 1} (a steal would have bumped it).

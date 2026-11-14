@@ -19,6 +19,7 @@ defmodule Fathom.Migrator.ShardMigrationReplicaTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Promote
   alias Fathom.{Directory, Migrator}
+  alias Fathom.Test.Env
 
   @v2_statements [
     "ALTER TABLE app_thing ADD COLUMN created_at TEXT",
@@ -33,13 +34,7 @@ defmodule Fathom.Migrator.ShardMigrationReplicaTest do
     dir = Path.join(System.tmp_dir!(), "migrep_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
 
-    prev = Application.get_env(:fathom, :replication_promote_on_open)
-
     on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :replication_promote_on_open),
-        else: Application.put_env(:fathom, :replication_promote_on_open, prev)
-
       File.rm_rf(dir)
 
       for path <- Path.wildcard(Path.join(Storage.Local.dir(), "#{shard}*")), do: File.rm(path)
@@ -155,7 +150,7 @@ defmodule Fathom.Migrator.ShardMigrationReplicaTest do
   test "run: promote-on-open off means a client open would not promote, so do not defer",
        %{shard: shard} = ctx do
     start_follower(ctx)
-    Application.put_env(:fathom, :replication_promote_on_open, false)
+    Env.put!(:replication_promote_on_open, false)
     seed_stamped_v1!(shard)
     {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
     seed_replica!(shard, 1)

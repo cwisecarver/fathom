@@ -13,6 +13,7 @@ defmodule Fathom.RestoreDrillJobTest do
   alias Fathom.Directory.Shard, as: DirShard
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
   alias Filo.Stmt
 
@@ -20,10 +21,8 @@ defmodule Fathom.RestoreDrillJobTest do
 
   setup do
     id = "drill_#{System.unique_integer([:positive])}"
-    prev_sample = Application.get_env(:fathom, :restore_drill_sample)
 
     on_exit(fn ->
-      restore(:restore_drill_sample, prev_sample)
       Shards.drain(id, 2_000)
 
       for dir <- [remote_dir(), Fathom.Shard.data_dir()],
@@ -34,18 +33,13 @@ defmodule Fathom.RestoreDrillJobTest do
     %{id: id}
   end
 
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
-
   # Point the storage backend at the S3EtagStore HTTP mock so the REAL S3 backend runs. A steal
   # sentinel is an S3-only concept (Local never returns {:absent, etag}, storage_contract.ex:39),
   # so this is the only way to plant one — via the steal path, exactly as s3_sentinel_test does.
   defp start_s3_store(objects) do
     store = start_supervised!({Agent, fn -> S3EtagStore.initial(objects) end})
-    prev_s3 = Application.get_env(:fathom, S3)
-    prev_backend = Application.get_env(:fathom, :shard_storage)
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -55,15 +49,7 @@ defmodule Fathom.RestoreDrillJobTest do
       req_plug: fn conn -> S3EtagStore.serve(conn, store) end
     )
 
-    Application.put_env(:fathom, :shard_storage, S3)
-
-    on_exit(fn ->
-      restore(:shard_storage, prev_backend)
-
-      if prev_s3,
-        do: Application.put_env(:fathom, S3, prev_s3),
-        else: Application.delete_env(:fathom, S3)
-    end)
+    Env.put!(:shard_storage, S3)
 
     store
   end
@@ -94,12 +80,6 @@ defmodule Fathom.RestoreDrillJobTest do
     # maximum pressure had only ever executed in unit tests. "A backup you haven't restored is a
     # hypothesis" was the drill's own framing; this closes the gap between verifying a file and
     # rehearsing the recovery.
-    setup do
-      prev = Application.get_env(:fathom, :restore_drill_full_sample)
-      on_exit(fn -> restore(:restore_drill_full_sample, prev) end)
-      :ok
-    end
-
     test "restores a sampled shard to a scratch tenant and matches its row counts", %{id: id} do
       seed(id, [
         "CREATE TABLE kv (v TEXT)",
@@ -194,7 +174,7 @@ defmodule Fathom.RestoreDrillJobTest do
     # the read-only drill costs a GET. Raising read-only coverage must not silently multiply that.
     test "it is inert unless :restore_drill_full_sample is set", %{id: id} do
       seed(id, ["CREATE TABLE kv (v TEXT)"])
-      Application.delete_env(:fathom, :restore_drill_full_sample)
+      Env.delete!(:restore_drill_full_sample)
 
       before = drill_scratch_rows()
       assert :ok = perform_job(RestoreDrillJob, %{})
@@ -271,20 +251,15 @@ defmodule Fathom.RestoreDrillJobTest do
         nil
       )
 
-      prev_storage = Application.get_env(:fathom, :shard_storage)
+      # Make list_snapshots/1 fail the way a bucket-policy change does. FaultyStorage delegates
+      # everything else to Local, so the seeded object above is still the one the drill pulls.
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
       on_exit(fn ->
         :telemetry.detach(handler)
         Application.delete_env(:fathom, :storage_list_snapshots_error)
-
-        if is_nil(prev_storage),
-          do: Application.delete_env(:fathom, :shard_storage),
-          else: Application.put_env(:fathom, :shard_storage, prev_storage)
       end)
 
-      # Make list_snapshots/1 fail the way a bucket-policy change does. FaultyStorage delegates
-      # everything else to Local, so the seeded object above is still the one the drill pulls.
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
       Application.put_env(:fathom, :storage_list_snapshots_error, {:s3_list_status, 403})
 
       assert {:ok, _} = RestoreDrillJob.run_drill(5)
@@ -587,7 +562,7 @@ defmodule Fathom.RestoreDrillJobTest do
   end
 
   test "perform is a no-op when :restore_drill_sample is unset (gated off)", %{id: id} do
-    Application.delete_env(:fathom, :restore_drill_sample)
+    Env.delete!(:restore_drill_sample)
     seed(id, ["CREATE TABLE t (v TEXT)"])
 
     ref = attach()
@@ -676,12 +651,6 @@ defmodule Fathom.RestoreDrillJobTest do
   # shard has a deadline; the hung one is killed, recorded as an error (durably), and the rest are
   # verified.
   describe "a hung shard does not stall the drill (expert review 2026-10-13 #26)" do
-    setup do
-      keys = [:shard_storage, :faulty_before, :restore_drill_shard_timeout_ms]
-      prev = for k <- keys, do: {k, Application.get_env(:fathom, k)}
-      on_exit(fn -> for {k, v} <- prev, do: restore(k, v) end)
-    end
-
     test "the run completes, verifies the others, and records the hung one as :error", %{id: id} do
       hung = id <> "_hung"
 
@@ -693,15 +662,14 @@ defmodule Fathom.RestoreDrillJobTest do
       for sid <- [id, hung],
           do: seed(sid, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
 
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:pull, fn sid -> if sid == hung, do: Process.sleep(60_000) end}
       )
 
-      Application.put_env(:fathom, :restore_drill_shard_timeout_ms, 300)
+      Env.put!(:restore_drill_shard_timeout_ms, 300)
 
       t0 = System.monotonic_time(:millisecond)
       assert {:ok, summary} = RestoreDrillJob.run_drill(10)
@@ -721,15 +689,7 @@ defmodule Fathom.RestoreDrillJobTest do
     test "a saturated gate holds the verify back until a permit frees up", %{id: id} do
       seed(id, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
 
-      prev = Application.fetch_env(:fathom, :background_scan_permits)
-      Application.put_env(:fathom, :background_scan_permits, 1)
-
-      on_exit(fn ->
-        case prev do
-          {:ok, v} -> Application.put_env(:fathom, :background_scan_permits, v)
-          :error -> Application.delete_env(:fathom, :background_scan_permits)
-        end
-      end)
+      Env.put!(:background_scan_permits, 1)
 
       test_pid = self()
 
@@ -767,12 +727,8 @@ defmodule Fathom.RestoreDrillJobTest do
          %{id: id} do
       seed(id, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
 
-      keys = [:background_scan_permits, :restore_drill_shard_timeout_ms]
-      prev = for k <- keys, do: {k, Application.get_env(:fathom, k)}
-      on_exit(fn -> for {k, v} <- prev, do: restore(k, v) end)
-
-      Application.put_env(:fathom, :background_scan_permits, 1)
-      Application.put_env(:fathom, :restore_drill_shard_timeout_ms, 2_000)
+      Env.put!(:background_scan_permits, 1)
+      Env.put!(:restore_drill_shard_timeout_ms, 2_000)
 
       test_pid = self()
 

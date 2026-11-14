@@ -19,21 +19,13 @@ defmodule Fathom.Shard.StmtCacheBytesTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Env
 
   @wide_cols 29
 
   setup do
     path = Path.join(System.tmp_dir!(), "stmtbytes_#{System.unique_integer([:positive])}.db")
     on_exit(fn -> for s <- ["", "-wal", "-shm"], do: File.rm(path <> s) end)
-
-    prev = Application.fetch_env(:fathom, :stmt_cache_bytes)
-
-    on_exit(fn ->
-      case prev do
-        {:ok, v} -> Application.put_env(:fathom, :stmt_cache_bytes, v)
-        :error -> Application.delete_env(:fathom, :stmt_cache_bytes)
-      end
-    end)
 
     {:ok, path: path}
   end
@@ -88,7 +80,7 @@ defmodule Fathom.Shard.StmtCacheBytesTest do
     assert one > 4096, "precondition: a wide statement measured only #{one} bytes"
 
     budget = 4 * one + div(one, 2)
-    Application.put_env(:fathom, :stmt_cache_bytes, budget)
+    Env.put!(:stmt_cache_bytes, budget)
 
     for i <- 1..20 do
       {:ok, r} = Connection.query(conn, wide_sql(i), [1])
@@ -104,14 +96,14 @@ defmodule Fathom.Shard.StmtCacheBytesTest do
     assert map_size(cache) < 20
 
     # Without the byte bound the same workload keeps every statement (the count cap is 64).
-    Application.put_env(:fathom, :stmt_cache_bytes, nil)
+    Env.put!(:stmt_cache_bytes, nil)
     for i <- 21..40, do: {:ok, _} = Connection.query(conn, wide_sql(i), [1])
     assert bytes(conn) > budget
     Connection.close(conn)
   end
 
   test "a statement wider than the whole budget still caches", %{path: path} do
-    Application.put_env(:fathom, :stmt_cache_bytes, 1)
+    Env.put!(:stmt_cache_bytes, 1)
     conn = open_wide(path)
     {:ok, _} = Connection.query(conn, wide_sql(1), [1])
     {:ok, _} = Connection.query(conn, wide_sql(2), [1])
@@ -123,15 +115,7 @@ defmodule Fathom.Shard.StmtCacheBytesTest do
   test "without the extension the size is estimated from the SQL, keeping the bound", %{
     path: path
   } do
-    prev = Application.fetch_env(:fathom, :sqlite_extension)
-    Application.put_env(:fathom, :sqlite_extension, false)
-
-    on_exit(fn ->
-      case prev do
-        {:ok, v} -> Application.put_env(:fathom, :sqlite_extension, v)
-        :error -> Application.delete_env(:fathom, :sqlite_extension)
-      end
-    end)
+    Env.put!(:sqlite_extension, false)
 
     conn = open_wide(path)
     sql = wide_sql(1)
@@ -142,7 +126,7 @@ defmodule Fathom.Shard.StmtCacheBytesTest do
 
   describe "the carried (pooled) form (#20)" do
     test "holds no per-column terms and round-trips columns and wire encoding", %{path: path} do
-      Application.put_env(:fathom, :stmt_cache_bytes, nil)
+      Env.put!(:stmt_cache_bytes, nil)
       conn = open_wide(path)
       sqls = for i <- 1..16, do: wide_sql(i)
 

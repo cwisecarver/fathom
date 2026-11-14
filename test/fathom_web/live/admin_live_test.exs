@@ -7,6 +7,7 @@ defmodule FathomWeb.AdminLiveTest do
   alias Fathom.Admin.MetricsCollector
   alias Fathom.Directory
   alias Fathom.Migrator
+  alias Fathom.Test.Env
 
   # config/test.exs sets admin_auth to admin/secret.
   @auth "Basic " <> Base.encode64("admin:secret")
@@ -70,14 +71,7 @@ defmodule FathomWeb.AdminLiveTest do
     # Expert review 2026-10-10 #W7: a failing scrape (reporter down) used to answer an empty 200,
     # which Prometheus records as a healthy scrape of zero series. Enabled-but-failing is a 503.
     test "GET /admin/metrics is 503 when metrics are enabled but the scrape fails", %{conn: conn} do
-      prev = Application.get_env(:fathom, :metrics_collector)
-      Application.put_env(:fathom, :metrics_collector, true)
-
-      on_exit(fn ->
-        if prev == nil,
-          do: Application.delete_env(:fathom, :metrics_collector),
-          else: Application.put_env(:fathom, :metrics_collector, prev)
-      end)
+      Env.put!(:metrics_collector, true)
 
       # The reporter is off in test, so scrape/0 raises — exactly the failure being pinned.
       assert Process.whereis(:fathom_metrics) == nil
@@ -90,9 +84,7 @@ defmodule FathomWeb.AdminLiveTest do
     end
 
     test "fails closed with 503 when no credentials are configured", %{conn: conn} do
-      prev = Application.get_env(:fathom, :admin_auth)
-      Application.delete_env(:fathom, :admin_auth)
-      on_exit(fn -> Application.put_env(:fathom, :admin_auth, prev) end)
+      Env.delete!(:admin_auth)
 
       conn = get(conn, "/admin")
       assert conn.status == 503
@@ -143,8 +135,7 @@ defmodule FathomWeb.AdminLiveTest do
     end
 
     test "Nodes live with the reporter ON but no check-ins says so", %{conn: conn} do
-      Application.put_env(:fathom, :load_reporter, true)
-      on_exit(fn -> Application.delete_env(:fathom, :load_reporter) end)
+      Env.put!(:load_reporter, true)
 
       {:ok, view, _html} = conn |> auth() |> live("/admin")
       broadcast_fleet([])

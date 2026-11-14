@@ -6,6 +6,7 @@ defmodule Fathom.ShardExecutorTest do
   import Plug.Test
 
   alias Fathom.ShardExecutor
+  alias Fathom.Test.Env
   alias Filo.{Error, Stmt, StmtResult}
 
   setup do
@@ -22,9 +23,6 @@ defmodule Fathom.ShardExecutorTest do
   end
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
-
-  defp restore_env(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore_env(k, v), do: Application.put_env(:fathom, k, v)
 
   defp rm_shard_files(id) do
     for base <- [
@@ -211,9 +209,7 @@ defmodule Fathom.ShardExecutorTest do
   test "with :block_tenant_ddl on, client DDL on a tenant is refused (DML unaffected)", %{
     shard: shard
   } do
-    prev = Application.get_env(:fathom, :block_tenant_ddl)
-    Application.put_env(:fathom, :block_tenant_ddl, true)
-    on_exit(fn -> restore_env(:block_tenant_ddl, prev) end)
+    Env.put!(:block_tenant_ddl, true)
 
     {:ok, conn} = ShardExecutor.open(shard)
 
@@ -227,16 +223,12 @@ defmodule Fathom.ShardExecutorTest do
   end
 
   test "the template shard is exempt from the tenant-DDL guard" do
-    prev = Application.get_env(:fathom, :block_tenant_ddl)
-    prev_tmpl = Application.get_env(:fathom, :template_shard_id)
     tmpl = "tmpl_ddl_#{System.unique_integer([:positive])}"
-    Application.put_env(:fathom, :block_tenant_ddl, true)
-    Application.put_env(:fathom, :template_shard_id, tmpl)
+    Env.put!(:block_tenant_ddl, true)
+    Env.put!(:template_shard_id, tmpl)
 
     on_exit(fn ->
       Fathom.Shards.drain(tmpl, 5_000)
-      restore_env(:block_tenant_ddl, prev)
-      restore_env(:template_shard_id, prev_tmpl)
       rm_shard_files(tmpl)
     end)
 
@@ -258,9 +250,7 @@ defmodule Fathom.ShardExecutorTest do
   test "config :shard_max_page_count caps a shard's size (writes past it get SQLITE_FULL)", %{
     shard: shard
   } do
-    prev = Application.get_env(:fathom, :shard_max_page_count)
-    Application.put_env(:fathom, :shard_max_page_count, 20)
-    on_exit(fn -> restore_env(:shard_max_page_count, prev) end)
+    Env.put!(:shard_max_page_count, 20)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (v TEXT)"))
@@ -387,14 +377,7 @@ defmodule Fathom.ShardExecutorTest do
   # fail closed to the default chain. Cross-tenant selection is release-blocker class
   # (AGENTS.md shard-isolation gate).
   test "with a serving zone configured, only hosts in the zone select shards" do
-    prev = Application.get_env(:fathom, :shard_base_domain)
-    Application.put_env(:fathom, :shard_base_domain, "fathom.test")
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :shard_base_domain),
-        else: Application.put_env(:fathom, :shard_base_domain, prev)
-    end)
+    Env.put!(:shard_base_domain, "fathom.test")
 
     resolve = fn url -> ShardExecutor.shard_from_conn(conn(:get, url)) end
 
@@ -421,14 +404,7 @@ defmodule Fathom.ShardExecutorTest do
   test "a blank serving zone is treated as unset, not as deny-everything" do
     import ExUnit.CaptureLog
 
-    prev = Application.get_env(:fathom, :shard_base_domain)
-    Application.put_env(:fathom, :shard_base_domain, "")
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :shard_base_domain),
-        else: Application.put_env(:fathom, :shard_base_domain, prev)
-    end)
+    Env.put!(:shard_base_domain, "")
 
     capture_log(fn ->
       assert ShardExecutor.shard_from_conn(conn(:get, "http://acme.fathom.test/")) == "acme",
@@ -461,9 +437,7 @@ defmodule Fathom.ShardExecutorTest do
   # default), the override is inert and a hostless request resolves to the default shard, never
   # the attacker-named one. Cross-shard isolation is a release-blocker (AGENTS.md), so pin it.
   test "with the override off, ?db= / x-fathom-shard cannot select a foreign shard" do
-    prev = Application.get_env(:fathom, :allow_shard_override)
-    Application.put_env(:fathom, :allow_shard_override, false)
-    on_exit(fn -> Application.put_env(:fathom, :allow_shard_override, prev) end)
+    Env.put!(:allow_shard_override, false)
 
     assert ShardExecutor.shard_from_conn(conn(:get, "http://localhost/?db=victim")) == "demo"
 
@@ -532,9 +506,7 @@ defmodule Fathom.ShardExecutorTest do
   # Finding #26: with no configured default shard (the prod fail-closed posture), a request that
   # resolves no subdomain/override must be REFUSED, not commingled into a shared "demo" shard.
   test "with no default shard, a hostless request resolves to nil and open/1 refuses with a 400" do
-    prev = Application.get_env(:fathom, :default_shard)
-    Application.put_env(:fathom, :default_shard, nil)
-    on_exit(fn -> Application.put_env(:fathom, :default_shard, prev) end)
+    Env.put!(:default_shard, nil)
 
     assert ShardExecutor.shard_from_conn(conn(:get, "http://localhost/")) == nil
 

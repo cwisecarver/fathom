@@ -39,17 +39,16 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
   alias Fathom.Shard.Replication.Wal
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   @modes [:legacy, :heartbeat]
 
   setup do
     id = "pinbf_#{System.unique_integer([:positive])}"
     path = Fathom.Shard.db_path(id)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    prev_repl = Application.get_env(:fathom, :replication_enabled)
 
     # The idle-stop would answer a pending flush with :coordinator_stopped (AGENTS.md testing note).
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_idle_ms, 600_000)
 
     test_pid = self()
     handler = "pinbf-#{id}"
@@ -73,16 +72,6 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
 
     on_exit(fn ->
       :telemetry.detach(handler)
-      Application.delete_env(:fathom, :flush_after_snapshot_hook)
-
-      if prev_repl == nil,
-        do: Application.delete_env(:fathom, :replication_enabled),
-        else: Application.put_env(:fathom, :replication_enabled, prev_repl)
-
-      if prev_idle,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
-
       Shards.stop(id)
       for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(path <> s)
     end)
@@ -235,7 +224,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
         on_exit(fn -> ShardExecutor.close(conn) end)
         test_pid = self()
 
-        Application.put_env(:fathom, :flush_after_snapshot_hook, fn sid ->
+        Env.put!(:flush_after_snapshot_hook, fn sid ->
           if sid == id do
             before = File.read!(path)
             # A raw handle (the executor refuses tenant checkpoints).
@@ -389,7 +378,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
         on_exit(fn -> ShardExecutor.close(conn) end)
         refute Wal.fully_backfilled?(wal)
 
-        Application.put_env(:fathom, :replication_enabled, true)
+        Env.put!(:replication_enabled, true)
         flush!(coordinator)
         Application.delete_env(:fathom, :replication_enabled)
 
@@ -415,7 +404,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
         :ok = Connection.close(raw)
         assert n > 0 and Wal.fully_backfilled?(wal) and wal_size(wal) > 0
 
-        Application.put_env(:fathom, :replication_enabled, true)
+        Env.put!(:replication_enabled, true)
         flush!(coordinator)
         Application.delete_env(:fathom, :replication_enabled)
 

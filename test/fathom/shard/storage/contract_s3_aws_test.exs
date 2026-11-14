@@ -12,14 +12,14 @@ defmodule Fathom.Shard.Storage.ContractS3AwsTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   setup do
     store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{}) end})
     S3EtagStore.set_missing_if_match_status(store, 404)
-    prev = Application.get_env(:fathom, S3)
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -28,12 +28,6 @@ defmodule Fathom.Shard.Storage.ContractS3AwsTest do
       path_style: true,
       req_plug: fn conn -> S3EtagStore.serve(conn, store) end
     )
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
 
     :ok
   end

@@ -12,17 +12,7 @@ defmodule Fathom.Migrator.RolloutTest do
   alias Fathom.Migrator.{ReconcileJob, RevertJob, ShardMigration, ShardMigrationJob}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Directory
-
-  defp put_env!(key, value) do
-    prev = Application.get_env(:fathom, key)
-    Application.put_env(:fathom, key, value)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, key, prev),
-        else: Application.delete_env(:fathom, key)
-    end)
-  end
+  alias Fathom.Test.Env
 
   describe "rollout/1" do
     test "enqueues a migration job for each active shard behind HEAD" do
@@ -44,14 +34,7 @@ defmodule Fathom.Migrator.RolloutTest do
     # itself → quarantine (and a drain racing an in-flight migrate can fork the fleet). It must be
     # excluded. Pre-fix rollout enqueues it too ({:ok, 2}, and refute below fails).
     test "the capture template is excluded from the rollout sweep" do
-      prev = Application.get_env(:fathom, :template_shard_id)
-      Application.put_env(:fathom, :template_shard_id, "tmpl_ex")
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, :template_shard_id, prev),
-          else: Application.delete_env(:fathom, :template_shard_id)
-      end)
+      Env.put!(:template_shard_id, "tmpl_ex")
 
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = resolve_flushed("tmpl_ex")
@@ -73,9 +56,9 @@ defmodule Fathom.Migrator.RolloutTest do
     # deep cold tail took months to converge. The cap is now :reconcile_batch_size (default 100) so
     # an operator can size convergence to the fleet.
     test "the reconcile sweep honors :reconcile_batch_size" do
-      put_env!(:reconcile_batch_size, 2)
+      Env.put!(:reconcile_batch_size, 2)
       # Watermark <= batch size is the pre-2026-10-14 one-chunk-per-run behaviour.
-      put_env!(:reconcile_watermark, 2)
+      Env.put!(:reconcile_watermark, 2)
 
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       for id <- ~w(rb_a rb_b rb_c rb_d), do: resolve_flushed(id)
@@ -90,8 +73,8 @@ defmodule Fathom.Migrator.RolloutTest do
     # 100/hour. The run now loops chunks while the live migration-job backlog is below the
     # watermark. Pre-fix this enqueues 2 (one chunk) where the assertion below wants 6.
     test "the reconcile run loops chunks up to the watermark, then stops" do
-      put_env!(:reconcile_batch_size, 2)
-      put_env!(:reconcile_watermark, 5)
+      Env.put!(:reconcile_batch_size, 2)
+      Env.put!(:reconcile_watermark, 5)
 
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       for n <- 1..10, do: resolve_flushed("wm_#{n}")
@@ -108,8 +91,8 @@ defmodule Fathom.Migrator.RolloutTest do
     end
 
     test "the chunk loop ends when the laggards run out, and the time budget cuts it after chunk 1" do
-      put_env!(:reconcile_batch_size, 2)
-      put_env!(:reconcile_watermark, 1_000)
+      Env.put!(:reconcile_batch_size, 2)
+      Env.put!(:reconcile_watermark, 1_000)
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       for n <- 1..5, do: resolve_flushed("ex_#{n}")
 
@@ -117,7 +100,7 @@ defmodule Fathom.Migrator.RolloutTest do
       assert length(all_enqueued(worker: ShardMigrationJob)) == 5
 
       for n <- 1..5, do: resolve_flushed("tb_#{n}")
-      put_env!(:reconcile_rollout_budget_ms, 0)
+      Env.put!(:reconcile_rollout_budget_ms, 0)
       assert :ok = perform_job(ReconcileJob, %{})
       # Budget 0: the first chunk still goes (no starvation), the second is cut.
       assert length(all_enqueued(worker: ShardMigrationJob)) == 7
@@ -480,8 +463,7 @@ defmodule Fathom.Migrator.RolloutTest do
       assert {:ok, %{status: "migration_failed"}} = Directory.get("cf")
       refute_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "cf"})
 
-      Application.put_env(:fathom, :migration_failed_cool_off_ms, 0)
-      on_exit(fn -> Application.delete_env(:fathom, :migration_failed_cool_off_ms) end)
+      Env.put!(:migration_failed_cool_off_ms, 0)
 
       assert :ok = perform_job(ReconcileJob, %{})
       assert {:ok, %{status: "active"}} = Directory.get("cf")
@@ -554,8 +536,7 @@ defmodule Fathom.Migrator.RolloutTest do
       {:ok, _} = resolve_flushed("lag")
 
       # A non-integer cool-off makes the requeue raise (stands in for a Postgres error).
-      Application.put_env(:fathom, :migration_failed_cool_off_ms, :boom)
-      on_exit(fn -> Application.delete_env(:fathom, :migration_failed_cool_off_ms) end)
+      Env.put!(:migration_failed_cool_off_ms, :boom)
 
       assert :ok = perform_job(ReconcileJob, %{})
       assert_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "lag", "target" => 2})

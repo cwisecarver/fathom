@@ -7,32 +7,23 @@ defmodule Fathom.Shard.Storage.S3BodyChecksumTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.{Codec, S3}
+  alias Fathom.Test.Env
 
   setup do
     dir = Path.join(System.tmp_dir!(), "s3crc_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    prev_enc = Application.get_env(:fathom, :shard_object_encoding)
-    prev_s3 = Application.get_env(:fathom, S3)
     S3.reset_body_hash_kind()
 
     on_exit(fn ->
       File.rm_rf!(dir)
       S3.reset_body_hash_kind()
-
-      if prev_enc,
-        do: Application.put_env(:fathom, :shard_object_encoding, prev_enc),
-        else: Application.delete_env(:fathom, :shard_object_encoding)
-
-      if prev_s3,
-        do: Application.put_env(:fathom, S3, prev_s3),
-        else: Application.delete_env(:fathom, S3)
     end)
 
     %{dir: dir}
   end
 
   defp put_s3_config(plug) do
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -76,7 +67,7 @@ defmodule Fathom.Shard.Storage.S3BodyChecksumTest do
   end
 
   defp flush_file(dir, encoding) do
-    Application.put_env(:fathom, :shard_object_encoding, encoding)
+    Env.put!(:shard_object_encoding, encoding)
     local = Path.join(dir, "s.db")
     File.write!(local, String.duplicate("row-data-0123456789 ", 20_000))
     assert {:ok, _, _} = S3.flush("s", local, nil)

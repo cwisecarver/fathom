@@ -15,6 +15,7 @@ defmodule Fathom.Shard.Replication.FollowerAppendMissingWalTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Replication.{Follower, Protocol}
+  alias Fathom.Test.Env
 
   setup do
     name = :"appendwal_#{System.unique_integer([:positive])}"
@@ -94,14 +95,7 @@ defmodule Fathom.Shard.Replication.FollowerAppendMissingWalTest do
   # and peers, so it is configurable — and 0 must really turn it off, not leave fds held.
   test "with the held-fd cache off, appends still land and no WAL fd is held", ctx do
     %{name: name, id: id, worker: worker} = ctx
-    prev = Application.get_env(:fathom, :replication_held_wal_fds)
-    Application.put_env(:fathom, :replication_held_wal_fds, 0)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :replication_held_wal_fds, prev),
-        else: Application.delete_env(:fathom, :replication_held_wal_fds)
-    end)
+    Env.put!(:replication_held_wal_fds, 0)
 
     :ok = Follower.seed(name, id, 1, 0, 0, 0)
     assert {:ack, ^id, 6} = send_push(ctx, push(id, 0))

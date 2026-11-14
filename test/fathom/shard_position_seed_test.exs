@@ -21,20 +21,16 @@ defmodule Fathom.ShardPositionSeedTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
 
   setup do
     shard = "posseed_#{System.unique_integer([:positive])}"
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
 
     on_exit(fn ->
-      if prev_idle,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
-
       for suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(Storage.Local.dir(), shard <> suffix))
     end)

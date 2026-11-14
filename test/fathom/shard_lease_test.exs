@@ -9,18 +9,13 @@ defmodule Fathom.ShardLeaseTest do
 
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
     shard = "lease_#{System.unique_integer([:positive])}"
 
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    prev_ttl = Application.get_env(:fathom, :shard_lease_ttl_ms)
-
     on_exit(fn ->
-      restore(:shard_idle_ms, prev_idle)
-      restore(:shard_lease_ttl_ms, prev_ttl)
-
       for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
@@ -33,9 +28,6 @@ defmodule Fathom.ShardLeaseTest do
 
     %{shard: shard}
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
 
@@ -172,7 +164,7 @@ defmodule Fathom.ShardLeaseTest do
 
   test "the flush is fenced: a coordinator that lost its lease drops local without flushing",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -319,25 +311,12 @@ defmodule Fathom.ShardLeaseTest do
   # concurrency-adjacent decisions.
   describe "lapse revalidation spread (#13b)" do
     setup do
-      prev_target = Application.get_env(:fathom, :lapse_revalidations_per_sec)
-      prev_jitter = Application.get_env(:fathom, :lapse_revalidate_jitter_ms)
-      Application.delete_env(:fathom, :lapse_revalidate_jitter_ms)
-
-      on_exit(fn ->
-        if prev_target,
-          do: Application.put_env(:fathom, :lapse_revalidations_per_sec, prev_target),
-          else: Application.delete_env(:fathom, :lapse_revalidations_per_sec)
-
-        if prev_jitter,
-          do: Application.put_env(:fathom, :lapse_revalidate_jitter_ms, prev_jitter),
-          else: Application.delete_env(:fathom, :lapse_revalidate_jitter_ms)
-      end)
-
+      Env.delete!(:lapse_revalidate_jitter_ms)
       :ok
     end
 
     test "scales with the open-shard population instead of being a constant" do
-      Application.put_env(:fathom, :lapse_revalidations_per_sec, 500)
+      Env.put!(:lapse_revalidations_per_sec, 500)
 
       # 500/s target: the spread is population/500 seconds. Pre-fix every one of these was 2 000.
       assert Fathom.Shard.lapse_spread_ms(500) == 1_000
@@ -359,7 +338,7 @@ defmodule Fathom.ShardLeaseTest do
 
       # A target of 1/s makes the derived spread absurd (100 000 ms for 100 shards) — the cap is
       # the only thing that can produce the expected value.
-      Application.put_env(:fathom, :lapse_revalidations_per_sec, 1)
+      Env.put!(:lapse_revalidations_per_sec, 1)
 
       assert Fathom.Shard.lapse_spread_ms(100) == margin
       assert Fathom.Shard.lapse_spread_ms(1_000_000) == margin
@@ -368,15 +347,15 @@ defmodule Fathom.ShardLeaseTest do
     test "floors at 1 so :rand.uniform/1 can never be handed a zero" do
       # Reachable: the broadcast can land as the last coordinator on the node stops, and
       # `:rand.uniform(0)` raises.
-      Application.put_env(:fathom, :lapse_revalidations_per_sec, 500)
+      Env.put!(:lapse_revalidations_per_sec, 500)
       assert Fathom.Shard.lapse_spread_ms(0) == 1
       assert Fathom.Shard.lapse_spread_ms(1) == 2
     end
 
     test "an explicit operator override still wins" do
       # Back-compat: someone who pinned the old knob keeps exactly what they set, at any fleet size.
-      Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 750)
-      Application.put_env(:fathom, :lapse_revalidations_per_sec, 500)
+      Env.put!(:lapse_revalidate_jitter_ms, 750)
+      Env.put!(:lapse_revalidations_per_sec, 500)
 
       assert Fathom.Shard.lapse_spread_ms(10) == 750
       assert Fathom.Shard.lapse_spread_ms(100_000) == 750

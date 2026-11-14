@@ -32,6 +32,7 @@ defmodule Fathom.ShardProvenanceTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.Env
   alias Filo.{Stmt, StmtResult}
 
   @sentinel "-"
@@ -40,7 +41,6 @@ defmodule Fathom.ShardProvenanceTest do
     shard = "prov_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :adopt_unprovenanced_warm)
       Shards.drain(shard, 2_000)
 
       for dir <- [local_dir(), remote_dir()],
@@ -185,7 +185,7 @@ defmodule Fathom.ShardProvenanceTest do
 
     test ":adopt_unprovenanced_warm restores the old behaviour for a legacy fleet",
          %{shard: shard} do
-      Application.put_env(:fathom, :adopt_unprovenanced_warm, true)
+      Env.put!(:adopt_unprovenanced_warm, true)
       seed_remote(shard, "genuine")
       seed_db(local_db(shard), "legacy_local")
       File.rm(sidecar(shard))

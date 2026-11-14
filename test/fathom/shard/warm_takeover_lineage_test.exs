@@ -19,6 +19,7 @@ defmodule Fathom.Shard.WarmTakeoverLineageTest do
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
   alias Filo.{Stmt, StmtResult}
 
@@ -26,24 +27,9 @@ defmodule Fathom.Shard.WarmTakeoverLineageTest do
 
   setup do
     shard = "lineage_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_s3 = Application.get_env(:fathom, S3)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
 
     on_exit(fn ->
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-
-      if prev_s3,
-        do: Application.put_env(:fathom, S3, prev_s3),
-        else: Application.delete_env(:fathom, S3)
-
-      if prev_idle,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
-
       for f <- Path.wildcard(Path.join(local_dir(), "#{shard}*")), do: File.rm_rf(f)
     end)
 
@@ -110,7 +96,7 @@ defmodule Fathom.Shard.WarmTakeoverLineageTest do
       resp
     end
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -120,7 +106,7 @@ defmodule Fathom.Shard.WarmTakeoverLineageTest do
       req_plug: plug
     )
 
-    Application.put_env(:fathom, :shard_storage, S3)
+    Env.put!(:shard_storage, S3)
 
     # This node's warm local file: a DIVERGED lineage (its own un-flushed write)
     # whose provenance sidecar honestly says it derives from the base object.

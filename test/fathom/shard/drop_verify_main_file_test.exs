@@ -18,6 +18,7 @@ defmodule Fathom.Shard.DropVerifyMainFileTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Heartbeat, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -25,8 +26,7 @@ defmodule Fathom.Shard.DropVerifyMainFileTest do
   setup do
     id = "dropverify_#{System.unique_integer([:positive])}"
     path = Shard.db_path(id)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_idle_ms, 600_000)
 
     test_pid = self()
     handler = "dropverify-#{id}"
@@ -49,10 +49,6 @@ defmodule Fathom.Shard.DropVerifyMainFileTest do
 
     on_exit(fn ->
       :telemetry.detach(handler)
-
-      if prev_idle,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
 
       Shards.stop(id)
       for f <- Path.wildcard(path <> ".corrupt.*"), do: File.rm(f)

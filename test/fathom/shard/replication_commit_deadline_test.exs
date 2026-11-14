@@ -12,21 +12,14 @@ defmodule Fathom.Shard.Replication.CommitDeadlineTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Replication.Session
+  alias Fathom.Test.Env
 
   test "the handler's commit deadline budget is strictly shorter than the caller's call timeout" do
-    prev_t = Application.get_env(:fathom, :replication_timeout_ms)
-    prev_m = Application.get_env(:fathom, :replication_reply_margin_ms)
-
-    on_exit(fn ->
-      restore(:replication_timeout_ms, prev_t)
-      restore(:replication_reply_margin_ms, prev_m)
-    end)
-
     # Default margin, across a large and a small timeout.
-    Application.delete_env(:fathom, :replication_reply_margin_ms)
+    Env.delete!(:replication_reply_margin_ms)
 
     for t <- [5_000, 500, 200] do
-      Application.put_env(:fathom, :replication_timeout_ms, t)
+      Env.put!(:replication_timeout_ms, t)
       budget = Session.commit_deadline_budget()
 
       assert budget < Session.timeout(),
@@ -38,8 +31,8 @@ defmodule Fathom.Shard.Replication.CommitDeadlineTest do
     end
 
     # A margin larger than half the timeout is floored, not allowed to gut the budget.
-    Application.put_env(:fathom, :replication_timeout_ms, 1_000)
-    Application.put_env(:fathom, :replication_reply_margin_ms, 900)
+    Env.put!(:replication_timeout_ms, 1_000)
+    Env.put!(:replication_reply_margin_ms, 900)
     assert Session.commit_deadline_budget() == 500
   end
 
@@ -47,16 +40,8 @@ defmodule Fathom.Shard.Replication.CommitDeadlineTest do
   # budget from the moment it was dequeued, so it could run up to that long past its caller. The
   # internal deadline is now bounded by the caller's own deadline less the reply margin.
   test "the commit deadline is bounded by the caller's deadline, not just the handler budget" do
-    prev_t = Application.get_env(:fathom, :replication_timeout_ms)
-    prev_m = Application.get_env(:fathom, :replication_reply_margin_ms)
-
-    on_exit(fn ->
-      restore(:replication_timeout_ms, prev_t)
-      restore(:replication_reply_margin_ms, prev_m)
-    end)
-
-    Application.put_env(:fathom, :replication_timeout_ms, 5_000)
-    Application.put_env(:fathom, :replication_reply_margin_ms, 100)
+    Env.put!(:replication_timeout_ms, 5_000)
+    Env.put!(:replication_reply_margin_ms, 100)
     now = 1_000_000
 
     # No caller deadline (the catch-up timer): the handler's own budget.
@@ -71,7 +56,4 @@ defmodule Fathom.Shard.Replication.CommitDeadlineTest do
     # Less than the margin left: whatever the caller has, never a deadline already in the past.
     assert Session.commit_deadline(now, now + 50) == now + 50
   end
-
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
 end

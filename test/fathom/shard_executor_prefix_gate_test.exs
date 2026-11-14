@@ -22,6 +22,7 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
   use ExUnit.Case, async: false
 
   alias Fathom.ShardExecutor
+  alias Fathom.Test.Env
   alias Filo.{Error, Stmt}
 
   setup do
@@ -281,18 +282,12 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
   # not at open, which cost ~85 KiB per connection and was refused by the served-density gate.
   describe "the TEMP schema under a 1 MiB shard cap" do
     setup do
-      prev = Application.get_env(:fathom, :shard_max_bytes)
-      Application.put_env(:fathom, :shard_max_bytes, 1024 * 1024)
+      Env.put!(:shard_max_bytes, 1024 * 1024)
       shard = "test_tempcap_#{System.unique_integer([:positive])}"
       {:ok, h} = ShardExecutor.open(shard)
 
       on_exit(fn ->
         ShardExecutor.close(h)
-
-        if prev,
-          do: Application.put_env(:fathom, :shard_max_bytes, prev),
-          else: Application.delete_env(:fathom, :shard_max_bytes)
-
         rm_shard_files(shard)
       end)
 
@@ -391,9 +386,7 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
     # The deny is checked BEFORE extra_pragma_allow(), so even an operator misconfiguration that
     # named a hardening pragma in :tenant_pragma_allow cannot widen a tenant back into disabling
     # the engine floor. Pre-#3 (deny == [query_only]) this override WOULD allow it.
-    prev = Application.get_env(:fathom, :tenant_pragma_allow, [])
-    Application.put_env(:fathom, :tenant_pragma_allow, ["writable_schema", "trusted_schema"])
-    on_exit(fn -> Application.put_env(:fathom, :tenant_pragma_allow, prev) end)
+    Env.put!(:tenant_pragma_allow, ["writable_schema", "trusted_schema"])
 
     for sql <- ["PRAGMA writable_schema=ON", "PRAGMA trusted_schema=ON"] do
       assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
@@ -404,14 +397,12 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
 
   test "leading-; and comment-prefixed DDL is refused under :block_tenant_ddl", %{shard: shard} do
     # block_ddl? is captured at OPEN (stream_opts/1), so set it before opening a fresh handle.
-    prev = Application.get_env(:fathom, :block_tenant_ddl, false)
-    Application.put_env(:fathom, :block_tenant_ddl, true)
+    Env.put!(:block_tenant_ddl, true)
     ddl_shard = "test_prefix_ddl_#{System.unique_integer([:positive])}"
     {:ok, h} = ShardExecutor.open(ddl_shard)
 
     on_exit(fn ->
       ShardExecutor.close(h)
-      Application.put_env(:fathom, :block_tenant_ddl, prev)
       rm_shard_files(ddl_shard)
     end)
 
@@ -440,14 +431,12 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
        %{
          shard: _shard
        } do
-    prev = Application.get_env(:fathom, :block_tenant_ddl, false)
-    Application.put_env(:fathom, :block_tenant_ddl, true)
+    Env.put!(:block_tenant_ddl, true)
     uv_shard = "test_uv_#{System.unique_integer([:positive])}"
     {:ok, h} = ShardExecutor.open(uv_shard)
 
     on_exit(fn ->
       ShardExecutor.close(h)
-      Application.put_env(:fathom, :block_tenant_ddl, prev)
       rm_shard_files(uv_shard)
     end)
 
@@ -483,14 +472,12 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
 
   test "with :block_tenant_ddl OFF, PRAGMA user_version stays settable (the durability capability)",
        %{shard: _shard} do
-    prev = Application.get_env(:fathom, :block_tenant_ddl, false)
-    Application.put_env(:fathom, :block_tenant_ddl, false)
+    Env.put!(:block_tenant_ddl, false)
     uv_shard = "test_uv_open_#{System.unique_integer([:positive])}"
     {:ok, h} = ShardExecutor.open(uv_shard)
 
     on_exit(fn ->
       ShardExecutor.close(h)
-      Application.put_env(:fathom, :block_tenant_ddl, prev)
       rm_shard_files(uv_shard)
     end)
 
@@ -507,14 +494,12 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
   # non-ASCII lead (or a head cut mid-codepoint) neither crashes nor matches a keyword.
   test "BOM- and ;-prefixed CREATE / PRAGMA user_version are refused through the shared head",
        %{shard: _shard} do
-    prev = Application.get_env(:fathom, :block_tenant_ddl, false)
-    Application.put_env(:fathom, :block_tenant_ddl, true)
+    Env.put!(:block_tenant_ddl, true)
     head_shard = "test_head_#{System.unique_integer([:positive])}"
     {:ok, h} = ShardExecutor.open(head_shard)
 
     on_exit(fn ->
       ShardExecutor.close(h)
-      Application.put_env(:fathom, :block_tenant_ddl, prev)
       rm_shard_files(head_shard)
     end)
 

@@ -18,22 +18,18 @@ defmodule Fathom.Tenants.TombstoneLocalEraseTest do
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
   alias Fathom.Tenants.Tombstones
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
 
   setup do
     id = "tomblocal_#{System.unique_integer([:positive])}"
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
 
     # Pin the idle timer high: an idle-stop racing the assertions would answer for the coordinator.
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_idle_ms, 600_000)
 
     on_exit(fn ->
-      if prev_idle,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
-
       :ets.delete(Tombstones, id)
       Shards.drain(id, 2_000)
       Storage.purge_shard(id)

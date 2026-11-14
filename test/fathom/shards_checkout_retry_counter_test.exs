@@ -16,11 +16,10 @@ defmodule Fathom.ShardsCheckoutRetryCounterTest do
 
   alias Fathom.{Shard, Shards}
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Env
 
   setup do
     shard = "retrycount_#{System.unique_integer([:positive])}"
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_idle_ms, 1)
 
     test_pid = self()
     handler = "retrycount-#{shard}"
@@ -34,17 +33,14 @@ defmodule Fathom.ShardsCheckoutRetryCounterTest do
 
     on_exit(fn ->
       :telemetry.detach(handler)
-
-      if prev_idle,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
-
       Shards.drain(shard, 2_000)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
     end)
+
+    Env.put!(:shard_idle_ms, 1)
 
     %{shard: shard}
   end
@@ -71,7 +67,7 @@ defmodule Fathom.ShardsCheckoutRetryCounterTest do
   end
 
   test "an ordinary checkout emits nothing", %{shard: shard} do
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    Env.put!(:shard_idle_ms, 60_000)
     assert {:ok, _pid, _ref, _path} = Shards.checkout(shard)
     refute_receive {:retry, _, _}, 100
   end

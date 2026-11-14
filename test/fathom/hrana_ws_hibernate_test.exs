@@ -13,12 +13,12 @@ defmodule Fathom.HranaWsHibernateTest do
 
   alias Fathom.Bench.HranaClient
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Env
 
   @hibernate_ms 200
 
   setup do
-    prev = Application.get_env(:fathom, :hrana_ws_hibernate_ms)
-    Application.put_env(:fathom, :hrana_ws_hibernate_ms, @hibernate_ms)
+    Env.put!(:hrana_ws_hibernate_ms, @hibernate_ms)
 
     shard = "wshib#{System.unique_integer([:positive])}"
     path = Path.join(Fathom.Shard.data_dir(), "#{shard}.db")
@@ -30,10 +30,6 @@ defmodule Fathom.HranaWsHibernateTest do
       )
 
     on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :hrana_ws_hibernate_ms),
-        else: Application.put_env(:fathom, :hrana_ws_hibernate_ms, prev)
-
       HranaClient.stop_listener(sup)
       _ = Fathom.Shards.drain(shard, 1_000)
       for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(path <> s)

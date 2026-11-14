@@ -14,11 +14,10 @@ defmodule Fathom.HranaAuthMintVersionTest do
 
   alias Fathom.{Directory, HranaAuth}
   alias Fathom.HranaAuth.Revocations
+  alias Fathom.Test.Env
 
   setup do
-    prev_mode = Application.get_env(:fathom, :hrana_auth, :disabled)
-    Application.put_env(:fathom, :hrana_auth, :required)
-    on_exit(fn -> Application.put_env(:fathom, :hrana_auth, prev_mode) end)
+    Env.put!(:hrana_auth, :required)
     %{shard: "mintver_#{System.unique_integer([:positive])}"}
   end
 

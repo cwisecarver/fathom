@@ -18,6 +18,7 @@ defmodule Fathom.Shard.Storage.S3PullRetryTest do
   @moduletag :tmp_dir
 
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   @body "pulled-after-throttle"
@@ -25,13 +26,6 @@ defmodule Fathom.Shard.Storage.S3PullRetryTest do
 
   setup %{tmp_dir: tmp_dir} do
     shard = "retry_#{System.unique_integer([:positive])}"
-    prev = Application.get_env(:fathom, S3)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
 
     store =
       start_supervised!(%{
@@ -51,7 +45,7 @@ defmodule Fathom.Shard.Storage.S3PullRetryTest do
   end
 
   defp use_store!(store, counter) do
-    Application.put_env(:fathom, S3,
+    Env.put!(:fathom, S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",

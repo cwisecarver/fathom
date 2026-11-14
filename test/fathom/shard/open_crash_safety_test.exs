@@ -26,6 +26,7 @@ defmodule Fathom.Shard.OpenCrashSafetyTest do
   alias Fathom.Shard.Storage.S3
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   @modes [:legacy, :heartbeat]
@@ -53,19 +54,22 @@ defmodule Fathom.Shard.OpenCrashSafetyTest do
     id = "opencrash_#{System.unique_integer([:positive])}"
     dir = Path.join(System.tmp_dir!(), "opencrash_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    prev = Map.new(@env, &{&1, Application.get_env(:fathom, &1)})
+
+    # Snapshot every key the tests below set. `Env` registers the restore here, BEFORE the `on_exit`
+    # that stops the shard, so the env is put back only after the coordinator is gone (on_exit
+    # callbacks run in reverse registration order).
+    for k <- @env do
+      case Application.fetch_env(:fathom, k) do
+        {:ok, v} -> Env.put!(k, v)
+        :error -> Env.delete!(k)
+      end
+    end
+
     prev_running = Fleet.running()
 
     on_exit(fn ->
       Shards.stop(id)
       Fleet.publish(prev_running)
-
-      for {k, v} <- prev do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
-
       File.rm_rf(dir)
       for f <- Path.wildcard(Fathom.Shard.db_path(id) <> "*"), do: File.rm_rf(f)
     end)

@@ -39,6 +39,7 @@ defmodule Fathom.Shard.Replication.FollowerEmptyWalRecoveryTest do
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Recovery
   alias Fathom.Shard.Replication.Wal
+  alias Fathom.Test.Env
 
   @lineage 3
   @ordinal 5
@@ -48,23 +49,11 @@ defmodule Fathom.Shard.Replication.FollowerEmptyWalRecoveryTest do
     root = Path.join(System.tmp_dir!(), "emptywal_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
 
-    prev =
-      for k <- [:replication_lineage_wire, :replication_ordinal_wire],
-          do: {k, Application.get_env(:fathom, k)}
-
     # The ranking travels only with both wires on (see replication_recovery_test).
-    Application.put_env(:fathom, :replication_lineage_wire, true)
-    Application.put_env(:fathom, :replication_ordinal_wire, true)
+    Env.put!(:replication_lineage_wire, true)
+    Env.put!(:replication_ordinal_wire, true)
 
-    on_exit(fn ->
-      for {k, v} <- prev do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
-
-      File.rm_rf(root)
-    end)
+    on_exit(fn -> File.rm_rf(root) end)
 
     %{id: id, root: root}
   end
@@ -332,14 +321,6 @@ defmodule Fathom.Shard.Replication.FollowerEmptyWalRecoveryTest do
   end
 
   test "with REPLICATION_FSYNC on the record is synced; off, it is not", %{id: id, root: root} do
-    prev = Application.get_env(:fathom, :replication_fsync)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :replication_fsync),
-        else: Application.put_env(:fathom, :replication_fsync, prev)
-    end)
-
     me = self()
     handler = "emptywal-#{id}"
 
@@ -353,7 +334,7 @@ defmodule Fathom.Shard.Replication.FollowerEmptyWalRecoveryTest do
     on_exit(fn -> :telemetry.detach(handler) end)
 
     for {fsync, tag} <- [{false, :off}, {true, :on}] do
-      Application.put_env(:fathom, :replication_fsync, fsync)
+      Env.put!(:replication_fsync, fsync)
       sid = "#{id}_#{tag}"
       f = :"emptywal_f_#{System.unique_integer([:positive])}"
       f_port = start!(root, f, 1)

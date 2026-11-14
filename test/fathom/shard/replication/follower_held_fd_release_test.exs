@@ -24,21 +24,14 @@ defmodule Fathom.Shard.Replication.FollowerHeldFdReleaseTest do
 
   alias Fathom.Shard.Replication.{Follower, Protocol}
   alias Fathom.Test.Await
+  alias Fathom.Test.Env
 
   setup do
     name = :"heldfd_#{System.unique_integer([:positive])}"
     dir = Path.join(System.tmp_dir!(), to_string(name))
     start_supervised!({Follower, name: name, port: 0, dir: dir}, id: name)
 
-    prev = Application.get_env(:fathom, :replication_held_wal_fd_idle_ms)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :replication_held_wal_fd_idle_ms),
-        else: Application.put_env(:fathom, :replication_held_wal_fd_idle_ms, prev)
-
-      File.rm_rf(dir)
-    end)
+    on_exit(fn -> File.rm_rf(dir) end)
 
     {:ok, l} = :gen_tcp.listen(0, [:binary, packet: 4, active: false])
     {:ok, port} = :inet.port(l)
@@ -115,7 +108,7 @@ defmodule Fathom.Shard.Replication.FollowerHeldFdReleaseTest do
 
   test "an fd unused past the idle window is closed, so a forget does not pin the WAL forever",
        ctx do
-    Application.put_env(:fathom, :replication_held_wal_fd_idle_ms, 20)
+    Env.put!(:replication_held_wal_fd_idle_ms, 20)
     wal = hold_wal!(ctx)
 
     # The erase unlinks the replica; it cannot reach the worker's descriptor.
@@ -129,7 +122,7 @@ defmodule Fathom.Shard.Replication.FollowerHeldFdReleaseTest do
   end
 
   test "an fd in active use is NOT swept out from under a shard that keeps writing", ctx do
-    Application.put_env(:fathom, :replication_held_wal_fd_idle_ms, 60_000)
+    Env.put!(:replication_held_wal_fd_idle_ms, 60_000)
     wal = hold_wal!(ctx)
 
     assert {:ack, _, 14} = send_frame(ctx, push(ctx.id, 10, "more"))

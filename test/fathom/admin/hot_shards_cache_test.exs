@@ -7,16 +7,10 @@ defmodule Fathom.Admin.HotShardsCacheTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Admin.HotShardsCache
+  alias Fathom.Test.Env
 
   setup do
-    prev = Application.get_env(:fathom, :admin_hot_shards_cache_ms)
-    Application.put_env(:fathom, :admin_hot_shards_cache_ms, 60_000)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :admin_hot_shards_cache_ms),
-        else: Application.put_env(:fathom, :admin_hot_shards_cache_ms, prev)
-    end)
+    Env.put!(:admin_hot_shards_cache_ms, 60_000)
 
     start_supervised!(HotShardsCache)
     :ok

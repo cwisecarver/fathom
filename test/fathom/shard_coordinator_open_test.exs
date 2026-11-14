@@ -22,6 +22,7 @@ defmodule Fathom.ShardCoordinatorOpenTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Env
   alias Fathom.Tenants.{Suspensions, Tombstones}
   alias Filo.Stmt
 
@@ -29,14 +30,8 @@ defmodule Fathom.ShardCoordinatorOpenTest do
 
   setup do
     shard = "coordopen_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
 
     on_exit(fn ->
-      restore(:shard_storage, prev_storage)
-      Application.delete_env(:fathom, :faulty_before)
-      Application.delete_env(:fathom, :fork_evidence_timeout_ms)
-      Application.delete_env(:fathom, :lapse_revalidate_jitter_ms)
       :ets.delete(Tombstones, shard)
       Suspensions.remove(shard)
       Shards.drain(shard, 2_000)
@@ -52,11 +47,12 @@ defmodule Fathom.ShardCoordinatorOpenTest do
       for f <- Path.wildcard(Path.join(Shard.data_dir(), "#{shard}.db.*")), do: File.rm(f)
     end)
 
+    # Registered after the cleanup above, so the storage is put back FIRST on exit and the drain
+    # runs against the real storage.
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+
     %{shard: shard}
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
 
@@ -190,11 +186,10 @@ defmodule Fathom.ShardCoordinatorOpenTest do
         Process.exit(first, :kill)
         assert_receive {:DOWN, ^ref, :process, ^first, _}, 5_000
 
-        Application.put_env(:fathom, :fork_evidence_timeout_ms, 100)
+        Env.put!(:fork_evidence_timeout_ms, 100)
         calls = :counters.new(1, [])
 
-        Application.put_env(
-          :fathom,
+        Env.put!(
           :faulty_before,
           {:object_etag,
            fn
@@ -226,7 +221,7 @@ defmodule Fathom.ShardCoordinatorOpenTest do
       hb = set_mode!(:heartbeat)
       # Keep the revalidation episode armed for the whole assertion (the default jitter is a few
       # ms, and the episode would resolve back to `false` before we could observe it).
-      Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 60_000)
+      Env.put!(:lapse_revalidate_jitter_ms, 60_000)
 
       # Bump the heartbeat generation between the acquire_gen sample and subscribe_lapse/0: its
       # broadcast fires while we are NOT yet subscribed, so it is lost. The hook is on
@@ -234,8 +229,7 @@ defmodule Fathom.ShardCoordinatorOpenTest do
       # pull, but the pull Task starts BEFORE the sample, so on some orders it bumped the
       # generation first, the sample read the bumped value, and the precondition below failed
       # (seed 587142, 2026-10-13).
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:acquire,
          fn
@@ -375,7 +369,7 @@ defmodule Fathom.ShardCoordinatorOpenTest do
         Process.exit(first, :kill)
         assert_receive {:DOWN, ^ref, :process, ^first, _}, 5_000
 
-        Application.put_env(:fathom, :fork_evidence_timeout_ms, 100)
+        Env.put!(:fork_evidence_timeout_ms, 100)
         test_pid = self()
         id = {:fork_evidence_timeout, make_ref()}
 
@@ -396,8 +390,7 @@ defmodule Fathom.ShardCoordinatorOpenTest do
       test "a single slow HEAD is retried once and the retry's verdict is used", %{shard: shard} do
         calls = :counters.new(1, [])
 
-        Application.put_env(
-          :fathom,
+        Env.put!(
           :faulty_before,
           {:object_etag,
            fn
@@ -419,8 +412,7 @@ defmodule Fathom.ShardCoordinatorOpenTest do
       end
 
       test "two timeouts emit attempts 1 and 2 and the open still serves warm", %{shard: shard} do
-        Application.put_env(
-          :fathom,
+        Env.put!(
           :faulty_before,
           {:object_etag,
            fn

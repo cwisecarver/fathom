@@ -29,6 +29,7 @@ defmodule Fathom.ShardIsolationAttachTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{Shard, ShardExecutor, Shards}
+  alias Fathom.Test.Env
   alias Filo.{Error, Stmt, StmtResult}
 
   setup do
@@ -499,9 +500,6 @@ defmodule Fathom.ShardIsolationAttachTest do
     end
 
     test ":tenant_pragma_allow widens the list without a release", ctx do
-      prev = Application.get_env(:fathom, :tenant_pragma_allow, [])
-      on_exit(fn -> Application.put_env(:fathom, :tenant_pragma_allow, prev) end)
-
       {:ok, a} = ShardExecutor.open(ctx.attacker)
 
       assert {:error, %Error{code: "FILO_PRAGMA_BLOCKED"}} =
@@ -513,7 +511,7 @@ defmodule Fathom.ShardIsolationAttachTest do
       # same handle; since the engine PRAGMA guard (expert review 2026-10-08 #1, tier b) the
       # allow-list is also handed to the handle's SQLite authorizer at open, set-once so a tenant
       # cannot widen it, and an already-open handle keeps the list it was opened with.
-      Application.put_env(:fathom, :tenant_pragma_allow, ["secure_delete"])
+      Env.put!(:tenant_pragma_allow, ["secure_delete"])
       {:ok, b} = ShardExecutor.open(ctx.attacker)
       assert {:ok, _} = ShardExecutor.execute(b, stmt("PRAGMA secure_delete=ON"))
 
@@ -526,11 +524,8 @@ defmodule Fathom.ShardIsolationAttachTest do
     # widening the allow-list for an unrelated pragma must not be able to turn every such stream's
     # scope into an advisory one by naming it here.
     test "the widening lever cannot re-open query_only", ctx do
-      prev = Application.get_env(:fathom, :tenant_pragma_allow, [])
-      on_exit(fn -> Application.put_env(:fathom, :tenant_pragma_allow, prev) end)
-
       # Widened BEFORE the open: the engine guard takes the list at open (see the test above).
-      Application.put_env(:fathom, :tenant_pragma_allow, ["query_only", "secure_delete"])
+      Env.put!(:tenant_pragma_allow, ["query_only", "secure_delete"])
 
       {:ok, a} = ShardExecutor.open(ctx.attacker)
 
@@ -592,9 +587,7 @@ defmodule Fathom.ShardIsolationAttachTest do
 
   describe ":block_tenant_ddl is not defeated by a comment prefix" do
     setup do
-      prev = Application.get_env(:fathom, :block_tenant_ddl, false)
-      Application.put_env(:fathom, :block_tenant_ddl, true)
-      on_exit(fn -> Application.put_env(:fathom, :block_tenant_ddl, prev) end)
+      Env.put!(:block_tenant_ddl, true)
       :ok
     end
 

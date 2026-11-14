@@ -21,6 +21,7 @@ defmodule Fathom.Cluster.WriteFenceSkewTest do
   use Fathom.ClusterShardCase, async: false
 
   alias Fathom.Shard.{Heartbeat, WriteFence}
+  alias Fathom.Test.Env
 
   @steal_margin 2_000
   @skew 1_900
@@ -33,18 +34,10 @@ defmodule Fathom.Cluster.WriteFenceSkewTest do
           shard_idle_ms: 600_000,
           shard_storage: Fathom.Test.FaultyStorage
         ] do
-      prev = Application.get_env(:fathom, k)
-      Application.put_env(:fathom, k, v)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, prev)
-      end)
+      Env.put!(k, v)
     end
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :storage_fault)
       WriteFence.forget(shard)
       Shards.drain(shard, 2_000)
     end)
@@ -126,20 +119,13 @@ defmodule Fathom.Cluster.WriteFenceSkewTest do
   } do
     refute Heartbeat.running?()
     assert Heartbeat.measured_skew_ms() == 0
-    prev = Application.get_env(:fathom, :shard_lease_ttl_ms)
-    Application.put_env(:fathom, :shard_lease_ttl_ms, 1_500)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :shard_lease_ttl_ms),
-        else: Application.put_env(:fathom, :shard_lease_ttl_ms, prev)
-    end)
+    Env.put!(:shard_lease_ttl_ms, 1_500)
 
     capture_log(fn ->
       {conn, coordinator} = open_dirty!(shard)
       assert is_nil(:sys.get_state(coordinator).acquire_gen), "expected legacy mode"
 
-      Application.put_env(:fathom, :storage_fault, :renew)
+      Env.put!(:storage_fault, :renew)
       first_not_valid!(coordinator)
 
       # margin (ttl/3 = 500) + steal_margin (2,000): nothing before ~2.5 s.

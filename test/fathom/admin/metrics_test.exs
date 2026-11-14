@@ -28,26 +28,18 @@ defmodule Fathom.Admin.MetricsTest do
   alias Fathom.Admin.{FlushWatermark, Measurements}
   alias Fathom.Shard.{Storage, WriteCounter}
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
-    prev = Application.get_env(:fathom, :metrics_collector)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
     # The dashboard/metrics layer is off in test by default; turn it on so watermark writes land.
-    Application.put_env(:fathom, :metrics_collector, true)
+    Env.put!(:metrics_collector, true)
     FlushWatermark.reset()
 
-    on_exit(fn ->
-      FlushWatermark.reset()
-      restore(:metrics_collector, prev)
-      restore(:shard_idle_ms, prev_idle)
-    end)
+    on_exit(fn -> FlushWatermark.reset() end)
 
     :ok
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, val), do: Application.put_env(:fathom, key, val)
 
   defp uniq(p), do: "#{p}_#{System.unique_integer([:positive])}"
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
@@ -101,7 +93,7 @@ defmodule Fathom.Admin.MetricsTest do
   end
 
   test "record is a no-op when the metrics layer is disabled" do
-    Application.put_env(:fathom, :metrics_collector, false)
+    Env.put!(:metrics_collector, false)
     FlushWatermark.record("off", 1, WriteCounter.generation())
     assert FlushWatermark.snapshot() == []
   end
@@ -143,7 +135,7 @@ defmodule Fathom.Admin.MetricsTest do
   # ── Query-latency telemetry event through the real executor hot path (1a) ──
 
   test "a successful query emits [:fathom,:shard,:query] with a positive duration" do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     attach([:fathom, :shard, :query])
     id = uniq("q")
     on_exit(fn -> clean_shard(id) end)
@@ -179,7 +171,7 @@ defmodule Fathom.Admin.MetricsTest do
   end
 
   test "an open shard publishes a watermark; draining forgets it" do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     id = uniq("wmshard")
     on_exit(fn -> clean_shard(id) end)
 
@@ -215,13 +207,9 @@ defmodule Fathom.Admin.MetricsTest do
   test "Storage.stored_usage counts live .db objects and sums bytes" do
     dir = Path.join(System.tmp_dir!(), "fathom_usage_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    prev = Application.get_env(:fathom, Fathom.Shard.Storage.Local)
-    Application.put_env(:fathom, Fathom.Shard.Storage.Local, dir: dir)
+    Env.put!(Fathom.Shard.Storage.Local, dir: dir)
 
-    on_exit(fn ->
-      File.rm_rf(dir)
-      restore(Fathom.Shard.Storage.Local, prev)
-    end)
+    on_exit(fn -> File.rm_rf(dir) end)
 
     File.write!(Path.join(dir, "a.db"), String.duplicate("x", 100))
     File.write!(Path.join(dir, "b.db"), String.duplicate("y", 200))
@@ -235,15 +223,8 @@ defmodule Fathom.Admin.MetricsTest do
   # ── MetricsCollector (Phase 2): broadcasts a well-formed metrics map each tick ──
 
   test "the collector broadcasts a metrics map with direct + aggregate fields" do
-    prev_load = Application.get_env(:fathom, :shard_load)
-    prev_tick = Application.get_env(:fathom, :admin_tick_ms)
-    Application.put_env(:fathom, :shard_load, true)
-    Application.put_env(:fathom, :admin_tick_ms, 80)
-
-    on_exit(fn ->
-      restore(:shard_load, prev_load)
-      restore(:admin_tick_ms, prev_tick)
-    end)
+    Env.put!(:shard_load, true)
+    Env.put!(:admin_tick_ms, 80)
 
     Phoenix.PubSub.subscribe(Fathom.PubSub, Fathom.Admin.MetricsCollector.topic())
     start_supervised!(Fathom.Admin.MetricsCollector)
@@ -329,9 +310,7 @@ defmodule Fathom.Admin.MetricsTest do
   #
   # Pins the throttle behaviourally via the cache stamp, since the walk itself has no seam to count.
   test "the RPO walk runs at most once per interval, not once per tick (expert review 2026-08-26 #27)" do
-    prev_tick = Application.get_env(:fathom, :admin_tick_ms)
-    Application.put_env(:fathom, :admin_tick_ms, 10)
-    on_exit(fn -> restore(:admin_tick_ms, prev_tick) end)
+    Env.put!(:admin_tick_ms, 10)
 
     pid = start_supervised!(Fathom.Admin.MetricsCollector)
 
@@ -366,17 +345,11 @@ defmodule Fathom.Admin.MetricsTest do
   # own 10 s interval and the ticks in between serve the cached hot list; node_qps comes from the
   # scrape-derived query rate. `hot_walks` counts REAL walks (the seam).
   test "the 1 s tick does not walk ShardLoad; the hot pass runs on its own interval (#1)" do
-    prev_load = Application.get_env(:fathom, :shard_load)
-    prev_tick = Application.get_env(:fathom, :admin_tick_ms)
-    Application.put_env(:fathom, :shard_load, true)
-    Application.put_env(:fathom, :admin_tick_ms, 10)
+    Env.put!(:shard_load, true)
+    Env.put!(:admin_tick_ms, 10)
     Fathom.ShardLoad.reset()
 
-    on_exit(fn ->
-      Fathom.ShardLoad.reset()
-      restore(:shard_load, prev_load)
-      restore(:admin_tick_ms, prev_tick)
-    end)
+    on_exit(fn -> Fathom.ShardLoad.reset() end)
 
     for i <- 1..2_000, do: Fathom.ShardLoad.record_query("hotwalk_#{i}", 1, 0)
     Fathom.ShardLoad.record_query("hotwalk_1", 1, 0)
@@ -409,9 +382,7 @@ defmodule Fathom.Admin.MetricsTest do
   # stuck) collector made it time out after 5 s, so the Reporter beat published an all-nil health
   # row — "unknown" in the Nodes triage table — exactly when the node was overloaded.
   test "NodeHealth stays populated while the collector is suspended (#17)" do
-    prev_tick = Application.get_env(:fathom, :admin_tick_ms)
-    Application.put_env(:fathom, :admin_tick_ms, 10)
-    on_exit(fn -> restore(:admin_tick_ms, prev_tick) end)
+    Env.put!(:admin_tick_ms, 10)
 
     pid = start_supervised!(Fathom.Admin.MetricsCollector)
 
@@ -495,14 +466,10 @@ defmodule Fathom.Admin.MetricsTest do
   # ── #12: per-shard latency percentiles are windowed, not lifetime-cumulative ──
 
   test "window_latency reports the recent window, not the lifetime max (expert review 2026-07-14 #12)" do
-    prev_load = Application.get_env(:fathom, :shard_load)
-    Application.put_env(:fathom, :shard_load, true)
+    Env.put!(:shard_load, true)
     Fathom.ShardLatency.reset()
 
-    on_exit(fn ->
-      Fathom.ShardLatency.reset()
-      restore(:shard_load, prev_load)
-    end)
+    on_exit(fn -> Fathom.ShardLatency.reset() end)
 
     id = uniq("w12")
     native = fn us -> System.convert_time_unit(us, :microsecond, :native) end
@@ -526,24 +493,12 @@ defmodule Fathom.Admin.MetricsTest do
   # ── #22: the storage-usage poll is supervised, overlap-guarded, and caches on completion ──
 
   test "the storage-usage poll is supervised + overlap-guarded (expert review 2026-07-14 #22)" do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_tick = Application.get_env(:fathom, :admin_tick_ms)
-    prev_usage = Application.get_env(:fathom, :admin_usage_ms)
-    prev_gate = Application.get_env(:fathom, :usage_poll_gate)
-
     # Slow the automatic tick + poll cadence right down (we drive :usage_poll manually) and point
     # storage at the blocking stub so a poll stays observably in flight.
-    Application.put_env(:fathom, :shard_storage, Fathom.Admin.MetricsTestUsageStub)
-    Application.put_env(:fathom, :admin_tick_ms, 60_000)
-    Application.put_env(:fathom, :admin_usage_ms, 60_000)
-    Application.put_env(:fathom, :usage_poll_gate, self())
-
-    on_exit(fn ->
-      restore(:shard_storage, prev_storage)
-      restore(:admin_tick_ms, prev_tick)
-      restore(:admin_usage_ms, prev_usage)
-      restore(:usage_poll_gate, prev_gate)
-    end)
+    Env.put!(:shard_storage, Fathom.Admin.MetricsTestUsageStub)
+    Env.put!(:admin_tick_ms, 60_000)
+    Env.put!(:admin_usage_ms, 60_000)
+    Env.put!(:usage_poll_gate, self())
 
     attach([:fathom, :storage, :usage])
 

@@ -16,6 +16,7 @@ defmodule Fathom.Shard.Storage.StealWatchTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   @shard "shard_watch"
@@ -28,33 +29,18 @@ defmodule Fathom.Shard.Storage.StealWatchTest do
   @watch_table Fathom.Shard.Storage.StealWatch
 
   setup do
-    prev = Application.get_env(:fathom, S3)
-    prev_watch = Application.get_env(:fathom, :steal_watch_ms)
-    prev_margin = Application.get_env(:fathom, :steal_margin_ms)
-
-    Application.put_env(:fathom, :steal_watch_ms, @window)
+    Env.put!(:steal_watch_ms, @window)
     # Margin 0 also turns the heartbeat read memo off (its TTL is margin / 5), so every acquire
     # below reads the heartbeat the test just wrote rather than a cached one.
-    Application.put_env(:fathom, :steal_margin_ms, 0)
+    Env.put!(:steal_margin_ms, 0)
     Storage.reset_steal_watch()
 
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-
-      restore(:steal_watch_ms, prev_watch)
-      restore(:steal_margin_ms, prev_margin)
-      Storage.reset_steal_watch()
-    end)
+    on_exit(fn -> Storage.reset_steal_watch() end)
 
     assert :ets.whereis(@watch_table) != :undefined, "the watch table is not up"
     assert Storage.steal_watch_window_ms() == @window, "the watch is not on"
     :ok
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, val), do: Application.put_env(:fathom, key, val)
 
   defp start_store(store_now, hb_exp, lock_exp) do
     objects = %{
@@ -66,7 +52,7 @@ defmodule Fathom.Shard.Storage.StealWatchTest do
     store = start_supervised!({Agent, fn -> S3EtagStore.initial(objects) end})
     S3EtagStore.set_date_ms(store, store_now)
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -93,7 +79,7 @@ defmodule Fathom.Shard.Storage.StealWatchTest do
   end
 
   test "precondition: with the watch off, the lagging-clock fixture IS stolen (the old rule)" do
-    Application.put_env(:fathom, :steal_watch_ms, 0)
+    Env.put!(:steal_watch_ms, 0)
     owner_now = Storage.now_ms()
     store = start_store(owner_now + 35_000, owner_now + 30_000, owner_now + 30_000)
 
@@ -202,8 +188,8 @@ defmodule Fathom.Shard.Storage.StealWatchTest do
   end
 
   test "the default window is the lease TTL plus the steal margin" do
-    Application.delete_env(:fathom, :steal_watch_ms)
-    Application.put_env(:fathom, :steal_margin_ms, 5_000)
+    Env.delete!(:steal_watch_ms)
+    Env.put!(:steal_margin_ms, 5_000)
     ttl = Application.get_env(:fathom, :shard_lease_ttl_ms, 30_000)
     assert Storage.steal_watch_window_ms() == ttl + 5_000
   end

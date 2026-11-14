@@ -16,6 +16,8 @@ defmodule Fathom.BenchTest do
   """
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.Env
+
   @moduletag :bench
 
   test "cold-open p50 is within the order-of-magnitude ceiling" do
@@ -228,22 +230,10 @@ defmodule Fathom.BenchTest do
        name: Fathom.Shard.Replication.Follower, port: 0, dir: dir}
     )
 
-    prev_gate = Application.get_env(:fathom, :replication_promote_on_open)
-    prev_recover = Application.get_env(:fathom, :replication_recover_from_peers)
-    Application.put_env(:fathom, :replication_promote_on_open, true)
-    Application.put_env(:fathom, :replication_recover_from_peers, false)
+    Env.put!(:replication_promote_on_open, true)
+    Env.put!(:replication_recover_from_peers, false)
 
-    on_exit(fn ->
-      if is_nil(prev_gate),
-        do: Application.delete_env(:fathom, :replication_promote_on_open),
-        else: Application.put_env(:fathom, :replication_promote_on_open, prev_gate)
-
-      if is_nil(prev_recover),
-        do: Application.delete_env(:fathom, :replication_recover_from_peers),
-        else: Application.put_env(:fathom, :replication_recover_from_peers, prev_recover)
-
-      File.rm_rf(dir)
-    end)
+    on_exit(fn -> File.rm_rf(dir) end)
 
     # 20 rows, object stamped at 10 — a cold open would serve 10, a promote serves 20. If the
     # promotion did not fire, promote_open_sample/3 raises and this test fails, which is the point.
@@ -267,22 +257,10 @@ defmodule Fathom.BenchTest do
        name: Fathom.Shard.Replication.Follower, port: 0, dir: dir}
     )
 
-    prev_gate = Application.get_env(:fathom, :replication_promote_on_open)
-    prev_recover = Application.get_env(:fathom, :replication_recover_from_peers)
-    Application.put_env(:fathom, :replication_promote_on_open, false)
-    Application.put_env(:fathom, :replication_recover_from_peers, false)
+    Env.put!(:replication_promote_on_open, false)
+    Env.put!(:replication_recover_from_peers, false)
 
-    on_exit(fn ->
-      if is_nil(prev_gate),
-        do: Application.delete_env(:fathom, :replication_promote_on_open),
-        else: Application.put_env(:fathom, :replication_promote_on_open, prev_gate)
-
-      if is_nil(prev_recover),
-        do: Application.delete_env(:fathom, :replication_recover_from_peers),
-        else: Application.put_env(:fathom, :replication_recover_from_peers, prev_recover)
-
-      File.rm_rf(dir)
-    end)
+    on_exit(fn -> File.rm_rf(dir) end)
 
     assert_raise RuntimeError, ~r/measured a cold open/, fn ->
       Fathom.Bench.promote_open_sample(20, 10, 4096)
@@ -328,14 +306,7 @@ defmodule Fathom.BenchTest do
   # rescues two ArgumentErrors). With the gate forced on, a wire run must leave rows in both.
   @tag timeout: 120_000
   test "setup starts the load tables and a wire run feeds them when :shard_load is on" do
-    prev = Application.get_env(:fathom, :shard_load)
-    Application.put_env(:fathom, :shard_load, true)
-
-    on_exit(fn ->
-      if prev == nil,
-        do: Application.delete_env(:fathom, :shard_load),
-        else: Application.put_env(:fathom, :shard_load, prev)
-    end)
+    Env.put!(:shard_load, true)
 
     # hrana_rt_stats/1 raises if the loop recorded nothing (assert_load_recorded!/2).
     assert is_float(Fathom.Bench.hrana_rt(hrana_rt_samples: 20))
@@ -686,17 +657,10 @@ defmodule Fathom.BenchTest do
   # the pinned route disabled the same trials take the VACUUM route, and the arm must RAISE rather
   # than silently change series. (Measured 2026-10-21: the 5 trials reported 5 x :vacuum.)
   test "flush_p50_us raises when its trials leave the pinned-live route" do
-    prev = Application.get_env(:fathom, :flush_pinned_live_upload)
-    Application.put_env(:fathom, :flush_pinned_live_upload, false)
+    Env.put!(:flush_pinned_live_upload, false)
 
-    try do
-      assert_raise RuntimeError, ~r/pinned_live/, fn ->
-        Fathom.Bench.flush_p50(trials: 2, flush_rows: 500)
-      end
-    after
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :flush_pinned_live_upload),
-        else: Application.put_env(:fathom, :flush_pinned_live_upload, prev)
+    assert_raise RuntimeError, ~r/pinned_live/, fn ->
+      Fathom.Bench.flush_p50(trials: 2, flush_rows: 500)
     end
   end
 end

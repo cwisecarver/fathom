@@ -23,26 +23,21 @@ defmodule Fathom.Shard.OrphanTerminateTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
 
   setup do
     shard = "orphan_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     on_exit(fn ->
       # The test kills a Registry partition; the one_for_all restart may still be in flight when
       # the NEXT test (any file) registers a coordinator, which then stops as an orphan: CI
       # 2026-10-14 (OTP 29, seed 935568) pre_touch_etag_flush_test and shard_coordinator_open_test.
       Fathom.Test.RegistryKill.settle()
-      Application.delete_env(:fathom, :faulty_before)
       Shards.drain(shard, 2_000)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
           p <- Path.wildcard(Path.join(dir, "#{shard}*")),
@@ -91,8 +86,7 @@ defmodule Fathom.Shard.OrphanTerminateTest do
       test = self()
       first = :counters.new(1, [])
 
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :faulty_before,
         {:flush,
          fn

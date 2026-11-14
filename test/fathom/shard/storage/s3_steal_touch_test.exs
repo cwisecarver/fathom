@@ -22,6 +22,7 @@ defmodule Fathom.Shard.Storage.S3StealTouchTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   @shard "shard_x"
@@ -37,9 +38,7 @@ defmodule Fathom.Shard.Storage.S3StealTouchTest do
   end
 
   defp put_config(store) do
-    prev = Application.get_env(:fathom, S3)
-
-    Application.put_env(:fathom, S3,
+    Env.put!(:fathom, S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -48,12 +47,6 @@ defmodule Fathom.Shard.Storage.S3StealTouchTest do
       path_style: true,
       req_plug: fn conn -> S3EtagStore.serve(conn, store) end
     )
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
   end
 
   defp start_store(objects) do

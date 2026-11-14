@@ -11,20 +11,16 @@ defmodule Fathom.ShardsCaseCanonicalTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
     n = System.unique_integer([:positive])
     a = "casea_#{n}"
     b = "caseb_#{n}"
-    prev = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    Env.put!(:shard_idle_ms, 60_000)
 
     on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :shard_idle_ms),
-        else: Application.put_env(:fathom, :shard_idle_ms, prev)
-
       for id <- [a, b] do
         Shards.stop(id)
 

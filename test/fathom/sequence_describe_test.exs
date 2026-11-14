@@ -8,6 +8,7 @@ defmodule Fathom.SequenceDescribeTest do
   use Fathom.DataCase, async: false
 
   alias Fathom.{Directory, HranaAuth, ShardExecutor, Shards}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
@@ -132,9 +133,7 @@ defmodule Fathom.SequenceDescribeTest do
   end
 
   test "a read-only token cannot run a script", %{shard: shard} do
-    prev = Application.get_env(:fathom, :hrana_auth, :disabled)
-    Application.put_env(:fathom, :hrana_auth, :required)
-    on_exit(fn -> Application.put_env(:fathom, :hrana_auth, prev) end)
+    Env.put!(:hrana_auth, :required)
 
     {:ok, _} = Directory.resolve(shard)
     {:ok, ro} = HranaAuth.token_for(shard, scope: :ro)

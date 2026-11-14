@@ -12,21 +12,15 @@ defmodule Fathom.Shard.Storage.TwoStealerTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.Local
+  alias Fathom.Test.Env
 
   @rounds 50
 
   setup do
     dir = Path.join(System.tmp_dir!(), "fathom_race_#{System.unique_integer([:positive])}")
-    prev = Application.get_env(:fathom, Fathom.Shard.Storage.Local)
-    Application.put_env(:fathom, Fathom.Shard.Storage.Local, dir: dir)
+    Env.put!(:fathom, Fathom.Shard.Storage.Local, dir: dir)
 
-    on_exit(fn ->
-      File.rm_rf!(dir)
-
-      if prev,
-        do: Application.put_env(:fathom, Fathom.Shard.Storage.Local, prev),
-        else: Application.delete_env(:fathom, Fathom.Shard.Storage.Local)
-    end)
+    on_exit(fn -> File.rm_rf!(dir) end)
 
     %{dir: dir}
   end

@@ -16,6 +16,7 @@ defmodule Fathom.Shard.InternalDeadlineTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.{Connection, Integrity}
+  alias Fathom.Test.Env
 
   setup do
     dir = Path.join(System.tmp_dir!(), "internal_deadline_#{System.unique_integer([:positive])}")
@@ -35,16 +36,9 @@ defmodule Fathom.Shard.InternalDeadlineTest do
     :ok = Connection.exec(c, "PRAGMA wal_checkpoint(TRUNCATE)")
     Connection.close(c)
 
-    prev = Application.get_env(:fathom, :query_timeout_ms)
-    Application.put_env(:fathom, :query_timeout_ms, 1)
+    Env.put!(:query_timeout_ms, 1)
 
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :query_timeout_ms, prev),
-        else: Application.delete_env(:fathom, :query_timeout_ms)
-
-      File.rm_rf!(dir)
-    end)
+    on_exit(fn -> File.rm_rf!(dir) end)
 
     %{dir: dir, path: path}
   end

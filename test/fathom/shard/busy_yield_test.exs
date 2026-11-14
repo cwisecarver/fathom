@@ -19,19 +19,15 @@ defmodule Fathom.Shard.BusyYieldTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Env
 
   setup do
     unless Fathom.Shard.Extension.available?(),
       do: flunk("fathom_udf extension not built: these tests would measure nothing")
 
-    prev = Application.get_env(:fathom, :query_timeout_ms)
-    Application.delete_env(:fathom, :query_timeout_ms)
-    on_exit(fn -> restore(:query_timeout_ms, prev) end)
+    Env.delete!(:query_timeout_ms)
     :ok
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, v), do: Application.put_env(:fathom, key, v)
 
   defp db_path!(tag) do
     path =

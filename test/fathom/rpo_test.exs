@@ -15,17 +15,13 @@ defmodule Fathom.RpoTest do
 
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
     shard = "rpo_#{System.unique_integer([:positive])}"
-    prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
 
     on_exit(fn ->
-      restore(:shard_flush_interval_ms, prev_flush)
-      restore(:shard_idle_ms, prev_idle)
-
       for dir <- [local_dir(), remote_dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".lock"],
           do: File.rm(Path.join(dir, shard <> suffix))
@@ -35,9 +31,6 @@ defmodule Fathom.RpoTest do
 
     %{shard: shard}
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
 
@@ -78,8 +71,8 @@ defmodule Fathom.RpoTest do
 
   test "node loss loses exactly the writes committed after the last flush", %{shard: shard} do
     # Interval 0 ⇒ only the explicit flush_now reaches storage, so the loss boundary is exact.
-    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_flush_interval_ms, 0)
+    Env.put!(:shard_idle_ms, 600_000)
 
     {:ok, h} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(h, stmt("CREATE TABLE t (seq INTEGER PRIMARY KEY)"))
@@ -101,8 +94,8 @@ defmodule Fathom.RpoTest do
   end
 
   test "a tighter flush cadence shrinks the loss window", %{shard: shard} do
-    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_flush_interval_ms, 0)
+    Env.put!(:shard_idle_ms, 600_000)
 
     {:ok, h} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(h, stmt("CREATE TABLE t (seq INTEGER PRIMARY KEY)"))
@@ -125,8 +118,8 @@ defmodule Fathom.RpoTest do
        %{shard: shard} do
     # No periodic flush + a long idle window: the ONLY thing in storage is one early flush, so a
     # survival of the later writes can only come from the local disk, not a re-pull.
-    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_flush_interval_ms, 0)
+    Env.put!(:shard_idle_ms, 600_000)
 
     {:ok, h} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(h, stmt("CREATE TABLE t (seq INTEGER PRIMARY KEY)"))

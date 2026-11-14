@@ -21,37 +21,20 @@ defmodule Fathom.Shard.ProtocolSigningTest do
 
   alias Fathom.Shard.Replication.FrameAuth
   alias Fathom.Shard.Replication.Protocol
+  alias Fathom.Test.Env
 
   @secret "a-fleet-shared-secret-long-enough-to-be-real"
 
   setup do
-    prev = %{
-      sign: Application.get_env(:fathom, :replication_sign_frames),
-      required: Application.get_env(:fathom, :replication_hmac_required),
-      secret: Application.get_env(:fathom, :replication_hmac_secret)
-    }
+    on_exit(fn -> FrameAuth.forget_key() end)
 
-    on_exit(fn ->
-      for {k, v} <- [
-            replication_sign_frames: prev.sign,
-            replication_hmac_required: prev.required,
-            replication_hmac_secret: prev.secret
-          ] do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
-
-      FrameAuth.forget_key()
-    end)
-
-    Application.put_env(:fathom, :replication_hmac_secret, @secret)
+    Env.put!(:replication_hmac_secret, @secret)
     FrameAuth.forget_key()
     :ok
   end
 
-  defp sign!(on?), do: Application.put_env(:fathom, :replication_sign_frames, on?)
-  defp require!(on?), do: Application.put_env(:fathom, :replication_hmac_required, on?)
+  defp sign!(on?), do: Env.put!(:replication_sign_frames, on?)
+  defp require!(on?), do: Env.put!(:replication_hmac_required, on?)
 
   defp push(overrides \\ []) do
     struct!(
@@ -175,7 +158,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
     test "a peer with a DIFFERENT key is refused" do
       signed = IO.iodata_to_binary(Protocol.encode_push(push()))
 
-      Application.put_env(:fathom, :replication_hmac_secret, "some-other-fleets-secret")
+      Env.put!(:replication_hmac_secret, "some-other-fleets-secret")
       FrameAuth.forget_key()
 
       assert {:error, :unauthenticated} = Protocol.decode(signed)
@@ -184,8 +167,8 @@ defmodule Fathom.Shard.ProtocolSigningTest do
     test "a peer with NO key is refused" do
       signed = IO.iodata_to_binary(Protocol.encode_push(push()))
 
-      Application.delete_env(:fathom, :replication_hmac_secret)
-      Application.delete_env(:fathom, :hrana_token_secret)
+      Env.delete!(:replication_hmac_secret)
+      Env.delete!(:hrana_token_secret)
       FrameAuth.forget_key()
 
       assert {:error, :unauthenticated} = Protocol.decode(signed)
@@ -274,26 +257,12 @@ defmodule Fathom.Shard.ProtocolSigningTest do
   end
 
   describe "the boot guard" do
-    setup do
-      prev_hrana = Application.get_env(:fathom, :hrana_token_secret)
-
-      on_exit(fn ->
-        if is_nil(prev_hrana),
-          do: Application.delete_env(:fathom, :hrana_token_secret),
-          else: Application.put_env(:fathom, :hrana_token_secret, prev_hrana)
-
-        FrameAuth.forget_key()
-      end)
-
-      :ok
-    end
-
     test "signing with NO key refuses to boot" do
       # The quiet failure this exists for: `sign/1` answers nil with no key and `seal/1` then sends
       # the frame UNSIGNED. The node believes it is authenticating and is not, which is the worst
       # of the three states — it would pass every "is signing on?" check an operator could run.
-      Application.delete_env(:fathom, :replication_hmac_secret)
-      Application.delete_env(:fathom, :hrana_token_secret)
+      Env.delete!(:replication_hmac_secret)
+      Env.delete!(:hrana_token_secret)
       FrameAuth.forget_key()
       sign!(true)
       require!(false)
@@ -304,8 +273,8 @@ defmodule Fathom.Shard.ProtocolSigningTest do
     end
 
     test "requiring with NO key refuses to boot" do
-      Application.delete_env(:fathom, :replication_hmac_secret)
-      Application.delete_env(:fathom, :hrana_token_secret)
+      Env.delete!(:replication_hmac_secret)
+      Env.delete!(:hrana_token_secret)
       FrameAuth.forget_key()
       sign!(true)
       require!(true)
@@ -332,8 +301,8 @@ defmodule Fathom.Shard.ProtocolSigningTest do
     test "the HRANA secret alone satisfies the key requirement" do
       # The documented fallback: a fleet already distributing one shared secret should not have to
       # distribute a second before it can turn this on.
-      Application.delete_env(:fathom, :replication_hmac_secret)
-      Application.put_env(:fathom, :hrana_token_secret, "an-existing-fleet-wide-hrana-secret")
+      Env.delete!(:replication_hmac_secret)
+      Env.put!(:hrana_token_secret, "an-existing-fleet-wide-hrana-secret")
       FrameAuth.forget_key()
       sign!(true)
       require!(true)
@@ -345,8 +314,8 @@ defmodule Fathom.Shard.ProtocolSigningTest do
     # unset. runtime.exs stored it, and `"" || hrana_secret` is "" (truthy), so the fallback above was
     # never reached and the boot refused with a message pointing at the wrong fix.
     test "an EMPTY replication secret does not shadow the Hrana fallback" do
-      Application.put_env(:fathom, :replication_hmac_secret, "")
-      Application.put_env(:fathom, :hrana_token_secret, "an-existing-fleet-wide-hrana-secret")
+      Env.put!(:replication_hmac_secret, "")
+      Env.put!(:hrana_token_secret, "an-existing-fleet-wide-hrana-secret")
       FrameAuth.forget_key()
       sign!(true)
       require!(true)
@@ -356,8 +325,8 @@ defmodule Fathom.Shard.ProtocolSigningTest do
     end
 
     test "both flags off is always fine, key or no key" do
-      Application.delete_env(:fathom, :replication_hmac_secret)
-      Application.delete_env(:fathom, :hrana_token_secret)
+      Env.delete!(:replication_hmac_secret)
+      Env.delete!(:hrana_token_secret)
       FrameAuth.forget_key()
       sign!(false)
       require!(false)
@@ -372,25 +341,12 @@ defmodule Fathom.Shard.ProtocolSigningTest do
   # booted, so the first test fails there.
   describe "the prod secret length floor" do
     setup do
-      prev_env = Application.get_env(:fathom, :env)
-      prev_hrana = Application.get_env(:fathom, :hrana_token_secret)
-      Application.put_env(:fathom, :env, :prod)
-
-      on_exit(fn ->
-        if is_nil(prev_env),
-          do: Application.delete_env(:fathom, :env),
-          else: Application.put_env(:fathom, :env, prev_env)
-
-        if is_nil(prev_hrana),
-          do: Application.delete_env(:fathom, :hrana_token_secret),
-          else: Application.put_env(:fathom, :hrana_token_secret, prev_hrana)
-      end)
-
+      Env.put!(:env, :prod)
       :ok
     end
 
     test "a short prod secret refuses to boot while signing is on" do
-      Application.put_env(:fathom, :replication_hmac_secret, "short")
+      Env.put!(:replication_hmac_secret, "short")
       FrameAuth.forget_key()
       sign!(true)
       require!(false)
@@ -401,7 +357,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
     end
 
     test "a short prod secret refuses to boot while requiring is on" do
-      Application.put_env(:fathom, :replication_hmac_secret, String.duplicate("s", 31))
+      Env.put!(:replication_hmac_secret, String.duplicate("s", 31))
       FrameAuth.forget_key()
       sign!(true)
       require!(true)
@@ -414,8 +370,8 @@ defmodule Fathom.Shard.ProtocolSigningTest do
     test "the HRANA fallback is held to the same floor" do
       # The guard checks whichever secret is RESOLVED, so a short HRANA_TOKEN_SECRET cannot slip
       # past it by not being the replication-specific variable.
-      Application.delete_env(:fathom, :replication_hmac_secret)
-      Application.put_env(:fathom, :hrana_token_secret, "short-hrana")
+      Env.delete!(:replication_hmac_secret)
+      Env.put!(:hrana_token_secret, "short-hrana")
       FrameAuth.forget_key()
       sign!(true)
       require!(false)
@@ -426,7 +382,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
     end
 
     test "exactly 32 bytes boots" do
-      Application.put_env(:fathom, :replication_hmac_secret, String.duplicate("k", 32))
+      Env.put!(:replication_hmac_secret, String.duplicate("k", 32))
       FrameAuth.forget_key()
       sign!(true)
       require!(true)
@@ -435,7 +391,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
     end
 
     test "a short secret is not refused while frame auth is off (the key is never used)" do
-      Application.put_env(:fathom, :replication_hmac_secret, "short")
+      Env.put!(:replication_hmac_secret, "short")
       FrameAuth.forget_key()
       sign!(false)
       require!(false)
@@ -449,7 +405,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
       # Domain separation. If the raw secret were the HMAC key, a leaked replication key would BE
       # the Hrana token-signing secret, and anyone holding it could mint a tenant credential for
       # any shard in the fleet.
-      Application.put_env(:fathom, :replication_hmac_secret, @secret)
+      Env.put!(:replication_hmac_secret, @secret)
       FrameAuth.forget_key()
 
       tag = FrameAuth.sign("some frame header")
@@ -463,19 +419,19 @@ defmodule Fathom.Shard.ProtocolSigningTest do
     end
 
     test "REPLICATION_HMAC_SECRET wins over the HRANA fallback" do
-      Application.put_env(:fathom, :hrana_token_secret, "the-hrana-one")
-      Application.put_env(:fathom, :replication_hmac_secret, "the-replication-one")
+      Env.put!(:hrana_token_secret, "the-hrana-one")
+      Env.put!(:replication_hmac_secret, "the-replication-one")
       FrameAuth.forget_key()
       dedicated = FrameAuth.sign("m")
 
-      Application.delete_env(:fathom, :replication_hmac_secret)
+      Env.delete!(:replication_hmac_secret)
       FrameAuth.forget_key()
       fallback = FrameAuth.sign("m")
 
       refute dedicated == fallback,
              "the dedicated secret did not take precedence, so the two cannot be rotated apart"
 
-      Application.delete_env(:fathom, :hrana_token_secret)
+      Env.delete!(:hrana_token_secret)
       FrameAuth.forget_key()
       assert FrameAuth.sign("m") == nil
     end

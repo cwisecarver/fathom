@@ -13,17 +13,14 @@ defmodule Fathom.Shards.LruEvictionTest do
 
   alias Fathom.{ShardExecutor, Shards}
   alias Fathom.Shards.Lru
+  alias Fathom.Test.Env
   alias Fathom.Test.FaultyStorage
   alias Filo.Stmt
 
   setup do
-    prev_cap = Application.get_env(:fathom, :max_open_shards)
-    prev_evict = Application.get_env(:fathom, :evict_idle_at_capacity)
     Lru.reset()
 
     on_exit(fn ->
-      restore(:max_open_shards, prev_cap)
-      restore(:evict_idle_at_capacity, prev_evict)
       Lru.reset()
 
       for dir <- [local_dir(), remote_dir()],
@@ -33,9 +30,6 @@ defmodule Fathom.Shards.LruEvictionTest do
 
     :ok
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, val), do: Application.put_env(:fathom, key, val)
 
   # These table-level tests use SYNTHETIC ids with no coordinator behind them, so the default
   # liveness predicate would (correctly) classify every row as a ghost. Pinning it keeps them
@@ -80,7 +74,7 @@ defmodule Fathom.Shards.LruEvictionTest do
   test "at capacity, a new open evicts an idle shard instead of refusing" do
     idle = open_idle(uniq())
     _busy = open_held(uniq())
-    Application.put_env(:fathom, :max_open_shards, 1)
+    Env.put!(:max_open_shards, 1)
 
     ref = Process.monitor(idle)
     # Pre-fix this was {:error, :node_at_capacity}; now the idle shard is evicted to admit.
@@ -92,7 +86,7 @@ defmodule Fathom.Shards.LruEvictionTest do
     older = open_idle(uniq())
     newer = open_idle(uniq())
     _busy = open_held(uniq())
-    Application.put_env(:fathom, :max_open_shards, 1)
+    Env.put!(:max_open_shards, 1)
 
     older_ref = Process.monitor(older)
     newer_ref = Process.monitor(newer)
@@ -159,7 +153,7 @@ defmodule Fathom.Shards.LruEvictionTest do
       assert Enum.take(Lru.lru_order(100, all_live()), 20) == ghosts,
              "the ghost wall is not at the cold end, so the probe never reaches it first"
 
-      Application.put_env(:fathom, :max_open_shards, 1)
+      Env.put!(:max_open_shards, 1)
 
       ref = Process.monitor(idle)
 
@@ -173,7 +167,7 @@ defmodule Fathom.Shards.LruEvictionTest do
 
   test "a busy shard is never evicted — all-busy at capacity still refuses" do
     busy = open_held(uniq())
-    Application.put_env(:fathom, :max_open_shards, 1)
+    Env.put!(:max_open_shards, 1)
 
     assert {:error, :node_at_capacity} = Shards.checkout(uniq())
     assert Process.alive?(busy), "a shard with a live connection must never be evicted"
@@ -194,7 +188,7 @@ defmodule Fathom.Shards.LruEvictionTest do
     # flake reproducible at `--seed 570749 --max-cases 8` (CI OTP-29, 2026-09-08). The reset Lru is
     # empty, so `evicted_for_room?/0` cannot make room, and the open is refused rather than evicting.
     # Headroom over the live count keeps the cap finite (Lru tracking active) while never at capacity.
-    Application.put_env(:fathom, :max_open_shards, Registry.count(Fathom.ShardRegistry) + 100)
+    Env.put!(:max_open_shards, Registry.count(Fathom.ShardRegistry) + 100)
     id = uniq()
 
     {:ok, pid, ref, _path} = Shards.checkout(id)
@@ -210,7 +204,7 @@ defmodule Fathom.Shards.LruEvictionTest do
   # risky case is the MIDDLE: with two holders, releasing one must leave the shard busy, and only
   # the last release may clear it.
   test "busy stays set while ANY holder remains and clears only on the last release" do
-    Application.put_env(:fathom, :max_open_shards, Registry.count(Fathom.ShardRegistry) + 100)
+    Env.put!(:max_open_shards, Registry.count(Fathom.ShardRegistry) + 100)
     id = uniq()
 
     {:ok, pid, ref1, _path} = Shards.checkout(id)
@@ -228,10 +222,10 @@ defmodule Fathom.Shards.LruEvictionTest do
   end
 
   test "with :evict_idle_at_capacity false (hard cap), an idle shard is not evicted" do
-    Application.put_env(:fathom, :evict_idle_at_capacity, false)
+    Env.put!(:evict_idle_at_capacity, false)
     idle = open_idle(uniq())
     _busy = open_held(uniq())
-    Application.put_env(:fathom, :max_open_shards, 1)
+    Env.put!(:max_open_shards, 1)
 
     assert {:error, :node_at_capacity} = Shards.checkout(uniq())
     assert Process.alive?(idle), "eviction is disabled, so the idle shard must survive"
@@ -239,7 +233,7 @@ defmodule Fathom.Shards.LruEvictionTest do
 
   describe "Lru table" do
     test "forget removes a row; lru_order is bounded by the limit" do
-      Application.put_env(:fathom, :max_open_shards, 100)
+      Env.put!(:max_open_shards, 100)
       Lru.reset()
       for i <- 1..5, do: Lru.touch("t#{i}")
 
@@ -257,7 +251,7 @@ defmodule Fathom.Shards.LruEvictionTest do
     # grow per checkout instead of per shard. Pre-fix (insert-only order keys) the size
     # assertion fails at 53.
     test "repeated touches keep one order key per shard; walk order is stamp order (#14)" do
-      Application.put_env(:fathom, :max_open_shards, 100)
+      Env.put!(:max_open_shards, 100)
       Lru.reset()
 
       for _ <- 1..50, do: Lru.touch("hot")
@@ -278,7 +272,7 @@ defmodule Fathom.Shards.LruEvictionTest do
     # so a stamp up to one window stale can at worst pick a slightly-less-cold victim, never a busy
     # one.
     test "repeated touches inside the granularity window do not rewrite the order key (#24)" do
-      Application.put_env(:fathom, :max_open_shards, 100)
+      Env.put!(:max_open_shards, 100)
       Lru.reset()
 
       Lru.touch("warm")
@@ -305,7 +299,7 @@ defmodule Fathom.Shards.LruEvictionTest do
     # granularity window the release now re-inserts the key at the shard's EXISTING stamp. Pre-fix,
     # the stamp assertion fails: the release re-stamped.
     test "a release inside the granularity window re-inserts at the existing stamp (2026-10-19 #5)" do
-      Application.put_env(:fathom, :max_open_shards, 100)
+      Env.put!(:max_open_shards, 100)
       Lru.reset()
 
       Lru.record_conns("a", 1)
@@ -331,7 +325,7 @@ defmodule Fathom.Shards.LruEvictionTest do
     # The other side of the window: a stream held longer than it re-stamps at release, so a shard
     # released after a younger one sorts AFTER it (LRU recency is by release, not by checkout).
     test "a release past the granularity window re-stamps at the release time (2026-10-19 #5)" do
-      Application.put_env(:fathom, :max_open_shards, 100)
+      Env.put!(:max_open_shards, 100)
       Lru.reset()
 
       Lru.record_conns("long", 1)
@@ -347,7 +341,7 @@ defmodule Fathom.Shards.LruEvictionTest do
     end
 
     test "touch is a no-op when eviction is unreachable (no finite cap)" do
-      Application.put_env(:fathom, :max_open_shards, :infinity)
+      Env.put!(:max_open_shards, :infinity)
       Lru.reset()
       Lru.touch("ghost")
       assert Lru.lru_order(10, all_live()) == []
@@ -358,7 +352,7 @@ defmodule Fathom.Shards.LruEvictionTest do
     # filter BUSY shards BEFORE the limit cut, so a bounded probe never wastes its slots on the busy
     # LRU front and 503s while an evictable idle shard sits just past the probe window.
     test "lru_order returns only IDLE candidates — a busy front never hides the idle tail (#14)" do
-      Application.put_env(:fathom, :max_open_shards, 100)
+      Env.put!(:max_open_shards, 100)
       Lru.reset()
 
       # 20 BUSY shards are the coldest (touched first); one IDLE shard is the warmest.
@@ -383,7 +377,7 @@ defmodule Fathom.Shards.LruEvictionTest do
     # independent of how many are busy. The counting predicate is called once per VISITED live-stamp
     # entry; pre-fix it is called ~20_000 times.
     test "the walk does not visit busy shards (#29)" do
-      Application.put_env(:fathom, :max_open_shards, 100_000)
+      Env.put!(:max_open_shards, 100_000)
       Lru.reset()
 
       for i <- 1..20_000 do
@@ -436,9 +430,7 @@ defmodule Fathom.Shards.LruEvictionTest do
     # for these fixtures so the shards publish their rows. With it off every candidate reads unknown
     # and the order is plain LRU, which is the fallback this describe does not exercise.
     setup do
-      prev = Application.get_env(:fathom, :metrics_collector)
-      Application.put_env(:fathom, :metrics_collector, true)
-      on_exit(fn -> restore(:metrics_collector, prev) end)
+      Env.put!(:metrics_collector, true)
       :ok
     end
 
@@ -452,7 +444,7 @@ defmodule Fathom.Shards.LruEvictionTest do
       assert Fathom.Shard.dirty?(dirty), "the colder fixture did not read dirty"
       refute Fathom.Shard.dirty?(clean), "the warmer fixture did not read clean"
 
-      Application.put_env(:fathom, :max_open_shards, 1)
+      Env.put!(:max_open_shards, 1)
       dirty_ref = Process.monitor(dirty)
       clean_ref = Process.monitor(clean)
 
@@ -471,7 +463,7 @@ defmodule Fathom.Shards.LruEvictionTest do
       assert Fathom.Shard.dirty?(older), "the colder fixture did not read dirty"
       assert Fathom.Shard.dirty?(newer), "the warmer fixture did not read dirty"
 
-      Application.put_env(:fathom, :max_open_shards, 1)
+      Env.put!(:max_open_shards, 1)
       older_ref = Process.monitor(older)
       newer_ref = Process.monitor(newer)
 
@@ -494,16 +486,7 @@ defmodule Fathom.Shards.LruEvictionTest do
   # just stops blocking on it and 503s fast (the LB retries).
   describe "eviction is bounded by :evict_budget_ms under a slow-flushing evictable shard" do
     setup do
-      prev_storage = Application.get_env(:fathom, :shard_storage)
-      prev_delay = Application.get_env(:fathom, :storage_flush_delay_ms)
-      prev_budget = Application.get_env(:fathom, :evict_budget_ms)
-      Application.put_env(:fathom, :shard_storage, FaultyStorage)
-
-      on_exit(fn ->
-        restore(:shard_storage, prev_storage)
-        restore(:storage_flush_delay_ms, prev_delay)
-        restore(:evict_budget_ms, prev_budget)
-      end)
+      Env.put!(:shard_storage, FaultyStorage)
 
       :ok
     end
@@ -512,12 +495,12 @@ defmodule Fathom.Shards.LruEvictionTest do
       # The evictable idle shard's terminate flush takes 3s (a slow/hung S3); the admission
       # budget is 400ms. Pre-fix the checkout blocked ~3s (the full flush) — up to 16 × 30s
       # in the worst case; post-fix it must refuse within a few × the 400ms budget.
-      Application.put_env(:fathom, :storage_flush_delay_ms, 3_000)
-      Application.put_env(:fathom, :evict_budget_ms, 400)
+      Env.put!(:storage_flush_delay_ms, 3_000)
+      Env.put!(:evict_budget_ms, 400)
 
       dirty = open_idle_dirty(uniq())
       ref = Process.monitor(dirty)
-      Application.put_env(:fathom, :max_open_shards, 1)
+      Env.put!(:max_open_shards, 1)
 
       t0 = System.monotonic_time(:millisecond)
       result = Shards.checkout(uniq())
@@ -540,11 +523,11 @@ defmodule Fathom.Shards.LruEvictionTest do
     test "with a fast flush under the budget, eviction still evicts and admits" do
       # Same path, but the flush is fast (no injected delay): the budget must not break the
       # happy path — the idle shard is evicted and the new tenant is admitted.
-      Application.put_env(:fathom, :evict_budget_ms, 2_000)
+      Env.put!(:evict_budget_ms, 2_000)
 
       dirty = open_idle_dirty(uniq())
       ref = Process.monitor(dirty)
-      Application.put_env(:fathom, :max_open_shards, 1)
+      Env.put!(:max_open_shards, 1)
 
       assert {:ok, _pid, _r, _p} = Shards.checkout(uniq())
       assert_receive {:DOWN, ^ref, :process, ^dirty, _}, 5_000

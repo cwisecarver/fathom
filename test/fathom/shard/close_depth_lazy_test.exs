@@ -9,11 +9,11 @@ defmodule Fathom.Shard.CloseDepthLazyTest do
 
   alias Fathom.{Shard, Shards}
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.Env
 
   setup do
     id = "closedepth_#{System.unique_integer([:positive])}"
-    prev = Application.fetch_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_idle_ms, 600_000)
     test_pid = self()
     handler = "closedepth-#{id}"
 
@@ -26,11 +26,6 @@ defmodule Fathom.Shard.CloseDepthLazyTest do
 
     on_exit(fn ->
       :telemetry.detach(handler)
-
-      case prev do
-        {:ok, v} -> Application.put_env(:fathom, :shard_idle_ms, v)
-        :error -> Application.delete_env(:fathom, :shard_idle_ms)
-      end
 
       Shards.stop(id)
 

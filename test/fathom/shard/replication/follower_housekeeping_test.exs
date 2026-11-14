@@ -11,6 +11,7 @@ defmodule Fathom.Shard.Replication.FollowerHousekeepingTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Replication.{Follower, Keepalive, Protocol}
+  alias Fathom.Test.Env
 
   setup do
     name = :"housekeeping_#{System.unique_integer([:positive])}"
@@ -19,17 +20,6 @@ defmodule Fathom.Shard.Replication.FollowerHousekeepingTest do
     on_exit(fn -> File.rm_rf(dir) end)
 
     %{name: name, dir: dir, id: "housekeeping-#{System.unique_integer([:positive])}"}
-  end
-
-  defp put_env(key, value) do
-    prev = Application.get_env(:fathom, key)
-    Application.put_env(:fathom, key, value)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, key),
-        else: Application.put_env(:fathom, key, prev)
-    end)
   end
 
   # A process that takes `id`'s replica lock and keeps it until told to release.
@@ -222,7 +212,7 @@ defmodule Fathom.Shard.Replication.FollowerHousekeepingTest do
     test "forget still completes when the lock stays busy (tombstone erase is not blockable)",
          ctx do
       %{name: name, id: id} = ctx
-      put_env(:replication_forget_lock_wait_ms, 50)
+      Env.put!(:replication_forget_lock_wait_ms, 50)
       :ok = Follower.seed(name, id, 1, 0, 0, 0, 3)
       holder = hold_lock(name, id)
 

@@ -13,24 +13,18 @@ defmodule Fathom.Tenants.TombstoneBurstBenchTest do
 
   alias Fathom.ShardExecutor
   alias Fathom.Tenants.Tombstones
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @stubs 100_000
   @burst 200
 
   setup do
-    prev = Application.get_env(:fathom, :shard_data_dir)
     dir = Path.join(System.tmp_dir!(), "fathom_tomb_burst_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    Application.put_env(:fathom, :shard_data_dir, dir)
+    Env.put!(:shard_data_dir, dir)
 
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :shard_data_dir),
-        else: Application.put_env(:fathom, :shard_data_dir, prev)
-
-      File.rm_rf(dir)
-    end)
+    on_exit(fn -> File.rm_rf(dir) end)
 
     %{dir: dir}
   end

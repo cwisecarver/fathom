@@ -4,6 +4,7 @@ defmodule Fathom.Telemetry.ProtocolTest do
 
   alias Fathom.Shard.Storage.S3
   alias Fathom.Telemetry.Protocol
+  alias Fathom.Test.Env
 
   setup do
     Protocol.reset()
@@ -112,23 +113,10 @@ defmodule Fathom.Telemetry.ProtocolTest do
   end
 
   describe "S3 Req steps" do
-    setup do
-      old = {Application.get_env(:fathom, :shard_storage), Application.get_env(:fathom, S3)}
-
-      on_exit(fn ->
-        # restore OR delete: leaving our S3 stub config behind sends later tests to a dead endpoint
-        for {key, val} <- [{:shard_storage, elem(old, 0)}, {S3, elem(old, 1)}] do
-          if val,
-            do: Application.put_env(:fathom, key, val),
-            else: Application.delete_env(:fathom, key)
-        end
-      end)
-    end
-
     defp use_s3(plug) do
-      Application.put_env(:fathom, :shard_storage, S3)
+      Env.put!(:shard_storage, S3)
 
-      Application.put_env(:fathom, S3,
+      Env.put!(S3,
         bucket: "b",
         region: "us-east-1",
         access_key_id: "k",

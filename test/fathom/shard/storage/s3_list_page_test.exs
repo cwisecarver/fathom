@@ -11,6 +11,7 @@ defmodule Fathom.Shard.Storage.S3ListPageTest do
 
   alias Fathom.Shard.Storage.S3
   alias Fathom.Shard.Storage.S3.ListPage
+  alias Fathom.Test.Env
 
   defp xml(inner, opts \\ []) do
     truncated = Keyword.get(opts, :truncated, false)
@@ -96,14 +97,7 @@ defmodule Fathom.Shard.Storage.S3ListPageTest do
 
   describe "the paginated callers" do
     setup do
-      prev = Application.get_env(:fathom, S3)
       test_pid = self()
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, S3, prev),
-          else: Application.delete_env(:fathom, S3)
-      end)
 
       %{test_pid: test_pid}
     end
@@ -135,7 +129,7 @@ defmodule Fathom.Shard.Storage.S3ListPageTest do
         end
       end
 
-      Application.put_env(:fathom, S3,
+      Env.put!(S3,
         bucket: "b",
         region: "us-east-1",
         access_key_id: "k",
@@ -336,7 +330,7 @@ defmodule Fathom.Shard.Storage.S3ListPageTest do
         end
       end
 
-      Application.put_env(:fathom, S3,
+      Env.put!(S3,
         bucket: "b",
         region: "us-east-1",
         access_key_id: "k",
@@ -348,14 +342,6 @@ defmodule Fathom.Shard.Storage.S3ListPageTest do
     end
 
     setup do
-      prev = Application.get_env(:fathom, S3)
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, S3, prev),
-          else: Application.delete_env(:fathom, S3)
-      end)
-
       %{test_pid: self()}
     end
 

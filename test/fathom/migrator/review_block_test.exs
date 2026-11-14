@@ -15,6 +15,7 @@ defmodule Fathom.Migrator.ReviewBlockTest do
   alias Fathom.Directory
   alias Fathom.Migrator
   alias Fathom.Migrator.Release
+  alias Fathom.Test.Env
 
   defmodule OkTransform do
     @moduledoc false
@@ -24,14 +25,7 @@ defmodule Fathom.Migrator.ReviewBlockTest do
   end
 
   setup do
-    prev = Application.get_env(:fathom, :migration_transforms)
-    Application.put_env(:fathom, :migration_transforms, [OkTransform])
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :migration_transforms, prev),
-        else: Application.delete_env(:fathom, :migration_transforms)
-    end)
+    Env.put!(:migration_transforms, [OkTransform])
 
     :ok
   end

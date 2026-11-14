@@ -10,37 +10,22 @@ defmodule Fathom.HranaAuthRotationTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Directory, HranaAuth}
+  alias Fathom.Test.Env
 
   setup do
-    prev_mode = Application.get_env(:fathom, :hrana_auth, :disabled)
-    prev_grace = Application.get_env(:fathom, :hrana_rotation_grace_ms)
-    prev_max_age = Application.get_env(:fathom, :hrana_token_max_age)
-    Application.put_env(:fathom, :hrana_auth, :required)
-
-    on_exit(fn ->
-      Application.put_env(:fathom, :hrana_auth, prev_mode)
-
-      if is_nil(prev_grace),
-        do: Application.delete_env(:fathom, :hrana_rotation_grace_ms),
-        else: Application.put_env(:fathom, :hrana_rotation_grace_ms, prev_grace)
-
-      if is_nil(prev_max_age),
-        do: Application.delete_env(:fathom, :hrana_token_max_age),
-        else: Application.put_env(:fathom, :hrana_token_max_age, prev_max_age)
-    end)
-
+    Env.put!(:hrana_auth, :required)
     :ok
   end
 
   test "the boot guard warns when tokens never expire (#24)" do
-    Application.delete_env(:fathom, :hrana_token_max_age)
+    Env.delete!(:hrana_token_max_age)
 
     log = capture_log(fn -> assert :ok = HranaAuth.check_config!() end)
     assert log =~ "NEVER expire"
   end
 
   test "a finite max_age silences the never-expire warning" do
-    Application.put_env(:fathom, :hrana_token_max_age, 86_400)
+    Env.put!(:hrana_token_max_age, 86_400)
 
     log = capture_log(fn -> assert :ok = HranaAuth.check_config!() end)
     refute log =~ "NEVER expire"
@@ -49,7 +34,7 @@ defmodule Fathom.HranaAuthRotationTest do
   defp uniq, do: "rot_#{System.unique_integer([:positive])}"
 
   test "rotate mints a working new token AND keeps the old valid during the grace window" do
-    Application.put_env(:fathom, :hrana_rotation_grace_ms, 3_600_000)
+    Env.put!(:hrana_rotation_grace_ms, 3_600_000)
     shard = uniq()
     {:ok, _} = Directory.resolve(shard)
     {:ok, old} = HranaAuth.token_for(shard)
@@ -62,7 +47,7 @@ defmodule Fathom.HranaAuthRotationTest do
   end
 
   test "once the grace window has elapsed the old token stops verifying" do
-    Application.put_env(:fathom, :hrana_rotation_grace_ms, 0)
+    Env.put!(:hrana_rotation_grace_ms, 0)
     shard = uniq()
     {:ok, _} = Directory.resolve(shard)
     {:ok, old} = HranaAuth.token_for(shard)
@@ -75,7 +60,7 @@ defmodule Fathom.HranaAuthRotationTest do
   end
 
   test "revoke is immediate — the previous version dies even with a long grace configured" do
-    Application.put_env(:fathom, :hrana_rotation_grace_ms, 3_600_000)
+    Env.put!(:hrana_rotation_grace_ms, 3_600_000)
     shard = uniq()
     {:ok, _} = Directory.resolve(shard)
     {:ok, old} = HranaAuth.token_for(shard)
@@ -87,7 +72,7 @@ defmodule Fathom.HranaAuthRotationTest do
   end
 
   test "only the immediately-previous version is covered by the grace, not older ones" do
-    Application.put_env(:fathom, :hrana_rotation_grace_ms, 3_600_000)
+    Env.put!(:hrana_rotation_grace_ms, 3_600_000)
     shard = uniq()
     {:ok, _} = Directory.resolve(shard)
     {:ok, v1} = HranaAuth.token_for(shard)

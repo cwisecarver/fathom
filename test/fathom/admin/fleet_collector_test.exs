@@ -10,6 +10,7 @@ defmodule Fathom.Admin.FleetCollectorTest do
 
   alias Fathom.Admin.FleetCollector
   alias Fathom.Directory
+  alias Fathom.Test.Env
 
   setup do
     # The collector is gated off in test (:metrics_collector false), so start it explicitly and
@@ -40,14 +41,7 @@ defmodule Fathom.Admin.FleetCollectorTest do
   # was looking. It now polls only while a viewer is registered.
   describe "polls only while watched (expert review 2026-10-01 perf #20)" do
     setup do
-      prev = Application.get_env(:fathom, :admin_fleet_refresh_ms)
-      Application.put_env(:fathom, :admin_fleet_refresh_ms, 30)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :admin_fleet_refresh_ms),
-          else: Application.put_env(:fathom, :admin_fleet_refresh_ms, prev)
-      end)
+      Env.put!(:admin_fleet_refresh_ms, 30)
 
       Phoenix.PubSub.subscribe(Fathom.PubSub, FleetCollector.topic())
       :ok
@@ -111,14 +105,7 @@ defmodule Fathom.Admin.FleetCollectorTest do
   # not the tab count); a TTL of 0 recomputes.
   describe "migrations_page/0 cache (expert review 2026-10-12 #33)" do
     setup do
-      prev = Application.get_env(:fathom, :admin_migrations_cache_ms)
-      Application.put_env(:fathom, :admin_migrations_cache_ms, 60_000)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :admin_migrations_cache_ms),
-          else: Application.put_env(:fathom, :admin_migrations_cache_ms, prev)
-      end)
+      Env.put!(:admin_migrations_cache_ms, 60_000)
 
       start_supervised!(FleetCollector)
       :ok
@@ -147,14 +134,7 @@ defmodule Fathom.Admin.FleetCollectorTest do
   # stale page or wait for the winner's.
   describe "migrations_page single-flight (expert review 2026-10-13 #28)" do
     setup do
-      prev = Application.get_env(:fathom, :admin_migrations_cache_ms)
-      Application.put_env(:fathom, :admin_migrations_cache_ms, 1)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :admin_migrations_cache_ms),
-          else: Application.put_env(:fathom, :admin_migrations_cache_ms, prev)
-      end)
+      Env.put!(:admin_migrations_cache_ms, 1)
 
       start_supervised!(FleetCollector)
       :ok

@@ -7,25 +7,17 @@ defmodule Fathom.ShardLatencyTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{ShardExecutor, ShardLatency, Shards}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
-    prev = Application.get_env(:fathom, :shard_load)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_load, true)
+    Env.put!(:shard_load, true)
     ShardLatency.reset()
 
-    on_exit(fn ->
-      ShardLatency.reset()
-      restore(:shard_load, prev)
-      restore(:shard_idle_ms, prev_idle)
-    end)
+    on_exit(fn -> ShardLatency.reset() end)
 
     :ok
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, val), do: Application.put_env(:fathom, key, val)
 
   defp uniq(p), do: "#{p}_#{System.unique_integer([:positive])}"
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
@@ -147,7 +139,7 @@ defmodule Fathom.ShardLatencyTest do
   # ── through the hot path ──
 
   test "a query records latency, and a stop forgets it" do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     id = uniq("lat")
     on_exit(fn -> clean_shard(id) end)
 
@@ -169,7 +161,7 @@ defmodule Fathom.ShardLatencyTest do
 
   test "the hot path records nothing when disabled" do
     Application.put_env(:fathom, :shard_load, false)
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     id = uniq("latoff")
     on_exit(fn -> clean_shard(id) end)
 

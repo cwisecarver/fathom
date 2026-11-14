@@ -8,24 +8,18 @@ defmodule Fathom.Shard.QuarantineTest do
 
   alias Fathom.Shard
   alias Fathom.Shard.TempReaper
+  alias Fathom.Test.Env
 
   setup do
     dir = Path.join(System.tmp_dir!(), "fathom_quar_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    prev_data = Application.get_env(:fathom, :shard_data_dir)
-    prev_ret = Application.get_env(:fathom, :quarantine_retention_ms)
 
     on_exit(fn ->
-      restore(:shard_data_dir, prev_data)
-      restore(:quarantine_retention_ms, prev_ret)
       File.rm_rf(dir)
     end)
 
     %{dir: dir}
   end
-
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
 
   defp touch!(path, body \\ "x") do
     File.write!(path, body)
@@ -48,12 +42,12 @@ defmodule Fathom.Shard.QuarantineTest do
 
   test "the reaper sweeps quarantines past retention, keeps fresh ones, and emits the count gauge",
        %{dir: dir} do
-    Application.put_env(:fathom, :shard_data_dir, dir)
+    Env.put!(:shard_data_dir, dir)
     # A 1-minute retention; the old file (quarantined 1h ago, per its name) is past it, the fresh
     # one is not. This used to set the age with `File.touch` on the mtime and name the files with
     # ms stamps of 1 and 2 — i.e. it pinned the mtime ageing that expert review 2026-09-29 #32
     # showed is wrong (rename preserves mtime). The name's stamp is the quarantine time now.
-    Application.put_env(:fathom, :quarantine_retention_ms, 60_000)
+    Env.put!(:quarantine_retention_ms, 60_000)
     now = System.system_time(:millisecond)
 
     old = touch!(Path.join(dir, "old.db.fenced.#{now - 3_600_000}-1"))
@@ -85,8 +79,8 @@ defmodule Fathom.Shard.QuarantineTest do
   # in the name, and a `.db` + `-wal` + `-shm` set is kept or swept as a unit.
   test "age is the quarantine time in the name, not the content's mtime; sets age as a unit",
        %{dir: dir} do
-    Application.put_env(:fathom, :shard_data_dir, dir)
-    Application.put_env(:fathom, :quarantine_retention_ms, 60_000)
+    Env.put!(:shard_data_dir, dir)
+    Env.put!(:quarantine_retention_ms, 60_000)
     now = System.system_time(:millisecond)
     ancient = System.os_time(:second) - 60 * 24 * 3600
 
@@ -114,8 +108,8 @@ defmodule Fathom.Shard.QuarantineTest do
   end
 
   test "retention 0 keeps quarantines forever (the leak-off escape hatch)", %{dir: dir} do
-    Application.put_env(:fathom, :shard_data_dir, dir)
-    Application.put_env(:fathom, :quarantine_retention_ms, 0)
+    Env.put!(:shard_data_dir, dir)
+    Env.put!(:quarantine_retention_ms, 0)
 
     old = touch!(Path.join(dir, "keep.db.fenced.1-1"))
     :ok = File.touch(old, System.os_time(:second) - 365 * 24 * 3600)

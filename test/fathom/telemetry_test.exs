@@ -5,6 +5,8 @@ defmodule Fathom.TelemetryTest do
   # collector needed. Helpers + setup from Fathom.ClusterShardCase.
   use Fathom.ClusterShardCase
 
+  alias Fathom.Test.Env
+
   # Named handler (telemetry warns on anonymous-fun handlers).
   def forward(event, measurements, meta, %{pid: pid}) do
     send(pid, {:telemetry, event, measurements, meta})
@@ -22,15 +24,7 @@ defmodule Fathom.TelemetryTest do
   # nothing. The invariant: with :otel_spans UNSET, the bridge must stay detached (runtime.exs
   # flips it true only alongside a real exporter).
   test "the OTel span bridge defaults OFF when :otel_spans is unset" do
-    original = Application.fetch_env(:fathom, :otel_spans)
-    Application.delete_env(:fathom, :otel_spans)
-
-    on_exit(fn ->
-      case original do
-        {:ok, v} -> Application.put_env(:fathom, :otel_spans, v)
-        :error -> Application.delete_env(:fathom, :otel_spans)
-      end
-    end)
+    Env.delete!(:otel_spans)
 
     refute Fathom.Telemetry.otel_spans?()
   end

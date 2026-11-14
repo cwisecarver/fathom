@@ -9,6 +9,7 @@ defmodule Fathom.Admin.HostMeasurementsTest do
   import ExUnit.CaptureLog
 
   alias Fathom.Admin.Measurements
+  alias Fathom.Test.Env
 
   @gib 1024 * 1024 * 1024
 
@@ -110,14 +111,7 @@ defmodule Fathom.Admin.HostMeasurementsTest do
 
   describe "check_vm_dirty_background!/1 (boot preflight)" do
     setup do
-      prev = Application.get_env(:fathom, :env)
-      Application.put_env(:fathom, :env, :prod)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :env),
-          else: Application.put_env(:fathom, :env, prev)
-      end)
+      Env.put!(:env, :prod)
     end
 
     test "a default large-RAM host warns once, with the rig evidence and 'measure', not 'lower'" do

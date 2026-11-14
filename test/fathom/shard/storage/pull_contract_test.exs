@@ -30,20 +30,14 @@ defmodule Fathom.Shard.Storage.PullContractTest do
 
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Env
 
   setup do
     dir = Path.join(System.tmp_dir!(), "pullcontract_#{System.unique_integer([:positive])}")
-    prev = Application.get_env(:fathom, Fathom.Shard.Storage.Local)
     File.mkdir_p!(dir)
-    Application.put_env(:fathom, Fathom.Shard.Storage.Local, dir: dir)
+    Env.put!(Fathom.Shard.Storage.Local, dir: dir)
 
-    on_exit(fn ->
-      File.rm_rf!(dir)
-
-      if prev,
-        do: Application.put_env(:fathom, Fathom.Shard.Storage.Local, prev),
-        else: Application.delete_env(:fathom, Fathom.Shard.Storage.Local)
-    end)
+    on_exit(fn -> File.rm_rf!(dir) end)
 
     %{dir: dir, id: "pc_#{System.unique_integer([:positive])}"}
   end

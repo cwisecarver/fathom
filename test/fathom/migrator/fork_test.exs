@@ -16,18 +16,14 @@ defmodule Fathom.Migrator.ForkTest do
   alias Fathom.Migrator
   alias Fathom.Shard.{Connection, Storage}
   alias Fathom.ShardExecutor
+  alias Fathom.Test.Env
   alias Filo.{Error, Stmt, StmtResult}
 
   setup do
     template = "tmplfork#{System.unique_integer([:positive])}"
-    prev = Application.get_env(:fathom, :template_shard_id)
-    Application.put_env(:fathom, :template_shard_id, template)
+    Env.put!(:template_shard_id, template)
 
     on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :template_shard_id, prev),
-        else: Application.delete_env(:fathom, :template_shard_id)
-
       cleanup_shard(template)
     end)
 
@@ -120,7 +116,7 @@ defmodule Fathom.Migrator.ForkTest do
     end
 
     test "returns :no_template when no template shard is configured" do
-      Application.delete_env(:fathom, :template_shard_id)
+      Env.delete!(:template_shard_id)
       {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
 
       assert {:error, :no_template} = Migrator.retain_template_head()
@@ -522,16 +518,7 @@ defmodule Fathom.Migrator.ForkTest do
     # be corrupted by the next rollout (replaying DDL over already-present tables).
     test "a fork that fails mid-stamp leaves no live object and the shard is born empty",
          %{template: template} do
-      prev_backend = Application.get_env(:fathom, :shard_storage)
-      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-
-      on_exit(fn ->
-        Application.delete_env(:fathom, :storage_fault)
-
-        if prev_backend,
-          do: Application.put_env(:fathom, :shard_storage, prev_backend),
-          else: Application.delete_env(:fathom, :shard_storage)
-      end)
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
       seed_template!(template)
       {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
@@ -541,7 +528,7 @@ defmodule Fathom.Migrator.ForkTest do
 
       # The stamped flush fails (S3 unreachable): the fork must clean up the copied
       # object rather than leave an unstamped fork.
-      Application.put_env(:fathom, :storage_fault, :flush)
+      Env.put!(:storage_fault, :flush)
       assert {:error, :s3_unreachable} = Migrator.fork_from_template(tenant)
       refute File.exists?(remote_object(tenant)), "a failed fork must leave NO live object"
 
@@ -557,8 +544,7 @@ defmodule Fathom.Migrator.ForkTest do
   describe "novel-shard admission" do
     test "with :fork_from_template on, a novel checkout is born at HEAD end to end",
          %{template: template} do
-      Application.put_env(:fathom, :fork_from_template, true)
-      on_exit(fn -> Application.put_env(:fathom, :fork_from_template, false) end)
+      Env.put!(:fork_from_template, true)
 
       seed_template!(template)
       {:ok, _} = Migrator.release(3, "v3", ["SELECT 1"])
@@ -579,8 +565,7 @@ defmodule Fathom.Migrator.ForkTest do
 
     test "with :fork_from_template on but HEAD 0, a novel shard is born empty and still serves",
          %{template: template} do
-      Application.put_env(:fathom, :fork_from_template, true)
-      on_exit(fn -> Application.put_env(:fathom, :fork_from_template, false) end)
+      Env.put!(:fork_from_template, true)
 
       seed_template!(template)
 
@@ -615,8 +600,7 @@ defmodule Fathom.Migrator.ForkTest do
     # is never noise.
     test "a fork fallback emits [:fathom, :migrator, :fork_fallback] and still serves",
          %{template: template} do
-      Application.put_env(:fathom, :fork_from_template, true)
-      on_exit(fn -> Application.put_env(:fathom, :fork_from_template, false) end)
+      Env.put!(:fork_from_template, true)
 
       seed_template!(template)
       # No release ⇒ HEAD 0 ⇒ no `template@HEAD` snapshot to fork from. This is the
@@ -665,8 +649,7 @@ defmodule Fathom.Migrator.ForkTest do
 
     test "a SUCCESSFUL fork is silent — no fallback alarm on the healthy path",
          %{template: template} do
-      Application.put_env(:fathom, :fork_from_template, true)
-      on_exit(fn -> Application.put_env(:fathom, :fork_from_template, false) end)
+      Env.put!(:fork_from_template, true)
 
       seed_template!(template)
       {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])

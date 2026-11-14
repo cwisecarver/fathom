@@ -16,18 +16,12 @@ defmodule Fathom.Shard.ReplicationReplyTimeoutTest do
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Protocol.{Push, SeedBegin}
   alias Fathom.Shard.Replication.Shipper
+  alias Fathom.Test.Env
 
   @timeout 300
 
   setup do
-    prev = Application.get_env(:fathom, :replication_reply_timeout_ms)
-    Application.put_env(:fathom, :replication_reply_timeout_ms, @timeout)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :replication_reply_timeout_ms),
-        else: Application.put_env(:fathom, :replication_reply_timeout_ms, prev)
-    end)
+    Env.put!(:replication_reply_timeout_ms, @timeout)
 
     :ok
   end

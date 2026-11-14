@@ -10,19 +10,10 @@ defmodule Fathom.HranaAuthRevocationTest do
 
   alias Fathom.{Directory, HranaAuth}
   alias Fathom.HranaAuth.Revocations
+  alias Fathom.Test.Env
 
   setup do
-    prev_mode = Application.get_env(:fathom, :hrana_auth, :disabled)
-    prev_secret = Application.get_env(:fathom, :hrana_token_secret)
-    Application.put_env(:fathom, :hrana_auth, :required)
-
-    on_exit(fn ->
-      Application.put_env(:fathom, :hrana_auth, prev_mode)
-
-      if is_nil(prev_secret),
-        do: Application.delete_env(:fathom, :hrana_token_secret),
-        else: Application.put_env(:fathom, :hrana_token_secret, prev_secret)
-    end)
+    Env.put!(:hrana_auth, :required)
 
     :ok
   end
@@ -154,15 +145,8 @@ defmodule Fathom.HranaAuthRevocationTest do
     import ExUnit.CaptureLog
 
     shard = uniq()
-    prev_ttl = Application.get_env(:fathom, :hrana_revocation_ttl_ms)
     # TTL 0: the cached entry is immediately expired, forcing the read-through.
-    Application.put_env(:fathom, :hrana_revocation_ttl_ms, 0)
-
-    on_exit(fn ->
-      if prev_ttl == nil,
-        do: Application.delete_env(:fathom, :hrana_revocation_ttl_ms),
-        else: Application.put_env(:fathom, :hrana_revocation_ttl_ms, prev_ttl)
-    end)
+    Env.put!(:hrana_revocation_ttl_ms, 0)
 
     test_pid = self()
     handler_id = "floor-error-#{shard}"
@@ -200,25 +184,13 @@ defmodule Fathom.HranaAuthRevocationTest do
     import ExUnit.CaptureLog
 
     shard = uniq()
-    prev_ttl = Application.get_env(:fathom, :hrana_revocation_ttl_ms)
-    prev_posture = Application.get_env(:fathom, :hrana_revocation_on_error)
-    Application.put_env(:fathom, :hrana_revocation_ttl_ms, 0)
-
-    on_exit(fn ->
-      if prev_ttl == nil,
-        do: Application.delete_env(:fathom, :hrana_revocation_ttl_ms),
-        else: Application.put_env(:fathom, :hrana_revocation_ttl_ms, prev_ttl)
-
-      if prev_posture == nil,
-        do: Application.delete_env(:fathom, :hrana_revocation_on_error),
-        else: Application.put_env(:fathom, :hrana_revocation_on_error, prev_posture)
-    end)
+    Env.put!(:hrana_revocation_ttl_ms, 0)
 
     Ecto.Adapters.SQL.Sandbox.mode(Fathom.Repo, :manual)
 
     capture_log(fn ->
       # Default: fail open — the signature stays the enforced control.
-      Application.delete_env(:fathom, :hrana_revocation_on_error)
+      Env.delete!(:hrana_revocation_on_error)
       assert Revocations.floor(shard) == 0
 
       # Fail closed: no floor knowledge means no token acceptance.
@@ -239,20 +211,10 @@ defmodule Fathom.HranaAuthRevocationTest do
     import ExUnit.CaptureLog
 
     shard = uniq()
-    prev_ttl = Application.get_env(:fathom, :hrana_revocation_ttl_ms)
-    prev_posture = Application.get_env(:fathom, :hrana_revocation_on_error)
-    Application.put_env(:fathom, :hrana_revocation_ttl_ms, 0)
-    Application.delete_env(:fathom, :hrana_revocation_on_error)
+    Env.put!(:hrana_revocation_ttl_ms, 0)
+    Env.delete!(:hrana_revocation_on_error)
 
     on_exit(fn ->
-      if prev_ttl == nil,
-        do: Application.delete_env(:fathom, :hrana_revocation_ttl_ms),
-        else: Application.put_env(:fathom, :hrana_revocation_ttl_ms, prev_ttl)
-
-      if prev_posture == nil,
-        do: Application.delete_env(:fathom, :hrana_revocation_on_error),
-        else: Application.put_env(:fathom, :hrana_revocation_on_error, prev_posture)
-
       File.rm(Path.join([Fathom.Shard.Storage.Local.dir(), "tokenfloors", shard]))
     end)
 
@@ -282,16 +244,10 @@ defmodule Fathom.HranaAuthRevocationTest do
     import ExUnit.CaptureLog
 
     shard = uniq()
-    prev_ttl = Application.get_env(:fathom, :hrana_revocation_ttl_ms)
-    Application.put_env(:fathom, :hrana_revocation_ttl_ms, 0)
-    Application.put_env(:fathom, :hrana_revocation_on_error, :fail_closed)
+    Env.put!(:hrana_revocation_ttl_ms, 0)
+    Env.put!(:hrana_revocation_on_error, :fail_closed)
 
     on_exit(fn ->
-      if prev_ttl == nil,
-        do: Application.delete_env(:fathom, :hrana_revocation_ttl_ms),
-        else: Application.put_env(:fathom, :hrana_revocation_ttl_ms, prev_ttl)
-
-      Application.delete_env(:fathom, :hrana_revocation_on_error)
       File.rm(Path.join([Fathom.Shard.Storage.Local.dir(), "tokenfloors", shard]))
     end)
 
@@ -311,7 +267,7 @@ defmodule Fathom.HranaAuthRevocationTest do
     shard = uniq()
     {:ok, _} = Directory.resolve(shard)
 
-    Application.put_env(:fathom, :hrana_token_secret, String.duplicate("a", 64))
+    Env.put!(:hrana_token_secret, String.duplicate("a", 64))
     {:ok, token} = HranaAuth.token_for(shard)
     assert {:ok, _} = HranaAuth.authorize(shard, token)
 
@@ -374,11 +330,9 @@ defmodule Fathom.HranaAuthRevocationTest do
     {:ok, token} = HranaAuth.token_for(shard)
     test_pid = self()
 
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :faulty_before,
       {:read_token_floor,
        fn
@@ -398,12 +352,6 @@ defmodule Fathom.HranaAuthRevocationTest do
 
     on_exit(fn ->
       :telemetry.detach(handler)
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-
       File.rm(Path.join([Fathom.Shard.Storage.Local.dir(), "tokenfloors", shard]))
     end)
 
@@ -426,10 +374,7 @@ defmodule Fathom.HranaAuthRevocationTest do
   # Revocations GenServer. (The old fixture used floor-0 rows, which is why it never caught this.)
   describe "cap eviction (2026-11-04 #2)" do
     setup do
-      prev = Application.get_env(:fathom, :hrana_revocation_max_entries)
-
-      Application.put_env(
-        :fathom,
+      Env.put!(
         :hrana_revocation_max_entries,
         :ets.info(Revocations, :size) + 200
       )
@@ -438,13 +383,7 @@ defmodule Fathom.HranaAuthRevocationTest do
       # one-second backoff behind that would otherwise silence the NEXT test's eviction.
       Revocations.reset_eviction_state()
 
-      on_exit(fn ->
-        Revocations.reset_eviction_state()
-
-        if prev,
-          do: Application.put_env(:fathom, :hrana_revocation_max_entries, prev),
-          else: Application.delete_env(:fathom, :hrana_revocation_max_entries)
-      end)
+      on_exit(fn -> Revocations.reset_eviction_state() end)
 
       :ok
     end
@@ -807,14 +746,7 @@ defmodule Fathom.HranaAuthRevocationTest do
     end
 
     test "a full reload is due again after the configured interval" do
-      prev = Application.get_env(:fathom, :hrana_revocation_full_reload_ms)
-      Application.put_env(:fathom, :hrana_revocation_full_reload_ms, 0)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, :hrana_revocation_full_reload_ms),
-          else: Application.put_env(:fathom, :hrana_revocation_full_reload_ms, prev)
-      end)
+      Env.put!(:hrana_revocation_full_reload_ms, 0)
 
       state = finish_full(Revocations.refresh(fresh_state()))
       assert %{full: %{}} = Revocations.refresh(state)

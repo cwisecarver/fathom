@@ -17,17 +17,13 @@ defmodule Fathom.ShardExecutorScriptSchemaGenTest do
 
   alias Fathom.Shard.SchemaGen
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Env
   alias Filo.{Stmt, StmtResult}
 
   setup do
     shard = "scriptgen_#{System.unique_integer([:positive])}"
-    prev_pool = Application.get_env(:fathom, :connection_pool)
 
     on_exit(fn ->
-      if is_nil(prev_pool),
-        do: Application.delete_env(:fathom, :connection_pool),
-        else: Application.put_env(:fathom, :connection_pool, prev_pool)
-
       Shards.drain(shard, 2_000)
 
       for dir <- [Fathom.Shard.data_dir(), Fathom.Shard.Storage.Local.dir()],
@@ -61,7 +57,7 @@ defmodule Fathom.ShardExecutorScriptSchemaGenTest do
   for pooled? <- [false, true] do
     test "a sibling re-reads its columns after a script's ALTER TABLE (pooled: #{pooled?})",
          %{shard: shard} do
-      Application.put_env(:fathom, :connection_pool, unquote(pooled?))
+      Env.put!(:connection_pool, unquote(pooled?))
 
       {:ok, writer} = ShardExecutor.open(shard)
       seed!(writer)

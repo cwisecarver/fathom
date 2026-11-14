@@ -19,6 +19,7 @@ defmodule Fathom.FSBypassTest do
 
   alias Fathom.{FS, Shards}
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Env
 
   defp fs_requests_touching(id, fun, dir \\ nil) do
     dir = dir || Path.dirname(Fathom.Shard.db_path(id))
@@ -237,14 +238,7 @@ defmodule Fathom.FSBypassTest do
     end
 
     test "TempReaper.sweep and Tombstones.sweep_local list without file_server_2", %{tmp_dir: dir} do
-      prev = Application.get_env(:fathom, :shard_data_dir)
-      Application.put_env(:fathom, :shard_data_dir, dir)
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, :shard_data_dir, prev),
-          else: Application.delete_env(:fathom, :shard_data_dir)
-      end)
+      Env.put!(:shard_data_dir, dir)
 
       for i <- 1..50, do: File.write!(Path.join(dir, "ls#{i}.db"), "")
       start_supervised!(Fathom.Shard.TempReaper)
@@ -320,16 +314,9 @@ defmodule Fathom.FSBypassTest do
 
     test "reaper, boot sweep and erase_local keep file_server_2 small and responsive",
          %{tmp_dir: dir} do
-      prev = Application.get_env(:fathom, :shard_data_dir)
-      Application.put_env(:fathom, :shard_data_dir, dir)
+      Env.put!(:shard_data_dir, dir)
 
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, :shard_data_dir, prev),
-          else: Application.delete_env(:fathom, :shard_data_dir)
-
-        :ets.delete(Fathom.Tenants.Tombstones, "benchvictim")
-      end)
+      on_exit(fn -> :ets.delete(Fathom.Tenants.Tombstones, "benchvictim") end)
 
       for i <- 1..30_000, suffix <- [".db", ".db-wal", ".db-shm", ".db.etag"] do
         File.write!(Path.join(dir, "bench#{i}#{suffix}"), "")

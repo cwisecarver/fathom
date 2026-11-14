@@ -33,24 +33,13 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
   alias Fathom.Shard.Replication.FrameAuth
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Protocol.Push
+  alias Fathom.Test.Env
 
   setup do
-    prev_ord = Application.get_env(:fathom, :replication_ordinal_wire)
-    prev_sign = Application.get_env(:fathom, :replication_sign_frames)
-    prev_secret = Application.get_env(:fathom, :replication_hmac_secret)
-
-    on_exit(fn ->
-      restore(:replication_ordinal_wire, prev_ord)
-      restore(:replication_sign_frames, prev_sign)
-      restore(:replication_hmac_secret, prev_secret)
-      FrameAuth.forget_key()
-    end)
+    on_exit(fn -> FrameAuth.forget_key() end)
 
     :ok
   end
-
-  defp restore(k, nil), do: Application.delete_env(:fathom, k)
-  defp restore(k, v), do: Application.put_env(:fathom, k, v)
 
   # `FrameAuth.key/0` memoizes the DERIVED key in `:persistent_term` under a constant cache key,
   # so setting `:replication_hmac_secret` alone does nothing once anything in the run has already
@@ -64,8 +53,8 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
   # exercising the unsigned path. `forget_key/0` exists for exactly this; `protocol_signing_test`
   # has always called it.
   defp enable_signing do
-    Application.put_env(:fathom, :replication_hmac_secret, :crypto.strong_rand_bytes(32))
-    Application.put_env(:fathom, :replication_sign_frames, true)
+    Env.put!(:replication_hmac_secret, :crypto.strong_rand_bytes(32))
+    Env.put!(:replication_sign_frames, true)
     FrameAuth.forget_key()
 
     assert FrameAuth.key_configured?(),
@@ -90,7 +79,7 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
 
   describe "with the gate OFF (the default)" do
     test "the frame is byte-identical to what shipped before" do
-      Application.put_env(:fathom, :replication_ordinal_wire, false)
+      Env.put!(:replication_ordinal_wire, false)
 
       # The whole safety argument for adding a type code rather than bumping the version: a node
       # with the gate off emits exactly what it emitted before, so a peer one deploy behind is
@@ -104,7 +93,7 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
     end
 
     test "a decoded push states no ordinal" do
-      Application.put_env(:fathom, :replication_ordinal_wire, false)
+      Env.put!(:replication_ordinal_wire, false)
 
       assert {:ok, %Push{wal_ordinal: nil}} = roundtrip(push()),
              "an ordinal appeared with the gate off"
@@ -113,7 +102,7 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
 
   describe "with the gate ON" do
     setup do
-      Application.put_env(:fathom, :replication_ordinal_wire, true)
+      Env.put!(:replication_ordinal_wire, true)
       :ok
     end
 
@@ -190,7 +179,7 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
       do: "acme" |> Protocol.encode_position(pos) |> IO.iodata_to_binary() |> Protocol.decode()
 
     test "with the gate OFF it is byte-identical to what shipped before" do
-      Application.put_env(:fathom, :replication_ordinal_wire, false)
+      Env.put!(:replication_ordinal_wire, false)
 
       with_ord = Protocol.encode_position("acme", offer()) |> IO.iodata_to_binary()
       without = Protocol.encode_position("acme", Map.delete(offer(), :wal_ordinal))
@@ -205,7 +194,7 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
     end
 
     test "with the gate ON the ordinal survives with every other field intact" do
-      Application.put_env(:fathom, :replication_ordinal_wire, true)
+      Env.put!(:replication_ordinal_wire, true)
 
       assert {:ok, {:position, "acme", decoded}} = offer_roundtrip(offer())
       assert decoded.wal_ordinal == 12
@@ -217,7 +206,7 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
     end
 
     test "an offer with no ordinal states 0, which fresher?/2 refuses to rank" do
-      Application.put_env(:fathom, :replication_ordinal_wire, true)
+      Env.put!(:replication_ordinal_wire, true)
 
       assert {:ok, {:position, "acme", decoded}} =
                offer_roundtrip(Map.delete(offer(), :wal_ordinal))
@@ -228,9 +217,9 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
     # "I hold nothing" keeps the OLD type code: there is no ordinal to state, so a new code would
     # buy nothing and cost a rolling upgrade.
     test "the empty offer is unchanged under either gate" do
-      Application.put_env(:fathom, :replication_ordinal_wire, true)
+      Env.put!(:replication_ordinal_wire, true)
       on = Protocol.encode_position("acme", nil) |> IO.iodata_to_binary()
-      Application.put_env(:fathom, :replication_ordinal_wire, false)
+      Env.put!(:replication_ordinal_wire, false)
       off = Protocol.encode_position("acme", nil) |> IO.iodata_to_binary()
 
       assert on == off
@@ -238,7 +227,7 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
     end
 
     test "it composes with frame signing, and a tampered offer is REJECTED" do
-      Application.put_env(:fathom, :replication_ordinal_wire, true)
+      Env.put!(:replication_ordinal_wire, true)
       enable_signing()
 
       frame = Protocol.encode_position("acme", offer()) |> IO.iodata_to_binary()
@@ -262,7 +251,7 @@ defmodule Fathom.Shard.Replication.PushOrdinalWireTest do
   end
 
   test "the version is NOT bumped — that is what keeps a rolling upgrade alive" do
-    Application.put_env(:fathom, :replication_ordinal_wire, true)
+    Env.put!(:replication_ordinal_wire, true)
     <<version::8, type::8, _::binary>> = Protocol.encode_push(push()) |> IO.iodata_to_binary()
 
     assert version == 2,

@@ -8,6 +8,7 @@ defmodule Fathom.Shard.Storage.S3RecreateFlagTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
 
   defp stub!(plan) do
     agent = start_supervised!({Agent, fn -> plan end})
@@ -23,9 +24,7 @@ defmodule Fathom.Shard.Storage.S3RecreateFlagTest do
       |> Plug.Conn.send_resp(status, "")
     end
 
-    prev = Application.get_env(:fathom, S3)
-
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -34,12 +33,6 @@ defmodule Fathom.Shard.Storage.S3RecreateFlagTest do
       path_style: true,
       req_plug: plug
     )
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
   end
 
   test "a lock re-created after it vanished mid-acquire is marked recreated" do

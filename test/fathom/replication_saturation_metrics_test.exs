@@ -19,14 +19,11 @@ defmodule Fathom.ReplicationSaturationMetricsTest do
   alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Protocol.Push
   alias Fathom.Shard.Replication.Shipper
+  alias Fathom.Test.Env
 
   @payload :binary.copy(<<0xAB>>, 4096)
 
   setup do
-    prev_cap = Application.get_env(:fathom, :replication_max_queue_bytes)
-    prev_followers = Application.get_env(:fathom, :replication_followers)
-    prev_enabled = Application.get_env(:fathom, :replication_enabled)
-
     name = :"satmetrics_#{System.unique_integer([:positive])}"
     Budget.install(name)
     Fleet.publish([{to_string(name), "127.0.0.1", 9100, name}])
@@ -34,16 +31,6 @@ defmodule Fathom.ReplicationSaturationMetricsTest do
     on_exit(fn ->
       Budget.forget(name)
       Fleet.publish([])
-
-      for {k, v} <- [
-            replication_max_queue_bytes: prev_cap,
-            replication_followers: prev_followers,
-            replication_enabled: prev_enabled
-          ] do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
     end)
 
     %{name: name}
@@ -67,9 +54,9 @@ defmodule Fathom.ReplicationSaturationMetricsTest do
 
   describe "budget.used_ratio — the leading signal" do
     test "reports what fraction of the node budget is in use", %{name: name} do
-      Application.put_env(:fathom, :replication_max_queue_bytes, 10_000)
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_followers, [{~c"127.0.0.1", 9100}])
+      Env.put!(:replication_max_queue_bytes, 10_000)
+      Env.put!(:replication_enabled, true)
+      Env.put!(:replication_followers, [{~c"127.0.0.1", 9100}])
 
       ref = attach([:fathom, :replication, :budget])
 
@@ -90,9 +77,9 @@ defmodule Fathom.ReplicationSaturationMetricsTest do
     test "a disabled bound reports 0.0 rather than dividing by zero", %{name: name} do
       # `max_bytes: 0` means the bound is OFF. A ratio against it is meaningless rather than
       # infinite, and a dashboard must show "no bound" instead of a fake 100% or a crash.
-      Application.put_env(:fathom, :replication_max_queue_bytes, 0)
-      Application.put_env(:fathom, :replication_enabled, true)
-      Application.put_env(:fathom, :replication_followers, [{~c"127.0.0.1", 9100}])
+      Env.put!(:replication_max_queue_bytes, 0)
+      Env.put!(:replication_enabled, true)
+      Env.put!(:replication_followers, [{~c"127.0.0.1", 9100}])
 
       ref = attach([:fathom, :replication, :budget])
       assert {:ok, 0} = Budget.reserve(name, 5_000)
@@ -102,7 +89,7 @@ defmodule Fathom.ReplicationSaturationMetricsTest do
     end
 
     test "nothing is emitted when replication is off" do
-      Application.put_env(:fathom, :replication_enabled, false)
+      Env.put!(:replication_enabled, false)
       ref = attach([:fathom, :replication, :budget])
 
       Fathom.Admin.Measurements.replication()
@@ -112,7 +99,7 @@ defmodule Fathom.ReplicationSaturationMetricsTest do
 
   describe "reject.count — the lagging signal" do
     test "an over-budget push emits :overloaded, tagged by reason and not by shard" do
-      Application.put_env(:fathom, :replication_max_queue_bytes, 1)
+      Env.put!(:replication_max_queue_bytes, 1)
       ref = attach([:fathom, :replication, :reject])
 
       # A shipper that will never connect: `push/2` consults the budget FIRST, in the caller, so the

@@ -9,19 +9,13 @@ defmodule Fathom.Rebalancer.ReporterTest do
   alias Fathom.Rebalancer
   alias Fathom.Rebalancer.{LoadSamples, Nodes, Reporter}
   alias Fathom.ShardLoad
+  alias Fathom.Test.Env
 
   setup do
-    prev_load = Application.get_env(:fathom, :shard_load)
-    Application.put_env(:fathom, :shard_load, true)
+    Env.put!(:shard_load, true)
     ShardLoad.reset()
 
-    on_exit(fn ->
-      ShardLoad.reset()
-
-      if is_nil(prev_load),
-        do: Application.delete_env(:fathom, :shard_load),
-        else: Application.put_env(:fathom, :shard_load, prev_load)
-    end)
+    on_exit(fn -> ShardLoad.reset() end)
 
     :ok
   end

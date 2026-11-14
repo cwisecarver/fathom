@@ -16,15 +16,12 @@ defmodule Fathom.HranaAuthTest do
   import Plug.Conn
 
   alias Fathom.HranaAuth
+  alias Fathom.Test.Env
 
   setup do
-    prev_mode = Application.get_env(:fathom, :hrana_auth, :disabled)
-    prev_age = Application.get_env(:fathom, :hrana_token_max_age, :infinity)
-
-    on_exit(fn ->
-      Application.put_env(:fathom, :hrana_auth, prev_mode)
-      Application.put_env(:fathom, :hrana_token_max_age, prev_age)
-    end)
+    # Pin the defaults so every test starts from them and the originals come back on exit.
+    Env.put!(:hrana_auth, :disabled)
+    Env.put!(:hrana_token_max_age, :infinity)
 
     :ok
   end
@@ -199,13 +196,10 @@ defmodule Fathom.HranaAuthTest do
     end
 
     test "a signing-secret change misses the cache and refuses the token", %{shard: shard} do
-      prev = Application.get_env(:fathom, :hrana_token_secret)
-      on_exit(fn -> Application.put_env(:fathom, :hrana_token_secret, prev) end)
-
       token = token!(shard)
       assert {:ok, _} = HranaAuth.authorize(shard, token)
 
-      Application.put_env(:fathom, :hrana_token_secret, String.duplicate("r", 64))
+      Env.put!(:hrana_token_secret, String.duplicate("r", 64))
 
       assert {:error, %Filo.Error{status: 401, code: "AUTH_REQUIRED"}} =
                HranaAuth.authorize(shard, token)
@@ -261,9 +255,8 @@ defmodule Fathom.HranaAuthTest do
   test "check_config! refuses :required without a usable secret" do
     require_auth!()
     prev = Application.get_env(:fathom, FathomWeb.Endpoint)
-    on_exit(fn -> Application.put_env(:fathom, FathomWeb.Endpoint, prev) end)
 
-    Application.put_env(:fathom, FathomWeb.Endpoint, Keyword.delete(prev, :secret_key_base))
+    Env.put!(FathomWeb.Endpoint, Keyword.delete(prev, :secret_key_base))
     assert_raise RuntimeError, ~r/secret_key_base/, fn -> HranaAuth.check_config!() end
 
     Application.put_env(:fathom, FathomWeb.Endpoint, Keyword.put(prev, :secret_key_base, "shrt"))
@@ -279,15 +272,7 @@ defmodule Fathom.HranaAuthTest do
     import ExUnit.CaptureLog
 
     require_auth!()
-    prev = Application.get_env(:fathom, :hrana_token_secret)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :hrana_token_secret),
-        else: Application.put_env(:fathom, :hrana_token_secret, prev)
-    end)
-
-    Application.delete_env(:fathom, :hrana_token_secret)
+    Env.delete!(:hrana_token_secret)
 
     assert capture_log(fn -> assert :ok = HranaAuth.check_config!() end) =~
              "no :hrana_token_secret",

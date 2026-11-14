@@ -16,6 +16,7 @@ defmodule Fathom.Shard.BusyFairnessBenchTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Env
 
   @moduletag :bench
   @window_ms 2_000
@@ -24,9 +25,7 @@ defmodule Fathom.Shard.BusyFairnessBenchTest do
     unless Fathom.Shard.Extension.available?(),
       do: flunk("fathom_udf extension not built: the busy yield (and this probe) needs it")
 
-    prev = Application.get_env(:fathom, :query_timeout_ms)
-    Application.delete_env(:fathom, :query_timeout_ms)
-    on_exit(fn -> if prev, do: Application.put_env(:fathom, :query_timeout_ms, prev) end)
+    Env.delete!(:query_timeout_ms)
     :ok
   end
 

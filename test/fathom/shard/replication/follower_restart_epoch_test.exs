@@ -22,6 +22,7 @@ defmodule Fathom.Shard.Replication.FollowerRestartEpochTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Wal
+  alias Fathom.Test.Env
 
   @lineage 7
   @epoch 5
@@ -32,16 +33,9 @@ defmodule Fathom.Shard.Replication.FollowerRestartEpochTest do
 
     # Pushes state their lineage only on the ordinal frame, on in prod (off in dev/test); the
     # epoch is recovered only where they do (see the wire-off test).
-    prev_wire = Application.get_env(:fathom, :replication_ordinal_wire)
-    Application.put_env(:fathom, :replication_ordinal_wire, true)
+    Env.put!(:replication_ordinal_wire, true)
 
-    on_exit(fn ->
-      if is_nil(prev_wire),
-        do: Application.delete_env(:fathom, :replication_ordinal_wire),
-        else: Application.put_env(:fathom, :replication_ordinal_wire, prev_wire)
-
-      File.rm_rf(root)
-    end)
+    on_exit(fn -> File.rm_rf(root) end)
 
     # A real SQLite WAL with committed frames, as a replica would hold it.
     src = Path.join(root, "src.db")
@@ -169,7 +163,7 @@ defmodule Fathom.Shard.Replication.FollowerRestartEpochTest do
   # to 1) `:stale_epoch` forever. The restart's epoch 0 stays the escape there.
   test "ordinal wire off: the persisted epoch is not recovered", ctx do
     {name, _port} = replica_then_restart!(ctx, @lineage)
-    Application.put_env(:fathom, :replication_ordinal_wire, false)
+    Env.put!(:replication_ordinal_wire, false)
     stop_supervised!(name)
     {name, port} = start!(ctx)
 

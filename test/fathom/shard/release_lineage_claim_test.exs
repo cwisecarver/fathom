@@ -30,29 +30,23 @@ defmodule Fathom.Shard.ReleaseLineageClaimTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
 
   setup do
     shard = "relclaim_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_repl = Application.get_env(:fathom, :replication_enabled)
+
+    # Registered before the on_exit below so the restore runs AFTER the drain: the tests flip
+    # :replication_enabled mid-test, and the drain must see the value they left (config/test.exs: false).
+    Env.put!(:replication_enabled, false)
 
     # FaultyStorage models S3's lock-etag contract, so the marker write is If-Match fenced here too.
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :storage_fault)
       Shards.drain(shard, 2_000)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-
-      if is_nil(prev_repl),
-        do: Application.delete_env(:fathom, :replication_enabled),
-        else: Application.put_env(:fathom, :replication_enabled, prev_repl)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
           p <- Path.wildcard(Path.join(dir, "#{shard}*")),
@@ -111,7 +105,7 @@ defmodule Fathom.Shard.ReleaseLineageClaimTest do
         assert Shard.dirty?(a), "the fixture must be dirty or the drop takes the clean path"
 
         # Fail the drop flush: keep_local_release_lease/3.
-        Application.put_env(:fathom, :storage_fault, :flush)
+        Env.put!(:storage_fault, :flush)
         ref = Process.monitor(a)
 
         log =

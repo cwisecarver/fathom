@@ -10,6 +10,7 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
 
   @good "shard-bytes"
 
@@ -21,9 +22,7 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
   end
 
   defp put_s3_config(plug) do
-    prev = Application.get_env(:fathom, S3)
-
-    Application.put_env(:fathom, S3,
+    Env.put!(:fathom, S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -32,12 +31,6 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
       path_style: true,
       req_plug: plug
     )
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
   end
 
   defp md5_etag(body),
@@ -91,14 +84,7 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
       conn |> Plug.Conn.put_resp_header("etag", md5_etag(body)) |> Plug.Conn.send_resp(200, "")
     end)
 
-    prev = Application.get_env(:fathom, :shard_object_encoding)
-    Application.put_env(:fathom, :shard_object_encoding, :zstd)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :shard_object_encoding, prev),
-        else: Application.delete_env(:fathom, :shard_object_encoding)
-    end)
+    Env.put!(:shard_object_encoding, :zstd)
 
     local = Path.join(dir, "s.db")
     plain = String.duplicate("row-data-0123456789 ", 50_000)
@@ -189,19 +175,10 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
       Plug.Conn.send_resp(conn, 200, "")
     end)
 
-    prev = Application.get_env(:fathom, :shard_object_encoding)
-    Application.put_env(:fathom, :shard_object_encoding, :zstd)
+    Env.put!(:shard_object_encoding, :zstd)
 
-    Application.put_env(:fathom, :s3_after_compress_hook, fn path ->
+    Env.put!(:s3_after_compress_hook, fn path ->
       File.write!(path, "the file changed after it was hashed")
-    end)
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :s3_after_compress_hook)
-
-      if prev,
-        do: Application.put_env(:fathom, :shard_object_encoding, prev),
-        else: Application.delete_env(:fathom, :shard_object_encoding)
     end)
 
     local = Path.join(dir, "s.db")
@@ -228,17 +205,8 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
       Plug.Conn.send_resp(conn, 200, "")
     end)
 
-    prev = Application.get_env(:fathom, :shard_object_encoding)
-    Application.put_env(:fathom, :shard_object_encoding, :zstd)
-    Application.put_env(:fathom, :codec_corrupt_hook, &corrupt_middle/1)
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :codec_corrupt_hook)
-
-      if prev,
-        do: Application.put_env(:fathom, :shard_object_encoding, prev),
-        else: Application.delete_env(:fathom, :shard_object_encoding)
-    end)
+    Env.put!(:shard_object_encoding, :zstd)
+    Env.put!(:codec_corrupt_hook, &corrupt_middle/1)
 
     local = Path.join(dir, "s.db")
     File.write!(local, String.duplicate(@good, 20_000))
@@ -338,8 +306,7 @@ defmodule Fathom.Shard.Storage.S3IntegrityTest do
   # shrunk via config so the test doesn't need a 5 GB file.)
   test "a flush past the single-PUT ceiling is refused explicitly", %{dir: dir} do
     put_s3_config(fn conn -> Plug.Conn.send_resp(conn, 200, "") end)
-    Application.put_env(:fathom, :s3_max_single_put, 4)
-    on_exit(fn -> Application.delete_env(:fathom, :s3_max_single_put) end)
+    Env.put!(:s3_max_single_put, 4)
 
     local = Path.join(dir, "big.db")
     File.write!(local, "way-more-than-four-bytes")

@@ -18,6 +18,7 @@ defmodule Fathom.Tenants.TombstoneReplicaEraseTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Tenants.Tombstones
+  alias Fathom.Test.Env
 
   setup do
     id = "tombrep_#{System.unique_integer([:positive])}"
@@ -133,7 +134,7 @@ defmodule Fathom.Tenants.TombstoneReplicaEraseTest do
   # push or seed) that re-derive answers nil for a tombstoned shard, the hook skipped the forget,
   # and the deleted tenant's `.db` + `-wal` stayed on disk until the next boot.
   test "a live delete erases a NON-resident replica while its lock is busy", %{id: id, dir: dir} do
-    put_env!(:replication_forget_lock_wait_ms, 100)
+    Env.put!(:replication_forget_lock_wait_ms, 100)
     {db, wal} = real_replica_bytes!(dir)
     File.write!(Path.join(dir, id <> ".db"), db)
     File.write!(Path.join(dir, id <> ".db-wal"), wal)
@@ -171,7 +172,7 @@ defmodule Fathom.Tenants.TombstoneReplicaEraseTest do
   # `forget/2` waits out its lock wait and erases without it, and the install then put the deleted
   # tenant's replica back on disk.
   test "a seed that began before the delete is discarded at install", %{id: id, dir: dir} do
-    put_env!(:replication_forget_lock_wait_ms, 50)
+    Env.put!(:replication_forget_lock_wait_ms, 50)
     start_follower!(dir)
     {db, _wal} = real_replica_bytes!(dir)
 
@@ -195,18 +196,6 @@ defmodule Fathom.Tenants.TombstoneReplicaEraseTest do
     assert {{:error, :tombstoned}, %{}} = Follower.finish_seed(Follower, seeds, id)
     assert Follower.state_of(Follower, id) == nil
     assert replica_files(id) == [], "the seed re-installed a deleted tenant's replica"
-  end
-
-  defp put_env!(key, value) do
-    prev = Application.get_env(:fathom, key)
-
-    on_exit(fn ->
-      if prev == nil,
-        do: Application.delete_env(:fathom, key),
-        else: Application.put_env(:fathom, key, prev)
-    end)
-
-    Application.put_env(:fathom, key, value)
   end
 
   # A real `.db` + committed `-wal` pair, built off to the side.

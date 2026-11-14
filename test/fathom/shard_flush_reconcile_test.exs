@@ -29,23 +29,15 @@ defmodule Fathom.ShardFlushReconcileTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.Env
   alias Filo.{Stmt, StmtResult}
 
   setup do
     shard = "reconcile_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    prev_flush = Application.get_env(:fathom, :shard_flush_interval_ms)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
 
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-
+    # The env is restored FIRST (this callback runs after the ones the tests register through `Env`),
+    # then the shard is drained: the same order the hand-rolled restore had.
     on_exit(fn ->
-      Application.delete_env(:fathom, :storage_fault)
-      Application.delete_env(:fathom, :storage_flush_delay_ms)
-      restore(:shard_storage, prev_storage)
-      restore(:shard_flush_interval_ms, prev_flush)
-      restore(:shard_idle_ms, prev_idle)
-
       Shards.drain(shard, 2_000)
 
       for dir <- [local_dir(), remote_dir()],
@@ -55,11 +47,9 @@ defmodule Fathom.ShardFlushReconcileTest do
       for f <- Path.wildcard(Path.join(local_dir(), "#{shard}.db.*")), do: File.rm(f)
     end)
 
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
     %{shard: shard}
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
   defp local_dir, do: Shard.data_dir()
@@ -99,7 +89,7 @@ defmodule Fathom.ShardFlushReconcileTest do
   describe "#3 — an in-flight flush task settled at terminate" do
     test "writes committed after the task's snapshot survive the stop", %{shard: shard} do
       # Never flush on a timer; every flush in this test is driven explicitly.
-      Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 60_000)
 
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, coordinator} = Shards.ensure(shard)
@@ -112,7 +102,7 @@ defmodule Fathom.ShardFlushReconcileTest do
 
       # Now make the flush slow, so the task is genuinely in flight when we stop the
       # coordinator — this is the window settle_flush_task/1 exists to close.
-      Application.put_env(:fathom, :storage_flush_delay_ms, 250)
+      Env.put!(:storage_flush_delay_ms, 250)
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('snapshotted')"))
       send(coordinator, :durability_flush)
 
@@ -137,7 +127,7 @@ defmodule Fathom.ShardFlushReconcileTest do
 
     test "a settled task's etag is folded, so the drop-flush does not 412 against itself",
          %{shard: shard} do
-      Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 60_000)
 
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, coordinator} = Shards.ensure(shard)
@@ -165,7 +155,7 @@ defmodule Fathom.ShardFlushReconcileTest do
   describe "#4 — a 412 with the lock still ours" do
     test "the shard stays DIRTY rather than being marked clean on an unproven reconcile",
          %{shard: shard} do
-      Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 60_000)
 
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, coordinator} = Shards.ensure(shard)
@@ -177,7 +167,7 @@ defmodule Fathom.ShardFlushReconcileTest do
       # Interval 1: the PUT LANDS but the response is lost. The coordinator believes the flush
       # failed, so it keeps its old fence etag and stays dirty. The object has advanced.
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('landed_silently')"))
-      Application.put_env(:fathom, :storage_fault, :flush_lands_then_errors)
+      Env.put!(:storage_fault, :flush_lands_then_errors)
       :ok = flush_now(coordinator)
       Application.delete_env(:fathom, :storage_fault)
 
@@ -200,7 +190,7 @@ defmodule Fathom.ShardFlushReconcileTest do
     end
 
     test "the re-flush after a reconcile actually lands every acked write", %{shard: shard} do
-      Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 60_000)
 
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, coordinator} = Shards.ensure(shard)
@@ -209,7 +199,7 @@ defmodule Fathom.ShardFlushReconcileTest do
       :ok = flush_now(coordinator)
 
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('landed_silently')"))
-      Application.put_env(:fathom, :storage_fault, :flush_lands_then_errors)
+      Env.put!(:storage_fault, :flush_lands_then_errors)
       :ok = flush_now(coordinator)
       Application.delete_env(:fathom, :storage_fault)
 
@@ -226,10 +216,10 @@ defmodule Fathom.ShardFlushReconcileTest do
     end
 
     test "an idle drop after a reconcile does not delete un-stored writes", %{shard: shard} do
-      Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 60_000)
       # idle_ms is captured into coordinator state at init, so it must be set BEFORE the open.
       # The held connection keeps the shard busy until we close it.
-      Application.put_env(:fathom, :shard_idle_ms, 100)
+      Env.put!(:shard_idle_ms, 100)
 
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, coordinator} = Shards.ensure(shard)
@@ -238,7 +228,7 @@ defmodule Fathom.ShardFlushReconcileTest do
       :ok = flush_now(coordinator)
 
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('landed_silently')"))
-      Application.put_env(:fathom, :storage_fault, :flush_lands_then_errors)
+      Env.put!(:storage_fault, :flush_lands_then_errors)
       :ok = flush_now(coordinator)
       Application.delete_env(:fathom, :storage_fault)
 
@@ -260,7 +250,7 @@ defmodule Fathom.ShardFlushReconcileTest do
   describe "the reconcile path still converges — it must not merely refuse forever" do
     test "a shard that reconciles once returns to clean on the next successful flush",
          %{shard: shard} do
-      Application.put_env(:fathom, :shard_flush_interval_ms, 60_000)
+      Env.put!(:shard_flush_interval_ms, 60_000)
 
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, coordinator} = Shards.ensure(shard)
@@ -268,7 +258,7 @@ defmodule Fathom.ShardFlushReconcileTest do
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('x')"))
       :ok = flush_now(coordinator)
 
-      Application.put_env(:fathom, :storage_fault, :flush_lands_then_errors)
+      Env.put!(:storage_fault, :flush_lands_then_errors)
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('y')"))
       :ok = flush_now(coordinator)
       Application.delete_env(:fathom, :storage_fault)

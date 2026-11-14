@@ -11,6 +11,7 @@ defmodule FathomWeb.Api.ApiKeyAuthTest do
   alias Fathom.Directory.Shard
   alias Fathom.Repo
   alias Fathom.Tenants.Tombstones
+  alias Fathom.Test.Env
 
   defp bearer(conn, token) do
     conn
@@ -71,14 +72,7 @@ defmodule FathomWeb.Api.ApiKeyAuthTest do
   describe "template credentials need destroy (#19)" do
     setup do
       template = "apikey_tpl_#{System.unique_integer([:positive])}"
-      prev = Application.get_env(:fathom, :template_shard_id)
-      Application.put_env(:fathom, :template_shard_id, template)
-
-      on_exit(fn ->
-        if prev,
-          do: Application.put_env(:fathom, :template_shard_id, prev),
-          else: Application.delete_env(:fathom, :template_shard_id)
-      end)
+      Env.put!(:template_shard_id, template)
 
       %{template: template}
     end

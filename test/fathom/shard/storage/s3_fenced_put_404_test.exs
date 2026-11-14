@@ -15,22 +15,11 @@ defmodule Fathom.Shard.Storage.S3FencedPut404Test do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   setup do
-    prev_enc = Application.get_env(:fathom, :shard_object_encoding)
-    Application.put_env(:fathom, :shard_object_encoding, :none)
-    prev = Application.get_env(:fathom, S3)
-
-    on_exit(fn ->
-      if prev_enc,
-        do: Application.put_env(:fathom, :shard_object_encoding, prev_enc),
-        else: Application.delete_env(:fathom, :shard_object_encoding)
-
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
+    Env.put!(:shard_object_encoding, :none)
 
     tmp = Path.join(System.tmp_dir!(), "s3_404_#{System.unique_integer([:positive])}.db")
     File.write!(tmp, "body")
@@ -39,7 +28,7 @@ defmodule Fathom.Shard.Storage.S3FencedPut404Test do
   end
 
   defp put_s3_config(plug) do
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",

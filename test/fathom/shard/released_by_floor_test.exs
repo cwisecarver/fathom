@@ -27,22 +27,18 @@ defmodule Fathom.Shard.ReleasedByFloorTest do
 
   alias Fathom.Shard.Replication.Recovery
   alias Fathom.Shard.Storage
+  alias Fathom.Test.Env
 
   @writer "nodeA#1"
 
   setup do
     shard = "relby_#{System.unique_integer([:positive])}"
-    prev_repl = Application.get_env(:fathom, :replication_enabled)
 
     # Replicating, so a steal records a lineage claim and a release leaves a marker (with no claim a
     # clean release deletes the lock, which is the case nothing here is about).
-    Application.put_env(:fathom, :replication_enabled, true)
+    Env.put!(:replication_enabled, true)
 
     on_exit(fn ->
-      if is_nil(prev_repl),
-        do: Application.delete_env(:fathom, :replication_enabled),
-        else: Application.put_env(:fathom, :replication_enabled, prev_repl)
-
       dir = Storage.Local.dir()
       for p <- Path.wildcard(Path.join(dir, "#{shard}*")), do: File.rm_rf(p)
     end)

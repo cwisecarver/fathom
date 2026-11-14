@@ -28,18 +28,17 @@ defmodule Fathom.ReadOnlyScopeTest do
   import Plug.Conn
 
   alias Fathom.{Directory, HranaAuth, Shards, ShardExecutor}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @streams __MODULE__.Streams
 
   setup do
-    prev_mode = Application.get_env(:fathom, :hrana_auth, :disabled)
-    Application.put_env(:fathom, :hrana_auth, :required)
+    Env.put!(:hrana_auth, :required)
     shard = "ro_#{System.unique_integer([:positive])}"
     start_supervised!({Filo.Streams, name: @streams})
 
     on_exit(fn ->
-      Application.put_env(:fathom, :hrana_auth, prev_mode)
       Shards.drain(shard, 2_000)
 
       for dir <- [remote_dir(), Fathom.Shard.data_dir()],

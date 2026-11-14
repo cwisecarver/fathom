@@ -6,22 +6,13 @@ defmodule Fathom.ShardCheckoutTimeoutTest do
   # above the coordinator's own open budget. Not async: shards + storage config are global.
   use Fathom.ClusterShardCase
 
+  alias Fathom.Test.Env
   alias Fathom.Test.FaultyStorage
 
   setup do
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, FaultyStorage)
+    Env.put!(:shard_storage, FaultyStorage)
     # Make every cold-open pull slow, so the checkout call timeout is what decides.
-    Application.put_env(:fathom, :storage_pull_delay_ms, 400)
-
-    on_exit(fn ->
-      Application.delete_env(:fathom, :storage_pull_delay_ms)
-      Application.delete_env(:fathom, :shard_checkout_timeout_ms)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-    end)
+    Env.put!(:storage_pull_delay_ms, 400)
 
     :ok
   end
@@ -30,7 +21,7 @@ defmodule Fathom.ShardCheckoutTimeoutTest do
        %{shard: shard} do
     # A 100ms budget below the 400ms pull must time out. Pre-fix the code ignored this config
     # entirely and used the 5s default, so a 400ms pull SUCCEEDED — this assertion failed.
-    Application.put_env(:fathom, :shard_checkout_timeout_ms, 100)
+    Env.put!(:shard_checkout_timeout_ms, 100)
 
     capture_log(fn ->
       assert {:error, :timeout} = Shards.checkout(shard)
@@ -50,15 +41,8 @@ defmodule Fathom.ShardCheckoutTimeoutTest do
   # checkout leaves the coordinator with zero connections, so it idles out normally.
   test "a timed-out checkout does not pin the shard open (phantom conn abandoned)",
        %{shard: shard} do
-    Application.put_env(:fathom, :shard_checkout_timeout_ms, 100)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_idle_ms, 50)
-
-    on_exit(fn ->
-      if is_nil(prev_idle),
-        do: Application.delete_env(:fathom, :shard_idle_ms),
-        else: Application.put_env(:fathom, :shard_idle_ms, prev_idle)
-    end)
+    Env.put!(:shard_checkout_timeout_ms, 100)
+    Env.put!(:shard_idle_ms, 50)
 
     capture_log(fn ->
       assert {:error, :timeout} = Shards.checkout(shard)
@@ -80,14 +64,14 @@ defmodule Fathom.ShardCheckoutTimeoutTest do
   # the timed-out call's grant.
   test "an abandoned second checkout does not drop the caller's live grant", %{shard: shard} do
     # First checkout: ample budget, a real live grant.
-    Application.put_env(:fathom, :shard_checkout_timeout_ms, 60_000)
+    Env.put!(:shard_checkout_timeout_ms, 60_000)
     assert {:ok, pid, live_ref, _path} = Shards.checkout(shard)
 
     # Second checkout of the SAME shard by the SAME caller times out (the
     # coordinator is suspended so the 1ms budget deterministically expires); its
     # grant is processed on resume and then abandoned — the cast is FIFO behind
     # the stale call.
-    Application.put_env(:fathom, :shard_checkout_timeout_ms, 1)
+    Env.put!(:shard_checkout_timeout_ms, 1)
     :ok = :sys.suspend(pid)
 
     capture_log(fn ->
@@ -113,7 +97,7 @@ defmodule Fathom.ShardCheckoutTimeoutTest do
   test "a slow cold open under the timeout budget still yields a connection", %{shard: shard} do
     # The same 400ms pull, but an ample budget: the checkout waits it out and gets a connection
     # rather than failing — the actual fix, letting a normal slow open through.
-    Application.put_env(:fathom, :shard_checkout_timeout_ms, 60_000)
+    Env.put!(:shard_checkout_timeout_ms, 60_000)
 
     assert {:ok, pid, ref, _path} = Shards.checkout(shard)
     Fathom.Shard.checkin(pid, ref)

@@ -11,6 +11,8 @@ defmodule Fathom.HranaListenerOptionsTest do
   """
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.Env
+
   defmodule EchoPlug do
     @behaviour Plug
     def init(o), do: o
@@ -118,14 +120,7 @@ defmodule Fathom.HranaListenerOptionsTest do
   end
 
   test "setting :hrana_listen_sockets to 1 drops reuseport for platforms that refuse it" do
-    prev = Application.get_env(:fathom, :hrana_listen_sockets)
-    Application.put_env(:fathom, :hrana_listen_sockets, 1)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :hrana_listen_sockets),
-        else: Application.put_env(:fathom, :hrana_listen_sockets, prev)
-    end)
+    Env.put!(:hrana_listen_sockets, 1)
 
     opts = Fathom.Application.hrana_transport_options()
 

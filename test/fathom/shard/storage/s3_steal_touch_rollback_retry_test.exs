@@ -18,6 +18,7 @@ defmodule Fathom.Shard.Storage.S3StealTouchRollbackRetryTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
 
   @shard "s21"
   @old_owner "old@node"
@@ -25,8 +26,6 @@ defmodule Fathom.Shard.Storage.S3StealTouchRollbackRetryTest do
   @error_body ~s(<?xml version="1.0"?><Error><Code>InternalError</Code><Message>boom</Message></Error>)
 
   setup do
-    prev = Application.get_env(:fathom, S3)
-
     old_lock = %{
       "owner" => @old_owner,
       "epoch" => 3,
@@ -46,7 +45,7 @@ defmodule Fathom.Shard.Storage.S3StealTouchRollbackRetryTest do
          }
        end})
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -55,12 +54,6 @@ defmodule Fathom.Shard.Storage.S3StealTouchRollbackRetryTest do
       path_style: true,
       req_plug: fn conn -> serve(conn, store) end
     )
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
 
     %{store: store}
   end

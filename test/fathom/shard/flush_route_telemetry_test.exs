@@ -23,6 +23,7 @@ defmodule Fathom.Shard.FlushRouteTelemetryTest do
   alias Fathom.Shard.Heartbeat
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   @modes [:legacy, :heartbeat]
   @events [
@@ -35,8 +36,7 @@ defmodule Fathom.Shard.FlushRouteTelemetryTest do
   setup do
     id = "flroute_#{System.unique_integer([:positive])}"
     path = Fathom.Shard.db_path(id)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_idle_ms, 600_000)
 
     test_pid = self()
     handler = "flroute-#{id}"
@@ -53,10 +53,6 @@ defmodule Fathom.Shard.FlushRouteTelemetryTest do
     on_exit(fn ->
       :telemetry.detach(handler)
       Measurements.clear_data_free_bytes()
-
-      if prev_idle,
-        do: Application.put_env(:fathom, :shard_idle_ms, prev_idle),
-        else: Application.delete_env(:fathom, :shard_idle_ms)
 
       Shards.stop(id)
       for s <- ["", "-wal", "-shm", ".etag"], do: File.rm(path <> s)

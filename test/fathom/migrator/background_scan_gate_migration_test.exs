@@ -16,6 +16,7 @@ defmodule Fathom.Migrator.BackgroundScanGateMigrationTest do
   alias Fathom.Migrator.{Copy, ShardMigration, ShardMigrationJob}
   alias Fathom.Shard.{BackgroundScanGate, Connection, Storage}
   alias Fathom.Directory
+  alias Fathom.Test.Env
 
   @v2_statements [
     "ALTER TABLE app_thing ADD COLUMN created_at TEXT",
@@ -64,19 +65,9 @@ defmodule Fathom.Migrator.BackgroundScanGateMigrationTest do
 
   setup do
     shard = "bsg_#{System.unique_integer([:positive])}"
-    keys = [:background_scan_permits, :background_scan_wait_ms, :migration_transforms]
-    prev = for k <- keys, do: {k, Application.fetch_env(:fathom, k)}
-
-    Application.put_env(:fathom, :background_scan_wait_ms, 50)
+    Env.put!(:background_scan_wait_ms, 50)
 
     on_exit(fn ->
-      for {k, v} <- prev do
-        case v do
-          {:ok, val} -> Application.put_env(:fathom, k, val)
-          :error -> Application.delete_env(:fathom, k)
-        end
-      end
-
       for path <- Path.wildcard(Path.join(remote_dir(), "#{shard}*")), do: File.rm(path)
 
       for path <- Path.wildcard(Path.join([Fathom.Shard.data_dir(), "#{shard}*"])),
@@ -133,7 +124,7 @@ defmodule Fathom.Migrator.BackgroundScanGateMigrationTest do
   # Take every permit the node has, from processes that keep them until `free_holders!/1` (or the
   # end of the test). Returns the holders.
   defp saturate!(permits) do
-    Application.put_env(:fathom, :background_scan_permits, permits)
+    Env.put!(:background_scan_permits, permits)
     parent = self()
 
     holders =
@@ -225,15 +216,9 @@ defmodule Fathom.Migrator.BackgroundScanGateMigrationTest do
     seed_v1!(shard)
     {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
 
-    prev_idle = Application.fetch_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    Env.put!(:shard_idle_ms, 60_000)
 
     on_exit(fn ->
-      case prev_idle do
-        {:ok, v} -> Application.put_env(:fathom, :shard_idle_ms, v)
-        :error -> Application.delete_env(:fathom, :shard_idle_ms)
-      end
-
       Fathom.Shards.drain(shard, 2_000)
     end)
 
@@ -256,8 +241,8 @@ defmodule Fathom.Migrator.BackgroundScanGateMigrationTest do
   test "a run keeps its permit through verify_migrated; a node filling up mid-run does not defer it",
        %{shard: shard} do
     seed_v1!(shard)
-    Application.put_env(:fathom, :background_scan_permits, 2)
-    Application.put_env(:fathom, :migration_transforms, [SaturateAfterReplay])
+    Env.put!(:background_scan_permits, 2)
+    Env.put!(:migration_transforms, [SaturateAfterReplay])
     {:ok, _} = Migrator.release(2, "add created_at", @v2_statements)
     :ok = Migrator.attach_transform(2, SaturateAfterReplay)
 

@@ -38,6 +38,7 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
   alias Fathom.Shard.{Connection, Heartbeat, Storage}
   alias Fathom.Shard.Storage.S3
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   @bucket "s3opcount"
   @modes [:legacy, :heartbeat]
@@ -52,27 +53,12 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
     dir = Path.join(System.tmp_dir!(), "fathom_s3opcount_#{n}")
     File.mkdir_p!(dir)
 
-    keys = [
-      :shard_storage,
-      :shard_data_dir,
-      :shard_flush_interval_ms,
-      :shard_idle_ms,
-      :shard_retain_local_bytes,
-      :shard_retain_min_bytes,
-      :directory_touch,
-      :migrate_on_touch,
-      :replication_enabled,
-      S3
-    ]
-
-    prev = for k <- keys, do: {k, Application.fetch_env(:fathom, k)}
-
     # The stub's table is owned by this Agent, so it outlives the test process and survives until
     # the heartbeat (a child started later, stopped first) has cleared its object.
     stub_owner = start_supervised!({Agent, fn -> S3Stub.start() end})
     {sup, port, table} = Agent.get(stub_owner, & &1)
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: @bucket,
       region: "us-east-1",
       endpoint: "http://127.0.0.1:#{port}",
@@ -81,13 +67,13 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
       secret_access_key: "s"
     )
 
-    Application.put_env(:fathom, :shard_storage, S3)
-    Application.put_env(:fathom, :shard_data_dir, dir)
-    Application.put_env(:fathom, :shard_flush_interval_ms, 0)
-    Application.put_env(:fathom, :shard_idle_ms, @idle_ms)
-    Application.put_env(:fathom, :directory_touch, false)
-    Application.put_env(:fathom, :migrate_on_touch, :off)
-    Application.put_env(:fathom, :replication_enabled, false)
+    Env.put!(:shard_storage, S3)
+    Env.put!(:shard_data_dir, dir)
+    Env.put!(:shard_flush_interval_ms, 0)
+    Env.put!(:shard_idle_ms, @idle_ms)
+    Env.put!(:directory_touch, false)
+    Env.put!(:migrate_on_touch, :off)
+    Env.put!(:replication_enabled, false)
 
     test_pid = self()
     handler = {__MODULE__, n}
@@ -109,8 +95,7 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
     on_exit(fn ->
       :telemetry.detach(handler)
 
-      # The stub's supervisor is linked to the Agent that owns it, which has stopped by now. A stop
-      # that finds it dead must not skip the env restore below.
+      # The stub's supervisor is linked to the Agent that owns it, which has stopped by now.
       try do
         Supervisor.stop(sup)
       catch
@@ -118,13 +103,6 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
       end
 
       File.rm_rf(dir)
-
-      for {k, v} <- prev do
-        case v do
-          {:ok, val} -> Application.put_env(:fathom, k, val)
-          :error -> Application.delete_env(:fathom, k)
-        end
-      end
     end)
 
     %{shard: shard, table: table}
@@ -329,8 +307,8 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
         # Retention keeps the clean local copy at drop; the reopen then serves it after a check of
         # the store's etag under the lease. The 1 MiB size floor is pinned to 0 so a tiny fixture
         # is retained.
-        Application.put_env(:fathom, :shard_retain_local_bytes, 64 * 1024 * 1024)
-        Application.put_env(:fathom, :shard_retain_min_bytes, 0)
+        Env.put!(:shard_retain_local_bytes, 64 * 1024 * 1024)
+        Env.put!(:shard_retain_min_bytes, 0)
 
         seed_object(shard)
         {:ok, pid, ref, path} = Shards.checkout(shard)
@@ -386,7 +364,7 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
       seed_object(shard)
       with_content_length(table, "/#{@bucket}/#{shard}.db")
       seed_dead_lock(table, shard)
-      Application.put_env(:fathom, :replication_enabled, true)
+      Env.put!(:replication_enabled, true)
       clear_ops()
 
       assert {:ok, lease} = Storage.acquire_lease(shard, "new-owner", 10_000)

@@ -25,6 +25,7 @@ defmodule Fathom.Shard.Storage.S3StealTouchRollbackTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
 
   @shard "s20"
   @old_owner "old@node"
@@ -32,8 +33,6 @@ defmodule Fathom.Shard.Storage.S3StealTouchRollbackTest do
   @db_body "raw shard bytes"
 
   setup do
-    prev = Application.get_env(:fathom, S3)
-
     # The store: a lock held by a DEAD owner (expired past the steal margin, no
     # heartbeat object), a data object at etag db-1, and a touch that fails once.
     old_lock = %{
@@ -55,7 +54,7 @@ defmodule Fathom.Shard.Storage.S3StealTouchRollbackTest do
          end}
       )
 
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -64,12 +63,6 @@ defmodule Fathom.Shard.Storage.S3StealTouchRollbackTest do
       path_style: true,
       req_plug: fn conn -> serve(conn, store) end
     )
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
 
     %{store: store}
   end

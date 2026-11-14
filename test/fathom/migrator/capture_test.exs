@@ -6,6 +6,7 @@ defmodule Fathom.Migrator.CaptureTest do
 
   alias Fathom.Migrator
   alias Fathom.Migrator.Capture
+  alias Fathom.Test.Env
 
   describe "classify/1" do
     test "recognizes transaction-control verbs, treating savepoints as :other" do
@@ -241,15 +242,8 @@ defmodule Fathom.Migrator.CaptureTest do
     test "a commit while an earlier capture is pending queues behind it, preserving version order" do
       import ExUnit.CaptureLog
 
-      prev_retry = Application.get_env(:fathom, :capture_retry_ms)
       # Stop the auto-retry from draining the pending list mid-test; we drive it manually.
-      Application.put_env(:fathom, :capture_retry_ms, 300_000)
-
-      on_exit(fn ->
-        if prev_retry,
-          do: Application.put_env(:fathom, :capture_retry_ms, prev_retry),
-          else: Application.delete_env(:fathom, :capture_retry_ms)
-      end)
+      Env.put!(:capture_retry_ms, 300_000)
 
       conn_a = make_ref()
       conn_b = make_ref()

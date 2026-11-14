@@ -7,17 +7,14 @@ defmodule Mix.Tasks.Fathom.TokenTest do
   use Fathom.DataCase, async: false
 
   alias Fathom.{Directory, HranaAuth}
+  alias Fathom.Test.Env
 
   setup do
     prev_shell = Mix.shell()
     Mix.shell(Mix.Shell.Process)
-    prev_mode = Application.get_env(:fathom, :hrana_auth, :disabled)
-    Application.put_env(:fathom, :hrana_auth, :required)
+    Env.put!(:hrana_auth, :required)
 
-    on_exit(fn ->
-      Mix.shell(prev_shell)
-      Application.put_env(:fathom, :hrana_auth, prev_mode)
-    end)
+    on_exit(fn -> Mix.shell(prev_shell) end)
 
     :ok
   end

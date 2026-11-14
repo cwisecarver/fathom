@@ -12,22 +12,13 @@ defmodule Fathom.ShardsFlushKeptLocalTest do
 
   alias Fathom.Shard.Storage
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
     id = "flushkept_#{System.unique_integer([:positive])}"
 
-    prev =
-      for key <- [:shard_storage, :storage_fault, :shard_idle_ms],
-          do: {key, Application.get_env(:fathom, key)}
-
     on_exit(fn ->
-      for {key, val} <- prev do
-        if is_nil(val),
-          do: Application.delete_env(:fathom, key),
-          else: Application.put_env(:fathom, key, val)
-      end
-
       Shards.stop(id)
 
       for dir <- [Fathom.Shard.data_dir(), Storage.Local.dir()],
@@ -35,8 +26,8 @@ defmodule Fathom.ShardsFlushKeptLocalTest do
           do: File.rm(path)
     end)
 
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_idle_ms, 60_000)
     %{id: id}
   end
 
@@ -69,7 +60,7 @@ defmodule Fathom.ShardsFlushKeptLocalTest do
     :ok = ShardExecutor.close(conn)
 
     # The drop's own flush fails, so the coordinator keeps the local copy and exits.
-    Application.put_env(:fathom, :storage_fault, :flush)
+    Env.put!(:storage_fault, :flush)
     {:ok, pid} = Shards.ensure(id)
     ref = Process.monitor(pid)
     _ = Shards.drain(id, 5_000)
@@ -96,7 +87,7 @@ defmodule Fathom.ShardsFlushKeptLocalTest do
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (1)"))
     :ok = ShardExecutor.close(conn)
 
-    Application.put_env(:fathom, :storage_fault, :flush)
+    Env.put!(:storage_fault, :flush)
     {:ok, pid} = Shards.ensure(id)
     ref = Process.monitor(pid)
     _ = Shards.drain(id, 5_000)
@@ -118,7 +109,7 @@ defmodule Fathom.ShardsFlushKeptLocalTest do
     :ok = Shards.flush(id)
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO t VALUES (1)"))
     :ok = ShardExecutor.close(conn)
-    Application.put_env(:fathom, :storage_fault, :flush)
+    Env.put!(:storage_fault, :flush)
     {:ok, pid} = Shards.ensure(id)
     {pid, Process.monitor(pid)}
   end

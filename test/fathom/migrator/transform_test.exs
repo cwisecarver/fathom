@@ -25,6 +25,7 @@ defmodule Fathom.Migrator.TransformTest do
   alias Fathom.Migrator.Copy
   alias Fathom.Migrator.Transform
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Env
 
   # --- test transforms -----------------------------------------------------------------------
 
@@ -74,19 +75,12 @@ defmodule Fathom.Migrator.TransformTest do
   @allowed [Backfill, Failing, Raising, BadReturn]
 
   setup do
-    prev = Application.get_env(:fathom, :migration_transforms)
-    Application.put_env(:fathom, :migration_transforms, @allowed)
+    Env.put!(:migration_transforms, @allowed)
 
     dir = Path.join(System.tmp_dir!(), "fathom_transform_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
 
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :migration_transforms, prev),
-        else: Application.delete_env(:fathom, :migration_transforms)
-
-      File.rm_rf(dir)
-    end)
+    on_exit(fn -> File.rm_rf(dir) end)
 
     src = Path.join(dir, "src.db")
     {:ok, conn} = Connection.open(src)
@@ -146,12 +140,12 @@ defmodule Fathom.Migrator.TransformTest do
 
       # Registered but without run/2 — the "you registered the wrong module" case, which should be
       # an error at attach time rather than an UndefinedFunctionError mid-rollout.
-      Application.put_env(:fathom, :migration_transforms, [Enum])
+      Env.put!(:migration_transforms, [Enum])
       refute Transform.valid?(Enum)
     end
 
     test "the allowlist is empty by default" do
-      Application.delete_env(:fathom, :migration_transforms)
+      Env.delete!(:migration_transforms)
       assert Transform.allowlist() == []
       assert {:error, :not_allowed} = Transform.resolve(to_string(Backfill))
     end

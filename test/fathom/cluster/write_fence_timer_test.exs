@@ -22,6 +22,7 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
   use Fathom.ClusterShardCase, async: false
 
   alias Fathom.Shard.{Heartbeat, WriteFence}
+  alias Fathom.Test.Env
 
   @modes [:legacy, :heartbeat]
 
@@ -34,18 +35,10 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
           # The double, for its `:renew` fault (the legacy route to `:skip`).
           shard_storage: Fathom.Test.FaultyStorage
         ] do
-      prev = Application.get_env(:fathom, k)
-      Application.put_env(:fathom, k, v)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, prev)
-      end)
+      Env.put!(k, v)
     end
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :storage_fault)
       WriteFence.forget(shard)
       Shards.drain(shard, 2_000)
     end)
@@ -68,14 +61,7 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
   # failing renew is what turns the flush fence into `:skip`.
   defp set_mode!(:legacy) do
     refute Heartbeat.running?()
-    prev = Application.get_env(:fathom, :shard_lease_ttl_ms)
-    Application.put_env(:fathom, :shard_lease_ttl_ms, 1_500)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :shard_lease_ttl_ms),
-        else: Application.put_env(:fathom, :shard_lease_ttl_ms, prev)
-    end)
+    Env.put!(:shard_lease_ttl_ms, 1_500)
 
     nil
   end
@@ -90,7 +76,7 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
   defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
 
   # Make the next flush fence answer `:skip`, the cut-from-storage symptom.
-  defp go_not_valid!(:legacy, _hb), do: Application.put_env(:fathom, :storage_fault, :renew)
+  defp go_not_valid!(:legacy, _hb), do: Env.put!(:storage_fault, :renew)
 
   defp go_not_valid!(:heartbeat, hb) do
     # Same generation, expired deadline: `valid_for_write?/1` answers `:not_valid` (a different
@@ -192,14 +178,7 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
   test "heartbeat mode: a lapse broadcast alone arms the fence, with no flush tick and no revalidation",
        %{shard: shard} do
     hb = set_mode!(:heartbeat)
-    prev = Application.get_env(:fathom, :lapse_revalidate_jitter_ms)
-    Application.put_env(:fathom, :lapse_revalidate_jitter_ms, 600_000)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :lapse_revalidate_jitter_ms),
-        else: Application.put_env(:fathom, :lapse_revalidate_jitter_ms, prev)
-    end)
+    Env.put!(:lapse_revalidate_jitter_ms, 600_000)
 
     capture_log(fn ->
       {:ok, coordinator} = Shards.ensure(shard)
@@ -285,7 +264,7 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
       assert :sys.get_state(coordinator).not_valid_since == nil
 
       # The renewal timer runs every ttl/3 (500 ms here); stealable-after is margin + steal margin.
-      Application.put_env(:fathom, :storage_fault, :renew)
+      Env.put!(:storage_fault, :renew)
 
       assert_receive :write_fenced,
                      5_000,

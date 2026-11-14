@@ -10,18 +10,16 @@ defmodule Fathom.Shard.EpochFirstSessionTest do
 
   alias Fathom.Shard
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
-  setup do
+  # The env is set from the `:replication_enabled` tag HERE, before the cleanup `on_exit` below is
+  # registered, so it is restored AFTER the cleanup drain (on_exit callbacks run in reverse order).
+  setup %{replication_enabled: enabled} do
     id = "epfirst_#{System.unique_integer([:positive])}"
-    prev = Application.fetch_env(:fathom, :replication_enabled)
+    Env.put!(:replication_enabled, enabled)
 
     on_exit(fn ->
       _ = Shards.drain(id)
-
-      case prev do
-        {:ok, v} -> Application.put_env(:fathom, :replication_enabled, v)
-        :error -> Application.delete_env(:fathom, :replication_enabled)
-      end
 
       for dir <- [Shard.data_dir(), Shard.Storage.Local.dir()],
           s <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock"],
@@ -43,9 +41,8 @@ defmodule Fathom.Shard.EpochFirstSessionTest do
     assert_receive {:DOWN, ^mref, :process, ^coordinator, _}, 5_000
   end
 
+  @tag replication_enabled: true
   test "replication on: true exactly once per coordinator life, then false", %{id: id} do
-    Application.put_env(:fathom, :replication_enabled, true)
-
     c1 = open!(id)
     assert is_integer(Shard.lineage(c1)) and Shard.lineage(c1) > 0, "the open took a lineage"
 
@@ -60,16 +57,16 @@ defmodule Fathom.Shard.EpochFirstSessionTest do
     assert {:ok, _epoch, true} = Shard.epoch_first_session(c2)
   end
 
+  @tag replication_enabled: true
   test "an epoch/1 answer consumes the flag", %{id: id} do
-    Application.put_env(:fathom, :replication_enabled, true)
     c = open!(id)
 
     assert {:ok, epoch} = Shard.epoch(c)
     assert {:ok, ^epoch, false} = Shard.epoch_first_session(c)
   end
 
+  @tag replication_enabled: false
   test "replication off (lineage :disabled): always false", %{id: id} do
-    Application.put_env(:fathom, :replication_enabled, false)
     c = open!(id)
 
     assert Shard.lineage(c) == 0

@@ -18,24 +18,16 @@ defmodule Fathom.Tenants.ForkDeleteRaceTest do
 
   alias Fathom.{Directory, HranaAuth, Tenants}
   alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.Env
   alias Fathom.Test.FaultyStorage
   alias Fathom.Tenants.Tombstones
 
   setup do
-    prev = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, FaultyStorage)
-
     n = System.unique_integer([:positive])
     src = "forkrace_src_#{n}"
     dst = "forkrace_dst_#{n}"
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev,
-        do: Application.put_env(:fathom, :shard_storage, prev),
-        else: Application.delete_env(:fathom, :shard_storage)
-
       for id <- [src, dst] do
         :ets.delete(Tombstones, id)
         Storage.purge_shard(id)
@@ -43,6 +35,8 @@ defmodule Fathom.Tenants.ForkDeleteRaceTest do
         File.rm(Path.join([Storage.Local.dir(), "tokenfloors", id]))
       end
     end)
+
+    Env.put!(:shard_storage, FaultyStorage)
 
     {:ok, _} = Directory.resolve(src)
     seed_object(src)
@@ -66,8 +60,7 @@ defmodule Fathom.Tenants.ForkDeleteRaceTest do
   defp at_copy(dst, fun) do
     test = self()
 
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :faulty_before,
       {:fork_shard,
        fn

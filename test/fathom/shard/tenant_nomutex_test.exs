@@ -14,16 +14,12 @@ defmodule Fathom.Shard.TenantNomutexTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Env
 
   setup do
     path = Path.join(System.tmp_dir!(), "nomutex_#{System.unique_integer([:positive])}.db")
-    prev = Application.get_env(:fathom, :tenant_nomutex)
 
     on_exit(fn ->
-      if prev == nil,
-        do: Application.delete_env(:fathom, :tenant_nomutex),
-        else: Application.put_env(:fathom, :tenant_nomutex, prev)
-
       for s <- ["", "-wal", "-shm"], do: File.rm(path <> s)
     end)
 
@@ -37,7 +33,7 @@ defmodule Fathom.Shard.TenantNomutexTest do
   test "with the flag ON, rw / ro / missing-file ro tenant handles open, query and reuse", %{
     path: path
   } do
-    Application.put_env(:fathom, :tenant_nomutex, true)
+    Env.put!(:tenant_nomutex, true)
 
     # `:ro` on a file that does not exist yet takes the create-then-readonly path.
     {:ok, ro_first} = Connection.open(path, tenant?: true, scope: :ro)

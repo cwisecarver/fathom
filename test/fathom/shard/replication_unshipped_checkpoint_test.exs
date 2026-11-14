@@ -30,6 +30,7 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Shards
+  alias Fathom.Test.Env
   import Fathom.Test.ReplicationCase
 
   setup do
@@ -37,25 +38,8 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
     root = Path.join(System.tmp_dir!(), "replunshipped_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
 
-    prev = [
-      enabled: Application.get_env(:fathom, :replication_enabled),
-      followers: Application.get_env(:fathom, :replication_followers),
-      quorum: Application.get_env(:fathom, :replication_quorum)
-    ]
-
     on_exit(fn ->
       Session.stop(id)
-
-      for {k, v} <- [
-            replication_enabled: prev[:enabled],
-            replication_followers: prev[:followers],
-            replication_quorum: prev[:quorum]
-          ] do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
-
       File.rm_rf(root)
       for s <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(id) <> s)
     end)
@@ -262,14 +246,7 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
   end
 
   defp low_threshold! do
-    prev = Application.get_env(:fathom, :replication_checkpoint_bytes)
-    Application.put_env(:fathom, :replication_checkpoint_bytes, 64 * 1024)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :replication_checkpoint_bytes, prev),
-        else: Application.delete_env(:fathom, :replication_checkpoint_bytes)
-    end)
+    Env.put!(:replication_checkpoint_bytes, 64 * 1024)
   end
 
   defp attach_checkpoint_events!(id) do
@@ -298,17 +275,6 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
     grown
   end
 
-  defp put_env!(key, value) do
-    prev = Application.get_env(:fathom, key)
-    Application.put_env(:fathom, key, value)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, key),
-        else: Application.put_env(:fathom, key, prev)
-    end)
-  end
-
   defp registry_count(conn, path) do
     {:ok, %{rows: [[n]]}} = Connection.query(conn, "SELECT fathom_wal_replicated(?1, 0)", [path])
     n
@@ -322,10 +288,10 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
   test "a threshold checkpoint is off the reply path: the commit and the next ship do not wait",
        ctx do
     low_threshold!()
-    put_env!(:replication_timeout_ms, 1_000)
+    Env.put!(:replication_timeout_ms, 1_000)
     test = self()
 
-    put_env!(:replication_checkpoint_hook, fn ->
+    Env.put!(:replication_checkpoint_hook, fn ->
       send(test, {:in_checkpoint, self()})
 
       receive do
@@ -358,14 +324,7 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
   test "a commit landing between the covers check and the PASSIVE is protected by the pin", ctx do
     # This pins the PIN, not the size gate (expert review 2026-10-20 #15): its WAL is a few frames,
     # which the gate would now skip before the covers check, so the seam would never run.
-    prev = Application.get_env(:fathom, :replication_flush_checkpoint_min_bytes)
-    Application.put_env(:fathom, :replication_flush_checkpoint_min_bytes, 0)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :replication_flush_checkpoint_min_bytes),
-        else: Application.put_env(:fathom, :replication_flush_checkpoint_min_bytes, prev)
-    end)
+    Env.put!(:replication_flush_checkpoint_min_bytes, 0)
 
     s = setup_shard!(ctx)
     flush_conn = open!(s.path)

@@ -29,20 +29,14 @@ defmodule Fathom.ShardFlushPrePutRecheckTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
     shard = "prepput_#{System.unique_integer([:positive])}"
-    prev_storage = Application.get_env(:fathom, :shard_storage)
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :faulty_before)
-
-      if prev_storage,
-        do: Application.put_env(:fathom, :shard_storage, prev_storage),
-        else: Application.delete_env(:fathom, :shard_storage)
-
       Shards.drain(shard, 2_000)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
@@ -74,8 +68,7 @@ defmodule Fathom.ShardFlushPrePutRecheckTest do
   # Fire `fun` inside the backend call for THIS shard only (the env is global and other
   # coordinators may still be flushing).
   defp on_backend_flush!(shard, fun) do
-    Application.put_env(
-      :fathom,
+    Env.put!(
       :faulty_before,
       {:flush, fn id -> if id == shard, do: fun.() end}
     )

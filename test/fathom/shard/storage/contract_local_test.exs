@@ -6,20 +6,14 @@ defmodule Fathom.Shard.Storage.ContractLocalTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.Local
+  alias Fathom.Test.Env
 
   setup do
     dir = Path.join(System.tmp_dir!(), "contract_local_#{System.unique_integer([:positive])}")
-    prev = Application.get_env(:fathom, Local)
     File.mkdir_p!(dir)
-    Application.put_env(:fathom, Local, dir: dir)
+    Env.put!(Local, dir: dir)
 
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, Local, prev),
-        else: Application.delete_env(:fathom, Local)
-
-      File.rm_rf(dir)
-    end)
+    on_exit(fn -> File.rm_rf(dir) end)
 
     :ok
   end

@@ -7,6 +7,8 @@ defmodule Fathom.RuntimeConfigTest do
   """
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.Env
+
   # Evaluate config/runtime.exs in :test env with env_overlay applied, return the
   # :fathom keyword list, then restore the environment.
   defp fathom_config(env_overlay, config_env \\ :test) do
@@ -464,13 +466,8 @@ defmodule Fathom.RuntimeConfigTest do
 
     test "unset: it follows the queues, so a queue added later raises it" do
       prev = Application.get_env(:fathom, Oban)
-      on_exit(fn -> Application.put_env(:fathom, Oban, prev) end)
 
-      Application.put_env(
-        :fathom,
-        Oban,
-        Keyword.put(prev, :queues, a: 30, b: [limit: 4, paused: true], c: false)
-      )
+      Env.put!(Oban, Keyword.put(prev, :queues, a: 30, b: [limit: 4, paused: true], c: false))
 
       assert Keyword.fetch!(repo_pool(%{"POOL_SIZE" => nil}), :pool_size) == 44
     end

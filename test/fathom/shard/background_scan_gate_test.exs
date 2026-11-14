@@ -10,18 +10,12 @@ defmodule Fathom.Shard.BackgroundScanGateTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.{BackgroundScanGate, ScanGate}
+  alias Fathom.Test.Env
 
   @gate :background_scan_gate_under_test
 
   setup do
-    prev = Application.get_env(:fathom, :background_scan_permits, :unset)
-    Application.put_env(:fathom, :background_scan_permits, 2)
-
-    on_exit(fn ->
-      if prev == :unset,
-        do: Application.delete_env(:fathom, :background_scan_permits),
-        else: Application.put_env(:fathom, :background_scan_permits, prev)
-    end)
+    Env.put!(:background_scan_permits, 2)
 
     gate = start_supervised!({BackgroundScanGate, name: @gate})
     %{gate: gate}
@@ -65,11 +59,11 @@ defmodule Fathom.Shard.BackgroundScanGateTest do
 
   test "cap/0 honours the config and 0/false turn the gate off" do
     assert BackgroundScanGate.cap() == 2
-    Application.put_env(:fathom, :background_scan_permits, 0)
+    Env.put!(:background_scan_permits, 0)
     assert BackgroundScanGate.cap() == nil
-    Application.put_env(:fathom, :background_scan_permits, false)
+    Env.put!(:background_scan_permits, false)
     assert BackgroundScanGate.cap() == nil
-    Application.delete_env(:fathom, :background_scan_permits)
+    Env.delete!(:background_scan_permits)
 
     assert BackgroundScanGate.cap() ==
              BackgroundScanGate.default_cap(:erlang.system_info(:dirty_io_schedulers))
@@ -239,24 +233,17 @@ defmodule Fathom.Shard.BackgroundScanGateTest do
   end
 
   test "gate disabled or not running is a no-op that fails open" do
-    Application.put_env(:fathom, :background_scan_permits, 0)
+    Env.put!(:background_scan_permits, 0)
     assert BackgroundScanGate.acquire(10, @gate) == :ok
     assert BackgroundScanGate.with_permit(fn -> :ran end, @gate, 10) == :ran
-    Application.put_env(:fathom, :background_scan_permits, 1)
+    Env.put!(:background_scan_permits, 1)
     assert BackgroundScanGate.acquire(10, :background_scan_gate_not_started) == :ok
     assert BackgroundScanGate.queued(fn -> :ran end, :background_scan_gate_not_started) == :ran
   end
 
   describe "independence from the flush ScanGate" do
     setup do
-      prev = Application.get_env(:fathom, :shard_flush_scan_permits, :unset)
-      Application.put_env(:fathom, :shard_flush_scan_permits, 2)
-
-      on_exit(fn ->
-        if prev == :unset,
-          do: Application.delete_env(:fathom, :shard_flush_scan_permits),
-          else: Application.put_env(:fathom, :shard_flush_scan_permits, prev)
-      end)
+      Env.put!(:shard_flush_scan_permits, 2)
 
       %{flush_gate: start_supervised!({ScanGate, name: :flush_gate_under_test})}
     end
@@ -297,10 +284,10 @@ defmodule Fathom.Shard.BackgroundScanGateTest do
     end
 
     test "the background permit count does not move the flush ScanGate's" do
-      Application.delete_env(:fathom, :shard_flush_scan_permits)
+      Env.delete!(:shard_flush_scan_permits)
       flush_default = ScanGate.cap()
 
-      Application.put_env(:fathom, :background_scan_permits, 5)
+      Env.put!(:background_scan_permits, 5)
       assert ScanGate.cap() == flush_default
       assert flush_default == ScanGate.default_cap(:erlang.system_info(:dirty_io_schedulers))
     end

@@ -20,20 +20,14 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   alias Exqlite.Sqlite3
   alias Fathom.Shard.{HandlePool, PoolBudget}
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Env
   alias Filo.{Stmt, StmtResult}
 
   setup do
-    prev_pool = Application.get_env(:fathom, :connection_pool)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    prev_opts = Application.get_env(:fathom, :connection_pool_opts)
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    Env.put!(:shard_idle_ms, 60_000)
     shard = "pool_it_#{System.unique_integer([:positive])}"
 
     on_exit(fn ->
-      restore(:connection_pool, prev_pool)
-      restore(:shard_idle_ms, prev_idle)
-      restore(:connection_pool_opts, prev_opts)
-
       for base <- [
             Path.join(Fathom.Shard.data_dir(), "#{shard}.db"),
             Path.join(Fathom.Shard.Storage.Local.dir(), "#{shard}.db")
@@ -45,8 +39,6 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     %{shard: shard}
   end
 
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, val), do: Application.put_env(:fathom, key, val)
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
   # Put a handle into a live coordinator's pool THROUGH the node-wide idle budget. A bare
   # `%{s | pool: HandlePool.put(...)}` skips `PoolBudget.adjust/2`, so when the coordinator later
@@ -67,7 +59,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
 
   # The pre-grace drain-on-close behaviour (`drain_grace_ms: 0`), for the tests that pin the idle
   # drain itself. Must run before the shard's coordinator starts: the pool reads it at init.
-  defp drain_on_close, do: Application.put_env(:fathom, :connection_pool_opts, drain_grace_ms: 0)
+  defp drain_on_close, do: Env.put!(:connection_pool_opts, drain_grace_ms: 0)
   defp conn_of({_pid, _ref, conn, _id, _sc, _v, _o}), do: conn
   defp pid_of({pid, _ref, _conn, _id, _sc, _v, _o}), do: pid
 
@@ -103,7 +95,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   test "Fathom.Shard.checkout/2 returns a pooled handle in the grant reply, in one call (#18)", %{
     shard: shard
   } do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
     {:ok, pid, ref, path, :open} = Shards.checkout(shard, :rw)
     on_exit(fn -> Fathom.Shard.checkin(pid, ref) end)
@@ -125,10 +117,8 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   test "pooling ON: the coordinator sweeps a pooled handle idle past the ttl (#19)", %{
     shard: shard
   } do
-    Application.put_env(:fathom, :connection_pool, true)
-    prev_opts = Application.get_env(:fathom, :connection_pool_opts)
-    Application.put_env(:fathom, :connection_pool_opts, max_per_scope: 4, ttl_ms: 60_000)
-    on_exit(fn -> restore(:connection_pool_opts, prev_opts) end)
+    Env.put!(:connection_pool, true)
+    Env.put!(:connection_pool_opts, max_per_scope: 4, ttl_ms: 60_000)
 
     {:ok, pid, ref, path} = Shards.checkout(shard)
 
@@ -160,9 +150,9 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   test "pooling ON: an idle coordinator with an empty pool gets no sweep wakeups (#35)", %{
     shard: shard
   } do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
-    Application.put_env(:fathom, :connection_pool_opts,
+    Env.put!(:connection_pool_opts,
       max_per_scope: 4,
       ttl_ms: 20,
       drain_grace_ms: 0
@@ -203,7 +193,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
 
   test "pooling ON: the sweep timer is armed while a handle is pooled and cancelled on drain (#35)",
        %{shard: shard} do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
     drain_on_close()
 
     {:ok, ha} = ShardExecutor.open(shard)
@@ -225,7 +215,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
 
   test "pooling ON: a handle checked in while the shard is still busy is reused by the next stream",
        %{shard: shard} do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, %StmtResult{}} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
@@ -254,7 +244,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   # stream's unqualified SQL — reads saw the temp rows, writes went to a table that is never flushed)
   # and its `ignore_check_constraints`. Pre-fix both handles were pooled and reused.
   test "pooling ON: a handle holding a TEMP object is closed, not pooled", %{shard: shard} do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
@@ -283,7 +273,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   test "pooling ON: a handle a stream set a session-only pragma on is closed, not pooled", %{
     shard: shard
   } do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE c (n INTEGER CHECK (n >= 0))"))
@@ -313,7 +303,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   test "pooling ON: a reused :ro handle sees a sibling's ADD COLUMN in its column names", %{
     shard: shard
   } do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
     {:ok, w} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(w, stmt("CREATE TABLE s (a INTEGER)"))
@@ -349,7 +339,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   # closes a stream on the coordinator's DOWN (self-fence, tenant delete, crash). Pre-fix the handle
   # is still open after close/1.
   test "pooling ON: closing a stream whose coordinator is dead closes the handle", %{shard: shard} do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
     {:ok, h} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(h, stmt("CREATE TABLE d (a INTEGER)"))
@@ -370,7 +360,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   test "pooling ON: a pooled handle lent to a caller that was already dead is closed", %{
     shard: shard
   } do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
     {:ok, pid, ref, path, :open} = Shards.checkout(shard, :rw)
     on_exit(fn -> Fathom.Shard.checkin(pid, ref) end)
@@ -397,7 +387,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   test "pooling ON: a foreign_keys pragma (reset on reuse) does not defeat pooling", %{
     shard: shard
   } do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(ha, stmt("PRAGMA foreign_keys = ON"))
@@ -412,7 +402,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
 
   test "pooling ON: draining a pooled handle checkpoints+unlinks the WAL (A2 durability invariant)",
        %{shard: shard} do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
     drain_on_close()
 
     {:ok, ha} = ShardExecutor.open(shard)
@@ -446,7 +436,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   # does run, and it still checkpoints+unlinks the WAL.
   test "pooling ON: the idle-transition close runs off the coordinator, and still checkpoints (#15)",
        %{shard: shard} do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
@@ -480,7 +470,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   end
 
   test "pooling ON: an idle shard drains its pool — the durability invariant", %{shard: shard} do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
     drain_on_close()
 
     {:ok, ha} = ShardExecutor.open(shard)
@@ -499,7 +489,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   end
 
   test "pooling ON: an uncommitted write from the reused stream does not survive", %{shard: shard} do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
@@ -526,7 +516,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   # reused, so the lazy rollback hides the stranded lock; here a SEPARATE handle competes for it.
   test "pooling ON: a mid-transaction checkin does not strand the write lock for a concurrent writer (#3)",
        %{shard: shard} do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
@@ -551,7 +541,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   test "pooling ON: scope isolation — a :ro stream is NOT handed the :rw pooled handle", %{
     shard: shard
   } do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
@@ -569,7 +559,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   end
 
   test "pooling OFF (default): the handle is closed on checkin, never pooled", %{shard: shard} do
-    Application.put_env(:fathom, :connection_pool, false)
+    Env.put!(:connection_pool, false)
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))
@@ -590,7 +580,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
        %{
          shard: shard
        } do
-    Application.put_env(:fathom, :connection_pool, true)
+    Env.put!(:connection_pool, true)
 
     {:ok, ha} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(ha, stmt("CREATE TABLE kv (v TEXT)"))

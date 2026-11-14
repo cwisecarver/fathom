@@ -25,23 +25,20 @@ defmodule Fathom.Shard.DropStampUnsyncedTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Provenance, Storage}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
 
   setup do
     shard = "dropstamp_#{System.unique_integer([:positive])}"
-    prev = Map.new([:shard_storage, :shard_flush_interval_ms, :shard_idle_ms], &{&1, env(&1)})
 
-    Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
-    Application.put_env(:fathom, :shard_flush_interval_ms, 600_000)
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+    Env.put!(:shard_flush_interval_ms, 600_000)
+    Env.put!(:shard_idle_ms, 600_000)
 
     on_exit(fn ->
-      Application.delete_env(:fathom, :provenance_write_hook)
-      Application.delete_env(:fathom, :storage_fault)
       Shards.drain(shard, 2_000)
-      for {k, v} <- prev, do: restore(k, v)
 
       for dir <- [Shard.data_dir(), Storage.Local.dir()],
           suffix <- [".db", ".db-wal", ".db-shm", ".db.etag", ".lock", ".pos", ".lineage"],
@@ -52,10 +49,6 @@ defmodule Fathom.Shard.DropStampUnsyncedTest do
 
     %{shard: shard}
   end
-
-  defp env(k), do: Application.get_env(:fathom, k)
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
   defp db(shard), do: Shard.db_path(shard)
@@ -81,7 +74,7 @@ defmodule Fathom.Shard.DropStampUnsyncedTest do
     test_pid = self()
     path = db(shard)
 
-    Application.put_env(:fathom, :provenance_write_hook, fn
+    Env.put!(:provenance_write_hook, fn
       :synced, ^path ->
         send(test_pid, {:synced, File.read!(path <> ".etag")})
 
@@ -135,7 +128,7 @@ defmodule Fathom.Shard.DropStampUnsyncedTest do
 
     # Short idle: the connection stays checked out until `idle_drop!/2` closes it, so nothing drops
     # before then; closing it is what arms the drop.
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, coordinator} = Shards.ensure(shard)
     assert_mode!(coordinator, mode)
@@ -202,7 +195,7 @@ defmodule Fathom.Shard.DropStampUnsyncedTest do
 
         # A periodic PUT that LANDS but reports failure: the fence etag goes stale, so the drop PUT
         # 412s with the lock still ours and takes retry_drop_upload/1.
-        Application.put_env(:fathom, :storage_fault, :flush_lands_then_errors)
+        Env.put!(:storage_fault, :flush_lands_then_errors)
         capture_log(fn -> assert {:error, _} = Shards.flush(shard) end)
         Application.delete_env(:fathom, :storage_fault)
         {:ok, _} = ShardExecutor.execute(ctx.conn, stmt("INSERT INTO kv VALUES ('r2')"))
@@ -210,13 +203,11 @@ defmodule Fathom.Shard.DropStampUnsyncedTest do
         capture!(shard)
         test_pid = self()
 
-        Application.put_env(
-          :fathom,
+        Env.put!(
           :faulty_before,
           {:flush, fn s -> if s == shard, do: send(test_pid, :drop_put) end}
         )
 
-        on_exit(fn -> Application.delete_env(:fathom, :faulty_before) end)
         capture_log(fn -> send(self(), {:events, idle_drop!(ctx, :normal)}) end)
         assert_received {:events, events}
 

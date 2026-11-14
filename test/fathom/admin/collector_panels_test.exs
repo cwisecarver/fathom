@@ -8,16 +8,10 @@ defmodule Fathom.Admin.CollectorPanelsTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Admin.{EventRing, Measurements, MetricsCollector}
+  alias Fathom.Test.Env
 
   setup do
-    prev = Application.get_env(:fathom, :admin_tick_ms)
-    Application.put_env(:fathom, :admin_tick_ms, 3_600_000)
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :admin_tick_ms, prev),
-        else: Application.delete_env(:fathom, :admin_tick_ms)
-    end)
+    Env.put!(:admin_tick_ms, 3_600_000)
 
     for child <- Fathom.Telemetry.reporter_children(), do: start_supervised!(child)
     # The Core reporter attaches its telemetry handlers AFTER start returns, so an event emitted

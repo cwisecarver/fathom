@@ -15,23 +15,16 @@ defmodule Fathom.Shard.ReplicationFlushCheckpointTest do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.{Fleet, Follower, Session, Wal}
   alias Fathom.Shards
+  alias Fathom.Test.Env
 
   @frame 4096 + 24
-  @keys [
-    :replication_enabled,
-    :replication_followers,
-    :replication_quorum,
-    :replication_checkpoint_bytes,
-    :replication_flush_checkpoint_min_bytes
-  ]
 
   setup do
     id = "repl_flush_ckpt_#{System.unique_integer([:positive])}"
     root = Path.join(System.tmp_dir!(), "replflushckpt_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
-    prev = Map.new(@keys, &{&1, Application.get_env(:fathom, &1)})
     # Threshold 80 frames, so the size gate sits at 20 frames.
-    Application.put_env(:fathom, :replication_checkpoint_bytes, 80 * @frame)
+    Env.put!(:replication_checkpoint_bytes, 80 * @frame)
 
     test = self()
     handler = "flush-ckpt-#{System.unique_integer([:positive])}"
@@ -46,11 +39,6 @@ defmodule Fathom.Shard.ReplicationFlushCheckpointTest do
     on_exit(fn ->
       :telemetry.detach(handler)
       Session.stop(id)
-
-      Enum.each(prev, fn
-        {k, nil} -> Application.delete_env(:fathom, k)
-        {k, v} -> Application.put_env(:fathom, k, v)
-      end)
 
       File.rm_rf(root)
       for s <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(id) <> s)
@@ -73,14 +61,9 @@ defmodule Fathom.Shard.ReplicationFlushCheckpointTest do
         port
       end
 
-    Application.put_env(:fathom, :replication_enabled, true)
-    Application.put_env(:fathom, :replication_quorum, 2)
-
-    Application.put_env(
-      :fathom,
-      :replication_followers,
-      for(p <- followers, do: {~c"127.0.0.1", p})
-    )
+    Env.put!(:replication_enabled, true)
+    Env.put!(:replication_quorum, 2)
+    Env.put!(:replication_followers, for(p <- followers, do: {~c"127.0.0.1", p}))
 
     start_supervised!(Fleet)
 
@@ -166,7 +149,7 @@ defmodule Fathom.Shard.ReplicationFlushCheckpointTest do
   end
 
   test "the gate at 0 restores the per-flush PASSIVE on a small WAL", ctx do
-    Application.put_env(:fathom, :replication_flush_checkpoint_min_bytes, 0)
+    Env.put!(:replication_flush_checkpoint_min_bytes, 0)
     s = replicated_shard!(ctx)
     write!(s, 4)
     await_all_current!(s)

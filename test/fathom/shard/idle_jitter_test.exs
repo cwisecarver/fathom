@@ -16,6 +16,7 @@ defmodule Fathom.Shard.IdleJitterTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.Env
 
   describe "jitter_idle_ms/2" do
     test "stays within ±ratio of the base and actually varies" do
@@ -41,14 +42,7 @@ defmodule Fathom.Shard.IdleJitterTest do
   end
 
   test "a coordinator's idle deadline carries the spread; a pinned tiny one stays exact" do
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    prev_ratio = Application.get_env(:fathom, :shard_idle_jitter_ratio)
-    Application.put_env(:fathom, :shard_idle_jitter_ratio, 0.1)
-
-    on_exit(fn ->
-      restore(:shard_idle_ms, prev_idle)
-      restore(:shard_idle_jitter_ratio, prev_ratio)
-    end)
+    Env.put!(:shard_idle_jitter_ratio, 0.1)
 
     open = fn id ->
       on_exit(fn -> Shards.stop(id) end)
@@ -58,7 +52,7 @@ defmodule Fathom.Shard.IdleJitterTest do
       :sys.get_state(coordinator).idle_ms
     end
 
-    Application.put_env(:fathom, :shard_idle_ms, 60_000)
+    Env.put!(:shard_idle_ms, 60_000)
     wide = for _ <- 1..12, do: open.("idlejit_#{System.unique_integer([:positive])}")
     assert Enum.all?(wide, &(&1 >= 54_000 and &1 <= 66_000))
     assert length(Enum.uniq(wide)) > 1, "twelve coordinators drew the same idle deadline"
@@ -66,7 +60,4 @@ defmodule Fathom.Shard.IdleJitterTest do
     Application.put_env(:fathom, :shard_idle_ms, 1)
     assert open.("idlejit_#{System.unique_integer([:positive])}") == 1
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, value), do: Application.put_env(:fathom, key, value)
 end

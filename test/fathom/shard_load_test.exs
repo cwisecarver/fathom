@@ -7,25 +7,17 @@ defmodule Fathom.ShardLoadTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{ShardExecutor, ShardLoad, Shards}
+  alias Fathom.Test.Env
   alias Filo.Stmt
 
   setup do
-    prev = Application.get_env(:fathom, :shard_load)
-    prev_idle = Application.get_env(:fathom, :shard_idle_ms)
-    Application.put_env(:fathom, :shard_load, true)
+    Env.put!(:shard_load, true)
     ShardLoad.reset()
 
-    on_exit(fn ->
-      ShardLoad.reset()
-      restore(:shard_load, prev)
-      restore(:shard_idle_ms, prev_idle)
-    end)
+    on_exit(fn -> ShardLoad.reset() end)
 
     :ok
   end
-
-  defp restore(key, nil), do: Application.delete_env(:fathom, key)
-  defp restore(key, val), do: Application.put_env(:fathom, key, val)
 
   defp uniq(p), do: "#{p}_#{System.unique_integer([:positive])}"
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
@@ -161,7 +153,7 @@ defmodule Fathom.ShardLoadTest do
   end
 
   test "recording is a no-op when disabled" do
-    Application.put_env(:fathom, :shard_load, false)
+    Env.put!(:shard_load, false)
     ShardLoad.record_checkout("x")
     ShardLoad.record_query("x", 9, 9)
 
@@ -172,7 +164,7 @@ defmodule Fathom.ShardLoadTest do
   # ── through the hot path ──
 
   test "a checkout + queries record load, and a stop forgets it" do
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_idle_ms, 50)
     id = uniq("load")
     on_exit(fn -> clean_shard(id) end)
 
@@ -193,8 +185,8 @@ defmodule Fathom.ShardLoadTest do
   end
 
   test "the hot path records nothing when disabled" do
-    Application.put_env(:fathom, :shard_load, false)
-    Application.put_env(:fathom, :shard_idle_ms, 50)
+    Env.put!(:shard_load, false)
+    Env.put!(:shard_idle_ms, 50)
     id = uniq("loadoff")
     on_exit(fn -> clean_shard(id) end)
 

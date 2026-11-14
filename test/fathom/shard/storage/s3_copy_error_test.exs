@@ -9,14 +9,13 @@ defmodule Fathom.Shard.Storage.S3CopyErrorTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
 
   @error_body ~s(<?xml version="1.0"?><Error><Code>InternalError</Code><Message>boom</Message></Error>)
   @ok_body ~s(<?xml version="1.0"?><CopyObjectResult><ETag>"abc"</ETag></CopyObjectResult>)
 
   defp put_s3_config(plug) do
-    prev = Application.get_env(:fathom, S3)
-
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -25,12 +24,6 @@ defmodule Fathom.Shard.Storage.S3CopyErrorTest do
       path_style: true,
       req_plug: plug
     )
-
-    on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, S3, prev),
-        else: Application.delete_env(:fathom, S3)
-    end)
   end
 
   test "a copy that returns 200 with an <Error> body is a failure, not success" do

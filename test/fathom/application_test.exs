@@ -4,6 +4,8 @@ defmodule Fathom.ApplicationTest do
   # shared supervised process.
   use ExUnit.Case, async: false
 
+  alias Fathom.Test.Env
+
   @planes [
     Fathom.Infra.Supervisor,
     Fathom.ControlPlane.Supervisor,
@@ -54,14 +56,7 @@ defmodule Fathom.ApplicationTest do
   # deploy. The violated invariant: the heartbeat must outlive the coordinators' final
   # flushes, i.e. start before the shard Registry/DynamicSupervisor.
   test "the heartbeat starts before the shard supervisor so it stops after the coordinators" do
-    prev = Application.get_env(:fathom, :heartbeat_server)
-    Application.put_env(:fathom, :heartbeat_server, true)
-
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :heartbeat_server),
-        else: Application.put_env(:fathom, :heartbeat_server, prev)
-    end)
+    Env.put!(:heartbeat_server, true)
 
     ids =
       for spec <- Fathom.Application.data_plane_children(),

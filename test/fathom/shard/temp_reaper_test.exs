@@ -11,6 +11,7 @@ defmodule Fathom.Shard.TempReaperTest do
 
   alias Fathom.Shard
   alias Fathom.Shard.TempReaper
+  alias Fathom.Test.Env
 
   setup do
     # A data dir THIS TEST OWNS, not the shared one (2026-07-26).
@@ -25,18 +26,11 @@ defmodule Fathom.Shard.TempReaperTest do
     # `Shard.data_dir/0` reads `:shard_data_dir` per call, so pointing it at a private dir makes
     # the sweep O(this test's files): the drain is instant, the exact count is exact by
     # construction, and the test neither suffers from nor contributes to the shared pile.
-    prev = Application.get_env(:fathom, :shard_data_dir)
     dir = Path.join(System.tmp_dir!(), "fathom_reaper_test_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
-    Application.put_env(:fathom, :shard_data_dir, dir)
+    Env.put!(:shard_data_dir, dir)
 
-    on_exit(fn ->
-      if is_nil(prev),
-        do: Application.delete_env(:fathom, :shard_data_dir),
-        else: Application.put_env(:fathom, :shard_data_dir, prev)
-
-      File.rm_rf(dir)
-    end)
+    on_exit(fn -> File.rm_rf(dir) end)
 
     # Unique shard id so this test's temps never collide with a co-resident file.
     shard = "reaper_#{System.unique_integer([:positive])}"
@@ -124,14 +118,7 @@ defmodule Fathom.Shard.TempReaperTest do
 
     start_supervised!(TempReaper)
     # Budget 0 (the test default) evicts a retained copy the moment it is indexed.
-    prev_budget = Application.get_env(:fathom, :shard_retain_local_bytes)
-    Application.put_env(:fathom, :shard_retain_local_bytes, 64 * 1024 * 1024)
-
-    on_exit(fn ->
-      if is_nil(prev_budget),
-        do: Application.delete_env(:fathom, :shard_retain_local_bytes),
-        else: Application.put_env(:fathom, :shard_retain_local_bytes, prev_budget)
-    end)
+    Env.put!(:shard_retain_local_bytes, 64 * 1024 * 1024)
 
     File.write!(path, "retained db bytes")
     File.write!(Retained.marker(path), "")
@@ -295,27 +282,11 @@ defmodule Fathom.Shard.TempReaperTest do
     # 1 EiB: no real volume has this much free, so the floor always refuses.
     @impossible_floor 1_152_921_504_606_846_976
 
-    setup do
-      keys = [:fathom_scratch_dir, :scratch_min_free_bytes]
-      prev = Enum.map(keys, &{&1, Application.get_env(:fathom, &1)})
-
-      on_exit(fn ->
-        for {k, v} <- prev,
-            do:
-              if(is_nil(v),
-                do: Application.delete_env(:fathom, k),
-                else: Application.put_env(:fathom, k, v)
-              )
-      end)
-
-      :ok
-    end
-
     test "scratch_dir/0 honours :fathom_scratch_dir" do
       dir =
         Path.join(System.tmp_dir!(), "fathom_scratch_cfg_#{System.unique_integer([:positive])}")
 
-      Application.put_env(:fathom, :fathom_scratch_dir, dir)
+      Env.put!(:fathom_scratch_dir, dir)
       on_exit(fn -> File.rm_rf(dir) end)
 
       assert TempReaper.scratch_dir() == dir
@@ -324,7 +295,7 @@ defmodule Fathom.Shard.TempReaperTest do
 
     test "a scratch pull is refused when the scratch volume is below the free-space floor" do
       # A floor no volume can meet: the reading is real, the refusal is the code under test.
-      Application.put_env(:fathom, :scratch_min_free_bytes, @impossible_floor)
+      Env.put!(:scratch_min_free_bytes, @impossible_floor)
 
       assert {:error, {:scratch_low_disk, free, min}} = TempReaper.check_scratch_headroom()
       assert min == @impossible_floor
@@ -332,7 +303,7 @@ defmodule Fathom.Shard.TempReaperTest do
     end
 
     test "the free-space check passes with a zero floor" do
-      Application.put_env(:fathom, :scratch_min_free_bytes, 0)
+      Env.put!(:scratch_min_free_bytes, 0)
       assert :ok = TempReaper.check_scratch_headroom()
     end
 
@@ -340,7 +311,7 @@ defmodule Fathom.Shard.TempReaperTest do
     # storage call. No shard exists here: the headroom check runs after the id casts and before the
     # download, so this would reach storage (and fail differently) if the check were missing.
     test "Snapshots.restore refuses before downloading when the scratch volume is short" do
-      Application.put_env(:fathom, :scratch_min_free_bytes, @impossible_floor)
+      Env.put!(:scratch_min_free_bytes, @impossible_floor)
 
       assert {:error, {:scratch_low_disk, _free, _min}} =
                Fathom.Snapshots.restore("acme", "20261013-000000-abcd", force: true)

@@ -27,24 +27,15 @@ defmodule Fathom.Shard.RecoveryEarlyExitTest do
   alias Fathom.Shard.PromoteOnOpen
   alias Fathom.Shard.Replication.{Fleet, Follower, Recovery}
   alias Fathom.Shard.Replication.Recovery.UnderQuorum
+  alias Fathom.Test.Env
 
   @slow_ms 1_500
 
   setup do
     id = "early_#{System.unique_integer([:positive])}"
-    prev_wire = Application.get_env(:fathom, :replication_lineage_wire)
-    prev_ord = Application.get_env(:fathom, :replication_ordinal_wire)
-    Application.put_env(:fathom, :replication_lineage_wire, true)
-    Application.put_env(:fathom, :replication_ordinal_wire, true)
+    Env.put!(:replication_lineage_wire, true)
+    Env.put!(:replication_ordinal_wire, true)
     Recovery.init_table()
-
-    on_exit(fn ->
-      for {k, v} <- [replication_lineage_wire: prev_wire, replication_ordinal_wire: prev_ord] do
-        if is_nil(v),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, v)
-      end
-    end)
 
     %{id: id, survivor: start_follower("early_surv")}
   end
@@ -233,46 +224,21 @@ defmodule Fathom.Shard.RecoveryEarlyExitTest do
 
   describe "the recovery marker" do
     setup do
-      prev =
-        Map.new(
-          [
-            :replication_promote_on_open,
-            :replication_recover_from_peers,
-            :replication_followers,
-            :recovery_ask_crash_hook,
-            :replication_quorum
-          ],
-          &{&1, Application.get_env(:fathom, &1)}
-        )
+      Env.put!(:replication_promote_on_open, true)
+      Env.put!(:replication_recover_from_peers, true)
+      Env.put!(:replication_quorum, 2)
+      Env.put!(:replication_followers, for(n <- 1..4, do: {"dead#{n}", "127.0.0.1", n}))
+
+      test = self()
+
+      Env.put!(:recovery_ask_crash_hook, fn path ->
+        send(test, {:asked, path})
+      end)
 
       prev_running = Fleet.running()
       Fleet.publish([])
 
-      on_exit(fn ->
-        Fleet.publish(prev_running)
-
-        for {k, v} <- prev do
-          if is_nil(v),
-            do: Application.delete_env(:fathom, k),
-            else: Application.put_env(:fathom, k, v)
-        end
-      end)
-
-      Application.put_env(:fathom, :replication_promote_on_open, true)
-      Application.put_env(:fathom, :replication_recover_from_peers, true)
-      Application.put_env(:fathom, :replication_quorum, 2)
-
-      Application.put_env(
-        :fathom,
-        :replication_followers,
-        for(n <- 1..4, do: {"dead#{n}", "127.0.0.1", n})
-      )
-
-      test = self()
-
-      Application.put_env(:fathom, :recovery_ask_crash_hook, fn path ->
-        send(test, {:asked, path})
-      end)
+      on_exit(fn -> Fleet.publish(prev_running) end)
 
       :ok
     end

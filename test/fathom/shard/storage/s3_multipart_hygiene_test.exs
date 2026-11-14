@@ -30,22 +30,13 @@ defmodule Fathom.Shard.Storage.S3MultipartHygieneTest do
   alias Fathom.Shard
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.{HeartbeatCache, S3}
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
 
   setup do
     shard = "mphyg_#{System.unique_integer([:positive])}"
 
-    for k <- [:shard_storage, S3, :steal_margin_ms] do
-      prev = Application.get_env(:fathom, k)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, prev)
-      end)
-    end
-
-    Application.put_env(:fathom, :steal_margin_ms, 0)
+    Env.put!(:steal_margin_ms, 0)
     HeartbeatCache.reset()
 
     on_exit(fn ->
@@ -57,7 +48,8 @@ defmodule Fathom.Shard.Storage.S3MultipartHygieneTest do
   end
 
   defp use_s3!(plug) do
-    Application.put_env(:fathom, S3,
+    Env.put!(
+      S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -67,7 +59,7 @@ defmodule Fathom.Shard.Storage.S3MultipartHygieneTest do
       req_plug: plug
     )
 
-    Application.put_env(:fathom, :shard_storage, S3)
+    Env.put!(:shard_storage, S3)
   end
 
   defp start_store(objects \\ %{}) do

@@ -35,26 +35,21 @@ defmodule Fathom.Shard.TouchProvenanceTest do
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Connection, Heartbeat, Storage}
   alias Fathom.Shard.Storage.S3
+  alias Fathom.Test.Env
   alias Fathom.Test.S3EtagStore
   alias Filo.{Stmt, StmtResult}
 
   setup do
     shard = "touchprov_#{System.unique_integer([:positive])}"
 
-    for k <- [:shard_storage, S3, :shard_idle_ms, :replication_enabled] do
-      prev = Application.get_env(:fathom, k)
-
-      on_exit(fn ->
-        if is_nil(prev),
-          do: Application.delete_env(:fathom, k),
-          else: Application.put_env(:fathom, k, prev)
-      end)
-    end
-
-    Application.put_env(:fathom, :shard_idle_ms, 600_000)
+    # `use_s3!/1` sets the backend per test. Registering their restore here, before the drain
+    # below, makes it run AFTER the drain. Both are unset in config/test.exs, so the delete is a no-op.
+    Env.delete!(:shard_storage)
+    Env.delete!(S3)
+    Env.put!(:shard_idle_ms, 600_000)
 
     # The marker and its claim exist only while replicating (d80e554, expert review 2026-10-12 #3).
-    Application.put_env(:fathom, :replication_enabled, true)
+    Env.put!(:replication_enabled, true)
 
     on_exit(fn ->
       Shards.drain(shard, 2_000)
@@ -77,7 +72,7 @@ defmodule Fathom.Shard.TouchProvenanceTest do
   end
 
   defp use_s3!(store) do
-    Application.put_env(:fathom, S3,
+    Env.put!(S3,
       bucket: "b",
       region: "us-east-1",
       access_key_id: "k",
@@ -87,7 +82,7 @@ defmodule Fathom.Shard.TouchProvenanceTest do
       req_plug: fn conn -> S3EtagStore.serve(conn, store) end
     )
 
-    Application.put_env(:fathom, :shard_storage, S3)
+    Env.put!(:shard_storage, S3)
   end
 
   defp set_mode!(:legacy), do: refute(Heartbeat.running?())

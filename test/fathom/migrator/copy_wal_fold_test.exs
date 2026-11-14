@@ -17,6 +17,7 @@ defmodule Fathom.Migrator.CopyWalFoldTest do
 
   alias Fathom.Migrator.Copy
   alias Fathom.Shard.Connection
+  alias Fathom.Test.Env
 
   defmodule PinsAReader do
     @behaviour Fathom.Migrator.Transform
@@ -40,14 +41,9 @@ defmodule Fathom.Migrator.CopyWalFoldTest do
     source = base <> "-old.db"
     dest = base <> "-new.db"
 
-    prev = Application.get_env(:fathom, :migration_transforms)
-    Application.put_env(:fathom, :migration_transforms, [PinsAReader])
+    Env.put!(:migration_transforms, [PinsAReader])
 
     on_exit(fn ->
-      if prev,
-        do: Application.put_env(:fathom, :migration_transforms, prev),
-        else: Application.delete_env(:fathom, :migration_transforms)
-
       for path <- [source, dest], suffix <- ["", "-wal", "-shm"], do: File.rm(path <> suffix)
     end)
 
