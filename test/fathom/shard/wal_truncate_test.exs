@@ -72,6 +72,10 @@ defmodule Fathom.Shard.WalTruncateTest do
     len = before.commit_extent - off
     assert len > 0, "the fixture wrote no frames"
 
+    # The handle Session holds across a commit: opened by `read_held/2` BEFORE the checkpoint, so the
+    # truncation shrinks the file under an fd that is still open on the same inode.
+    {:ok, _header, held} = Wal.read_held(nil, wal)
+
     # The same sequence the durability flush produces: a PASSIVE checkpoint, then a write that
     # resets the log. With the limit at 0 the reset truncates the file.
     {:ok, _} = Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", [])
@@ -85,8 +89,12 @@ defmodule Fathom.Shard.WalTruncateTest do
     assert after_.size < before.commit_extent, "the limit did not truncate the WAL"
 
     # A2's read of the range it planned from `before` fails instead of returning new-generation
-    # bytes under the old header: the round fails and re-plans.
-    assert {:error, :short_read} = Wal.read_delta(wal, off, len)
+    # bytes under the old header: the round fails and re-plans. This is `read_delta_held/4`, the
+    # read Session ships through (cleanliness audit 2026-11-13 #4: this asserted a plain
+    # `read_delta/3` that nothing in lib called, so a regression in the held-fd short-read branch
+    # left it green).
+    assert {:error, :short_read, held} = Wal.read_delta_held(held, wal, off, len)
+    Wal.close_held(held)
 
     :ok = Connection.close(conn)
   end

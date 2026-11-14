@@ -261,7 +261,7 @@ defmodule Fathom.Shard.Replication.WalHeldFdTest do
     assert {:ok, held, h} = Wal.read_held(nil, path)
     assert plain == held, "read_held/2 disagrees with read/1 on the same file"
 
-    assert {:ok, plain_delta} = Wal.read_delta(path, 32, 100)
+    plain_delta = binary_part(File.read!(path), 32, 100)
     assert {:ok, held_delta, h} = Wal.read_delta_held(h, path, 32, 100)
     assert plain_delta == held_delta
 

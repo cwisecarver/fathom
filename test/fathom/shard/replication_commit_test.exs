@@ -826,12 +826,13 @@ defmodule Fathom.Shard.ReplicationCommitTest do
              "the checkpoint did not change the WAL's identity, so this fixture demonstrates " <>
                "nothing — check whether PASSIVE still restarts the log"
 
-      # AND THE EXISTING GUARD CANNOT SEE IT. read_delta/3 only fails on a SHORT read, so the same
-      # range reads back fine and would have shipped stamped with `before`'s identity.
-      assert {:ok, bin} = Fathom.Shard.Replication.Wal.read_delta(wal, off, len)
+      # AND THE EXISTING GUARD CANNOT SEE IT. read_delta_held/4 only fails on a SHORT read, so the
+      # same range reads back fine and would have shipped stamped with `before`'s identity.
+      assert {:ok, bin, held} = Fathom.Shard.Replication.Wal.read_delta_held(nil, wal, off, len)
+      Fathom.Shard.Replication.Wal.close_held(held)
 
       assert byte_size(bin) == len,
-             "read_delta refused the range, which would mean the file shrank — the dangerous " <>
+             "read_delta_held refused the range, which would mean the file shrank — the dangerous " <>
                "case is precisely the one where it does not"
 
       :ok = Connection.close(conn)
@@ -839,7 +840,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
 
     # Expert review 2026-10-12 #33: the SESSION-LEVEL behaviour, not just the structure. A log
     # reset whose new generation is at least as long as the planned range leaves the planned
-    # (off, len) perfectly readable — `read_delta` succeeds with new-generation bytes — so only the
+    # (off, len) perfectly readable — `read_delta_held` succeeds with new-generation bytes — so only the
     # header re-check in `Session.build_pushes/5` stands between those bytes and a follower stamped
     # with the old generation. (This is also the shape `journal_size_limit` makes possible, which is
     # why its rationale cites this check rather than the short read.)
@@ -886,7 +887,8 @@ defmodule Fathom.Shard.ReplicationCommitTest do
                "other guard catches; the case under test is the regrown one"
 
       # PRECONDITION that makes this test discriminate: the byte read alone is perfectly happy.
-      assert {:ok, bin} = Fathom.Shard.Replication.Wal.read_delta(wal, off, len)
+      assert {:ok, bin, held} = Fathom.Shard.Replication.Wal.read_delta_held(nil, wal, off, len)
+      Fathom.Shard.Replication.Wal.close_held(held)
       assert byte_size(bin) == len
 
       state = %{wal_fd: nil, shard_id: "wal33"}

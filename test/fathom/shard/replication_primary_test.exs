@@ -77,7 +77,7 @@ defmodule Fathom.Shard.ReplicationPrimaryTest do
       assert second.size > first.size
     end
 
-    test "read_delta returns exactly the requested range", ctx do
+    test "read_delta_held returns exactly the requested range", ctx do
       %{path: path, wal: wal} = ctx
       {:ok, conn} = Connection.open(path)
       on_exit(fn -> Connection.close(conn) end)
@@ -85,12 +85,13 @@ defmodule Fathom.Shard.ReplicationPrimaryTest do
       {:ok, _} = Connection.query(conn, "CREATE TABLE t (a)", [])
       {:ok, h} = Wal.read(wal)
 
-      assert {:ok, bin} = Wal.read_delta(wal, 0, h.size)
+      assert {:ok, bin, held} = Wal.read_delta_held(nil, wal, 0, h.size)
       assert byte_size(bin) == h.size
       assert bin == File.read!(wal)
 
-      assert {:ok, <<>>} = Wal.read_delta(wal, 0, 0)
-      assert {:error, :short_read} = Wal.read_delta(wal, 0, h.size + 1_000)
+      assert {:ok, <<>>, held} = Wal.read_delta_held(held, wal, 0, 0)
+      assert {:error, :short_read, held} = Wal.read_delta_held(held, wal, 0, h.size + 1_000)
+      Wal.close_held(held)
     end
   end
 

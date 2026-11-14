@@ -166,37 +166,15 @@ defmodule Fathom.Shard.Replication.Wal do
     end
   end
 
-  @doc false
-  # Test seam: only tests call this.
-  @spec read_delta(Path.t(), non_neg_integer(), non_neg_integer()) ::
-          {:ok, binary()} | {:error, term()}
-  def read_delta(_path, _offset, 0), do: {:ok, <<>>}
-
-  def read_delta(path, offset, len) do
-    with {:ok, fd} <- :file.open(path, [:read, :raw, :binary]),
-         {:ok, bin} <- :file.pread(fd, offset, len),
-         :ok <- :file.close(fd) do
-      if byte_size(bin) == len do
-        {:ok, bin}
-      else
-        # A short read means the file shrank under us — a checkpoint raced this read. Refuse; the
-        # next commit re-reads the header and takes the reset path.
-        {:error, :short_read}
-      end
-    else
-      :eof -> {:error, :short_read}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
   @doc "Size of the WAL header, which is where generation N's frames begin."
   @spec header_bytes() :: pos_integer()
   def header_bytes, do: @header_bytes
 
   # --- held-fd reads (expert review 2026-08-26 #32) --------------------------------------------
   #
-  # `read/1` and `read_delta/3` above each do their own `open`+`pread`+`close`. One
-  # `Session.commit/3` calls them three times, so a replicated commit paid THREE open/close pairs
+  # `read/1` and the plain range read this file used to have (`read_delta/3`, deleted when only tests
+  # called it) each did their own `open`+`pread`+`close`. One
+  # `Session.commit/3` called them three times, so a replicated commit paid THREE open/close pairs
   # and TWO stats, all on dirty-IO schedulers, on the tenant's synchronous write path.
   #
   # MEASURED before building, because the finding is explicit that it is a hypothesis: 2 000 reps
@@ -354,8 +332,9 @@ defmodule Fathom.Shard.Replication.Wal do
   end
 
   @doc """
-  `read_delta/3` through `handle`. Same `{:ok, bin, handle}` / `{:error, reason, handle}` shape,
-  and the same short-read guard: a shrunken file means a checkpoint raced us, so refuse.
+  A range read of `len` bytes at `offset` through `handle`: `{:ok, bin, handle}` or
+  `{:error, reason, handle}`. A short read means the file shrank under us (a checkpoint raced this
+  read), so refuse: the next commit re-reads the header and takes the reset path.
   """
   @spec read_delta_held(handle(), Path.t(), non_neg_integer(), non_neg_integer()) ::
           {:ok, binary(), handle()} | {:error, term(), handle()}

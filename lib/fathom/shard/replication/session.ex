@@ -337,7 +337,7 @@ defmodule Fathom.Shard.Replication.Session do
        wal_path: nil,
        # A held, inode-revalidated read fd for `wal_path` (expert review 2026-08-26 #32). One
        # commit used to do THREE `open`/`close` pairs on this file — `Wal.read/1` in `ship/5`,
-       # `Wal.read_delta/3` per range, and `Wal.read/1` again for the stability re-check — all on
+       # a plain `open`+`pread`+`close` range read, and `Wal.read/1` again for the stability re-check — all on
        # dirty-IO schedulers on the tenant's synchronous write path. Measured at 123 µs/commit
        # against 19 µs for a held fd, i.e. ~104 µs of the 288 µs `replication_cost_test` attributes
        # to replication.
@@ -1953,7 +1953,7 @@ defmodule Fathom.Shard.Replication.Session do
     # `native/fathom_udf/src/wal.rs` gives the tenant's OWN commit thread a second uncoordinated
     # source of the same generation change at 4000 frames.
     #
-    # `read_delta/3`'s `byte_size(bin) == len` guard only fires if the file SHRANK. A checkpoint
+    # `read_delta_held/4`'s `byte_size(bin) == len` guard only fires if the file SHRANK. A checkpoint
     # that restarts the log without shrinking it — a PASSIVE checkpoint followed by a write, which
     # `Wal`'s own moduledoc says need not shrink the file — leaves the requested range perfectly
     # readable, so the pread succeeds and returns bytes from the NEW generation stamped with the
@@ -4413,7 +4413,7 @@ defmodule Fathom.Shard.Replication.Session do
   # `Shipper` produces one for every push to a follower whose socket is down, and `drop/2` produces
   # one for every waiter when a link fails. There was no backoff, no attempt limit and no "this
   # follower is not coming back" condition, so with one peer down every Session on the node ran a
-  # full `Wal.read` + `Primary.plan` + `Wal.read_delta` + budget-reserve + ship cycle once per
+  # full `Wal.read` + `Primary.plan` + `Wal.read_delta_held` + budget-reserve + ship cycle once per
   # second, indefinitely, on shards with ZERO tenant traffic. At the ~200 shards/node the rig holds
   # at 1024 tenants that is ~200 pointless plan-and-read cycles per second, each of which also
   # blocks its session for up to `replication_timeout_ms` (5 s) inside `handle_info`, so real client
