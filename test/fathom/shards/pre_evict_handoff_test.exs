@@ -216,6 +216,7 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
   describe "the slot offer" do
     test "two adopters, one offer: exactly one adopts" do
       {:ok, holder} = Task.start(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(holder, :kill) end)
       id = uniq()
       :ok = Lru.offer_slot(id, holder)
       test_pid = self()
@@ -233,6 +234,7 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
 
     test "a slot the drain did not free is reported to its adopter at once" do
       {:ok, holder} = Task.start(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(holder, :kill) end)
       id = uniq()
       :ok = Lru.offer_slot(id, holder)
       assert {:ok, ^id, ^holder, ref} = Lru.adopt_slot()
@@ -247,6 +249,7 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
 
     test "a freed slot sends nothing; its adopter learns from the victim's exit" do
       {:ok, holder} = Task.start(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(holder, :kill) end)
       id = uniq()
       :ok = Lru.offer_slot(id, holder)
       assert {:ok, ^id, ^holder, ref} = Lru.adopt_slot()

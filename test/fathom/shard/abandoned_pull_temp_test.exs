@@ -37,7 +37,7 @@ defmodule Fathom.Shard.AbandonedPullTempTest do
     :persistent_term.put({SlowBody, :test}, self())
     on_exit(fn -> :persistent_term.erase({SlowBody, :test}) end)
 
-    {:ok, server} = Bandit.start_link(plug: SlowBody, port: 0, ip: :loopback)
+    server = start_supervised!({Bandit, plug: SlowBody, port: 0, ip: :loopback})
     {:ok, {_, port}} = ThousandIsland.listener_info(server)
 
     prev_s3 = Application.get_env(:fathom, S3)

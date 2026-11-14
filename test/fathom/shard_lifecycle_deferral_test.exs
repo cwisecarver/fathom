@@ -147,6 +147,7 @@ defmodule Fathom.ShardLifecycleDeferralTest do
     h = dirty_shard(shard)
     pid = pid_of(h)
     stuck = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Process.exit(stuck, :kill) end)
     :sys.replace_state(pid, &%{&1 | closing: stuck})
 
     send(pid, :durability_flush)
@@ -179,6 +180,7 @@ defmodule Fathom.ShardLifecycleDeferralTest do
     _ = :sys.get_state(pid)
 
     stuck = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Process.exit(stuck, :kill) end)
     :sys.replace_state(pid, &%{&1 | closing: stuck})
     assert File.exists?(Shard.db_path(shard)), "precondition: a local copy"
 
@@ -202,6 +204,7 @@ defmodule Fathom.ShardLifecycleDeferralTest do
     refute Shard.dirty?(pid), "precondition: clean, so the pre-fix clause would drop_local"
 
     stuck = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Process.exit(stuck, :kill) end)
     :sys.replace_state(pid, &%{&1 | closing: stuck, lease_lost: true})
 
     pref = Process.monitor(pid)

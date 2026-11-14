@@ -75,7 +75,7 @@ defmodule Fathom.Shard.Replication.SeedPinnedSnapshotTest do
     path = Path.join(dir, "warm.db")
     {:ok, conn} = Connection.open(path)
     {:ok, _} = Connection.query(conn, "CREATE TABLE w (a)", [])
-    {:ok, shipper} = FakeShipper.start_link(fn -> :ok end)
+    shipper = start_supervised!({FakeShipper, fn -> :ok end}, restart: :temporary)
     {:ok, _} = Session.do_seed(shipper, "seedpin_warm", path, path <> "-wal", 1, 0)
     :ok = Connection.set_busy_timeout(conn, 200)
     {:ok, _} = Connection.query(conn, "PRAGMA wal_checkpoint(TRUNCATE)", [])
@@ -155,7 +155,9 @@ defmodule Fathom.Shard.Replication.SeedPinnedSnapshotTest do
   test "a PASSIVE checkpoint during the .db stream cannot leak later commits into the base",
        ctx do
     %{root: root, path: path} = ctx
-    {:ok, shipper} = FakeShipper.start_link(update_and_checkpoint(path, self()))
+
+    shipper =
+      start_supervised!({FakeShipper, update_and_checkpoint(path, self())}, restart: :temporary)
 
     result = Session.do_seed(shipper, "seedpin", path, path <> "-wal", 1, 0)
 
@@ -199,14 +201,15 @@ defmodule Fathom.Shard.Replication.SeedPinnedSnapshotTest do
   # would stall that shard's durability flush (and grow its WAL) indefinitely. Checked on both a
   # completed seed and one whose stream fails mid-way.
   test "the pinned read is released when the seed completes", ctx do
-    {:ok, shipper} = FakeShipper.start_link(fn -> :ok end)
+    shipper = start_supervised!({FakeShipper, fn -> :ok end}, restart: :temporary)
 
     assert {:ok, _} =
              seed_in_held_process(shipper, ctx.path, fn -> assert_truncate_completes(ctx.conn) end)
   end
 
   test "the pinned read is released when the stream fails mid-way", ctx do
-    {:ok, shipper} = FakeShipper.start_link(fn -> {:error, :disconnected} end)
+    shipper =
+      start_supervised!({FakeShipper, fn -> {:error, :disconnected} end}, restart: :temporary)
 
     assert {:error, :disconnected} =
              seed_in_held_process(shipper, ctx.path, fn -> assert_truncate_completes(ctx.conn) end)
@@ -260,7 +263,7 @@ defmodule Fathom.Shard.Replication.SeedPinnedSnapshotTest do
 
   test "a seed of a shard with no .db fails without creating one", ctx do
     missing = Path.join(ctx.root, "absent.db")
-    {:ok, shipper} = FakeShipper.start_link(fn -> :ok end)
+    shipper = start_supervised!({FakeShipper, fn -> :ok end}, restart: :temporary)
 
     assert {:error, :enoent} =
              Session.do_seed(shipper, "seedpin", missing, missing <> "-wal", 1, 0)

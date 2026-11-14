@@ -106,6 +106,7 @@ defmodule Fathom.Shard.ReplicationSeedWaitLateAckTest do
     # The expectation a late ack will disagree with.
     straggler = spawn(fn -> Process.sleep(:infinity) end)
     on_exit(fn -> Process.exit(straggler, :kill) end)
+    on_exit(fn -> Process.exit(straggler, :kill) end)
 
     :sys.replace_state(session, fn s ->
       %{

@@ -301,6 +301,7 @@ defmodule Fathom.Shard.PoolCloseLifecycleTest do
       end
 
       stuck = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(stuck, :kill) end)
 
       :sys.replace_state(pid, fn st ->
         %{st | closing: stuck, lease_lost: clause == :lease_lost}

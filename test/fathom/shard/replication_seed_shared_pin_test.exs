@@ -232,6 +232,7 @@ defmodule Fathom.Shard.ReplicationSeedSharedPinTest do
 
     test "the pin dies with its Session", %{db: db} do
       session = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(session, :kill) end)
       {:ok, pin} = SeedPin.start(session, db)
       ref = Process.monitor(pin)
       Process.exit(session, :kill)

@@ -175,8 +175,16 @@ defmodule Fathom.Telemetry.ProtocolTest do
       filo =
         {Filo.Plug, executor: Fathom.ShardExecutor, streams: :none, key: Filo.Baton.new_key()}
 
-      {:ok, a} = Bandit.start_link(plug: filo, port: 0, ip: :loopback, startup_log: false)
-      {:ok, b} = Bandit.start_link(plug: Other, port: 0, ip: :loopback, startup_log: false)
+      a =
+        start_supervised!({Bandit, plug: filo, port: 0, ip: :loopback, startup_log: false},
+          id: :filo_bandit
+        )
+
+      b =
+        start_supervised!({Bandit, plug: Other, port: 0, ip: :loopback, startup_log: false},
+          id: :other_bandit
+        )
+
       {:ok, {_, pa}} = ThousandIsland.listener_info(a)
       {:ok, {_, pb}} = ThousandIsland.listener_info(b)
 

@@ -1556,6 +1556,7 @@ defmodule Fathom.Shard.ReplicationCommitTest do
     # the commit itself errors; what is under test is WHICH Session it was routed to.)
     successor = spawn(fn -> Process.sleep(:infinity) end)
     on_exit(fn -> Process.exit(successor, :kill) end)
+    on_exit(fn -> Process.exit(successor, :kill) end)
     _ = Session.commit(id, path <> "-wal", successor)
 
     assert_received {:DOWN, ^old_ref, :process, ^old, _}

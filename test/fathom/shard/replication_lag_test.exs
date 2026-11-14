@@ -292,6 +292,7 @@ defmodule Fathom.Shard.ReplicationLagTest do
 
     # A process that dies while flagged (killed: no terminate/2 ran) must not leak +1.
     pid = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> Process.exit(pid, :kill) end)
     LagGauge.mark(pid, true)
     assert LagGauge.count() == base + 1
     ref = Process.monitor(pid)

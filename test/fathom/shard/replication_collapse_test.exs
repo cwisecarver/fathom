@@ -113,6 +113,7 @@ defmodule Fathom.Shard.ReplicationCollapseTest do
   defp fake_seed_in_flight!(session, shipper) do
     dummy = spawn(fn -> Process.sleep(:infinity) end)
     on_exit(fn -> Process.exit(dummy, :kill) end)
+    on_exit(fn -> Process.exit(dummy, :kill) end)
 
     :sys.replace_state(session, fn state ->
       entry = %{
