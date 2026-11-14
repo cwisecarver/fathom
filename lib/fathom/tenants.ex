@@ -1001,9 +1001,13 @@ defmodule Fathom.Tenants do
 
   @doc """
   Stops this node's coordinator for a tombstoned `shard_id` and removes every local working file
-  (expert review 2026-10-15 #3). Run on EVERY node by `Fathom.Tenants.Tombstones` when it learns of a
-  delete, and by its boot sweep, not only by `purge/1` on the DeleteJob's node. Idempotent. Refuses
+  (expert review 2026-10-15 #3). Erasing runs on EVERY node when `Fathom.Tenants.Tombstones` learns of
+  a delete, and in its boot sweep, not only by `purge/1` on the DeleteJob's node. Idempotent. Refuses
   (no-op) for an id that is not tombstoned: this is destructive and unfenced.
+
+  THIS FUNCTION is the synchronous form. `Tombstones` itself hands each id to
+  `Fathom.Tenants.LocalEraser.erase_async/1` (which coalesces and applies these same per-id
+  semantics); `purge/1` and the tests call this one (cleanliness audit 2026-11-13 #21).
 
   Returns `{:error, reason}` when the data dir could not be listed (rv8 F7): nothing was erased,
   so `[:fathom, :tenants, :local_erased]` is NOT emitted; `rm_local/1` has already logged and

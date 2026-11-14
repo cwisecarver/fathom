@@ -263,7 +263,9 @@ defmodule Fathom.Shard.FlushGate do
     ArgumentError -> :ok
   end
 
-  @doc "Current stamp-lane in-flight count (tests / observability)."
+  @doc false
+  # Test seam: only tests call this (`test/support/flush_gate_scope.ex`). No metric or gauge reads it.
+  # The current stamp-lane in-flight count.
   @spec stamp_in_flight() :: non_neg_integer()
   def stamp_in_flight do
     case :ets.lookup(@table, @stamp_counter) do

@@ -89,7 +89,8 @@ defmodule Fathom.Shard.Replication.FrameAuth do
   @spec required?() :: boolean()
   def required?, do: Application.get_env(:fathom, :replication_hmac_required, false) == true
 
-  @doc "Length in bytes of the tag `sign/1` produces."
+  @doc false
+  # Test seam: only tests call this. Length in bytes of the tag `sign/1` produces.
   @spec tag_bytes() :: pos_integer()
   def tag_bytes, do: @tag_bytes
 

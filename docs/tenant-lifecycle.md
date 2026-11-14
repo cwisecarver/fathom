@@ -131,7 +131,8 @@ stray `.fenced.*` / `.forked.*` / `.corrupt.*` copies (anchored at `<id>.db` so 
 id). Together with the A2 replica erase above, no copy of a deleted tenant is left on disk.
 
 **Every node erases its own local files (expert review 2026-10-15 #3).** `purge` runs on whichever node
-Oban picks, usually not the shard's LB home. `Tombstones` therefore runs `Tenants.erase_local/1` (stop
+Oban picks, usually not the shard's LB home. `Tombstones` therefore hands every deleted id to `Tenants.LocalEraser.erase_async/1`, which
+applies `Tenants.erase_local/1`'s semantics (stop
 the local coordinator, remove `<id>.db*`, including `.fenced/.forked/.corrupt` copies; erasure
 outranks forensics) on EVERY node when it learns of a delete (NOTIFY, `put/1`, incremental refresh),
 and a boot sweep lists the data dir once after the first successful tombstone load and erases the files

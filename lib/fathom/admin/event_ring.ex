@@ -62,7 +62,9 @@ defmodule Fathom.Admin.EventRing do
     ArgumentError -> []
   end
 
-  @doc "Total events ever pushed under `kind` since the ring started (the head counter)."
+  @doc false
+  # Test seam: only tests call this. Total events ever pushed under `kind` since the ring started (the
+  # head counter).
   @spec total(atom()) :: non_neg_integer()
   def total(kind) when is_atom(kind) do
     case :ets.lookup(@table, {kind, :head}) do
