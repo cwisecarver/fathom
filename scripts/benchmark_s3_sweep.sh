@@ -66,8 +66,13 @@ curl -fsS -X POST "http://localhost:$API/proxies" \
 
 printf '\n%-14s %s\n' "one_way_ms" "cold_open_s3_ms"
 for L in $LATENCIES; do
-  curl -fsS -X DELETE "http://localhost:$API/proxies/minio/toxics/lat_down" >/dev/null 2>&1 || true
-  curl -fsS -X DELETE "http://localhost:$API/proxies/minio/toxics/lat_up" >/dev/null 2>&1 || true
+  # The names must be the ones created below. They were `lat_down`/`lat_up` (benchmark_s3_latency.sh's
+  # names) while this loop creates `lat_${stream}`, so the DELETEs never matched, toxiproxy answered the
+  # next POST of an existing name with a 409 (silenced below), and every point after the first measured
+  # the FIRST latency (cleanliness audit 2026-11-13 #3; reproduced against a toxiproxy stand-in).
+  for stream in downstream upstream; do
+    curl -fsS -X DELETE "http://localhost:$API/proxies/minio/toxics/lat_${stream}" >/dev/null 2>&1 || true
+  done
   if [ "$L" != 0 ]; then
     for stream in downstream upstream; do
       curl -fsS -X POST "http://localhost:$API/proxies/minio/toxics" \
