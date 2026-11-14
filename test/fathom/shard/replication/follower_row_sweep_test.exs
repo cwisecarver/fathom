@@ -17,6 +17,7 @@ defmodule Fathom.Shard.Replication.FollowerRowSweepTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Wal
+  alias Fathom.Test.ReplicationWire
 
   @lineage 3
   @ordinal 5
@@ -77,21 +78,10 @@ defmodule Fathom.Shard.Replication.FollowerRowSweepTest do
 
   defp resident?(name, id), do: :ets.lookup(Follower.table(name), id) != []
 
-  defp send_frame!(port, frame) do
-    {:ok, sock} =
-      :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 5_000)
-
-    try do
-      :ok = :gen_tcp.send(sock, frame)
-      {:ok, bytes} = :gen_tcp.recv(sock, 0, 5_000)
-      Protocol.decode(bytes)
-    after
-      :gen_tcp.close(sock)
-    end
-  end
-
   defp position!(port, id) do
-    {:ok, {:position, ^id, answer}} = send_frame!(port, Protocol.encode_position_query(id))
+    {:ok, {:position, ^id, answer}} =
+      ReplicationWire.send_frame!(port, Protocol.encode_position_query(id))
+
     answer
   end
 
@@ -207,7 +197,7 @@ defmodule Fathom.Shard.Replication.FollowerRowSweepTest do
       lineage: @lineage
     }
 
-    assert {:ok, {:ack, ^id, 32}} = send_frame!(port, Protocol.encode_push(push))
+    assert {:ok, {:ack, ^id, 32}} = ReplicationWire.send_frame!(port, Protocol.encode_push(push))
 
     assert %{salt1: ^salt, lineage: @lineage, wal_ordinal: ordinal, torn: false} =
              Follower.state_of(name, id)
@@ -246,7 +236,7 @@ defmodule Fathom.Shard.Replication.FollowerRowSweepTest do
     }
 
     assert {:ok, {:reject, ^id, :stale_epoch, 0}} =
-             send_frame!(port, Protocol.encode_push(zombie))
+             ReplicationWire.send_frame!(port, Protocol.encode_push(zombie))
 
     # The replica is untouched: same WAL identity, lineage and ordinal, not torn. (Its epoch is
     # the persisted one since r8 #8; it was 0 here before, and the lineage fence is what refused.)

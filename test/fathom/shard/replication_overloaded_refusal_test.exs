@@ -28,11 +28,11 @@ defmodule Fathom.Shard.ReplicationOverloadedRefusalTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Heartbeat
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shards
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   import Fathom.Test.ReplicationCase
 
   @modes [:legacy, :heartbeat]
@@ -51,26 +51,11 @@ defmodule Fathom.Shard.ReplicationOverloadedRefusalTest do
     %{id: id, root: root}
   end
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    owner = "n_#{System.unique_integer([:positive])}@test"
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000, owner: owner})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
-  defp assert_mode!(:legacy, coordinator),
-    do: assert(is_nil(Fathom.Shard.acquire_gen(coordinator)), "expected LEGACY liveness")
-
-  defp assert_mode!(:heartbeat, coordinator),
-    do: refute(is_nil(Fathom.Shard.acquire_gen(coordinator)), "expected HEARTBEAT liveness")
-
   for mode <- @modes do
     describe "#{mode} mode" do
       test "a refused first push leaves no phantom in-flight and the next commit ships at once",
            %{id: id, root: root} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode), owner: "n_#{System.unique_integer([:positive])}@test")
         followers = start_followers!(root, 3, "ov")
 
         # A short timeout so the PRE-fix failure (a commit waiting out its deadline for replies that
@@ -81,7 +66,7 @@ defmodule Fathom.Shard.ReplicationOverloadedRefusalTest do
         on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
         {:ok, conn} = Connection.open(path)
         on_exit(fn -> Connection.close(conn) end)
-        assert_mode!(unquote(mode), coordinator)
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
         {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])

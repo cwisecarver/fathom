@@ -24,11 +24,12 @@ defmodule Fathom.Shard.FlushPinReleasedAfterCaptureTest do
   """
   use ExUnit.Case, async: false
 
-  alias Fathom.Shard.{Connection, Heartbeat}
+  alias Fathom.Shard.Connection
   alias Fathom.Shard.Storage.S3
   alias Fathom.ShardExecutor
   alias Fathom.Shards
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Fathom.Test.S3EtagStore
 
   @modes [:legacy, :heartbeat]
@@ -74,24 +75,6 @@ defmodule Fathom.Shard.FlushPinReleasedAfterCaptureTest do
   end
 
   defp stmt(sql, args \\ []), do: %Filo.Stmt{sql: sql, args: args}
-
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(), "legacy mode needs the heartbeat OFF"
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
-  defp assert_mode!(c, :heartbeat),
-    do: assert(is_integer(:sys.get_state(c).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(c, :legacy),
-    do: assert(is_nil(:sys.get_state(c).acquire_gen), "legacy mode did not take")
 
   # The S3 stub, with a hook run INSIDE the data-object PUT (after the client has sent it, before
   # the store answers): tenant commits land and a PASSIVE checkpoint runs, both on the live file.
@@ -174,7 +157,7 @@ defmodule Fathom.Shard.FlushPinReleasedAfterCaptureTest do
     Env.put!(:shard_object_encoding, encoding)
 
     {:ok, c} = Shards.ensure(id)
-    assert_mode!(c, mode)
+    LivenessMode.assert!(c, mode)
     {:ok, h} = ShardExecutor.open(id)
     on_exit(fn -> ShardExecutor.close(h) end)
     {:ok, _} = ShardExecutor.execute(h, stmt("CREATE TABLE t (a INTEGER, b BLOB)"))
@@ -198,7 +181,7 @@ defmodule Fathom.Shard.FlushPinReleasedAfterCaptureTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "zstd: the pin is released once the body is captured, before the PUT", ctx do
         {store, _busy, log, ckpt} =

@@ -26,7 +26,7 @@ defmodule Fathom.Shard.Replication.FollowerQuietAbsorbTest do
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Wal
-  alias Fathom.Test.Env
+  alias Fathom.Test.{Env, ReplicationWire}
 
   @lineage 3
   @ordinal 5
@@ -101,19 +101,6 @@ defmodule Fathom.Shard.Replication.FollowerQuietAbsorbTest do
     end
   end
 
-  defp send_frame!(port, frame) do
-    {:ok, sock} =
-      :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 5_000)
-
-    try do
-      :ok = :gen_tcp.send(sock, frame)
-      {:ok, bytes} = :gen_tcp.recv(sock, 0, 5_000)
-      Protocol.decode(bytes)
-    after
-      :gen_tcp.close(sock)
-    end
-  end
-
   defp push(id, h, fields) do
     struct!(
       %Protocol.Push{
@@ -163,13 +150,13 @@ defmodule Fathom.Shard.Replication.FollowerQuietAbsorbTest do
     plant!(ctx)
 
     {:ok, {:position, ^id, wire_before}} =
-      send_frame!(port, Protocol.encode_position_query(id))
+      ReplicationWire.send_frame!(port, Protocol.encode_position_query(id))
 
     age!(name, id)
     assert Follower.quiet_absorb_pass(name) == 1
 
     {:ok, {:position, ^id, wire_after}} =
-      send_frame!(port, Protocol.encode_position_query(id))
+      ReplicationWire.send_frame!(port, Protocol.encode_position_query(id))
 
     assert wire_after.lineage == wire_before.lineage
     assert wire_after.wal_ordinal == wire_before.wal_ordinal
@@ -267,7 +254,7 @@ defmodule Fathom.Shard.Replication.FollowerQuietAbsorbTest do
         wal_ordinal: @ordinal + 1
       )
 
-    assert {:ok, {:ack, ^id, 32}} = send_frame!(port, Protocol.encode_push(reset))
+    assert {:ok, {:ack, ^id, 32}} = ReplicationWire.send_frame!(port, Protocol.encode_push(reset))
 
     assert %{salt1: ^salt, lineage: @lineage, torn: false} = Follower.state_of(name, id)
   end
@@ -283,13 +270,16 @@ defmodule Fathom.Shard.Replication.FollowerQuietAbsorbTest do
     stale = push(id, h, offset: h.commit_extent, payload: :binary.copy(<<7>>, 64))
 
     assert {:ok, {:reject, ^id, :offset_mismatch, 0}} =
-             send_frame!(port, Protocol.encode_push(stale))
+             ReplicationWire.send_frame!(port, Protocol.encode_push(stale))
 
     assert wal_size(name, id) == 0, "the refused append wrote into the emptied WAL"
 
     # It re-ships its WAL from offset 0, and the replica is what it was before the absorb.
     reship = push(id, h, payload: wal_bytes)
-    assert {:ok, {:ack, ^id, size}} = send_frame!(port, Protocol.encode_push(reship))
+
+    assert {:ok, {:ack, ^id, size}} =
+             ReplicationWire.send_frame!(port, Protocol.encode_push(reship))
+
     assert size == byte_size(wal_bytes)
     assert wal_size(name, id) == byte_size(wal_bytes)
 

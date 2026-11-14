@@ -40,6 +40,7 @@ defmodule Fathom.Shard.Replication.FollowerEmptyWalRecoveryTest do
   alias Fathom.Shard.Replication.Recovery
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Test.Env
+  alias Fathom.Test.ReplicationWire
 
   @lineage 3
   @ordinal 5
@@ -95,19 +96,6 @@ defmodule Fathom.Shard.Replication.FollowerEmptyWalRecoveryTest do
     h
   end
 
-  defp send_frame!(port, frame) do
-    {:ok, sock} =
-      :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 5_000)
-
-    try do
-      :ok = :gen_tcp.send(sock, frame)
-      {:ok, bytes} = :gen_tcp.recv(sock, 0, 5_000)
-      Protocol.decode(bytes)
-    after
-      :gen_tcp.close(sock)
-    end
-  end
-
   # The primary checkpointed: a reset push for the NEXT generation, same ownership, stating that
   # the outgoing generation reached `extent` — the follower held all of it, so it absorbs its WAL
   # into its `.db` (the real `absorb_before_reset/5`) before laying down the new header.
@@ -129,11 +117,13 @@ defmodule Fathom.Shard.Replication.FollowerEmptyWalRecoveryTest do
       lineage: @lineage
     }
 
-    assert {:ok, {:ack, ^id, 32}} = send_frame!(port, Protocol.encode_push(push))
+    assert {:ok, {:ack, ^id, 32}} = ReplicationWire.send_frame!(port, Protocol.encode_push(push))
   end
 
   defp position!(port, id) do
-    {:ok, {:position, ^id, answer}} = send_frame!(port, Protocol.encode_position_query(id))
+    {:ok, {:position, ^id, answer}} =
+      ReplicationWire.send_frame!(port, Protocol.encode_position_query(id))
+
     answer
   end
 

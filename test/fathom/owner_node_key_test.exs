@@ -21,6 +21,7 @@ defmodule Fathom.OwnerNodeKeyTest do
   alias Fathom.Shard.{Heartbeat, Storage}
   alias Fathom.Shards
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
 
@@ -70,11 +71,11 @@ defmodule Fathom.OwnerNodeKeyTest do
         Env.put!(:remote_flush_ms, 200)
 
         id = "ownerkey-flush-#{System.unique_integer([:positive])}"
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         on_exit(fn -> cleanup(id) end)
 
         {:ok, pid, _ref, _path} = Shards.checkout(id)
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
         assert {:held, owner} = Storage.lease_holder(id)
         assert Rebalancer.owner_node_key(owner) == Rebalancer.node_key()
 
@@ -104,11 +105,11 @@ defmodule Fathom.OwnerNodeKeyTest do
     for mode <- @modes do
       test "the pin is kept when the target (by NODE_KEY) holds the lease (#{mode})", %{key: key} do
         shard = "ownerkey-handoff-#{System.unique_integer([:positive])}"
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         on_exit(fn -> cleanup(shard) end)
 
         {:ok, pid, _ref, _path} = Shards.checkout(shard)
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
         assert {:held, owner} = Storage.lease_holder(shard)
         assert String.starts_with?(owner, key <> "#")
 
@@ -126,17 +127,6 @@ defmodule Fathom.OwnerNodeKeyTest do
       end
     end
   end
-
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
 
   defp cleanup(id) do
     Shards.stop(id)

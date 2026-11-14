@@ -27,8 +27,9 @@ defmodule Fathom.Shard.OpenStatErrorTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Connection, Heartbeat, Materializer, Provenance, Retained}
+  alias Fathom.Shard.{Connection, Materializer, Provenance, Retained}
   alias Fathom.Shard.Storage.Local
+  alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
 
@@ -72,14 +73,6 @@ defmodule Fathom.Shard.OpenStatErrorTest do
     %{shard: shard, db: Shard.db_path(shard)}
   end
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?(), "legacy mode needs the heartbeat OFF")
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
   defp put_object!(shard, v) do
     tmp = Path.join(System.tmp_dir!(), "statfail_seed_#{System.unique_integer([:positive])}.db")
     {:ok, c} = Connection.open(tmp)
@@ -113,7 +106,7 @@ defmodule Fathom.Shard.OpenStatErrorTest do
   for mode <- @modes do
     describe "#{mode} mode" do
       setup do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         :ok
       end
 

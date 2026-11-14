@@ -23,6 +23,7 @@ defmodule Fathom.ShardFlushFailureBackoffTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @backoff_ms 100
@@ -107,23 +108,6 @@ defmodule Fathom.ShardFlushFailureBackoffTest do
     :ok = ShardExecutor.close(conn)
   end
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "legacy mode did not take")
-
   # Kick the first flush attempt now rather than waiting out the 60 s interval, then collect the
   # next `count - 1` automatic retries. Returns [{consecutive, mono_ms}] in arrival order.
   defp collect_attempts(coordinator, count) do
@@ -149,13 +133,13 @@ defmodule Fathom.ShardFlushFailureBackoffTest do
 
   for mode <- [:legacy, :heartbeat] do
     describe "transient PUT failure (#{mode})" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "retries on the short backoff, doubles per consecutive failure, resets on success",
            %{shard: shard} do
         seed!(shard)
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
         assert Shard.dirty?(coordinator)
 
         Application.put_env(:fathom, :storage_fault, :flush)
@@ -195,13 +179,13 @@ defmodule Fathom.ShardFlushFailureBackoffTest do
   # removed before healing, and a real one already in flight is left alone (same guard verdict).
   for {mode, field} <- [legacy: :renew_task, heartbeat: :lapse_revalidate_pending] do
     describe "retry tick deferred behind #{field} (#{mode})" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "keeps the short backoff instead of the full interval", %{shard: shard} do
         field = unquote(field)
         seed!(shard)
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         Application.put_env(:fathom, :storage_fault, :flush)
         capture_log(fn -> [{1, _}] = collect_attempts(coordinator, 1) end)
@@ -247,12 +231,12 @@ defmodule Fathom.ShardFlushFailureBackoffTest do
   defp mode_idle(:lapse_revalidate_pending), do: false
 
   describe "ownership unconfirmed (heartbeat alive, deadline lapsed)" do
-    setup do: set_mode!(:heartbeat)
+    setup do: LivenessMode.set!(:heartbeat)
 
     test "a :fence_skip retries on the backoff, not the interval", %{shard: shard} do
       seed!(shard)
       {:ok, coordinator} = Shards.ensure(shard)
-      assert_mode!(coordinator, :heartbeat)
+      LivenessMode.assert!(coordinator, :heartbeat)
 
       # Same generation, past deadline: the real `:not_valid`, which makes Fence.check answer :skip.
       state = :sys.get_state(Process.whereis(Heartbeat))

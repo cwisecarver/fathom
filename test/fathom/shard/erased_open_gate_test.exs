@@ -22,8 +22,9 @@ defmodule Fathom.Shard.ErasedOpenGateTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Retained, Storage}
+  alias Fathom.Shard.{Retained, Storage}
   alias Fathom.Tenants.Tombstones
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   setup do
@@ -69,21 +70,10 @@ defmodule Fathom.Shard.ErasedOpenGateTest do
     rows
   end
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(id, mode) do
+  # Assert the shard reopened in `mode`, then drain it so the next open starts cold.
+  defp assert_mode_and_drain!(id, mode) do
     {:ok, pid} = Shards.ensure(id)
-    gen = :sys.get_state(pid).acquire_gen
-
-    if mode == :heartbeat,
-      do: assert(is_integer(gen), "heartbeat mode did not take"),
-      else: assert(is_nil(gen), "legacy mode did not take")
+    LivenessMode.assert!(pid, mode)
 
     ref = Process.monitor(pid)
     assert :ok = Shards.drain(id, 5_000)
@@ -93,13 +83,13 @@ defmodule Fathom.Shard.ErasedOpenGateTest do
   # A shard with a stored object AND a clean-retained local copy, the shape a node that was down for
   # the delete (or kept a retained copy) wakes up with.
   defp residue!(id, path, mode) do
-    set_mode!(mode)
+    LivenessMode.set!(mode)
     write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('erased-person')"])
     assert :ok = Shards.drain(id, 5_000)
     assert File.exists?(path), "fixture: the clean drop must have retained the local copy"
     assert File.exists?(Retained.marker(path)), "fixture: ... as a CLEAN-RETAINED one"
     assert {:ok, true} = Storage.any_shard_object?(id), "fixture: the object must be stored"
-    assert_mode!(id, mode)
+    assert_mode_and_drain!(id, mode)
     :ok
   end
 

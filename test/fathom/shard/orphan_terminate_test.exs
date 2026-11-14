@@ -22,8 +22,9 @@ defmodule Fathom.Shard.OrphanTerminateTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Shard.Storage
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -47,16 +48,6 @@ defmodule Fathom.Shard.OrphanTerminateTest do
     %{shard: shard}
   end
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
-
   defp registry_partition(pid) do
     {:links, links} = Process.info(pid, :links)
 
@@ -73,9 +64,9 @@ defmodule Fathom.Shard.OrphanTerminateTest do
 
   for mode <- @modes do
     test "#{mode} mode: an orphan stops its flush task and frees its gate slot", %{shard: shard} do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       {:ok, orphan} = Shards.ensure(shard)
-      assert_mode!(orphan, unquote(mode))
+      LivenessMode.assert!(orphan, unquote(mode))
 
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, _} = ShardExecutor.execute(conn, %Stmt{sql: "CREATE TABLE t (v TEXT)", args: []})

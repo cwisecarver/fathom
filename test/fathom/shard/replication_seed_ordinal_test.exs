@@ -28,7 +28,6 @@ defmodule Fathom.Shard.ReplicationSeedOrdinalTest do
   """
   use ExUnit.Case, async: false
 
-  alias Fathom.Shard.Heartbeat
   alias Fathom.Shard.Replication.Fleet
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Promote
@@ -38,6 +37,7 @@ defmodule Fathom.Shard.ReplicationSeedOrdinalTest do
   alias Fathom.Shard.Storage
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
 
@@ -91,23 +91,6 @@ defmodule Fathom.Shard.ReplicationSeedOrdinalTest do
 
     %{id: id, root: root}
   end
-
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
-  defp assert_mode!(:legacy, coordinator),
-    do: assert(is_nil(Fathom.Shard.acquire_gen(coordinator)), "expected LEGACY liveness")
-
-  defp assert_mode!(:heartbeat, coordinator),
-    do: refute(is_nil(Fathom.Shard.acquire_gen(coordinator)), "expected HEARTBEAT liveness")
 
   defp start_follower!(root) do
     name = :"seedord_f_#{System.unique_integer([:positive])}"
@@ -200,7 +183,7 @@ defmodule Fathom.Shard.ReplicationSeedOrdinalTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "a write acked only through a re-seed is rankable on every replica and survives failover",
            %{id: id, root: root} do
@@ -210,7 +193,7 @@ defmodule Fathom.Shard.ReplicationSeedOrdinalTest do
         # Ownership 1: row 1, replicated and flushed, so the object carries a RANKABLE stamp.
         {:ok, conn} = ShardExecutor.open(id)
         c1 = coordinator!(id)
-        assert_mode!(unquote(mode), c1)
+        LivenessMode.assert!(c1, unquote(mode))
         lineage1 = Fathom.Shard.lineage(c1)
         exec!(conn, "CREATE TABLE t (a INTEGER PRIMARY KEY)")
         exec!(conn, "INSERT INTO t VALUES (1)")
@@ -224,7 +207,7 @@ defmodule Fathom.Shard.ReplicationSeedOrdinalTest do
         # followers from inside its own commit. Q = 2, so this :ok means at least two seeds landed.
         {:ok, conn} = ShardExecutor.open(id)
         c2 = coordinator!(id)
-        assert_mode!(unquote(mode), c2)
+        LivenessMode.assert!(c2, unquote(mode))
         lineage2 = Fathom.Shard.lineage(c2)
         assert lineage2 > lineage1, "precondition: the reopen did not claim a new lineage"
         exec!(conn, "INSERT INTO t VALUES (999)")

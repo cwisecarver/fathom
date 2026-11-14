@@ -14,7 +14,8 @@ defmodule Fathom.ShardFlushDeadlineTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{FlushGate, Heartbeat, Storage}
+  alias Fathom.Shard.{FlushGate, Storage}
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @deadline_ms 1_500
@@ -89,23 +90,6 @@ defmodule Fathom.ShardFlushDeadlineTest do
     :ok = ShardExecutor.close(conn)
   end
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "legacy mode did not take")
-
   defp await(coordinator, fun, tries \\ 100) do
     cond do
       fun.() ->
@@ -126,13 +110,13 @@ defmodule Fathom.ShardFlushDeadlineTest do
 
   for mode <- [:legacy, :heartbeat], fault <- [:flush_hangs, :flush_lands_then_hangs] do
     describe "#{fault} (#{mode})" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "the deadline frees the slot, keeps the shard dirty, and a healed store converges",
            %{shard: shard} do
         seed!(shard, "a")
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
         assert Shard.dirty?(coordinator)
 
         Application.put_env(:fathom, :storage_fault, unquote(fault))

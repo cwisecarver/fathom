@@ -19,11 +19,12 @@ defmodule Fathom.Shard.RefusedOpenUnderQuorumTest do
   import ExUnit.CaptureLog
 
   alias Fathom.Shard
-  alias Fathom.Shard.{Connection, Heartbeat, Storage}
+  alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Replication.{Fleet, Follower, Recovery}
   alias Fathom.Shard.Storage.S3
   alias Fathom.ShardExecutor
   alias Fathom.Shards
+  alias Fathom.Test.LivenessMode
   alias Fathom.Test.S3EtagStore
   alias Filo.{Stmt, StmtResult}
 
@@ -119,17 +120,6 @@ defmodule Fathom.Shard.RefusedOpenUnderQuorumTest do
     Application.put_env(:fathom, :shard_storage, S3)
   end
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
   defp lock(store, shard),
     do: store |> S3EtagStore.body_of("#{shard}.lock") |> Jason.decode!()
 
@@ -144,7 +134,7 @@ defmodule Fathom.Shard.RefusedOpenUnderQuorumTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "a floor refusal keeps the steal-touch provenance, and logs a warning", %{shard: shard} do
         base = build_db!(["base"])

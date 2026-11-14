@@ -17,9 +17,10 @@ defmodule Fathom.Shard.RetainedTest do
   use Fathom.DataCase, async: false
 
   alias Fathom.{Shard, ShardExecutor, Shards, Tenants}
-  alias Fathom.Shard.{Heartbeat, Provenance, Retained, Storage, WriteCounter}
+  alias Fathom.Shard.{Provenance, Retained, Storage, WriteCounter}
   alias Fathom.Tenants.Tombstones
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -85,17 +86,6 @@ defmodule Fathom.Shard.RetainedTest do
     refute File.exists?(path <> "-wal"), "a retained copy kept its -wal"
   end
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
-
   defp attach_cold_open!(id) do
     name = "retained-cold-open-#{id}"
     test = self()
@@ -115,10 +105,10 @@ defmodule Fathom.Shard.RetainedTest do
   for mode <- @modes do
     test "[#{mode}] a clean durable drop retains the copy; the reopen is warm and stays clean",
          %{id: id, path: path} do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('a')"])
       {:ok, pid} = Shards.ensure(id)
-      assert_mode!(pid, unquote(mode))
+      LivenessMode.assert!(pid, unquote(mode))
       drop!(id)
 
       assert_retained!(path)
@@ -130,7 +120,7 @@ defmodule Fathom.Shard.RetainedTest do
       assert_receive {:opened, true}, 1_000
 
       {:ok, pid} = Shards.ensure(id)
-      assert_mode!(pid, unquote(mode))
+      LivenessMode.assert!(pid, unquote(mode))
       st = :sys.get_state(pid)
 
       # Clean: a retained copy equals the object, so it must NOT be seeded dirty like a warm restart.
@@ -148,7 +138,7 @@ defmodule Fathom.Shard.RetainedTest do
 
     test "[#{mode}] a retained copy the lineage moved past is discarded and pulled, not quarantined",
          %{id: id, path: path} do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('old')"])
       drop!(id)
       assert_retained!(path)
@@ -163,7 +153,7 @@ defmodule Fathom.Shard.RetainedTest do
 
       write!(id, ["INSERT INTO t VALUES ('new')"])
       {:ok, pid} = Shards.ensure(id)
-      assert_mode!(pid, unquote(mode))
+      LivenessMode.assert!(pid, unquote(mode))
       drop!(id)
       for f <- Path.wildcard(path <> "*"), do: File.rm(f)
       for f <- files, do: :ok = File.rename(Path.join(stash, Path.basename(f)), f)
@@ -230,13 +220,13 @@ defmodule Fathom.Shard.RetainedTest do
 
   defp assert_opened_mode!(id, mode) do
     {:ok, pid} = Shards.ensure(id)
-    assert_mode!(pid, mode)
+    LivenessMode.assert!(pid, mode)
   end
 
   for mode <- @modes do
     test "[#{mode}] a retained copy is never served when the fork-evidence HEAD is unreachable",
          %{id: id, path: path} do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       stage_moved_lineage!(id, path)
       faulty_storage!(id, {:error, :timeout})
       assert {:error, :timeout} = Storage.object_etag(id), "fixture: the fault did not take"
@@ -250,7 +240,7 @@ defmodule Fathom.Shard.RetainedTest do
 
     test "[#{mode}] a retained copy is never served when only the post-lease HEAD fails",
          %{id: id, path: path} do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       stage_moved_lineage!(id, path)
 
       # This fixture used to answer the FIRST etag read with the copy's own etag (the pre-lease
@@ -277,7 +267,7 @@ defmodule Fathom.Shard.RetainedTest do
 
     test "[#{mode}] a retained copy with an unreachable store fails the open instead of serving",
          %{id: id, path: path} do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       stage_moved_lineage!(id, path)
       faulty_storage!(id, {:error, :timeout})
       Env.put!(:storage_fault, :pull)

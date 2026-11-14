@@ -40,8 +40,9 @@ defmodule Fathom.Shard.ColdOpenReleaseRaceTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Connection, Heartbeat, Provenance}
+  alias Fathom.Shard.{Connection, Provenance}
   alias Fathom.Shard.Storage.Local
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -84,14 +85,6 @@ defmodule Fathom.Shard.ColdOpenReleaseRaceTest do
     Application.put_env(:fathom, :replication_recover_from_peers, false)
 
     %{shard: shard}
-  end
-
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?(), "legacy mode needs the heartbeat OFF")
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
   end
 
   defp set_replication!(on?), do: Application.put_env(:fathom, :replication_enabled, on?)
@@ -163,12 +156,6 @@ defmodule Fathom.Shard.ColdOpenReleaseRaceTest do
     List.flatten(rows)
   end
 
-  defp assert_mode!(pid, :heartbeat),
-    do: assert(is_integer(:sys.get_state(pid).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(pid, :legacy),
-    do: assert(is_nil(:sys.get_state(pid).acquire_gen), "legacy mode did not take")
-
   # A replicating open of an unstamped object takes its own stamping flush right after the open
   # (`stamp_on_open/3`), so the fence etag is checked against the CURRENT object after a flush, not
   # against `e1` itself. Pre-fix that stamping flush If-Matched the stale etag and self-fenced.
@@ -189,7 +176,7 @@ defmodule Fathom.Shard.ColdOpenReleaseRaceTest do
   for mode <- @modes do
     describe "#{mode} mode" do
       setup do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         :ok
       end
 
@@ -198,7 +185,7 @@ defmodule Fathom.Shard.ColdOpenReleaseRaceTest do
         set_replication!(true)
         e0 = put_object!(shard, "e0")
         {e1, pid} = open_racing!(shard, e0)
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
 
         refute Map.get(:sys.get_state(pid).lease, :took_over),
                "fixture: this must not be a takeover"
@@ -213,7 +200,7 @@ defmodule Fathom.Shard.ColdOpenReleaseRaceTest do
           Application.put_env(:fathom, :faulty_acquire_recreated, true)
           e0 = put_object!(shard, "e0")
           {e1, pid} = open_racing!(shard, e0)
-          assert_mode!(pid, unquote(mode))
+          LivenessMode.assert!(pid, unquote(mode))
           assert :sys.get_state(pid).lease[:recreated] == true, "fixture: the flag did not ride"
           assert_serves_new_object!(shard, pid, e1)
         end

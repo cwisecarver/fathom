@@ -19,9 +19,10 @@ defmodule Fathom.Shard.RecoveryPrefetchTest do
   """
   use ExUnit.Case, async: false
 
-  alias Fathom.Shard.{Heartbeat, PromoteOnOpen, Storage}
+  alias Fathom.Shard.{PromoteOnOpen, Storage}
   alias Fathom.Shard.Replication.{Fleet, Follower, Recovery}
   alias Fathom.{ShardExecutor, Shards}
+  alias Fathom.Test.LivenessMode
 
   @moduletag :capture_log
   @modes [:legacy, :heartbeat]
@@ -65,17 +66,6 @@ defmodule Fathom.Shard.RecoveryPrefetchTest do
     Recovery.init_table()
     start_supervised!({Follower, name: Follower, port: 0, dir: dir})
     %{id: id, dir: dir}
-  end
-
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
   end
 
   defp stmt(sql, args \\ []), do: %Filo.Stmt{sql: sql, args: args}
@@ -129,7 +119,7 @@ defmodule Fathom.Shard.RecoveryPrefetchTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "the marker + ask start while the pull is still in flight", %{id: id} do
         path = fixture!(id)

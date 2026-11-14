@@ -17,8 +17,9 @@ defmodule Fathom.Shard.DropVerifyMainFileTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Connection, Heartbeat, Storage}
+  alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -62,20 +63,6 @@ defmodule Fathom.Shard.DropVerifyMainFileTest do
   end
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
-
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "legacy mode did not take")
 
   defp write!(id, sqls) do
     {:ok, conn} = ShardExecutor.open(id)
@@ -151,9 +138,9 @@ defmodule Fathom.Shard.DropVerifyMainFileTest do
       id: id,
       path: path
     } do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       {:ok, coordinator} = Shards.ensure(id)
-      assert_mode!(coordinator, unquote(mode))
+      LivenessMode.assert!(coordinator, unquote(mode))
       write!(id, @seed)
       settle_wal_gone(path)
       assert Shard.dirty?(coordinator), "fixture: the drop must have something to upload"
@@ -167,9 +154,9 @@ defmodule Fathom.Shard.DropVerifyMainFileTest do
     end
 
     test "[#{mode}] a WAL holding frames keeps the full checkpoint check", %{id: id, path: path} do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       {:ok, coordinator} = Shards.ensure(id)
-      assert_mode!(coordinator, unquote(mode))
+      LivenessMode.assert!(coordinator, unquote(mode))
 
       # A trusted connection held across the tenant close keeps it from being the LAST close, so
       # SQLite's close-time checkpoint does not run and the WAL keeps its frames.
@@ -191,7 +178,7 @@ defmodule Fathom.Shard.DropVerifyMainFileTest do
       id: id,
       path: path
     } do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       remote = object(id)
 
       write!(id, @seed)
@@ -206,7 +193,7 @@ defmodule Fathom.Shard.DropVerifyMainFileTest do
       end
 
       {:ok, coordinator} = Shards.ensure(id)
-      assert_mode!(coordinator, unquote(mode))
+      LivenessMode.assert!(coordinator, unquote(mode))
       write!(id, ["INSERT INTO t (v) VALUES ('more')"])
       settle_wal_gone(path)
       corrupt_page!(path)

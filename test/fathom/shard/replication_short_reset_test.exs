@@ -37,6 +37,7 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Shards
   alias Fathom.Test.Env
+  alias Fathom.Test.ReplicationWire
   import Fathom.Test.ReplicationCase
 
   setup do
@@ -92,24 +93,6 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     |> case do
       :waiting -> flunk("follower never got seeded")
       state -> state
-    end
-  end
-
-  # One frame in, one reply out, on a socket of our own — the follower's listener speaks
-  # `packet: 4`, so this is the whole client.
-  defp send_frame!(port, frame) do
-    {:ok, sock} =
-      :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 5_000)
-
-    try do
-      :ok = :gen_tcp.send(sock, frame)
-
-      case :gen_tcp.recv(sock, 0, 5_000) do
-        {:ok, bytes} -> Protocol.decode(bytes)
-        other -> other
-      end
-    after
-      :gen_tcp.close(sock)
     end
   end
 
@@ -262,7 +245,8 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     # are incomplete.
     ahead = state.next_offset + 4096
 
-    assert {:ok, _} = send_frame!(port, Protocol.encode_push(reset_push(id, state, ahead)))
+    assert {:ok, _} =
+             ReplicationWire.send_frame(port, Protocol.encode_push(reset_push(id, state, ahead)))
 
     assert Follower.state_of(name, id).torn,
            "the follower absorbed a SHORT WAL and cleared torn anyway. That replica is missing " <>
@@ -278,7 +262,10 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     # un-promotable — which is the failure A2 exists to prevent, arriving through the door marked
     # safety.
     assert {:ok, _} =
-             send_frame!(port, Protocol.encode_push(reset_push(id, state, state.next_offset)))
+             ReplicationWire.send_frame(
+               port,
+               Protocol.encode_push(reset_push(id, state, state.next_offset))
+             )
 
     refute Follower.state_of(name, id).torn,
            "a follower that held everything the primary shipped was still marked torn"
@@ -289,7 +276,8 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
 
     # An un-upgraded primary sets no field, so it arrives as 0. Reading absence as a gap would
     # mark every replica in the fleet torn for the length of a rolling upgrade.
-    assert {:ok, _} = send_frame!(port, Protocol.encode_push(reset_push(id, state, 0)))
+    assert {:ok, _} =
+             ReplicationWire.send_frame(port, Protocol.encode_push(reset_push(id, state, 0)))
 
     refute Follower.state_of(name, id).torn,
            "a reset carrying no prev_extent was read as evidence of a gap; during a rolling " <>
@@ -320,7 +308,7 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
       %{name: name, port: port, state: state, id: id} = at_ordinal!(ctx, 1)
       push = %{reset_push(id, state, state.next_offset) | wal_ordinal: 33, lineage: state.lineage}
 
-      assert {:ok, reply} = send_frame!(port, Protocol.encode_push(push))
+      assert {:ok, reply} = ReplicationWire.send_frame(port, Protocol.encode_push(push))
 
       assert match?({:reject, ^id, :unknown_shard, _}, reply),
              "no seed requested: #{inspect(reply)}"
@@ -334,7 +322,7 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
       %{name: name, port: port, state: state, id: id} = at_ordinal!(ctx, 1)
       push = %{reset_push(id, state, state.next_offset) | wal_ordinal: 2, lineage: state.lineage}
 
-      assert {:ok, _} = send_frame!(port, Protocol.encode_push(push))
+      assert {:ok, _} = ReplicationWire.send_frame(port, Protocol.encode_push(push))
 
       refute Follower.state_of(name, id).torn,
              "an adjacent generation held in full was treated as a gap; every reset would re-seed"
@@ -356,7 +344,7 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     %{name: name, port: port, state: state, id: id} = seeded_follower!(ctx)
 
     assert {:ok, _} =
-             send_frame!(
+             ReplicationWire.send_frame(
                port,
                Protocol.encode_push(reset_push(id, state, state.next_offset + 4096))
              )
@@ -366,7 +354,10 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
 
     # The next generation, held in full: `prev_extent` equals exactly what the follower has.
     assert {:ok, _} =
-             send_frame!(port, Protocol.encode_push(reset_push(id, torn, torn.next_offset)))
+             ReplicationWire.send_frame(
+               port,
+               Protocol.encode_push(reset_push(id, torn, torn.next_offset))
+             )
 
     assert Follower.state_of(name, id).torn,
            "a complete reset laundered a replica that is still missing the earlier seam's pages"
@@ -395,7 +386,7 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     assert recovered.torn, "precondition: recovery dropped the durable torn marker"
 
     assert {:ok, _} =
-             send_frame!(port2, Protocol.encode_push(reset_push(id, state, 0)))
+             ReplicationWire.send_frame(port2, Protocol.encode_push(reset_push(id, state, 0)))
 
     assert Follower.state_of(name, id).torn,
            "the first push after a follower restart cleared a durably-recorded torn flag"
@@ -456,7 +447,7 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     Env.put!(:replication_ordinal_wire, true)
 
     assert {:ok, {:reject, ^id, :stale_epoch, _}} =
-             send_frame!(port, Protocol.encode_push(deposed)),
+             ReplicationWire.send_frame(port, Protocol.encode_push(deposed)),
            "a restarted follower accepted a push from a lower-lineage (deposed) primary"
   end
 
@@ -470,7 +461,7 @@ defmodule Fathom.Shard.ReplicationShortResetTest do
     Env.put!(:replication_hmac_required, true)
 
     unsigned = Protocol.encode_push(reset_push(id, state, 999_999))
-    result = send_frame!(port, unsigned)
+    result = ReplicationWire.send_frame(port, unsigned)
 
     assert match?({:error, :closed}, result) or match?({:error, _}, result),
            "an unsigned frame was answered while :replication_hmac_required was on: #{inspect(result)}"

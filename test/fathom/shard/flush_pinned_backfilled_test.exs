@@ -35,11 +35,12 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
   """
   use ExUnit.Case, async: false
 
-  alias Fathom.Shard.{Connection, Heartbeat, Storage}
+  alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Replication.Wal
   alias Fathom.ShardExecutor
   alias Fathom.Shards
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
 
@@ -80,26 +81,6 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
   end
 
   defp stmt(sql, args \\ []), do: %Filo.Stmt{sql: sql, args: args}
-
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(),
-           "legacy mode needs the heartbeat OFF; config/test.exs default is heartbeat_server: false"
-
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "legacy mode did not take")
 
   # A stream that stays OPEN (the django-libsql WS / CONN_MAX_AGE shape): it is never the last
   # connection, so nothing ever unlinks or truncates the `-wal`.
@@ -192,12 +173,12 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "replication off: a persistent stream's non-empty WAL takes :pinned_live", ctx do
         %{id: id, wal: wal} = ctx
         {:ok, coordinator} = Shards.ensure(id)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         conn = persistent_stream!(id, 1..50)
         on_exit(fn -> ShardExecutor.close(conn) end)
@@ -218,7 +199,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
       test "a commit and checkpoints under the pin cannot move the main file", ctx do
         %{id: id, path: path, wal: wal} = ctx
         {:ok, coordinator} = Shards.ensure(id)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         conn = persistent_stream!(id, 1..10)
         on_exit(fn -> ShardExecutor.close(conn) end)
@@ -262,7 +243,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
            ctx do
         %{id: id, path: path} = ctx
         {:ok, coordinator} = Shards.ensure(id)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         conn = persistent_stream!(id, [])
         {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE u (a INTEGER)"))
@@ -341,7 +322,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
            ctx do
         %{id: id, path: path, wal: wal} = ctx
         {:ok, coordinator} = Shards.ensure(id)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         conn = persistent_stream!(id, 1..10)
         on_exit(fn -> ShardExecutor.close(conn) end)
@@ -372,7 +353,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
       test "replicated, un-backfilled WAL: no checkpoint is added, route :vacuum", ctx do
         %{id: id, wal: wal} = ctx
         {:ok, coordinator} = Shards.ensure(id)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         conn = persistent_stream!(id, 1..20)
         on_exit(fn -> ShardExecutor.close(conn) end)
@@ -393,7 +374,7 @@ defmodule Fathom.Shard.FlushPinnedBackfilledTest do
       test "replicated, WAL already fully backfilled: route :pinned_live", ctx do
         %{id: id, path: path, wal: wal} = ctx
         {:ok, coordinator} = Shards.ensure(id)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         conn = persistent_stream!(id, 1..20)
         on_exit(fn -> ShardExecutor.close(conn) end)

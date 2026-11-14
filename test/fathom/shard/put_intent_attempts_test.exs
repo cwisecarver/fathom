@@ -33,8 +33,9 @@ defmodule Fathom.Shard.PutIntentAttemptsTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Fork, Heartbeat, Provenance, Storage}
+  alias Fathom.Shard.{Fork, Provenance, Storage}
   alias Fathom.Shard.Storage.Local
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -76,20 +77,6 @@ defmodule Fathom.Shard.PutIntentAttemptsTest do
     %{shard: shard, db: Shard.db_path(shard)}
   end
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?(), "legacy mode needs the heartbeat OFF")
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(pid, :heartbeat),
-    do: assert(is_integer(:sys.get_state(pid).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(pid, :legacy),
-    do: assert(is_nil(:sys.get_state(pid).acquire_gen), "legacy mode did not take")
-
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
 
   defp exec!(conn, sql), do: {:ok, _} = ShardExecutor.execute(conn, stmt(sql))
@@ -99,7 +86,7 @@ defmodule Fathom.Shard.PutIntentAttemptsTest do
   defp open_with_object!(shard, mode) do
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, pid} = Shards.ensure(shard)
-    assert_mode!(pid, mode)
+    LivenessMode.assert!(pid, mode)
     exec!(conn, "CREATE TABLE kv (v TEXT)")
     exec!(conn, "INSERT INTO kv VALUES ('base')")
     assert :ok = Shards.flush(shard)
@@ -159,7 +146,7 @@ defmodule Fathom.Shard.PutIntentAttemptsTest do
   for mode <- @modes do
     describe "#{mode} mode" do
       setup do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         :ok
       end
 

@@ -23,8 +23,8 @@ defmodule Fathom.Shard.RetainedReopenTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Provenance, Retained, Storage}
-  alias Fathom.Test.Env
+  alias Fathom.Shard.{Provenance, Retained, Storage}
+  alias Fathom.Test.{Env, LivenessMode}
   alias Filo.Stmt
 
   setup do
@@ -70,21 +70,10 @@ defmodule Fathom.Shard.RetainedReopenTest do
     assert_receive {:DOWN, ^ref, :process, ^pid, _}, 5_000
   end
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(id, mode) do
+  # Assert the shard (resolved by id) opened in `mode`.
+  defp assert_shard_mode!(id, mode) do
     {:ok, pid} = Shards.ensure(id)
-    gen = :sys.get_state(pid).acquire_gen
-
-    if mode == :heartbeat,
-      do: assert(is_integer(gen), "heartbeat mode did not take"),
-      else: assert(is_nil(gen), "legacy mode did not take")
+    LivenessMode.assert!(pid, mode)
   end
 
   # Count this shard's object-etag reads (object_etag/1 and object_head/1) during the reopen.
@@ -124,7 +113,7 @@ defmodule Fathom.Shard.RetainedReopenTest do
       id: id,
       path: path
     } do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('a')"])
       drop!(id)
       assert File.exists?(Retained.marker(path)), "fixture: the clean drop did not retain"
@@ -139,14 +128,14 @@ defmodule Fathom.Shard.RetainedReopenTest do
       assert :counters.get(reads, 1) == 1,
              "a retained reopen read the object etag #{:counters.get(reads, 1)} times (pre-#26: 2)"
 
-      assert_mode!(id, unquote(mode))
+      assert_shard_mode!(id, unquote(mode))
     end
 
     test "[#{mode}] a retained copy the lineage moved past is still discarded and pulled", %{
       id: id,
       path: path
     } do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       write!(id, ["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('old')"])
       drop!(id)
 
@@ -165,7 +154,7 @@ defmodule Fathom.Shard.RetainedReopenTest do
 
       assert rows!(id) == [["new"], ["old"]], "the stale retained copy was served"
       assert Path.wildcard(path <> ".forked.*") == []
-      assert_mode!(id, unquote(mode))
+      assert_shard_mode!(id, unquote(mode))
     end
   end
 

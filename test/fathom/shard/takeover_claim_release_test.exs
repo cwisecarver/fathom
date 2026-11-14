@@ -28,8 +28,9 @@ defmodule Fathom.Shard.TakeoverClaimReleaseTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, Shards}
-  alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Shard.Storage
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
   # X's lineage: shipped under, never stamped. The object carries @stamped, so a fresh create would
@@ -52,24 +53,6 @@ defmodule Fathom.Shard.TakeoverClaimReleaseTest do
 
     %{shard: shard}
   end
-
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(), "legacy mode needs the heartbeat OFF (config/test.exs default)"
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
-  defp assert_mode!(pid, :heartbeat),
-    do: assert(is_integer(:sys.get_state(pid).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(pid, :legacy),
-    do: assert(is_nil(:sys.get_state(pid).acquire_gen), "legacy mode did not take")
 
   defp lock_path(shard), do: Path.join(Storage.Local.dir(), "#{shard}.lock")
 
@@ -116,7 +99,7 @@ defmodule Fathom.Shard.TakeoverClaimReleaseTest do
     Application.delete_env(:fathom, :storage_fault)
     Application.delete_env(:fathom, :faulty_before)
     {:ok, z} = Shards.ensure(shard)
-    assert_mode!(z, mode)
+    LivenessMode.assert!(z, mode)
     lz = Shard.lineage(z)
 
     assert lz > @x_claim,
@@ -126,7 +109,7 @@ defmodule Fathom.Shard.TakeoverClaimReleaseTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "the successor's PULL fails: the release keeps the takeover claim", %{shard: shard} do
         dead_x!(shard)
@@ -170,7 +153,7 @@ defmodule Fathom.Shard.TakeoverClaimReleaseTest do
       } do
         dead_x!(shard)
         {:ok, y} = Shards.ensure(shard)
-        assert_mode!(y, unquote(mode))
+        LivenessMode.assert!(y, unquote(mode))
         ly = Shard.lineage(y)
         assert ly > @x_claim, "the fixture must be a takeover above X"
         refute Shard.dirty?(y)

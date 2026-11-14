@@ -21,8 +21,9 @@ defmodule Fathom.Shard.TombstonedTerminateEraseTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Shard.Storage
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -44,17 +45,6 @@ defmodule Fathom.Shard.TombstonedTerminateEraseTest do
     %{shard: shard}
   end
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
-
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
 
   defp local_residue(shard), do: Path.wildcard(Path.join(Shard.data_dir(), "#{shard}.db*"))
@@ -67,10 +57,10 @@ defmodule Fathom.Shard.TombstonedTerminateEraseTest do
 
   # A flushed shard with one more (unflushed) write: dirty, with a local `.db`, `-wal` and `.etag`.
   defp open_written!(shard, mode) do
-    set_mode!(mode)
+    LivenessMode.set!(mode)
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, pid} = Shards.ensure(shard)
-    assert_mode!(pid, mode)
+    LivenessMode.assert!(pid, mode)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('secret')"))
     assert :ok = Shard.flush_now(pid)

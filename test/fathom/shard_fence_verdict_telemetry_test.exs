@@ -15,7 +15,7 @@ defmodule Fathom.ShardFenceVerdictTelemetryTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
-  alias Fathom.Test.Env
+  alias Fathom.Test.{Env, LivenessMode}
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -50,24 +50,6 @@ defmodule Fathom.ShardFenceVerdictTelemetryTest do
     %{shard: shard}
   end
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "legacy mode did not take")
-
   defp seed!(shard) do
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, %Stmt{sql: "CREATE TABLE kv (v TEXT)", args: []})
@@ -86,12 +68,12 @@ defmodule Fathom.ShardFenceVerdictTelemetryTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "a confirmed fence on the drop flush is counted :ok", %{shard: shard} do
         seed!(shard)
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
         assert Shard.dirty?(coordinator), "the fixture must be dirty to reach the fence"
 
         drain!(shard, coordinator)
@@ -104,7 +86,7 @@ defmodule Fathom.ShardFenceVerdictTelemetryTest do
       } do
         seed!(shard)
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         if unquote(mode) == :legacy do
           Application.put_env(:fathom, :storage_fault, :renew)

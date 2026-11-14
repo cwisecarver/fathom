@@ -40,7 +40,7 @@ defmodule Fathom.ShardReleaseRetryTest do
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
   alias Fathom.Shard.Storage.S3
-  alias Fathom.Test.{Env, S3EtagStore}
+  alias Fathom.Test.{Env, LivenessMode, S3EtagStore}
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -75,24 +75,12 @@ defmodule Fathom.ShardReleaseRetryTest do
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?(), "legacy mode needs the heartbeat OFF")
-
-  defp set_mode!(:heartbeat) do
-    # Started AFTER the store: its terminate clears its object through the store.
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
-
   defp lock_key(shard), do: shard <> ".lock"
 
   # A shard written through and CLOSED, so the next drain is the idle-drop shape.
   defp open_written!(shard, mode) do
     {:ok, pid} = Shards.ensure(shard)
-    assert_mode!(pid, mode)
+    LivenessMode.assert!(pid, mode)
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('x')"))
@@ -109,7 +97,8 @@ defmodule Fathom.ShardReleaseRetryTest do
   for mode <- @modes do
     describe "#{mode} mode" do
       setup do
-        set_mode!(unquote(mode))
+        # After the store (`setup` above): the heartbeat's terminate clears its object through it.
+        LivenessMode.set!(unquote(mode))
         :ok
       end
 

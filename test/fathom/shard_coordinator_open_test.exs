@@ -22,7 +22,7 @@ defmodule Fathom.ShardCoordinatorOpenTest do
 
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
-  alias Fathom.Test.Env
+  alias Fathom.Test.{Env, LivenessMode}
   alias Fathom.Tenants.{Suspensions, Tombstones}
   alias Filo.Stmt
 
@@ -56,24 +56,6 @@ defmodule Fathom.ShardCoordinatorOpenTest do
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(),
-           "legacy mode needs the heartbeat OFF; config/test.exs default is heartbeat_server: false"
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    hb
-  end
-
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "legacy mode did not take")
-
   defp seed!(shard) do
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
@@ -95,10 +77,10 @@ defmodule Fathom.ShardCoordinatorOpenTest do
     describe "#{mode} mode — expert review 2026-10-10 #5 (Registry partition death)" do
       test "a coordinator whose Registry partition dies stops instead of living on unregistered",
            %{shard: shard} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         seed!(shard)
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         # The via-Registry registration links the coordinator to its partition process.
         {:links, links} = Process.info(coordinator, :links)
@@ -129,10 +111,10 @@ defmodule Fathom.ShardCoordinatorOpenTest do
 
       test "an abnormal EXIT from an unrelated process does not stop a registered coordinator",
            %{shard: shard} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         seed!(shard)
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         send(coordinator, {:EXIT, self(), :boom})
         _ = :sys.get_state(coordinator)
@@ -145,7 +127,7 @@ defmodule Fathom.ShardCoordinatorOpenTest do
     describe "#{mode} mode — expert review 2026-10-10 #18 (lifecycle re-check at open)" do
       test "an open racing a completed delete stops before taking a lease or creating a file",
            %{shard: shard} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         Tombstones.put(shard)
 
         {:ok, pid} = start_ungated(shard)
@@ -159,7 +141,7 @@ defmodule Fathom.ShardCoordinatorOpenTest do
 
       test "an open racing a suspend stops before taking a lease or creating a file",
            %{shard: shard} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         Suspensions.put(shard)
 
         {:ok, pid} = start_ungated(shard)
@@ -173,10 +155,10 @@ defmodule Fathom.ShardCoordinatorOpenTest do
     describe "#{mode} mode — expert review 2026-10-10 #29 (fork-evidence wait)" do
       test "a hung fork-evidence HEAD is abandoned after the short bound, not 60 s",
            %{shard: shard} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         seed!(shard)
         {:ok, first} = Shards.ensure(shard)
-        assert_mode!(first, unquote(mode))
+        LivenessMode.assert!(first, unquote(mode))
 
         # Durable flush so the provenance sidecar exists (evidence otherwise answers
         # :no_sidecar without touching storage), then kill the coordinator, leaving the local
@@ -218,7 +200,8 @@ defmodule Fathom.ShardCoordinatorOpenTest do
   describe "heartbeat mode — expert review 2026-10-10 #12 (lapse during the open window)" do
     test "a generation bump between sampling acquire_gen and subscribing is delivered after open",
          %{shard: shard} do
-      hb = set_mode!(:heartbeat)
+      LivenessMode.set!(:heartbeat)
+      hb = Process.whereis(Heartbeat)
       # Keep the revalidation episode armed for the whole assertion (the default jitter is a few
       # ms, and the episode would resolve back to `false` before we could observe it).
       Env.put!(:lapse_revalidate_jitter_ms, 60_000)
@@ -244,7 +227,7 @@ defmodule Fathom.ShardCoordinatorOpenTest do
       )
 
       {:ok, coordinator} = Shards.ensure(shard)
-      assert_mode!(coordinator, :heartbeat)
+      LivenessMode.assert!(coordinator, :heartbeat)
 
       state = :sys.get_state(coordinator)
 
@@ -301,12 +284,12 @@ defmodule Fathom.ShardCoordinatorOpenTest do
     describe "#{mode} mode — fix-review R1-1 / R1-2 (orphan coordinator)" do
       test "an orphan's registry_lost stop leaves the replacement's files and lease intact",
            %{shard: shard} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         seed!(shard)
 
         capture_log(fn ->
           {orphan, ref, replacement} = orphan_and_replacement(shard)
-          assert_mode!(replacement, unquote(mode))
+          LivenessMode.assert!(replacement, unquote(mode))
 
           # Send the check now rather than wait out the 250 ms timer.
           send(orphan, :verify_registration)
@@ -331,7 +314,7 @@ defmodule Fathom.ShardCoordinatorOpenTest do
       # clean registry_lost stop, never a crash.
       test "a verify racing the partition restart never crashes the coordinator",
            %{shard: shard} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         seed!(shard)
         {:ok, orphan} = Shards.ensure(shard)
         {:links, links} = Process.info(orphan, :links)
@@ -360,10 +343,10 @@ defmodule Fathom.ShardCoordinatorOpenTest do
 
     describe "#{mode} mode — fix-review R1-5 (fork-evidence timeout)" do
       setup %{shard: shard} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         seed!(shard)
         {:ok, first} = Shards.ensure(shard)
-        assert_mode!(first, unquote(mode))
+        LivenessMode.assert!(first, unquote(mode))
         assert :ok = Shards.flush(shard)
         ref = Process.monitor(first)
         Process.exit(first, :kill)

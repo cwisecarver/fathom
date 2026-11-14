@@ -27,10 +27,10 @@ defmodule Fathom.Shard.ReplicationBlindIndexTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Heartbeat
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shards
+  alias Fathom.Test.LivenessMode
   import Fathom.Test.ReplicationCase
 
   @modes [:legacy, :heartbeat]
@@ -49,21 +49,6 @@ defmodule Fathom.Shard.ReplicationBlindIndexTest do
     %{id: id, root: root}
   end
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    owner = "n_#{System.unique_integer([:positive])}@test"
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000, owner: owner})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
-  defp assert_mode!(:legacy, coordinator),
-    do: assert(is_nil(Fathom.Shard.acquire_gen(coordinator)), "expected LEGACY liveness")
-
-  defp assert_mode!(:heartbeat, coordinator),
-    do: refute(is_nil(Fathom.Shard.acquire_gen(coordinator)), "expected HEARTBEAT liveness")
-
   defp holders(followers, id, expected) do
     Enum.count(followers, fn {name, _} ->
       File.read(Follower.wal_path(name, id)) == {:ok, expected}
@@ -73,7 +58,7 @@ defmodule Fathom.Shard.ReplicationBlindIndexTest do
   # A seeded 3-follower quorum, one acked commit (so the Session holds a WAL handle with a cursor and
   # every follower sits at `E_old`), then a SECOND insert whose frames are past that cursor.
   defp primed!(%{id: id, root: root}, mode) do
-    set_mode!(mode)
+    LivenessMode.set!(mode, owner: "n_#{System.unique_integer([:positive])}@test")
     followers = start_followers!(root, 3, "bl")
     enable_replication!(followers, connected: :all)
 
@@ -81,7 +66,7 @@ defmodule Fathom.Shard.ReplicationBlindIndexTest do
     on_exit(fn -> Fathom.Shard.checkin(coordinator, ref) end)
     {:ok, conn} = Connection.open(path)
     on_exit(fn -> Connection.close(conn) end)
-    assert_mode!(mode, coordinator)
+    LivenessMode.assert!(coordinator, mode)
 
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER, b TEXT)", [])
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1, 'one')", [])

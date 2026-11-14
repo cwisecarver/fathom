@@ -28,6 +28,7 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
   alias Fathom.Shard.{Heartbeat, Storage}
   alias Fathom.Shard.Storage.S3
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Fathom.Test.S3EtagStore
 
   @modes [:legacy, :heartbeat]
@@ -50,26 +51,6 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
 
     %{shard: shard}
   end
-
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(), "legacy mode needs the heartbeat OFF (config/test.exs default)"
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
-  # The mode is captured at open, from `Heartbeat.running?/0`. The failed open leaves no coordinator
-  # to inspect, so the retry that follows is the one that is checked.
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen))
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen))
 
   # The foreign-owner view, the only one that sees the damage: this node reclaims its own lock.
   defp assert_foreign_owner_can_acquire!(shard) do
@@ -98,7 +79,7 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
 
   for mode <- @modes do
     describe "FaultyStorage, #{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "a create that LANDED with its reply lost does not strand the lock", %{shard: shard} do
         watch_release!(shard)
@@ -120,9 +101,10 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
                        1_000,
                        "the fault never left a lock behind (or the reconcile never ran)"
 
-        # And the shard still opens normally for this node, in the mode under test.
+        # And the shard still opens normally for this node, in the mode under test. The failed open
+        # leaves no coordinator to inspect, so this retry is the one whose mode is checked.
         assert {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
       end
 
       test "an acquire that wrote NOTHING (a read blip) is left alone", %{shard: shard} do
@@ -193,7 +175,7 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
         )
 
         Env.put!(:shard_storage, S3)
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         %{store: store, lock_key: shard <> ".lock"}
       end
 
@@ -217,7 +199,7 @@ defmodule Fathom.ShardAcquireLandsThenErrorsTest do
 
         # The next open is an ordinary fresh create at epoch 1.
         assert {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         assert %{"owner" => _, "epoch" => 1} =
                  store |> S3EtagStore.body_of(lock_key) |> Jason.decode!()

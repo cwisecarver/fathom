@@ -24,11 +24,11 @@ defmodule Fathom.Shard.FlushPinnedMainFileCheckTest do
   """
   use ExUnit.Case, async: false
 
-  alias Fathom.Shard.{Connection, Heartbeat, Storage}
+  alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Replication.Wal
   alias Fathom.ShardExecutor
   alias Fathom.Shards
-  alias Fathom.Test.Env
+  alias Fathom.Test.{Env, LivenessMode}
 
   @modes [:legacy, :heartbeat]
 
@@ -59,26 +59,6 @@ defmodule Fathom.Shard.FlushPinnedMainFileCheckTest do
   end
 
   defp stmt(sql, args \\ []), do: %Filo.Stmt{sql: sql, args: args}
-
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(),
-           "legacy mode needs the heartbeat OFF; config/test.exs default is heartbeat_server: false"
-
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "legacy mode did not take")
 
   defp insert!(conn, rows) do
     for i <- rows,
@@ -129,13 +109,13 @@ defmodule Fathom.Shard.FlushPinnedMainFileCheckTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "corrupt .db pages under a WAL-mark pin: the pinned-live flush refuses to upload",
            ctx do
         %{id: id, path: path, wal: wal} = ctx
         {:ok, coordinator} = Shards.ensure(id)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         {:ok, conn} = ShardExecutor.open(id)
         on_exit(fn -> ShardExecutor.close(conn) end)

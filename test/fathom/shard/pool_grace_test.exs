@@ -23,6 +23,7 @@ defmodule Fathom.Shard.PoolGraceTest do
   alias Exqlite.Sqlite3
   alias Fathom.Shard
   alias Fathom.Shard.{Connection, HandlePool, Heartbeat, PoolBudget, Storage, WriteFence}
+  alias Fathom.Test.LivenessMode
   alias Fathom.{ShardExecutor, Shards}
   alias Filo.Stmt
 
@@ -140,34 +141,16 @@ defmodule Fathom.Shard.PoolGraceTest do
     end
   end
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(), "legacy mode needs the heartbeat OFF (config/test.exs default)"
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
-  defp assert_mode!(pid, :heartbeat),
-    do: assert(is_integer(:sys.get_state(pid).acquire_gen), "expected heartbeat mode")
-
-  defp assert_mode!(pid, :legacy),
-    do: assert(is_nil(:sys.get_state(pid).acquire_gen), "expected legacy mode")
-
   # A shard whose last stream wrote and closed INSIDE the grace: the pooled handle holds a live WAL,
   # and the coordinator stands on wal_ordinal 1 for a salt the WAL does not carry. That is the
   # fixture ShardPositionSeedTest uses: a stamp taken over the live WAL reads a salt the coordinator
   # never numbered and so carries NO ordinal, while a stamp taken after the close checkpointed the
   # WAL is the empty-WAL over-claim, ordinal 2. Returns {coordinator, the pooled conn}.
   defp written_and_pooled!(shard, mode) do
-    set_mode!(mode)
+    LivenessMode.set!(mode)
     h = request(shard, ["CREATE TABLE kv (k INTEGER, v TEXT)", "INSERT INTO kv VALUES (1, 'a')"])
     pid = pid_of(h)
-    assert_mode!(pid, mode)
+    LivenessMode.assert!(pid, mode)
     assert 1 = Shard.wal_ordinal(pid, 987_654_321)
 
     assert pool_count(pid) == 1, "precondition: the closed stream's handle is pooled in the grace"

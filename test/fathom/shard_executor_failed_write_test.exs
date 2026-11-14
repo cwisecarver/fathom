@@ -21,7 +21,8 @@ defmodule Fathom.ShardExecutorFailedWriteTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Storage, WriteCounter}
+  alias Fathom.Shard.{Storage, WriteCounter}
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -50,23 +51,6 @@ defmodule Fathom.ShardExecutorFailedWriteTest do
 
   defp stmt(sql), do: %Stmt{sql: sql}
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(),
-           "legacy mode needs the heartbeat OFF; config/test.exs default is heartbeat_server: false"
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "the mode setup did not take")
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "something started the heartbeat")
-
   defp count!(h, table \\ "t") do
     {:ok, %{rows: [[n]]}} = ShardExecutor.execute(h, stmt("SELECT count(*) FROM #{table}"))
     n
@@ -89,9 +73,9 @@ defmodule Fathom.ShardExecutorFailedWriteTest do
     describe "#{mode} mode" do
       test "a failed sequence keeps the statements that committed before the error",
            %{shard: shard} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         {:ok, {pid, _, _, _, _, _, _} = h} = ShardExecutor.open(shard)
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
         assert WriteCounter.count(shard) == 0, "fixture: a fresh shard must start clean"
 
         assert {:error, %Filo.Error{code: "SQLITE_CONSTRAINT_NOTNULL"}} =
@@ -119,10 +103,10 @@ defmodule Fathom.ShardExecutorFailedWriteTest do
 
       test "a capped INSERT … RETURNING that committed is counted and survives the drop",
            %{shard: shard} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         Application.put_env(:fathom, :query_max_rows, 5)
         {pid, _, _, _, _, _, _} = h = open_clean_with_table!(shard)
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
 
         assert {:error, %Filo.Error{code: "FILO_RESULT_TOO_LARGE"}} =
                  ShardExecutor.execute(h, stmt(@ten_row_insert))
@@ -140,7 +124,7 @@ defmodule Fathom.ShardExecutorFailedWriteTest do
       end
 
       test "a capped RETURNING DML inside a transaction is re-counted at COMMIT", %{shard: shard} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         Application.put_env(:fathom, :query_max_rows, 5)
         h = open_clean_with_table!(shard)
 

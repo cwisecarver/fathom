@@ -61,6 +61,7 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
   alias Fathom.ShardExecutor
   alias Fathom.Shards
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
 
   setup do
     id = "promoteopen_#{System.unique_integer([:positive])}"
@@ -1086,8 +1087,6 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
   #
   # Both liveness modes: the failing step is a flush/publish and the retry re-runs the lease open.
   describe "the retry after a failed promotion recovers the tail (expert review 2026-11-07 #3)" do
-    alias Fathom.Shard.Heartbeat
-
     setup do
       prev_running = Fleet.running()
       on_exit(fn -> Fleet.publish(prev_running) end)
@@ -1097,24 +1096,6 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
       Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
       :ok
     end
-
-    defp set_mode!(:legacy) do
-      refute Heartbeat.running?(), "legacy mode needs the heartbeat OFF (config/test.exs default)"
-    end
-
-    defp set_mode!(:heartbeat) do
-      hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-      _ = :sys.get_state(hb)
-      assert Heartbeat.running?()
-    end
-
-    # Assert the coordinator really opened in the mode asked for: a scenario that silently ran
-    # legacy twice would look like two-mode coverage and be one.
-    defp assert_mode!(coordinator, :heartbeat),
-      do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "not heartbeat mode")
-
-    defp assert_mode!(coordinator, :legacy),
-      do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "not legacy mode")
 
     # Peers are configured only AFTER the fixture is built: with them present the fixture's own
     # flush would run as a replicating shard and stamp a different position than the replica.
@@ -1161,10 +1142,10 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     for mode <- [:legacy, :heartbeat] do
       test "(a) a failed publish restores the replica and the retry promotes it (#{mode})", ctx do
         %{id: id} = ctx
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
 
         {conn, coordinator} = build_shard(id, 10, 3)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
         assert {:ok, stamp} = Storage.object_position(id)
 
         install_replica(id, %{
@@ -1192,16 +1173,16 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
         assert open_and_read(id) == Enum.to_list(1..10)
 
         assert {:ok, now} = Shards.ensure(id)
-        assert_mode!(now, unquote(mode))
+        LivenessMode.assert!(now, unquote(mode))
       end
 
       test "(b) a replica that failed verification is refilled from a peer on the retry (#{mode})",
            ctx do
         %{id: id} = ctx
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
 
         {conn, coordinator} = build_shard(id, 10, 3)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
         assert {:ok, stamp} = Storage.object_position(id)
 
         position = %{
@@ -1255,7 +1236,7 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
                "the retry could not refill the torn replica from the peer holding the tail"
 
         assert {:ok, now} = Shards.ensure(id)
-        assert_mode!(now, unquote(mode))
+        LivenessMode.assert!(now, unquote(mode))
       end
     end
   end

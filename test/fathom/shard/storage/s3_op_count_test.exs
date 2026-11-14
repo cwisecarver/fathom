@@ -39,12 +39,14 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
   alias Fathom.Shard.Storage.S3
   alias Fathom.Shards
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
 
   @bucket "s3opcount"
   @modes [:legacy, :heartbeat]
   # Long enough that the idle timer never fires inside a test: each scenario drains explicitly.
   @idle_ms 600_000
   # The heartbeat renews every ttl/3, so a long TTL keeps its renewals out of a test's window.
+  # The mode must be set before the shard is first opened (it is captured at open).
   @heartbeat_ttl_ms 300_000
 
   setup do
@@ -106,34 +108,6 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
     end)
 
     %{shard: shard, table: table}
-  end
-
-  # Puts the NEXT coordinator open into `mode`. The mode is captured at open, so this runs before
-  # the shard is first opened. The heartbeat is started by the test, as `shard_lease_release_test`
-  # does, because `config/test.exs` leaves it off.
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(), "legacy mode needs the heartbeat OFF"
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: @heartbeat_ttl_ms})
-    # Syncs past the heartbeat's init so its first renewal is not counted in a scenario.
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
-  # The coordinator must actually have opened in the mode the test names. A scenario that silently
-  # ran legacy twice would look like two-mode coverage and be one.
-  defp assert_mode!(coordinator, :heartbeat) do
-    assert is_integer(:sys.get_state(coordinator).acquire_gen),
-           "expected heartbeat mode (non-nil acquire_gen): the mode setup did not take"
-  end
-
-  defp assert_mode!(coordinator, :legacy) do
-    assert is_nil(:sys.get_state(coordinator).acquire_gen),
-           "expected legacy mode (nil acquire_gen): something started the heartbeat"
   end
 
   # Every `:s3_op` event the test process has been sent, in order. Telemetry runs in the emitting
@@ -203,7 +177,7 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode), ttl_ms: @heartbeat_ttl_ms)
 
       test "a clean cold open is one lock PUT and one data GET", %{shard: shard} do
         seed_object(shard)
@@ -211,7 +185,7 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
 
         {:ok, pid, ref, _path} = Shards.checkout(shard)
         ops = take_ops()
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
 
         # The comment at s3.ex `acquire_lease` says 3 → 2: the optimistic create (PUT lock,
         # If-None-Match) and the pull (GET db), with no GET of the lock on the common path.
@@ -233,7 +207,7 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
 
         {:ok, pid, ref, _path} = Shards.checkout(shard)
         ops = take_ops()
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
 
         # PUT lock, GET data (404), HEAD tombstones/<id> (404).
         assert counts(ops) == %{put: 1, get: 1, head: 1}
@@ -263,7 +237,7 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
       test "a clean idle drop is the lock DELETE and no data PUT", %{shard: shard, table: table} do
         seed_object(shard)
         {:ok, pid, ref, _path} = Shards.checkout(shard)
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
         Shard.checkin(pid, ref)
         clear_ops()
 
@@ -312,7 +286,7 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
 
         seed_object(shard)
         {:ok, pid, ref, path} = Shards.checkout(shard)
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
         Shard.checkin(pid, ref)
         assert :ok = Shards.drain(shard)
 
@@ -335,7 +309,7 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
   describe "steal of a dead owner's lock" do
     for mode <- @modes do
       test "#{mode} mode: the steal is 4 GETs, 3 PUTs and 1 HEAD", %{shard: shard, table: table} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode), ttl_ms: @heartbeat_ttl_ms)
         seed_object(shard)
         with_content_length(table, "/#{@bucket}/#{shard}.db")
         seed_dead_lock(table, shard)
@@ -343,7 +317,7 @@ defmodule Fathom.Shard.Storage.S3OpCountTest do
 
         {:ok, pid, ref, _path} = Shards.checkout(shard)
         ops = take_ops()
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
 
         # Each request, in order: the create (PUT lock, 412: the dead lock exists), the lock read
         # that finds the dead holder, the pull's GET (overlapped with the acquire), the dead owner's

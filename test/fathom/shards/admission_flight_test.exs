@@ -20,9 +20,9 @@ defmodule Fathom.Shards.AdmissionFlightTest do
   use Fathom.DataCase, async: false
 
   alias Fathom.Shards
-  alias Fathom.Shard.Heartbeat
   alias Fathom.Shards.{AdmissionFlight, Lru, NovelLimiter}
   alias Fathom.Test.FaultyStorage
+  alias Fathom.Test.LivenessMode
 
   @moduletag :capture_log
   @modes [:legacy, :heartbeat]
@@ -76,24 +76,9 @@ defmodule Fathom.Shards.AdmissionFlightTest do
     :ok
   end
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
-  defp assert_mode!(id, mode) do
+  defp assert_shard_mode!(id, mode) do
     [{pid, _}] = Registry.lookup(Fathom.ShardRegistry, id)
-    gen = :sys.get_state(pid).acquire_gen
-
-    if mode == :heartbeat,
-      do: assert(is_integer(gen), "heartbeat mode did not take"),
-      else: assert(is_nil(gen), "legacy mode did not take")
+    LivenessMode.assert!(pid, mode)
   end
 
   defp uniq, do: "admfl_#{System.unique_integer([:positive])}"
@@ -156,9 +141,9 @@ defmodule Fathom.Shards.AdmissionFlightTest do
     @tag mode: mode
     test "#{mode}: K concurrent checkouts of one cold shard at the cap evict one tenant",
          %{mode: mode} do
-      set_mode!(mode)
+      LivenessMode.set!(mode)
       {filled, cap} = fill_to_cap()
-      assert_mode!(hd(filled), mode)
+      assert_shard_mode!(hd(filled), mode)
       hot = uniq()
       on_exit(fn -> cleanup([hot | filled]) end)
 
@@ -167,7 +152,7 @@ defmodule Fathom.Shards.AdmissionFlightTest do
       assert Enum.all?(results, &(&1 == :ok)),
              "every request for the admitted shard must succeed: #{inspect(results)}"
 
-      assert_mode!(hot, mode)
+      assert_shard_mode!(hot, mode)
       evicted = drain_evicted()
 
       # Pre-fix: one eviction per concurrent request (16 here), and the node fell below the cap.

@@ -16,9 +16,10 @@ defmodule Fathom.Tenants.TombstoneLocalEraseTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Shard.Storage
   alias Fathom.Tenants.Tombstones
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -41,17 +42,6 @@ defmodule Fathom.Tenants.TombstoneLocalEraseTest do
     %{id: id}
   end
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
-
   defp local_files(id), do: Path.wildcard(Path.join(Shard.data_dir(), id <> ".db*"))
 
   defp seed!(id) do
@@ -67,10 +57,10 @@ defmodule Fathom.Tenants.TombstoneLocalEraseTest do
   for mode <- @modes do
     test "[#{mode}] a NOTIFY on a node that never ran purge stops the coordinator and erases every local file",
          %{id: id} do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       seed!(id)
       {:ok, pid} = Shards.ensure(id)
-      assert_mode!(pid, unquote(mode))
+      LivenessMode.assert!(pid, unquote(mode))
       ref = Process.monitor(pid)
 
       # Forensic copies a prior self-fence/quarantine left (default D1: erasure may destroy them),

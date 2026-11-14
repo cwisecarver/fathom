@@ -32,9 +32,10 @@ defmodule Fathom.Shard.ReplicatingOpenRttTest do
   @moduletag :capture_log
 
   alias Fathom.Shard
-  alias Fathom.Shard.{Connection, Heartbeat, Provenance, Storage}
+  alias Fathom.Shard.{Connection, Provenance, Storage}
   alias Fathom.Shard.Storage.Local
   alias Fathom.Shards
+  alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
   @d 100
@@ -73,14 +74,6 @@ defmodule Fathom.Shard.ReplicatingOpenRttTest do
     Application.put_env(:fathom, :shard_flush_interval_ms, 0)
 
     %{shard: shard}
-  end
-
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
   end
 
   defp latency!(shard, extra \\ %{}) do
@@ -154,7 +147,7 @@ defmodule Fathom.Shard.ReplicatingOpenRttTest do
   for mode <- @modes do
     describe "#{mode} mode" do
       setup %{shard: shard} do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         latency!(shard, %{pull: @d})
         :ok
       end
@@ -257,7 +250,7 @@ defmodule Fathom.Shard.ReplicatingOpenRttTest do
 
   @tag :bench
   test "bench: warm replicating open stays within 2 round trips (was 3)", %{shard: shard} do
-    set_mode!(:legacy)
+    LivenessMode.set!(:legacy)
     latency!(shard)
     etag = seed_object!(shard)
     place_warm!(shard, etag)

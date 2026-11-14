@@ -24,8 +24,8 @@ defmodule Fathom.Shard.DropStampUnsyncedTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Provenance, Storage}
-  alias Fathom.Test.Env
+  alias Fathom.Shard.{Provenance, Storage}
+  alias Fathom.Test.{Env, LivenessMode}
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -52,20 +52,6 @@ defmodule Fathom.Shard.DropStampUnsyncedTest do
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
   defp db(shard), do: Shard.db_path(shard)
-
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?(), "legacy mode needs the heartbeat OFF")
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "legacy mode did not take")
 
   # `:synced` = an fsynced in-place sidecar image; `:put_landed` = the post-PUT stamp is about to be
   # written (`:flush_stamp` post-fix, `:write_durable` pre-fix — both run after the PUT landed, before
@@ -124,14 +110,14 @@ defmodule Fathom.Shard.DropStampUnsyncedTest do
   # Open, create + write `rows`, take one periodic flush (so the sidecar is an in-place record with a
   # landed object), then write `tail` rows that only the DROP flush will carry.
   defp open_written!(shard, mode, tail) do
-    set_mode!(mode)
+    LivenessMode.set!(mode)
 
     # Short idle: the connection stays checked out until `idle_drop!/2` closes it, so nothing drops
     # before then; closing it is what arms the drop.
     Env.put!(:shard_idle_ms, 50)
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, coordinator} = Shards.ensure(shard)
-    assert_mode!(coordinator, mode)
+    LivenessMode.assert!(coordinator, mode)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('r0')"))
     await_sidecar_task!(coordinator)

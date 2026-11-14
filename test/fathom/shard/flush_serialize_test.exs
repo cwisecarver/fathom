@@ -21,7 +21,8 @@ defmodule Fathom.Shard.FlushSerializeTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Connection, Heartbeat, Storage}
+  alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @env_keys [
@@ -80,20 +81,6 @@ defmodule Fathom.Shard.FlushSerializeTest do
   end
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
-
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "legacy mode did not take")
 
   defp object(id), do: Path.join(Storage.Local.dir(), id <> ".db")
 
@@ -156,9 +143,9 @@ defmodule Fathom.Shard.FlushSerializeTest do
       id: id,
       path: path
     } do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       {:ok, coordinator} = Shards.ensure(id)
-      assert_mode!(coordinator, unquote(mode))
+      LivenessMode.assert!(coordinator, unquote(mode))
       conn = seed_in_wal!(id, path, 2_000)
 
       # Precondition: the main file alone does NOT hold the rows (they are WAL frames), so an
@@ -388,9 +375,9 @@ defmodule Fathom.Shard.FlushSerializeTest do
       id: id,
       path: path
     } do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       {:ok, coordinator} = Shards.ensure(id)
-      assert_mode!(coordinator, unquote(mode))
+      LivenessMode.assert!(coordinator, unquote(mode))
       conn = seed_in_wal!(id, path, 2_000)
       test_pid = self()
 

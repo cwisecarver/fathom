@@ -24,8 +24,8 @@ defmodule Fathom.Shard.AmbiguousDropReleaseTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Storage}
-  alias Fathom.Test.Env
+  alias Fathom.Shard.Storage
+  alias Fathom.Test.{Env, LivenessMode}
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -46,24 +46,13 @@ defmodule Fathom.Shard.AmbiguousDropReleaseTest do
     %{shard: shard}
   end
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
-
   defp lock_path(shard), do: Path.join(Storage.Local.dir(), shard <> ".lock")
 
   defp open_dirty!(shard, mode) do
-    set_mode!(mode)
+    LivenessMode.set!(mode)
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, pid} = Shards.ensure(shard)
-    assert_mode!(pid, mode)
+    LivenessMode.assert!(pid, mode)
     {:ok, _} = ShardExecutor.execute(conn, %Stmt{sql: "CREATE TABLE kv (v TEXT)", args: []})
     :ok = ShardExecutor.close(conn)
     assert Shard.dirty?(pid)

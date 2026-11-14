@@ -23,9 +23,10 @@ defmodule Fathom.Shard.PreTouchEtagFlushTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Fathom.Test.S3EtagStore
   alias Filo.Stmt
 
@@ -61,20 +62,6 @@ defmodule Fathom.Shard.PreTouchEtagFlushTest do
 
     Application.put_env(:fathom, :shard_storage, S3)
   end
-
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
 
@@ -119,13 +106,13 @@ defmodule Fathom.Shard.PreTouchEtagFlushTest do
         # Started AFTER the store: start_supervised! stops in reverse order, and the Heartbeat's
         # terminate clears its object through the store, so the store must outlive it (CI
         # 2026-10-14 logged a crash of Heartbeat.terminate/2 against a dead store).
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
 
         capture_log(fn ->
           e0 = x_flushes_then_dies!(shard, store)
 
           {:ok, y} = Shards.ensure(shard)
-          assert_mode!(y, unquote(mode))
+          LivenessMode.assert!(y, unquote(mode))
           assert :sys.get_state(y).lease[:touch_pre_etag] == e0, "Y's steal must touch from E0"
           e1 = S3EtagStore.etag_of(store, "#{shard}.db")
           assert e1 != e0

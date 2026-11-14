@@ -28,8 +28,8 @@ defmodule Fathom.Shard.SidecarOffMailboxTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Provenance, Storage}
-  alias Fathom.Test.Env
+  alias Fathom.Shard.{Provenance, Storage}
+  alias Fathom.Test.{Env, LivenessMode}
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -58,24 +58,6 @@ defmodule Fathom.Shard.SidecarOffMailboxTest do
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
   defp db(shard), do: Shard.db_path(shard)
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(), "legacy mode needs the heartbeat OFF"
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "legacy mode did not take")
-
   # Hold the sidecar write for `stage` on `shard`'s sidecar at the seam: report the PROCESS running
   # it, then block until told to go. Writes of other stages / other shards pass straight through.
   defp hold_sidecar_write!(shard, stage) do
@@ -101,10 +83,10 @@ defmodule Fathom.Shard.SidecarOffMailboxTest do
 
   # A seeded, flushed-once shard in `mode`, with a second write pending so the next flush has work.
   defp open_dirty!(shard, mode) do
-    set_mode!(mode)
+    LivenessMode.set!(mode)
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, coordinator} = Shards.ensure(shard)
-    assert_mode!(coordinator, mode)
+    LivenessMode.assert!(coordinator, mode)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('first')"))
     # The first-write sidecar fsync is its own (asynchronous) task now; let it finish.
@@ -220,7 +202,7 @@ defmodule Fathom.Shard.SidecarOffMailboxTest do
     test "runs in a task: the coordinator answers, and the flush waits behind it", %{
       shard: shard
     } do
-      set_mode!(:legacy)
+      LivenessMode.set!(:legacy)
       hold_sidecar_write!(shard, :make_durable)
 
       {:ok, conn} = ShardExecutor.open(shard)
@@ -251,7 +233,7 @@ defmodule Fathom.Shard.SidecarOffMailboxTest do
     end
 
     test "a drain settles an in-flight first-write fsync before the drop flush", %{shard: shard} do
-      set_mode!(:legacy)
+      LivenessMode.set!(:legacy)
       hold_sidecar_write!(shard, :make_durable)
 
       {:ok, conn} = ShardExecutor.open(shard)

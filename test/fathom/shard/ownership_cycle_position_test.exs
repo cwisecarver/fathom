@@ -37,12 +37,12 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Heartbeat
   alias Fathom.Shard.Replication.Follower
   alias Fathom.Shard.Replication.Promote
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Storage
   alias Fathom.Shards
+  alias Fathom.Test.LivenessMode
   import Fathom.Test.ReplicationCase
 
   setup do
@@ -70,30 +70,6 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
     end)
 
     %{root: root}
-  end
-
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(),
-           "legacy mode needs the heartbeat OFF; config/test.exs default is heartbeat_server: false"
-
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
-  defp assert_mode!(coordinator, :heartbeat) do
-    assert is_integer(:sys.get_state(coordinator).acquire_gen),
-           "expected heartbeat mode (non-nil acquire_gen) — the mode setup did not take"
-  end
-
-  defp assert_mode!(coordinator, :legacy) do
-    assert is_nil(:sys.get_state(coordinator).acquire_gen),
-           "expected legacy mode (nil acquire_gen) — something started the heartbeat"
   end
 
   # The first follower with a real recorded position, or fail loudly. Any of them proves the
@@ -136,7 +112,7 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
       # went out that way, and any lagging replica then outranked it (#4).
       test "a gracefully dropped object is NOT outranked by the follower that watched it", ctx do
         %{root: root} = ctx
-        set_mode!(@mode)
+        LivenessMode.set!(@mode)
 
         id = "occ_#{System.unique_integer([:positive])}"
         followers = start_followers!(root, 2, "oc")
@@ -144,7 +120,7 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
         enable_replication!(followers, quorum: 1, connected: :all)
 
         {:ok, coordinator, ref, path} = Shards.checkout(id)
-        assert_mode!(coordinator, @mode)
+        LivenessMode.assert!(coordinator, @mode)
 
         on_exit(fn ->
           Shards.drain(id, 5_000)
@@ -241,7 +217,7 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
   # hand-installed replicas.
   test "a real seeded replica ranks on the same counter as the object's stamp", ctx do
     %{root: root} = ctx
-    set_mode!(:heartbeat)
+    LivenessMode.set!(:heartbeat)
 
     id = "occlin_#{System.unique_integer([:positive])}"
 
@@ -266,7 +242,7 @@ defmodule Fathom.Shard.OwnershipCyclePositionTest do
     enable_replication!(followers, quorum: 1, connected: :all)
 
     {:ok, coordinator, ref, path} = Shards.checkout(id)
-    assert_mode!(coordinator, :heartbeat)
+    LivenessMode.assert!(coordinator, :heartbeat)
 
     lineage = Fathom.Shard.lineage(coordinator)
     {:ok, lock_epoch} = Fathom.Shard.epoch(coordinator)

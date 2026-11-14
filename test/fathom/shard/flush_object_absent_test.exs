@@ -24,8 +24,9 @@ defmodule Fathom.Shard.FlushObjectAbsentTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Shard.Storage
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -47,20 +48,6 @@ defmodule Fathom.Shard.FlushObjectAbsentTest do
 
     %{shard: shard}
   end
-
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
 
   defp object(shard), do: Path.join(Storage.Local.dir(), "#{shard}.db")
 
@@ -101,14 +88,14 @@ defmodule Fathom.Shard.FlushObjectAbsentTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "a vanished object fails the flush loudly, then the next flush re-creates it", %{
         shard: shard
       } do
         attach_absent_handler()
         pid = flushed_then_vanished!(shard)
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
 
         log = capture_log(fn -> assert Shard.flush_now(pid) == {:error, :object_absent} end)
 
@@ -130,7 +117,7 @@ defmodule Fathom.Shard.FlushObjectAbsentTest do
         shard: shard
       } do
         pid = flushed_then_vanished!(shard)
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
 
         # Insert the tombstone WITHOUT the on_new hook. `Tombstones.put/1` now also stops the local
         # coordinator and erases its files (expert review 2026-10-15 #3), which would pre-empt the

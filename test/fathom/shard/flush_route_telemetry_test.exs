@@ -20,10 +20,10 @@ defmodule Fathom.Shard.FlushRouteTelemetryTest do
   import ExUnit.CaptureLog
 
   alias Fathom.Admin.Measurements
-  alias Fathom.Shard.Heartbeat
   alias Fathom.ShardExecutor
   alias Fathom.Shards
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
   @events [
@@ -63,24 +63,6 @@ defmodule Fathom.Shard.FlushRouteTelemetryTest do
 
   defp stmt(sql, args \\ []), do: %Filo.Stmt{sql: sql, args: args}
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(), "legacy mode needs the heartbeat OFF"
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
-  defp assert_mode!(c, :heartbeat),
-    do: assert(is_integer(:sys.get_state(c).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(c, :legacy),
-    do: assert(is_nil(:sys.get_state(c).acquire_gen), "legacy mode did not take")
-
   defp flush!(c, tries \\ 400) do
     send(c, :durability_flush)
     settle(c, tries)
@@ -111,11 +93,11 @@ defmodule Fathom.Shard.FlushRouteTelemetryTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "flush and drop-flush duration events carry the route they took", %{id: id} do
         {:ok, c} = Shards.ensure(id)
-        assert_mode!(c, unquote(mode))
+        LivenessMode.assert!(c, unquote(mode))
 
         {:ok, conn} = ShardExecutor.open(id)
         {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE t (a INTEGER)"))

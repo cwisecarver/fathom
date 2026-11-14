@@ -19,7 +19,6 @@ defmodule Fathom.Shard.OpenCrashSafetyTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Heartbeat
   alias Fathom.Shard.PromoteOnOpen
   alias Fathom.Shard.Replication.{Fleet, Follower, Recovery}
   alias Fathom.Shard.Storage
@@ -27,6 +26,7 @@ defmodule Fathom.Shard.OpenCrashSafetyTest do
   alias Fathom.ShardExecutor
   alias Fathom.Shards
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Fathom.Test.S3EtagStore
 
   @modes [:legacy, :heartbeat]
@@ -79,23 +79,9 @@ defmodule Fathom.Shard.OpenCrashSafetyTest do
     %{id: id, dir: dir}
   end
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
   defp assert_mode!(id, mode) do
     [{pid, _}] = Registry.lookup(Fathom.ShardRegistry, id)
-
-    if mode == :heartbeat,
-      do: assert(is_integer(:sys.get_state(pid).acquire_gen)),
-      else: assert(is_nil(:sys.get_state(pid).acquire_gen))
+    LivenessMode.assert!(pid, mode)
   end
 
   defp stmt(sql, args \\ []), do: %Filo.Stmt{sql: sql, args: args}
@@ -203,7 +189,7 @@ defmodule Fathom.Shard.OpenCrashSafetyTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       # Symptom (#4): a node restart during the peer ask left a MATCHING file + sidecar; the
       # reopen was warm and served the short object without recovering. The precondition asserts
@@ -350,7 +336,7 @@ defmodule Fathom.Shard.OpenCrashSafetyTest do
 
   for mode <- @modes do
     describe "negative cache, #{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       # Symptom (#11): every 503 retry re-stole the lease, re-touched and re-pulled the object.
       test "a refused shard's retry inside the window makes zero Storage calls", %{id: id} do

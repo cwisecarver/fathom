@@ -25,8 +25,9 @@ defmodule Fathom.Shard.UnknownLineageTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{Shard, Shards}
-  alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Shard.Storage
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
 
@@ -46,20 +47,6 @@ defmodule Fathom.Shard.UnknownLineageTest do
 
     %{shard: shard}
   end
-
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
 
   # Waits for the coordinator's in-flight lineage HEAD (if any) to finish and its reply to be
   # applied: the task sends its reply before exiting, so after its DOWN a sync call sees the result.
@@ -87,7 +74,7 @@ defmodule Fathom.Shard.UnknownLineageTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "an :unknown lineage refuses to ship, then recovers once the HEAD answers", %{
         shard: shard
@@ -96,7 +83,7 @@ defmodule Fathom.Shard.UnknownLineageTest do
 
         Application.put_env(:fathom, :storage_fault, :object_head)
         {:ok, pid} = Shards.ensure(shard)
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
         assert :sys.get_state(pid).lineage == :unknown, "the fixture must open with no lineage"
 
         # Still unreadable: the session's gate must refuse, not ship lineage 0.
@@ -118,7 +105,7 @@ defmodule Fathom.Shard.UnknownLineageTest do
         stored_at!(shard, 4)
         Application.put_env(:fathom, :storage_fault, :object_head)
         {:ok, pid} = Shards.ensure(shard)
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
         assert :sys.get_state(pid).lineage == :unknown
         Application.delete_env(:fathom, :storage_fault)
 

@@ -22,8 +22,8 @@ defmodule Fathom.Shard.DropCompactionTest do
 
   alias Fathom.Shard.{ScanGate, Storage}
   alias Fathom.{ShardExecutor, Shards}
-  alias Fathom.Shard.Heartbeat
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
 
@@ -66,20 +66,6 @@ defmodule Fathom.Shard.DropCompactionTest do
   end
 
   defp stmt(sql, args \\ []), do: %Filo.Stmt{sql: sql, args: args}
-
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "legacy mode did not take")
 
   # ~3.2 MB of random (incompressible) rows, then optionally delete 90% of them. The last stream
   # closing folds and unlinks the WAL, so the header counts are current. `fixture_ok!` asserts the
@@ -194,9 +180,9 @@ defmodule Fathom.Shard.DropCompactionTest do
       id: id,
       path: path
     } do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       coordinator = seed!(id, path, true)
-      assert_mode!(coordinator, unquote(mode))
+      LivenessMode.assert!(coordinator, unquote(mode))
       local_size = File.stat!(path).size
 
       assert :ok = Shards.stop(id)
@@ -219,9 +205,9 @@ defmodule Fathom.Shard.DropCompactionTest do
       id: id,
       path: path
     } do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       coordinator = seed!(id, path, true)
-      assert_mode!(coordinator, unquote(mode))
+      LivenessMode.assert!(coordinator, unquote(mode))
 
       events = trace_drop(id)
 
@@ -245,9 +231,9 @@ defmodule Fathom.Shard.DropCompactionTest do
       id: id,
       path: path
     } do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       coordinator = seed!(id, path, false)
-      assert_mode!(coordinator, unquote(mode))
+      LivenessMode.assert!(coordinator, unquote(mode))
       local_size = File.stat!(path).size
 
       assert :ok = Shards.stop(id)

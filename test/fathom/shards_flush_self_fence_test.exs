@@ -28,8 +28,8 @@ defmodule Fathom.ShardsFlushSelfFenceTest do
   use Fathom.ClusterShardCase, async: false
 
   alias Fathom.Shard
-  alias Fathom.Shard.Heartbeat
   alias Fathom.Test.Await
+  alias Fathom.Test.LivenessMode
 
   @thief "thiefnode#t1"
 
@@ -44,17 +44,6 @@ defmodule Fathom.ShardsFlushSelfFenceTest do
 
     :ok
   end
-
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?(), "legacy mode needs the heartbeat OFF")
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
 
   defp fake_task, do: %Task{mfa: {__MODULE__, :fake, 0}, owner: self(), pid: nil, ref: make_ref()}
 
@@ -73,12 +62,12 @@ defmodule Fathom.ShardsFlushSelfFenceTest do
 
   for mode <- [:legacy, :heartbeat] do
     test "#{mode}: a flush queued behind a self-fence stop is not answered :ok", %{shard: shard} do
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
       {:ok, conn} = ShardExecutor.open(shard)
       {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
       {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('acked')"))
       {:ok, pid} = Shards.ensure(shard)
-      assert_mode!(pid, unquote(mode))
+      LivenessMode.assert!(pid, unquote(mode))
       assert Shard.dirty?(pid), "fixture: the shard holds acked, unflushed writes"
 
       # Another node now holds the lease, with a live heartbeat: the remote holder is real.

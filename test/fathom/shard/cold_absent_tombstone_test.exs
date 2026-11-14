@@ -28,9 +28,10 @@ defmodule Fathom.Shard.ColdAbsentTombstoneTest do
   @moduletag :capture_log
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Connection, Heartbeat}
+  alias Fathom.Shard.Connection
   alias Fathom.Shard.Storage.Local
   alias Fathom.Tenants.Tombstones
+  alias Fathom.Test.LivenessMode
 
   @env [
     :shard_storage,
@@ -75,27 +76,10 @@ defmodule Fathom.Shard.ColdAbsentTombstoneTest do
     %{erased: erased, novel: novel, other: other}
   end
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(), "legacy mode needs the heartbeat OFF"
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
   # Opens `id` as a CONTROL and asserts the coordinator took the mode the test names.
   defp assert_mode_took!(id, mode) do
     {:ok, pid, ref, _path} = Shards.checkout(id)
-    gen = :sys.get_state(pid).acquire_gen
-
-    if mode == :heartbeat,
-      do: assert(is_integer(gen), "heartbeat mode did not take"),
-      else: assert(is_nil(gen), "legacy mode did not take")
-
+    LivenessMode.assert!(pid, mode)
     Shard.checkin(pid, ref)
   end
 
@@ -158,7 +142,7 @@ defmodule Fathom.Shard.ColdAbsentTombstoneTest do
 
   for mode <- [:legacy, :heartbeat] do
     describe "#{mode}: a cold open with no local copy and no stored object" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "an erased id (marker, directory half not loaded) is refused 410 and nothing is created",
            %{erased: id, other: control} do

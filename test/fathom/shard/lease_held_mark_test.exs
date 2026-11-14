@@ -23,8 +23,9 @@ defmodule Fathom.Shard.LeaseHeldMarkTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Shard.Storage
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -43,20 +44,6 @@ defmodule Fathom.Shard.LeaseHeldMarkTest do
 
     %{shard: shard}
   end
-
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
 
   # Record the coordinator's registry value from INSIDE the release (the hook runs in the caller).
   defp observe_release!(shard) do
@@ -83,11 +70,11 @@ defmodule Fathom.Shard.LeaseHeldMarkTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "a clean drop clears the mark before its release", %{shard: shard} do
         {:ok, pid} = Shards.ensure(shard)
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
         assert [{^pid, :lease_held}] = Registry.lookup(Fathom.ShardRegistry, shard)
 
         observe_release!(shard)
@@ -99,7 +86,7 @@ defmodule Fathom.Shard.LeaseHeldMarkTest do
 
       test "a failed drop flush clears the mark before its release", %{shard: shard} do
         {:ok, pid} = Shards.ensure(shard)
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
         {:ok, conn} = ShardExecutor.open(shard)
         {:ok, _} = ShardExecutor.execute(conn, %Stmt{sql: "CREATE TABLE t (v TEXT)", args: []})
         :ok = ShardExecutor.close(conn)

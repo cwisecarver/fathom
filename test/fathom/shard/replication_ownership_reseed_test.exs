@@ -38,6 +38,7 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
   alias Fathom.Shard.Storage
   alias Fathom.Shards
   alias Fathom.Test.Env
+  alias Fathom.Test.ReplicationWire
 
   setup do
     id = "repl_reseed_#{System.unique_integer([:positive])}"
@@ -137,22 +138,6 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
     end
   end
 
-  defp send_frame!(port, frame) do
-    {:ok, sock} =
-      :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 5_000)
-
-    try do
-      :ok = :gen_tcp.send(sock, frame)
-
-      case :gen_tcp.recv(sock, 0, 5_000) do
-        {:ok, bytes} -> Protocol.decode(bytes)
-        other -> other
-      end
-    after
-      :gen_tcp.close(sock)
-    end
-  end
-
   # A follower holding a REAL seeded replica — a `.db`, a non-empty WAL and a stated lineage — then
   # the real primary quiesced, so the crafted frames below are the only ones it will ever see.
   # (`replication_short_reset_test.exs` records at length why stopping the Session alone is not
@@ -215,7 +200,7 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
     before = files(name, id)
 
     assert {:ok, {:reject, ^id, :unknown_shard, 0}} =
-             send_frame!(port, Protocol.encode_push(new_owner_push(id, state))),
+             ReplicationWire.send_frame(port, Protocol.encode_push(new_owner_push(id, state))),
            "the follower ACCEPTED the new owner's first push. It then absorbs the old owner's WAL " <>
              "and appends the new owner's onto it — a base the new owner never built from after " <>
              "a restore, a revert, an unflushed takeover or a lagging handoff."
@@ -238,7 +223,7 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
     deposed = %{new_owner_push(id, state) | lineage: state.lineage, epoch: state.epoch}
 
     assert {:ok, {:reject, ^id, :stale_epoch, _}} =
-             send_frame!(port, Protocol.encode_push(deposed))
+             ReplicationWire.send_frame(port, Protocol.encode_push(deposed))
   end
 
   test "a torn replica keeps asking for a seed on every push", ctx do
@@ -246,12 +231,12 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
     push = new_owner_push(id, state)
 
     assert {:ok, {:reject, ^id, :unknown_shard, 0}} =
-             send_frame!(port, Protocol.encode_push(push))
+             ReplicationWire.send_frame(port, Protocol.encode_push(push))
 
     # The SAME ownership now, and a push decide/2 would accept — but the replica is torn and only a
     # seed can clear that, so it asks again rather than appending onto files it cannot vouch for.
     assert {:ok, {:reject, ^id, :unknown_shard, 0}} =
-             send_frame!(port, Protocol.encode_push(push))
+             ReplicationWire.send_frame(port, Protocol.encode_push(push))
 
     assert Follower.state_of(name, id).torn
   end
@@ -265,7 +250,7 @@ defmodule Fathom.Shard.ReplicationOwnershipReseedTest do
     # The switch restores "accept and replicate while torn", NOT the hybrid: the old WAL is not
     # absorbed and the flag does not clear.
     assert {:ok, {:ack, ^id, _}} =
-             send_frame!(port, Protocol.encode_push(new_owner_push(id, state)))
+             ReplicationWire.send_frame(port, Protocol.encode_push(new_owner_push(id, state)))
 
     assert Follower.state_of(name, id).torn,
            "an ownership-change reset cleared torn — that is the hybrid #1 is about"

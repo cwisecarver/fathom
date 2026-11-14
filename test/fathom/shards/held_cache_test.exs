@@ -12,11 +12,11 @@ defmodule Fathom.Shards.HeldCacheTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Heartbeat
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
   alias Fathom.Shards
   alias Fathom.Shards.HeldCache
+  alias Fathom.Test.LivenessMode
   alias Fathom.Test.S3EtagStore
 
   @env [:shard_storage, S3, :shard_idle_ms, :held_refusal_cache_ms, :crash_failover_hold_ms]
@@ -63,21 +63,9 @@ defmodule Fathom.Shards.HeldCacheTest do
     %{id: id, store: store}
   end
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
   for mode <- [:legacy, :heartbeat] do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       # Symptom: each retry against a held lease re-paid a cancelled cold pull.
       test "retries inside the window make zero Storage calls and return the same error", %{

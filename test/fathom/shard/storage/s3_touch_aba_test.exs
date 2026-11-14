@@ -29,9 +29,10 @@ defmodule Fathom.Shard.Storage.S3TouchAbaTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Connection, Heartbeat, Storage}
+  alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Storage.{Codec, HeartbeatCache, S3}
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Fathom.Test.S3EtagStore
   alias Filo.{Stmt, StmtResult}
 
@@ -291,16 +292,6 @@ defmodule Fathom.Shard.Storage.S3TouchAbaTest do
 
   # --- end to end: a real coordinator is the zombie ---
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
-
   # Holds the coordinator's fenced data PUT (it has passed every fence check of its own) until the
   # test says go — the stalled-zombie window.
   defp stalling_plug(store, gate, shard) do
@@ -336,7 +327,7 @@ defmodule Fathom.Shard.Storage.S3TouchAbaTest do
       store = start_supervised!({Agent, fn -> S3EtagStore.initial(%{"#{shard}.db" => base}) end})
       gate = start_supervised!({Agent, fn -> false end}, id: :gate)
       use_s3!(store, stalling_plug(store, gate, shard))
-      set_mode!(unquote(mode))
+      LivenessMode.set!(unquote(mode))
 
       capture_log(fn ->
         {:ok, conn} = ShardExecutor.open(shard)
@@ -349,7 +340,7 @@ defmodule Fathom.Shard.Storage.S3TouchAbaTest do
 
         :ok = ShardExecutor.close(conn)
         {:ok, z} = Shards.ensure(shard)
-        assert_mode!(z, unquote(mode))
+        LivenessMode.assert!(z, unquote(mode))
         assert Shard.dirty?(z)
         e0 = S3EtagStore.etag_of(store, "#{shard}.db")
 

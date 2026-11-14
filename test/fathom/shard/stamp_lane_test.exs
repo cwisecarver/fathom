@@ -13,12 +13,12 @@ defmodule Fathom.Shard.StampLaneTest do
   """
   use ExUnit.Case, async: false
 
-  alias Fathom.Test.{Await, FlushGateScope}
+  alias Fathom.Test.{Await, FlushGateScope, LivenessMode}
 
   @moduletag :capture_log
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{FlushGate, Heartbeat, Storage}
+  alias Fathom.Shard.{FlushGate, Storage}
   alias Fathom.Shard.Replication.{Fleet, Follower, Recovery, Session}
   alias Filo.Stmt
 
@@ -170,17 +170,6 @@ defmodule Fathom.Shard.StampLaneTest do
       followers
     end
 
-    defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-    defp set_mode!(:heartbeat) do
-      hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-      _ = :sys.get_state(hb)
-      assert Heartbeat.running?()
-    end
-
-    defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-    defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
-
     defp run(conn, sql), do: ShardExecutor.execute(conn, %Stmt{sql: sql, args: []})
 
     # The head once `ready?.(head)`; on timeout the LAST head seen (nil: no object), so the caller's
@@ -230,7 +219,7 @@ defmodule Fathom.Shard.StampLaneTest do
       @tag mode: mode
       test "gets its object while the main flush lane is fully held (#{mode})",
            %{id: id, root: root, mode: mode} do
-        set_mode!(mode)
+        LivenessMode.set!(mode)
         followers = replicating!(root)
         assert {:ok, nil} = Storage.object_head(id), "fixture: the shard must have no object"
 
@@ -240,7 +229,7 @@ defmodule Fathom.Shard.StampLaneTest do
 
         {:ok, conn} = ShardExecutor.open(id)
         {:ok, pid} = Shards.ensure(id)
-        assert_mode!(pid, mode)
+        LivenessMode.assert!(pid, mode)
         for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
 
         {:ok, _} = run(conn, "CREATE TABLE kv (v TEXT)")
@@ -268,7 +257,7 @@ defmodule Fathom.Shard.StampLaneTest do
     # ~12, the doubling one (250+500+1000+2000) at most 5.
     test "a refused first-write stamp backs off (bounded wakeups, not a fixed 250 ms)",
          %{id: id, root: root} do
-      set_mode!(:legacy)
+      LivenessMode.set!(:legacy)
       Application.put_env(:fathom, :shard_stamp_flush_max_concurrency, 1)
       followers = replicating!(root)
       assert :ok = FlushGate.try_acquire_stamp()
@@ -301,7 +290,7 @@ defmodule Fathom.Shard.StampLaneTest do
     # stamps depend on.
     test "a flush of an existing object takes the main gate, never the stamp lane",
          %{id: id, root: root} do
-      set_mode!(:legacy)
+      LivenessMode.set!(:legacy)
       followers = replicating!(root)
       {:ok, conn} = ShardExecutor.open(id)
       {:ok, pid} = Shards.ensure(id)

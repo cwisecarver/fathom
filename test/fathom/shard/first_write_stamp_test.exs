@@ -20,8 +20,9 @@ defmodule Fathom.Shard.FirstWriteStampTest do
   @moduletag :capture_log
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Storage}
   alias Fathom.Shard.Replication.{Fleet, Follower, Recovery, Session}
+  alias Fathom.Shard.Storage
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -85,17 +86,6 @@ defmodule Fathom.Shard.FirstWriteStampTest do
     followers
   end
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
-
   defp run(conn, sql), do: ShardExecutor.execute(conn, %Stmt{sql: sql, args: []})
 
   # Let the coordinator handle the write's `:became_dirty` and finish any flush it started.
@@ -115,13 +105,13 @@ defmodule Fathom.Shard.FirstWriteStampTest do
       @tag mode: mode
       test "replicating: the first write creates a rankable object without waiting the interval",
            %{id: id, root: root, mode: mode} do
-        set_mode!(mode)
+        LivenessMode.set!(mode)
         followers = replicating!(root)
         assert {:ok, nil} = Storage.object_head(id), "fixture: the shard must have no object"
 
         {:ok, conn} = ShardExecutor.open(id)
         {:ok, pid} = Shards.ensure(id)
-        assert_mode!(pid, mode)
+        LivenessMode.assert!(pid, mode)
         for {name, _} <- followers, do: Follower.seed(name, id, 0, 0, 0, 0)
 
         {:ok, _} = run(conn, "CREATE TABLE kv (v TEXT)")
@@ -142,12 +132,12 @@ defmodule Fathom.Shard.FirstWriteStampTest do
       @tag mode: mode
       test "replication off: the first write waits for the interval as before",
            %{id: id, mode: mode} do
-        set_mode!(mode)
+        LivenessMode.set!(mode)
         Application.put_env(:fathom, :replication_enabled, false)
 
         {:ok, conn} = ShardExecutor.open(id)
         {:ok, pid} = Shards.ensure(id)
-        assert_mode!(pid, mode)
+        LivenessMode.assert!(pid, mode)
 
         {:ok, _} = run(conn, "CREATE TABLE kv (v TEXT)")
         _ = :sys.get_state(pid)

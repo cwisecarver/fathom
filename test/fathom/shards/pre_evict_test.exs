@@ -21,8 +21,8 @@ defmodule Fathom.Shards.PreEvictTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{ShardExecutor, Shards}
-  alias Fathom.Shard.Heartbeat
   alias Fathom.Shards.Lru
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
   import Fathom.Test.TelemetryScope, only: [received_for: 2]
 
@@ -66,24 +66,10 @@ defmodule Fathom.Shards.PreEvictTest do
     :ok
   end
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
-  defp assert_mode!(id, mode) do
+  # The shard's coordinator pid, by id, for `LivenessMode.assert!/2`.
+  defp assert_shard_mode!(id, mode) do
     [{pid, _}] = Registry.lookup(Fathom.ShardRegistry, id)
-    gen = :sys.get_state(pid).acquire_gen
-
-    if mode == :heartbeat,
-      do: assert(is_integer(gen), "heartbeat mode did not take"),
-      else: assert(is_nil(gen), "legacy mode did not take")
+    LivenessMode.assert!(pid, mode)
   end
 
   defp uniq, do: "preev_#{System.unique_integer([:positive])}"
@@ -140,7 +126,7 @@ defmodule Fathom.Shards.PreEvictTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "near the cap, idle shards drop in the background; busy never, dirty flushed first" do
         # Cap 40 over the live population: headroom = 16 (the minimum), watermark = base + 24.
@@ -154,7 +140,7 @@ defmodule Fathom.Shards.PreEvictTest do
         held_id = uniq()
         held = open_held(held_id)
         held_ref = Process.monitor(held)
-        assert_mode!(held_id, unquote(mode))
+        assert_shard_mode!(held_id, unquote(mode))
 
         # 30 dirty idle shards: enough to cross the watermark (base + 1 + 30 > base + 24) while
         # staying under the cap, so the inline path is never needed.

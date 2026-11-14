@@ -28,9 +28,10 @@ defmodule Fathom.Shard.RefusedOpenProvenanceTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Connection, Heartbeat, Storage}
+  alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Storage.S3
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Fathom.Test.S3EtagStore
   alias Filo.{Stmt, StmtResult}
 
@@ -116,17 +117,6 @@ defmodule Fathom.Shard.RefusedOpenProvenanceTest do
     Application.put_env(:fathom, :shard_storage, S3)
   end
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
   defp lock(store, shard),
     do: store |> S3EtagStore.body_of("#{shard}.lock") |> Jason.decode!()
 
@@ -145,7 +135,7 @@ defmodule Fathom.Shard.RefusedOpenProvenanceTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "after one and after TWO refused opens, A's acked local copy is not a fork", %{
         shard: shard

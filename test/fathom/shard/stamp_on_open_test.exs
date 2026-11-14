@@ -22,9 +22,10 @@ defmodule Fathom.Shard.StampOnOpenTest do
   @moduletag :capture_log
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Connection, Heartbeat, Storage}
+  alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Replication.Recovery
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -48,17 +49,6 @@ defmodule Fathom.Shard.StampOnOpenTest do
     %{shard: shard}
   end
 
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
-
   defp replicating!(on?), do: Application.put_env(:fathom, :replication_enabled, on?)
 
   # An object written out of band, the way the migration copy writes it: no stamp.
@@ -76,7 +66,7 @@ defmodule Fathom.Shard.StampOnOpenTest do
   # Open, and let any flush the open started run to completion.
   defp open_settled!(shard, mode) do
     {:ok, pid} = Shards.ensure(shard)
-    assert_mode!(pid, mode)
+    LivenessMode.assert!(pid, mode)
     settle(pid, 400)
     pid
   end
@@ -97,7 +87,7 @@ defmodule Fathom.Shard.StampOnOpenTest do
       @tag mode: mode
       test "a replicating open over an unstamped object stamps it with this lineage",
            %{shard: shard, mode: mode} do
-        set_mode!(mode)
+        LivenessMode.set!(mode)
         replicating!(true)
         plant_unstamped_object!(shard)
 
@@ -127,7 +117,7 @@ defmodule Fathom.Shard.StampOnOpenTest do
 
       @tag mode: mode
       test "replication off: an unstamped object is left alone", %{shard: shard, mode: mode} do
-        set_mode!(mode)
+        LivenessMode.set!(mode)
         replicating!(false)
         plant_unstamped_object!(shard)
         {:ok, etag} = Storage.object_etag(shard)
@@ -141,7 +131,7 @@ defmodule Fathom.Shard.StampOnOpenTest do
 
       @tag mode: mode
       test "an already-stamped object is not re-PUT", %{shard: shard, mode: mode} do
-        set_mode!(mode)
+        LivenessMode.set!(mode)
         replicating!(true)
         plant_unstamped_object!(shard)
 

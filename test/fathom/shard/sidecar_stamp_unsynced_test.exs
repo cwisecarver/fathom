@@ -33,8 +33,9 @@ defmodule Fathom.Shard.SidecarStampUnsyncedTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Provenance, Storage}
+  alias Fathom.Shard.{Provenance, Storage}
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -59,20 +60,6 @@ defmodule Fathom.Shard.SidecarStampUnsyncedTest do
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
   defp db(shard), do: Shard.db_path(shard)
-
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?(), "legacy mode needs the heartbeat OFF")
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(coordinator, :heartbeat),
-    do: assert(is_integer(:sys.get_state(coordinator).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(coordinator, :legacy),
-    do: assert(is_nil(:sys.get_state(coordinator).acquire_gen), "legacy mode did not take")
 
   # Record, in order, (a) every fsynced in-place sidecar image and (b) the instant each flush PUT has
   # landed (just before the unsynced stamp), with the stored object's etag + md5 at that instant.
@@ -119,12 +106,12 @@ defmodule Fathom.Shard.SidecarStampUnsyncedTest do
   # Open `shard` in `mode`, take the first write + first flush, then run `rounds` more
   # write-then-flush rounds. Returns the per-round events and the coordinator/conn.
   defp run_rounds!(shard, mode, rounds) do
-    set_mode!(mode)
+    LivenessMode.set!(mode)
     capture!(shard)
 
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, coordinator} = Shards.ensure(shard)
-    assert_mode!(coordinator, mode)
+    LivenessMode.assert!(coordinator, mode)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('r0')"))
 

@@ -29,9 +29,10 @@ defmodule Fathom.Migrator.ShardMigrationDirtyReleaseTest do
 
   alias Fathom.{Directory, Migrator, Shard, ShardExecutor, Shards}
   alias Fathom.Migrator.ShardMigration
-  alias Fathom.Shard.{Connection, Heartbeat, Storage}
+  alias Fathom.Shard.{Connection, Storage}
   alias Fathom.Shard.Storage.Local
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -64,17 +65,6 @@ defmodule Fathom.Migrator.ShardMigrationDirtyReleaseTest do
 
     %{shard: shard}
   end
-
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?(), "legacy mode needs the heartbeat OFF")
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
   defp exec!(conn, sql), do: {:ok, _} = ShardExecutor.execute(conn, stmt(sql))
@@ -115,7 +105,7 @@ defmodule Fathom.Migrator.ShardMigrationDirtyReleaseTest do
   defp keeper_leaves_dirty_marker!(shard, mode) do
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, pid} = Shards.ensure(shard)
-    assert_mode!(pid, mode)
+    LivenessMode.assert!(pid, mode)
 
     exec!(conn, "INSERT INTO app_thing (id, name) VALUES (2, 'acked-only-on-K')")
 
@@ -145,7 +135,7 @@ defmodule Fathom.Migrator.ShardMigrationDirtyReleaseTest do
   for mode <- @modes do
     describe "#{mode} keeper" do
       setup do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         :ok
       end
 

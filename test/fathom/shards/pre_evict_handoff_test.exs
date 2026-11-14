@@ -25,9 +25,9 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shards
-  alias Fathom.Shard.Heartbeat
   alias Fathom.Shards.Lru
   alias Fathom.Test.FaultyStorage
+  alias Fathom.Test.LivenessMode
   import Fathom.Test.TelemetryScope, only: [received_for: 2]
 
   @moduletag :capture_log
@@ -73,26 +73,6 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
     Application.put_env(:fathom, :evict_idle_at_capacity, true)
     Application.put_env(:fathom, :pre_evict_headroom, 0)
     :ok
-  end
-
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
-  defp assert_mode!(id, mode) do
-    [{pid, _}] = Registry.lookup(Fathom.ShardRegistry, id)
-    gen = :sys.get_state(pid).acquire_gen
-
-    if mode == :heartbeat,
-      do: assert(is_integer(gen), "heartbeat mode did not take"),
-      else: assert(is_nil(gen), "legacy mode did not take")
   end
 
   defp uniq, do: "pehand_#{System.unique_integer([:positive])}"
@@ -160,9 +140,9 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
     @tag mode: mode
     test "#{mode}: an admission at the cap adopts an in-flight pre-eviction instead of evicting",
          %{mode: mode} do
-      set_mode!(mode)
+      LivenessMode.set!(mode)
       [victim | _] = filled = fill_to_cap(4)
-      assert_mode!(victim, mode)
+      LivenessMode.assert!(coordinator(victim), mode)
       victim_pid = coordinator(victim)
       new = uniq()
       on_exit(fn -> cleanup([new | filled]) end)
@@ -209,7 +189,7 @@ defmodule Fathom.Shards.PreEvictHandoffTest do
              "the admission evicted a second tenant"
 
       assert Enum.all?(tl(filled), &open?/1)
-      assert_mode!(new, mode)
+      LivenessMode.assert!(coordinator(new), mode)
     end
   end
 

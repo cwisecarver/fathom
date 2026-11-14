@@ -28,8 +28,8 @@ defmodule Fathom.Shard.ReconcileForkTest do
   use ExUnit.Case, async: false
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Connection, Heartbeat, Storage}
-  alias Fathom.Test.Env
+  alias Fathom.Shard.{Connection, Storage}
+  alias Fathom.Test.{Env, LivenessMode}
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -52,17 +52,6 @@ defmodule Fathom.Shard.ReconcileForkTest do
   end
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
-
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?())
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
 
   defp rows_of(path) do
     {:ok, conn} = Connection.open(path)
@@ -93,10 +82,10 @@ defmodule Fathom.Shard.ReconcileForkTest do
   end
 
   defp open_with_object!(shard, mode) do
-    set_mode!(mode)
+    LivenessMode.set!(mode)
     {:ok, conn} = ShardExecutor.open(shard)
     {:ok, pid} = Shards.ensure(shard)
-    assert_mode!(pid, mode)
+    LivenessMode.assert!(pid, mode)
     {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
     {:ok, _} = ShardExecutor.execute(conn, stmt("INSERT INTO kv VALUES ('mine_flushed')"))
     assert :ok = Shards.flush(shard)

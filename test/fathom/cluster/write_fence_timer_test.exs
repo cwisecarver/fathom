@@ -23,6 +23,7 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
 
   alias Fathom.Shard.{Heartbeat, WriteFence}
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
 
@@ -59,21 +60,17 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
 
   # Legacy: a short lease TTL makes `Heartbeat.margin_ms/0`'s heartbeat-down fallback small, and a
   # failing renew is what turns the flush fence into `:skip`.
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
+  defp enter_mode!(:legacy) do
+    LivenessMode.set!(:legacy)
     Env.put!(:shard_lease_ttl_ms, 1_500)
 
     nil
   end
 
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    hb
+  defp enter_mode!(:heartbeat) do
+    LivenessMode.set!(:heartbeat)
+    Process.whereis(Heartbeat)
   end
-
-  defp assert_mode!(pid, :heartbeat), do: assert(is_integer(:sys.get_state(pid).acquire_gen))
-  defp assert_mode!(pid, :legacy), do: assert(is_nil(:sys.get_state(pid).acquire_gen))
 
   # Make the next flush fence answer `:skip`, the cut-from-storage symptom.
   defp go_not_valid!(:legacy, _hb), do: Env.put!(:storage_fault, :renew)
@@ -121,11 +118,11 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
     test "#{mode} mode: the fence arms at stealable-after with no later flush tick", %{
       shard: shard
     } do
-      hb = set_mode!(unquote(mode))
+      hb = enter_mode!(unquote(mode))
 
       capture_log(fn ->
         {conn, coordinator} = open_dirty!(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         go_not_valid!(unquote(mode), hb)
         # ONE fence verdict: the first `:not_valid` observation. Nothing else will call it — the
@@ -145,11 +142,11 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
   test "heartbeat mode: a heartbeat that recovered before the timer closes the episode", %{
     shard: shard
   } do
-    hb = set_mode!(:heartbeat)
+    hb = enter_mode!(:heartbeat)
 
     capture_log(fn ->
       {conn, coordinator} = open_dirty!(shard)
-      assert_mode!(coordinator, :heartbeat)
+      LivenessMode.assert!(coordinator, :heartbeat)
 
       go_not_valid!(:heartbeat, hb)
       first_not_valid!(coordinator)
@@ -177,12 +174,12 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
   # the shard is CLEAN (nothing would ever flush it): pre-fix nothing armed the fence at all.
   test "heartbeat mode: a lapse broadcast alone arms the fence, with no flush tick and no revalidation",
        %{shard: shard} do
-    hb = set_mode!(:heartbeat)
+    hb = enter_mode!(:heartbeat)
     Env.put!(:lapse_revalidate_jitter_ms, 600_000)
 
     capture_log(fn ->
       {:ok, coordinator} = Shards.ensure(shard)
-      assert_mode!(coordinator, :heartbeat)
+      LivenessMode.assert!(coordinator, :heartbeat)
       refute Fathom.Shard.dirty?(coordinator)
       gen = :sys.get_state(coordinator).acquire_gen
 
@@ -212,11 +209,11 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
   test "heartbeat mode: a lapse broadcast with the status already valid again starts no clock", %{
     shard: shard
   } do
-    hb = set_mode!(:heartbeat)
+    hb = enter_mode!(:heartbeat)
 
     capture_log(fn ->
       {:ok, coordinator} = Shards.ensure(shard)
-      assert_mode!(coordinator, :heartbeat)
+      LivenessMode.assert!(coordinator, :heartbeat)
       gen = :sys.get_state(coordinator).acquire_gen
 
       # Lapsed and already renewed: a new generation, a healthy deadline -> `:revalidate`, not
@@ -237,11 +234,11 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
   end
 
   test "legacy mode: a lapse broadcast is not this coordinator's signal", %{shard: shard} do
-    set_mode!(:legacy)
+    enter_mode!(:legacy)
 
     capture_log(fn ->
       {:ok, coordinator} = Shards.ensure(shard)
-      assert_mode!(coordinator, :legacy)
+      LivenessMode.assert!(coordinator, :legacy)
       send(coordinator, {:heartbeat_lapsed, 7})
       assert :sys.get_state(coordinator).not_valid_since == nil
     end)
@@ -255,11 +252,11 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
   # works again (nothing else clears it on a clean shard).
   test "legacy mode: a failing renewal starts the clock on a CLEAN shard, and a success lifts the fence",
        %{shard: shard} do
-    set_mode!(:legacy)
+    enter_mode!(:legacy)
 
     capture_log(fn ->
       {:ok, coordinator} = Shards.ensure(shard)
-      assert_mode!(coordinator, :legacy)
+      LivenessMode.assert!(coordinator, :legacy)
       refute Fathom.Shard.dirty?(coordinator), "fixture: the shard must be CLEAN"
       assert :sys.get_state(coordinator).not_valid_since == nil
 

@@ -23,6 +23,7 @@ defmodule Fathom.Shard.Replication.FollowerRestartEpochTest do
   alias Fathom.Shard.Replication.Protocol
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Test.Env
+  alias Fathom.Test.ReplicationWire
 
   @lineage 7
   @epoch 5
@@ -109,22 +110,6 @@ defmodule Fathom.Shard.Replication.FollowerRestartEpochTest do
     )
   end
 
-  defp send_frame!(port, frame) do
-    {:ok, sock} =
-      :gen_tcp.connect(~c"127.0.0.1", port, [:binary, packet: 4, active: false], 5_000)
-
-    try do
-      :ok = :gen_tcp.send(sock, frame)
-
-      case :gen_tcp.recv(sock, 0, 5_000) do
-        {:ok, bytes} -> Protocol.decode(bytes)
-        other -> other
-      end
-    after
-      :gen_tcp.close(sock)
-    end
-  end
-
   test "the owner's next append after a follower restart is accepted where the replica ends",
        ctx do
     {name, port} = replica_then_restart!(ctx, @lineage)
@@ -138,7 +123,9 @@ defmodule Fathom.Shard.Replication.FollowerRestartEpochTest do
     wal_before = File.read!(Follower.wal_path(name, ctx.id))
 
     # Before the fix: {:reject, id, :offset_mismatch, 0} — "send me the whole WAL again".
-    assert {:ok, {:ack, _id, next}} = send_frame!(port, Protocol.encode_push(append(ctx, [])))
+    assert {:ok, {:ack, _id, next}} =
+             ReplicationWire.send_frame(port, Protocol.encode_push(append(ctx, [])))
+
     assert next == extent + 64
 
     # An append, not a reset: the bytes the follower held are untouched (no absorb, no truncate).
@@ -155,7 +142,7 @@ defmodule Fathom.Shard.Replication.FollowerRestartEpochTest do
     assert %{epoch: 0, lineage: @lineage} = Follower.state_of(name, ctx.id)
 
     assert {:ok, {:reject, _id, :offset_mismatch, 0}} =
-             send_frame!(port, Protocol.encode_push(append(ctx, [])))
+             ReplicationWire.send_frame(port, Protocol.encode_push(append(ctx, [])))
   end
 
   # With the ordinal wire off (dev/test default) pushes state no lineage, so ownership is decided by
@@ -172,7 +159,10 @@ defmodule Fathom.Shard.Replication.FollowerRestartEpochTest do
     # The reopened owner (epoch 1, lineage unstated on this wire) is not fenced out.
     refute match?(
              {:ok, {:reject, _, :stale_epoch, _}},
-             send_frame!(port, Protocol.encode_push(append(ctx, epoch: 1, offset: 0)))
+             ReplicationWire.send_frame(
+               port,
+               Protocol.encode_push(append(ctx, epoch: 1, offset: 0))
+             )
            )
   end
 
@@ -187,7 +177,7 @@ defmodule Fathom.Shard.Replication.FollowerRestartEpochTest do
 
     # A deposed owner (lower lineage), even with a higher lock epoch: refused.
     assert {:ok, {:reject, _id, :stale_epoch, 0}} =
-             send_frame!(
+             ReplicationWire.send_frame(
                port,
                Protocol.encode_push(append(ctx, lineage: @lineage - 1, epoch: @epoch + 10))
              )
@@ -195,7 +185,7 @@ defmodule Fathom.Shard.Replication.FollowerRestartEpochTest do
     # A new ownership (higher lineage) whose lock epoch reset to 1: asked to re-seed, never
     # fenced `:stale_epoch` by the persisted 5.
     assert {:ok, {:reject, _id, :unknown_shard, 0}} =
-             send_frame!(
+             ReplicationWire.send_frame(
                port,
                Protocol.encode_push(
                  append(ctx, lineage: @lineage + 1, epoch: 1, offset: 0, salt1: 12_345)

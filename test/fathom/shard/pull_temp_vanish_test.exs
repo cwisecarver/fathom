@@ -34,8 +34,9 @@ defmodule Fathom.Shard.PullTempVanishTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Connection, Heartbeat, Materializer, Provenance, TempReaper}
+  alias Fathom.Shard.{Connection, Materializer, Provenance, TempReaper}
   alias Fathom.Shard.Storage.Local
+  alias Fathom.Test.LivenessMode
   alias Filo.{Stmt, StmtResult}
 
   @modes [:legacy, :heartbeat]
@@ -85,20 +86,6 @@ defmodule Fathom.Shard.PullTempVanishTest do
 
     %{shard: shard, db: Shard.db_path(shard)}
   end
-
-  defp set_mode!(:legacy), do: refute(Heartbeat.running?(), "legacy mode needs the heartbeat OFF")
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-  end
-
-  defp assert_mode!(pid, :heartbeat),
-    do: assert(is_integer(:sys.get_state(pid).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(pid, :legacy),
-    do: assert(is_nil(:sys.get_state(pid).acquire_gen), "legacy mode did not take")
 
   defp stmt(sql), do: %Stmt{sql: sql, args: []}
 
@@ -178,7 +165,7 @@ defmodule Fathom.Shard.PullTempVanishTest do
   for mode <- @modes do
     describe "#{mode} mode" do
       setup do
-        set_mode!(unquote(mode))
+        LivenessMode.set!(unquote(mode))
         :ok
       end
 
@@ -189,7 +176,8 @@ defmodule Fathom.Shard.PullTempVanishTest do
 
         pid = open_parked!(shard, e0)
         ref = Process.monitor(pid)
-        # (The mode took: `set_mode!/1` asserted the heartbeat's state, and the coordinator cannot
+
+        # (The mode took: `LivenessMode.set!/2` asserted the heartbeat's state, and the coordinator cannot
         # be inspected while it is parked in its open.)
         assert File.exists?(temp), "fixture: the completed pull must be parked on disk"
 
@@ -256,7 +244,7 @@ defmodule Fathom.Shard.PullTempVanishTest do
 
         release!(pid)
         assert "kv" in tables(shard), "the open must promote the pull it was holding"
-        assert_mode!(pid, unquote(mode))
+        LivenessMode.assert!(pid, unquote(mode))
         assert Local.object_etag(shard) == {:ok, e0}
       end
 
@@ -311,7 +299,7 @@ defmodule Fathom.Shard.PullTempVanishTest do
   defp assert_mode_after_open!(shard, mode) do
     {:ok, pid} = Shards.ensure(shard)
     _ = :sys.get_state(pid)
-    assert_mode!(pid, mode)
+    LivenessMode.assert!(pid, mode)
   end
 
   test "promote_pull with bytes reported and no temp is a refusal, never a brand-new shard",

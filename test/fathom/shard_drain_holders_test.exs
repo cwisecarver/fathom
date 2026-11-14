@@ -18,7 +18,7 @@ defmodule Fathom.ShardDrainHoldersTest do
 
   alias Fathom.Bench.HranaClient
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.Heartbeat
+  alias Fathom.Test.LivenessMode
 
   @modes [:legacy, :heartbeat]
 
@@ -34,34 +34,13 @@ defmodule Fathom.ShardDrainHoldersTest do
     id
   end
 
-  # Put the NEXT coordinator open into `mode` (captured at open as `acquire_gen`); same pattern as
-  # shard_lease_release_test.exs. config/test.exs defaults to legacy (heartbeat_server: false).
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(), "legacy mode needs the heartbeat OFF"
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
   defp coordinator(id) do
     [{pid, _}] = Registry.lookup(Fathom.ShardRegistry, id)
     pid
   end
 
-  # Assert the coordinator opened in the mode asked for: a scenario that silently ran legacy twice
-  # looks like two-mode coverage and is one.
-  defp assert_mode!(id, :heartbeat) do
-    assert is_integer(:sys.get_state(coordinator(id)).acquire_gen), "heartbeat mode did not take"
-  end
-
-  defp assert_mode!(id, :legacy) do
-    assert is_nil(:sys.get_state(coordinator(id)).acquire_gen), "legacy mode did not take"
-  end
+  # Assert the coordinator for shard `id` opened in the mode asked for.
+  defp assert_opened_mode!(id, mode), do: LivenessMode.assert!(coordinator(id), mode)
 
   defp wait_until(fun, tries \\ 100) do
     cond do
@@ -95,13 +74,13 @@ defmodule Fathom.ShardDrainHoldersTest do
 
   for mode <- @modes do
     describe "WebSocket holder (#{mode})" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "an idle WebSocket stream is closed and the drain completes", %{port: port} do
         id = shard("drainws")
         {:ok, c} = HranaClient.connect(port, id)
         {:ok, _c, _} = HranaClient.execute(c, "CREATE TABLE t (v INTEGER)")
-        assert_mode!(id, unquote(mode))
+        assert_opened_mode!(id, unquote(mode))
 
         # The socket's process is the holder the coordinator sees: pin that the classifier matches
         # what a real Bandit WebSocket looks like, not just the literal above.
@@ -122,7 +101,7 @@ defmodule Fathom.ShardDrainHoldersTest do
         {:ok, c, _} = HranaClient.execute(c, "CREATE TABLE t (v INTEGER)")
         {:ok, c, _} = HranaClient.execute(c, "BEGIN")
         {:ok, c, _} = HranaClient.execute(c, "INSERT INTO t VALUES (1)")
-        assert_mode!(id, unquote(mode))
+        assert_opened_mode!(id, unquote(mode))
 
         assert {:error, :busy} = Shards.drain(id, 300)
 
@@ -141,7 +120,7 @@ defmodule Fathom.ShardDrainHoldersTest do
     end
 
     describe "HTTP baton stream holder (#{mode})" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "an idle baton stream is closed and the drain completes", %{port: port} do
         id = shard("drainhttp")
@@ -155,19 +134,19 @@ defmodule Fathom.ShardDrainHoldersTest do
         resp = Req.post!(url, json: body, headers: [{"host", "#{id}.local"}], retry: false)
         assert resp.status == 200
         assert is_binary(resp.body["baton"]), "the stream was not kept open, so nothing is held"
-        assert_mode!(id, unquote(mode))
+        assert_opened_mode!(id, unquote(mode))
 
         assert :ok = Shards.drain(id, 5_000)
       end
     end
 
     describe "non-Filo holder (#{mode})" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "a holder that is not a Filo transport is not messaged" do
         id = shard("drainother")
         {:ok, conn} = ShardExecutor.open(id, :trusted)
-        assert_mode!(id, unquote(mode))
+        assert_opened_mode!(id, unquote(mode))
 
         assert {:error, :busy} = Shards.drain(id, 200)
         refute_received :filo_drain
@@ -178,7 +157,7 @@ defmodule Fathom.ShardDrainHoldersTest do
     end
 
     describe "aborted drain (#{mode})" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       # Expert review 2026-10-12 #34: nothing pinned that a drain that runs out its window RESUMES
       # serving. Invariant: draining is reset, a new checkout is granted (not {:error, :draining}),
@@ -191,7 +170,7 @@ defmodule Fathom.ShardDrainHoldersTest do
         {:ok, c, _} = HranaClient.execute(c, "INSERT INTO t VALUES (1)")
 
         pid = coordinator(id)
-        assert_mode!(id, unquote(mode))
+        assert_opened_mode!(id, unquote(mode))
 
         Shard.request_drain(pid, 200, self())
         assert_receive {:drain_aborted, ^pid}, 5_000
@@ -214,7 +193,7 @@ defmodule Fathom.ShardDrainHoldersTest do
     end
 
     describe "reconnect during a drain (#{mode})" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "an idle socket is closed, a new connect is refused in-window, served after",
            %{port: port} do
@@ -235,7 +214,7 @@ defmodule Fathom.ShardDrainHoldersTest do
         }
 
         pid = coordinator(id)
-        assert_mode!(id, unquote(mode))
+        assert_opened_mode!(id, unquote(mode))
         ref = Process.monitor(pid)
         Shard.request_drain(pid, 30_000, self())
 

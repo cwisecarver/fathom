@@ -29,8 +29,9 @@ defmodule Fathom.Shard.ReleaseLineageClaimTest do
   import ExUnit.CaptureLog
 
   alias Fathom.{Shard, ShardExecutor, Shards}
-  alias Fathom.Shard.{Heartbeat, Storage}
+  alias Fathom.Shard.Storage
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -56,30 +57,12 @@ defmodule Fathom.Shard.ReleaseLineageClaimTest do
     %{shard: shard}
   end
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(), "legacy mode needs the heartbeat OFF (config/test.exs default)"
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
-  defp assert_mode!(pid, :heartbeat),
-    do: assert(is_integer(:sys.get_state(pid).acquire_gen), "heartbeat mode did not take")
-
-  defp assert_mode!(pid, :legacy),
-    do: assert(is_nil(:sys.get_state(pid).acquire_gen), "legacy mode did not take")
-
   defp lock_body(shard),
     do: Path.join(Storage.Local.dir(), "#{shard}.lock") |> File.read!() |> Jason.decode!()
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "a failed drop flush's release keeps the claim; the next owner opens above it", %{
         shard: shard
@@ -87,7 +70,7 @@ defmodule Fathom.Shard.ReleaseLineageClaimTest do
         # Open while replicating, so the coordinator fixes an integer lineage L for its life.
         Application.put_env(:fathom, :replication_enabled, true)
         {:ok, a} = Shards.ensure(shard)
-        assert_mode!(a, unquote(mode))
+        LivenessMode.assert!(a, unquote(mode))
         l = Shard.lineage(a)
         assert is_integer(l) and l > 0, "the fixture must open with a stated lineage"
 
@@ -124,7 +107,7 @@ defmodule Fathom.Shard.ReleaseLineageClaimTest do
         # deleted, the reopen was a fresh create, and this came back == L.
         Application.put_env(:fathom, :replication_enabled, true)
         {:ok, b} = Shards.ensure(shard)
-        assert_mode!(b, unquote(mode))
+        LivenessMode.assert!(b, unquote(mode))
         lb = Shard.lineage(b)
 
         assert lb > l,

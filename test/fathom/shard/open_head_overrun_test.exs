@@ -25,8 +25,9 @@ defmodule Fathom.Shard.OpenHeadOverrunTest do
   """
   use ExUnit.Case, async: false
 
-  alias Fathom.Shard.{Heartbeat, PromoteOnOpen, Storage}
+  alias Fathom.Shard.{PromoteOnOpen, Storage}
   alias Fathom.Shard.Replication.{Fleet, Follower, Recovery}
+  alias Fathom.Test.LivenessMode
   alias Fathom.{ShardExecutor, Shards}
 
   @moduletag :capture_log
@@ -69,17 +70,6 @@ defmodule Fathom.Shard.OpenHeadOverrunTest do
     %{id: id}
   end
 
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?()
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    _ = :sys.get_state(hb)
-    :ok
-  end
-
   defp stmt(sql, args \\ []), do: %Filo.Stmt{sql: sql, args: args}
 
   # Same fixture as `RecoveryPrefetchTest`: a rankable stored object, a replica row on this node's
@@ -117,7 +107,7 @@ defmodule Fathom.Shard.OpenHeadOverrunTest do
 
   for mode <- @modes do
     describe "#{mode} mode" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "a head task that outlives checkout_timeout: retryable 503, then the open completes",
            %{id: id} do

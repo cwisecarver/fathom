@@ -65,6 +65,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
   alias Fathom.{Shard, ShardExecutor, Shards}
   alias Fathom.Shard.{Heartbeat, Storage}
   alias Fathom.Test.Env
+  alias Fathom.Test.LivenessMode
   alias Filo.Stmt
 
   @modes [:legacy, :heartbeat]
@@ -90,36 +91,6 @@ defmodule Fathom.ShardLeaseReleaseTest do
   end
 
   defp stmt(sql, args \\ []), do: %Stmt{sql: sql, args: args}
-
-  # Put the NEXT coordinator open into `mode`. The mode is captured at open (`acquire_gen`), so
-  # this must run before the shard is first opened. `Heartbeat.terminate/2` clears its own storage
-  # object on a clean stop, so `start_supervised!` is the whole cleanup.
-  defp set_mode!(:legacy) do
-    refute Heartbeat.running?(),
-           "legacy mode needs the heartbeat OFF; config/test.exs default is heartbeat_server: false"
-
-    :ok
-  end
-
-  defp set_mode!(:heartbeat) do
-    hb = start_supervised!({Heartbeat, ttl_ms: 30_000})
-    # Long TTL so it never lapses on its own; a test that wants a lapse forces one.
-    _ = :sys.get_state(hb)
-    assert Heartbeat.running?()
-    :ok
-  end
-
-  # Assert the coordinator actually opened in the mode we asked for, rather than trusting the
-  # setup. A scenario that silently ran legacy twice would look like two-mode coverage and be one.
-  defp assert_mode!(coordinator, :heartbeat) do
-    assert is_integer(:sys.get_state(coordinator).acquire_gen),
-           "expected heartbeat mode (non-nil acquire_gen) — the mode setup did not take"
-  end
-
-  defp assert_mode!(coordinator, :legacy) do
-    assert is_nil(:sys.get_state(coordinator).acquire_gen),
-           "expected legacy mode (nil acquire_gen) — something started the heartbeat"
-  end
 
   defp seed!(shard, value) do
     {:ok, conn} = ShardExecutor.open(shard)
@@ -202,12 +173,12 @@ defmodule Fathom.ShardLeaseReleaseTest do
   # proves nothing, because it reclaims its own lock silently.
   for mode <- @modes do
     describe "#{mode} mode — a data-PUT 412 on the drop path" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "releases the lock when the re-fenced upload fails", %{shard: shard} do
         seed!(shard, "unflushed")
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         assert Shard.dirty?(coordinator),
                "the fixture must be dirty or the drop takes the clean path"
@@ -260,7 +231,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
       test "releases the lock when the post-412 lock re-check is inconclusive", %{shard: shard} do
         seed!(shard, "unflushed")
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         assert Shard.dirty?(coordinator),
                "the fixture must be dirty or the drop takes the clean path"
@@ -303,12 +274,12 @@ defmodule Fathom.ShardLeaseReleaseTest do
 
   for mode <- @modes do
     describe "#{mode} mode — a TRANSIENT flush failure on the drop path" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "releases the lease, keeps the local copy", %{shard: shard} do
         seed!(shard, "unflushed")
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         assert Shard.dirty?(coordinator),
                "the fixture must be dirty or the drop takes the clean path"
@@ -336,7 +307,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
       test "the kept copy still serves the write that never reached storage", %{shard: shard} do
         seed!(shard, "unflushed")
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         prev = Application.get_env(:fathom, :storage_fault)
         Application.put_env(:fathom, :storage_fault, :flush)
@@ -358,12 +329,12 @@ defmodule Fathom.ShardLeaseReleaseTest do
     end
 
     describe "#{mode} mode — #11, dirty but the local file is gone" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       test "releases the lease rather than stranding it", %{shard: shard} do
         seed!(shard, "gone")
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         # Delete the local copy out from under the (dirty) coordinator and make sure it still
         # believes it is dirty. This is what a WriteCounter restart produces at fleet scale.
@@ -400,7 +371,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
 
         seed!(shard, "x")
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         path = Path.join(Shard.data_dir(), "#{shard}.db")
         for s <- ["", "-wal", "-shm"], do: File.rm(path <> s)
@@ -413,7 +384,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
     end
 
     describe "#{mode} mode — an EXCEPTION after the lease is acquired" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       # `handle_continue(:open, …)` holds the lock from `acquire_lease` until it RETURNS the built
       # state. Every failure the code anticipated is an `{:error, _}` TUPLE, which reaches
@@ -434,7 +405,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
         :ok = Shards.flush(shard)
 
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
         ref = Process.monitor(coordinator)
         Process.exit(coordinator, :kill)
         assert_receive {:DOWN, ^ref, :process, ^coordinator, :killed}, 5_000
@@ -469,7 +440,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
 
   for mode <- @modes do
     describe "#{mode} mode — the lock's etag rotated under a live holder" do
-      setup do: set_mode!(unquote(mode))
+      setup do: LivenessMode.set!(unquote(mode))
 
       # The LAST variant of the leaked-lock class, and the one that survived #9, #11 and the
       # 2026-08-04 drop-path fixes: it is not in any CALLER, it is in `release_lease` itself.
@@ -502,7 +473,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
       test "a normal drop still frees the lock", %{shard: shard} do
         seed!(shard, "rotated")
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         # Rotate the lock's etag behind the coordinator, exactly as a same-owner re-acquire does.
         # The lease the coordinator holds now carries a stale lock_etag.
@@ -524,7 +495,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
       } do
         seed!(shard, "stolen")
         {:ok, coordinator} = Shards.ensure(shard)
-        assert_mode!(coordinator, unquote(mode))
+        LivenessMode.assert!(coordinator, unquote(mode))
 
         # A different owner now holds the lock. Our release must be a no-op.
         Fathom.Test.FaultyStorage.replace_lock_owner(shard, "thief@othernode#deadbeef")
@@ -542,12 +513,12 @@ defmodule Fathom.ShardLeaseReleaseTest do
     # and that PUT is what rotates the lock's etag and made releasing with the pre-fence lease a
     # silent no-op. Heartbeat mode performs no per-shard renew, so this mechanism cannot occur
     # there. Reachable in production from any Heartbeat restart (finding #29).
-    setup do: set_mode!(:legacy)
+    setup do: LivenessMode.set!(:legacy)
 
     test "a dirty shard's drain leaves the lock FREE, so a peer can take it", %{shard: shard} do
       seed!(shard, "dirty")
       {:ok, coordinator} = Shards.ensure(shard)
-      assert_mode!(coordinator, :legacy)
+      LivenessMode.assert!(coordinator, :legacy)
       drain_and_wait!(shard, coordinator)
 
       assert Storage.lease_holder(shard) == :free,
@@ -573,12 +544,12 @@ defmodule Fathom.ShardLeaseReleaseTest do
     # conditional `DELETE … If-Match: <the etag we last wrote>`, so if ownership was genuinely lost
     # the delete no-ops on someone else's lock. Either we still hold it (release, correct) or we do
     # not (no-op, correct). There is no third case where this deletes a lock that is not ours.
-    setup do: set_mode!(:legacy)
+    setup do: LivenessMode.set!(:legacy)
 
     test "releases the lease rather than stranding it", %{shard: shard} do
       seed!(shard, "unconfirmed")
       {:ok, coordinator} = Shards.ensure(shard)
-      assert_mode!(coordinator, :legacy)
+      LivenessMode.assert!(coordinator, :legacy)
       assert Shard.dirty?(coordinator), "the fixture must be dirty to reach flush_then_drop/1"
 
       put_fault!(:renew)
@@ -612,12 +583,12 @@ defmodule Fathom.ShardLeaseReleaseTest do
     # moment, not a contrivance: it is exactly what the safety margin exists to catch, and it
     # happens whenever a renewal runs late. Publish a past deadline at the SAME generation — a
     # different generation would route to `:revalidate` instead.
-    setup do: set_mode!(:heartbeat)
+    setup do: LivenessMode.set!(:heartbeat)
 
     test "releases the lease rather than stranding it", %{shard: shard} do
       seed!(shard, "hb-unconfirmed")
       {:ok, coordinator} = Shards.ensure(shard)
-      assert_mode!(coordinator, :heartbeat)
+      LivenessMode.assert!(coordinator, :heartbeat)
       assert Shard.dirty?(coordinator), "the fixture must be dirty to reach flush_then_drop/1"
 
       hb = Process.whereis(Heartbeat)
@@ -655,12 +626,12 @@ defmodule Fathom.ShardLeaseReleaseTest do
     # NOT a regression test — it passes against the unfixed code. It is labelled here so nobody
     # reads it as one, and so the next person does not "simplify" the `:not_valid` fixture above
     # back into this one.
-    setup do: set_mode!(:heartbeat)
+    setup do: LivenessMode.set!(:heartbeat)
 
     test "a coordinator opened in heartbeat mode still releases its lock", %{shard: shard} do
       seed!(shard, "hb-crash")
       {:ok, coordinator} = Shards.ensure(shard)
-      assert_mode!(coordinator, :heartbeat)
+      LivenessMode.assert!(coordinator, :heartbeat)
 
       stop_supervised!(Heartbeat)
       refute Heartbeat.running?()
@@ -712,7 +683,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
 
       seed!(shard, "read-mostly")
       {:ok, coordinator} = Shards.ensure(shard)
-      assert_mode!(coordinator, :heartbeat)
+      LivenessMode.assert!(coordinator, :heartbeat)
 
       # Drain the write the fixture made, so the shard is genuinely CLEAN — the state in which the
       # old code could never start the clock.
@@ -783,7 +754,7 @@ defmodule Fathom.ShardLeaseReleaseTest do
     test "a durability flush still uploads while the Heartbeat process is down", %{shard: shard} do
       seed!(shard, "before-crash")
       {:ok, coordinator} = Shards.ensure(shard)
-      assert_mode!(coordinator, :heartbeat)
+      LivenessMode.assert!(coordinator, :heartbeat)
 
       stop_supervised!(Heartbeat)
       refute Heartbeat.running?()
