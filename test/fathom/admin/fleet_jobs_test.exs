@@ -80,6 +80,26 @@ defmodule Fathom.Admin.FleetJobsTest do
       assert %{count: 1} = Enum.find(rows, &(&1.worker == "A.Worker" and &1.state == "discarded"))
       assert %{count: 2} = Enum.find(rows, &(&1.worker == "B.Worker" and &1.state == "discarded"))
     end
+
+    # `completed` is excluded so the panel's group-by does not scan the Pruner's 7-day retention of
+    # completed jobs — millions of rows after a fleet rollout, counted on every dashboard refresh.
+    # This is seeded on purpose: over an empty table the exclusion is vacuously true, so a test that
+    # inserted nothing passed with the `where` clause deleted (cleanliness audit 2026-11-13 #8).
+    test "counts the actionable states and excludes completed" do
+      insert_job(%{worker: "Done.Worker", state: "completed"})
+      insert_job(%{worker: "Live.Worker", state: "available"})
+      insert_job(%{worker: "Retry.Worker", state: "retryable"})
+
+      rows = Fleet.oban_counts()
+
+      assert %{count: 1} = Enum.find(rows, &(&1.worker == "Live.Worker"))
+      assert %{count: 1} = Enum.find(rows, &(&1.worker == "Retry.Worker"))
+
+      refute Enum.any?(rows, &(&1.state == "completed")),
+             "completed jobs must not be counted: #{inspect(rows)}"
+
+      refute Enum.any?(rows, &(&1.worker == "Done.Worker"))
+    end
   end
 
   describe "failed_jobs/0" do

@@ -36,18 +36,9 @@ defmodule Fathom.Admin.FleetTest do
     assert overview.by_status == %{"active" => 1, "migration_failed" => 1, "deleted" => 1}
   end
 
-  # `completed` is excluded so the panel's group-by does not scan the Pruner's 7-day retention of
-  # completed jobs — millions of rows after a fleet rollout, counted on every dashboard refresh.
-  test "oban_counts covers the actionable states and excludes completed" do
-    assert is_list(Fleet.oban_counts())
-
-    states =
-      Fleet.oban_counts()
-      |> Enum.map(& &1.state)
-      |> Enum.uniq()
-
-    refute "completed" in states
-  end
+  # The `oban_counts/0` state filter is tested against seeded jobs in `fleet_jobs_test.exs`. A test here
+  # used to assert `refute "completed" in states` over an EMPTY table, which passes with the filter
+  # removed (cleanliness audit 2026-11-13 #8).
 
   test "Nodes.all + node_roster tag alive nodes and carry the published p99" do
     :ok = Nodes.beat("fathom1", q_p99: 12.0, sample_count: 5)
