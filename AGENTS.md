@@ -86,7 +86,7 @@ agents (e.g. Codex) read only this file.
 mix setup          # deps.get + ecto.setup (Postgres) + assets
 mix compile        # build (mix precommit uses --warnings-as-errors)
 mix test           # creates+migrates the test Postgres DB, then runs tests
-mix test test/fathom_web/controllers/page_controller_test.exs:7  # single test
+mix test test/fathom_web/controllers/page_controller_test.exs:6  # single test
 mix test --failed  # rerun last failures
 mix format         # format
 mix precommit      # the gate: compile --warnings-as-errors, deps.unlock --unused, format, dialyzer, test

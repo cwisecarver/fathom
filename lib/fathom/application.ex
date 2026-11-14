@@ -1218,7 +1218,6 @@ defmodule Fathom.Application do
   # Everything else depends on Repo/PubSub, so this plane starts first.
   defp infra_children do
     [
-      FathomWeb.Telemetry,
       Fathom.Repo,
       # PARTITIONED like `Fathom.ShardRegistry` (expert review 2026-08-26 #18), and for the same
       # reason that Registry was: it now holds the same one-row-per-coordinator population.
