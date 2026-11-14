@@ -592,18 +592,24 @@ same way AGENTS.md says to treat a suspiciously good benchmark: unproven until i
 `sqlite3_wal_hook()` settings."* Auto-checkpointing **is** a built-in WAL hook; registering ours
 evicts it.
 
-Both orderings are wrong, and fathom is currently in the worse one:
+Both orderings are wrong:
 
 - **Pragma after hook** → the pragma silently evicts our hook. A2 quietly ships nothing; the shard
   looks replicated and is not.
 - **Hook after pragma** → our hook evicts auto-checkpointing. **The WAL grows without bound.**
 
-`Fathom.Shard.Connection.configure_readwrite/3` runs `configure/1` first
-(`lib/fathom/shard/connection.ex:79`, which sets `PRAGMA wal_autocheckpoint=4000` at `:196`) and
-`load_extension/1` second (`:80`). So a hook registered naïvely from `fathom_udf` lands in the
-**second** case — unbounded WAL growth on every tenant connection, presenting as the disk-fill
-failure that expert review #36 built `FathomDiskFillingUp` for, with the diagnostic pointing at
-storage rather than at this.
+*How this was resolved* (cleanliness audit 2026-11-13 #15 rewrote this paragraph from "fathom is
+currently in the worse ordering", which described the code before expert review 2026-10-22 r8 #14).
+That version had `configure_readwrite` run the pragma first and `load_extension` second, so a hook
+registered naïvely from `fathom_udf` landed in the second case: unbounded WAL growth on every tenant
+connection, presenting as the disk-fill failure that expert review #36 built `FathomDiskFillingUp`
+for, with the diagnostic pointing at storage rather than at this. Today `rw_open_sql/2` in
+`lib/fathom/shard/connection.ex` chooses **one or the other, never both**: under the auto-extension
+(`mode == :auto`) the open batch runs `SELECT fathom_conn_init()` *in place of*
+`PRAGMA wal_autocheckpoint=4000`, and that call installs a hook which re-implements the same
+4000-frame PASSIVE checkpoint (`native/fathom_udf/src/wal.rs`); without the extension it runs the
+pragma. Nothing after that batch touches the slot, and `wal_hook_test.exs` asserts both halves (the
+hook fires; the WAL still truncates).
 
 That threshold is not a default to be casually displaced: it was deliberately raised from SQLite's
 1000 frames to 4000 by expert review 2026-07-24 #4, because an autocheckpoint runs **inline inside
