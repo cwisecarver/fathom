@@ -341,6 +341,20 @@ defmodule Fathom.Shard.ProtocolSigningTest do
       assert Fathom.Application.check_replication_frame_auth!() == nil
     end
 
+    # Cleanliness audit 2026-11-13 #5: compose passes `REPLICATION_HMAC_SECRET: "${X:-}"`, which is "" when
+    # unset. runtime.exs stored it, and `"" || hrana_secret` is "" (truthy), so the fallback above was
+    # never reached and the boot refused with a message pointing at the wrong fix.
+    test "an EMPTY replication secret does not shadow the Hrana fallback" do
+      Application.put_env(:fathom, :replication_hmac_secret, "")
+      Application.put_env(:fathom, :hrana_token_secret, "an-existing-fleet-wide-hrana-secret")
+      FrameAuth.forget_key()
+      sign!(true)
+      require!(true)
+
+      assert FrameAuth.key_configured?()
+      assert Fathom.Application.check_replication_frame_auth!() == nil
+    end
+
     test "both flags off is always fine, key or no key" do
       Application.delete_env(:fathom, :replication_hmac_secret)
       Application.delete_env(:fathom, :hrana_token_secret)

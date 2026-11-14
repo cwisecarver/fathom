@@ -665,4 +665,23 @@ defmodule Fathom.RuntimeConfigTest do
       end
     end
   end
+
+  # Cleanliness audit 2026-11-13 #5: an empty REPLICATION_HMAC_SECRET (the compose `"${X:-}"` shape) is
+  # unset, so it must not be written and must not shadow HRANA_TOKEN_SECRET.
+  test "an empty REPLICATION_HMAC_SECRET is unset; a value is stored" do
+    refute Keyword.has_key?(
+             fathom_config(%{"REPLICATION_HMAC_SECRET" => ""}),
+             :replication_hmac_secret
+           )
+
+    refute Keyword.has_key?(
+             fathom_config(%{"REPLICATION_HMAC_SECRET" => nil}),
+             :replication_hmac_secret
+           )
+
+    assert Keyword.fetch!(
+             fathom_config(%{"REPLICATION_HMAC_SECRET" => "s3cret-value"}),
+             :replication_hmac_secret
+           ) == "s3cret-value"
+  end
 end

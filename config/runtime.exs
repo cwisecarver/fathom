@@ -1417,8 +1417,15 @@ end
 # HRANA_TOKEN_SECRET — so a fleet already distributing one shared secret does not have to
 # distribute a second, while an operator who wants them rotated independently can have that. Both
 # flags above refuse to boot without one.
-if secret = System.get_env("REPLICATION_HMAC_SECRET") do
-  config :fathom, :replication_hmac_secret, secret
+#
+# EMPTY IS UNSET (cleanliness audit 2026-11-13 #5), like every `env_*` helper here and the compose
+# convention `REPLICATION_HMAC_SECRET: "${REPLICATION_HMAC_SECRET:-}"`. Storing the empty string made
+# `FrameAuth.configured_secret/0` return `""` (truthy), so the documented HRANA_TOKEN_SECRET fallback was
+# never reached and a node with only the Hrana secret refused to boot with "set REPLICATION_HMAC_SECRET,
+# or HRANA_TOKEN_SECRET".
+case System.get_env("REPLICATION_HMAC_SECRET") do
+  secret when secret not in [nil, ""] -> config :fathom, :replication_hmac_secret, secret
+  _ -> :ok
 end
 
 # THE LINEAGE-CARRYING SEED FRAME (expert review 2026-08-24 #12). The second wire-shape gate, and

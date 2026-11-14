@@ -188,8 +188,12 @@ defmodule Fathom.Shard.Replication.FrameAuth do
 
   # The Hrana secret is the FALLBACK, not the default, and the order matters: an operator who sets
   # REPLICATION_HMAC_SECRET wants the two rotated independently, so it must win.
+  #
+  # An EMPTY secret is no secret (cleanliness audit 2026-11-13 #5): `"" || fallback` returns `""`, which is
+  # truthy, so an empty value anywhere in the app env would shadow the fallback and derive no key.
   defp configured_secret do
-    Application.get_env(:fathom, :replication_hmac_secret) ||
-      Application.get_env(:fathom, :hrana_token_secret)
+    [:replication_hmac_secret, :hrana_token_secret]
+    |> Enum.map(&Application.get_env(:fathom, &1))
+    |> Enum.find(&(is_binary(&1) and &1 != ""))
   end
 end
