@@ -43,6 +43,7 @@ defmodule Fathom.Shard.Replication.Session do
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication
   alias Fathom.Shard.Replication.LagGauge
+  alias Fathom.Shard.Replication.Pin
   alias Fathom.Shard.Replication.Primary
   alias Fathom.Shard.Replication.Priority
   alias Fathom.Shard.Replication.Protocol, as: ReplProtocol
@@ -504,7 +505,7 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   # Whether quorum-acked replicas hold everything up to `header` — the question the coordinator's
-  # flush asks before it checkpoints (`checkpoint_after_snapshot/2`).
+  # flush asks before it checkpoints (`FlushCheckpoint.after_snapshot/2`).
   #
   # The same laggard rule as the threshold checkpoint (expert review 2026-10-20 #8): Q-covered but
   # a connected follower still owed frames ⇒ not yet, below `laggard_wait_bytes/0`, with the
@@ -1950,8 +1951,8 @@ defmodule Fathom.Shard.Replication.Session do
     #
     # The header above came from a `Wal.read/1` in `ship/5`; the payloads come from separate
     # held-fd preads here. Nothing serialises this READ against a log restart. The coordinator's
-    # flush task runs OFF-PROCESS by design and does call into this module (`checkpoint_after_snapshot/3`,
-    # `with_flush_pin/3`: its checkpoints are pinned and quorum-gated, so they cannot backfill frames this
+    # flush task runs OFF-PROCESS by design and does call into this module (`FlushCheckpoint.after_snapshot/3`,
+    # `Pin.with_flush_pin/3`: its checkpoints are pinned and quorum-gated, so they cannot backfill frames this
     # Session has not read), but a pin is about which frames may be folded, not a lock on the file while a
     # payload is being read. And `native/fathom_udf/src/wal.rs` gives the tenant's OWN commit thread a
     # second source of the same generation change at 4000 frames, with no pin at all. So the recheck below
@@ -2400,7 +2401,7 @@ defmodule Fathom.Shard.Replication.Session do
   #     the pin and a checkout grant, off the reply path (`maybe_pin/2`, `start_checkpoint/3`) — so
   #     it pays the open only on a commit that crosses the threshold;
   #   * the coordinator's post-snapshot PASSIVE (`Fathom.Shard.Snapshot.do_snapshot/3`) calls
-  #     `checkpoint_after_snapshot/2`, which pins and asks this Session `{:covers, header}`;
+  #     `FlushCheckpoint.after_snapshot/2`, which pins and asks this Session `{:covers, header}`;
   #   * a tenant's own `PRAGMA wal_checkpoint` is refused on a registered file by the extension's
   #     authorizer (`pragma_guard.rs`).
   #
@@ -2450,7 +2451,8 @@ defmodule Fathom.Shard.Replication.Session do
   @seen_generations 4
 
   # The hook's 4000-frame threshold at the default 4 KiB page, in bytes because the header is.
-  defp checkpoint_bytes,
+  @doc false
+  def checkpoint_bytes,
     do: Application.get_env(:fathom, :replication_checkpoint_bytes, @default_checkpoint_bytes)
 
   # How much further a WAL must grow before a skipped or ineffective attempt is retried.
@@ -2465,103 +2467,6 @@ defmodule Fathom.Shard.Replication.Session do
   # Past this, an uncovered checkpoint runs anyway (see THE BOUND above).
   defp checkpoint_force_bytes,
     do: Application.get_env(:fathom, :replication_checkpoint_force_bytes, 4 * checkpoint_bytes())
-
-  @doc """
-  The coordinator's post-snapshot checkpoint, on the flush's own connection `conn`.
-
-  Replication off (or no shard id): the unconditional `PRAGMA wal_checkpoint(PASSIVE)` it always
-  was. Replication on: pinned and gated on the quorum holding the WAL — see "Checkpoints of a
-  replicated WAL" above. Never raises; a skipped checkpoint is retried at the next flush.
-  """
-  #
-  # `opts[:before_checkpoint]` is a TEST seam (a 0-arity fun run after the covers check and before
-  # the PASSIVE): it is how `replication_unshipped_checkpoint_test.exs` lands a commit inside that
-  # window, proving the pin — not the covers check — is what protects a late commit.
-  #
-  # STARVATION, KNOWN AND ACCEPTED: the header is read here, outside the Session, so on a shard with
-  # a commit in flight it is usually a few frames ahead of what the quorum has acked and `covers`
-  # answers false. On a steadily written shard this checkpoint therefore rarely runs, and the WAL is
-  # bounded by the Session's own threshold checkpoint (which pins before its ship, so it is covered
-  # as soon as that ship lands). It still runs on every quiet shard, which is where it matters.
-  #
-  # COUNTED, AND SKIPPED WHEN SMALL UNDER REPLICATION (expert review 2026-10-20 #15). Every outcome
-  # emits `[:fathom, :shard, :flush_checkpoint]` tagged `result` (`:ran | :busy |
-  # :skipped_not_covered | :skipped_small | :skipped_no_session | :error`) and `replicated`; before,
-  # only the Session's threshold checkpoints were counted, so nothing showed that a write-active
-  # replicated shard took a WAL generation reset (follower absorb = 2 fsyncs, plus a reset round on
-  # the next commit) on EVERY flush — the measured 22-25% txn/s gap between a 5 s and a 30 s flush
-  # interval. Under replication the PASSIVE now runs only once the WAL's commit extent reaches
-  # `flush_checkpoint_min_bytes/0` (1/4 of the Session threshold, ~4 MB): the snapshot does not
-  # need it (VACUUM INTO reads `.db` + WAL), the Session's threshold checkpoint bounds a busy WAL,
-  # and the covered idle close (#7) folds a quiet one. The original reason for this checkpoint
-  # (2026-07-24 #4: SQLite's autocheckpoint billed to a tenant statement) does not apply under A2,
-  # where the extension hook steps aside and the Session checkpoints off the reply path.
-  # Replication OFF is unchanged: the unconditional PASSIVE.
-  @spec checkpoint_after_snapshot(reference(), String.t() | nil, keyword()) ::
-          {:ok, map()} | {:error, term()} | :skipped
-  def checkpoint_after_snapshot(conn, shard_id, opts \\ []) do
-    replicated? = is_binary(shard_id) and enabled?()
-
-    {result, outcome} =
-      if replicated? do
-        case lookup(shard_id) do
-          # No Session: nothing has shipped for this shard under this coordinator, and the
-          # extension hook has not been told to step aside, so there is nothing to gate on.
-          # Skipping is the safe direction; the WAL stays bounded by the hook and the idle close.
-          nil -> {:skipped, :skipped_no_session}
-          pid -> pinned_flush_checkpoint(conn, pid, Fathom.Shard.db_path(shard_id), opts)
-        end
-      else
-        passive(conn)
-      end
-
-    :telemetry.execute(
-      [:fathom, :shard, :flush_checkpoint],
-      %{count: 1},
-      %{result: outcome, replicated: replicated?}
-    )
-
-    result
-  end
-
-  @doc """
-  The REPLICATION-OFF flush PASSIVE, run BEFORE the pinned-live route takes its pin rather than
-  after a `VACUUM INTO` (expert review 2026-10-21 #11). Counted like `checkpoint_after_snapshot/3`
-  (`replicated: false`).
-
-  Never call it for a replicated shard: under A2 a flush checkpoint is pinned and quorum-gated
-  (`checkpoint_after_snapshot/3`), and the user decision of 2026-10-21 is that the replicated flush
-  gains NO new checkpoint (each one is a WAL-generation reset the followers pay for).
-  """
-  @spec checkpoint_before_pin(reference()) :: {:ok, map()} | {:error, term()}
-  def checkpoint_before_pin(conn) do
-    {result, outcome} = passive(conn)
-
-    :telemetry.execute(
-      [:fathom, :shard, :flush_checkpoint],
-      %{count: 1},
-      %{result: outcome, replicated: false}
-    )
-
-    result
-  end
-
-  defp passive(conn) do
-    case Connection.query(conn, "PRAGMA wal_checkpoint(PASSIVE)", []) do
-      {:ok, %{rows: [[1 | _] | _]}} = r -> {r, :busy}
-      {:ok, _} = r -> {r, :ran}
-      other -> {other, :error}
-    end
-  end
-
-  # 0 disables the size gate (every flush checkpoints, as before #15) — the rig A/B lever.
-  defp flush_checkpoint_min_bytes,
-    do:
-      Application.get_env(
-        :fathom,
-        :replication_flush_checkpoint_min_bytes,
-        div(checkpoint_bytes(), 4)
-      )
 
   @doc """
   The coordinator's covered-idle-close ask (expert review 2026-10-20 #7), sent from the coordinator
@@ -2590,152 +2495,14 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
-  defp lookup(shard_id) do
+  @doc false
+  def lookup(shard_id) do
     case Registry.lookup(@registry, shard_id) do
       [{pid, _}] -> pid
       [] -> nil
     end
   rescue
     ArgumentError -> nil
-  end
-
-  defp pinned_flush_checkpoint(conn, session, db_path, opts) do
-    wal = db_path <> "-wal"
-
-    # The size gate reads the header BEFORE pinning, so a small WAL — the common case on a flush —
-    # costs one header read and never the pin's connection open (~0.4 ms). The decision to RUN is
-    # still made on a header read under the pin, below.
-    if small_wal?(wal) do
-      {:skipped, :skipped_small}
-    else
-      case with_pin(db_path, fn -> covered_passive(conn, session, wal, opts) end) do
-        :skipped ->
-          {:skipped, :error}
-
-        {result, _outcome} = verdict ->
-          # rv6 F1: the coordinator's checkpoint fsyncs this WAL through ITS fd, so an IOERR it
-          # consumed is one the Session's next fdatasync will not see. Tell the Session.
-          if WalSync.io_error?(result), do: send(session, {:checkpoint_io_error, result})
-          verdict
-      end
-    end
-  catch
-    :exit, _ -> {:skipped, :skipped_not_covered}
-  end
-
-  defp covered_passive(conn, session, wal, opts) do
-    # `index: true` (expert review 2026-10-20 #1/#17): the covers-check must not count a torn
-    # stale-tail frame, and it is one index pread instead of the backward walk.
-    with {:ok, %{} = header} <- Wal.read(wal, index: true),
-         true <- GenServer.call(session, {:covers, header}, 1_000) do
-      if hook = opts[:before_checkpoint], do: hook.()
-      passive(conn)
-    else
-      {:ok, :empty} -> {:skipped, :skipped_small}
-      _ -> {:skipped, :skipped_not_covered}
-    end
-  end
-
-  defp small_wal?(wal) do
-    case flush_checkpoint_min_bytes() do
-      min when is_integer(min) and min > 0 ->
-        case Wal.read(wal, index: true) do
-          {:ok, %{commit_extent: e}} -> e < min
-          {:ok, :empty} -> true
-          _ -> false
-        end
-
-      _ ->
-        false
-    end
-  end
-
-  @doc """
-  Run `fun.(pin_conn, release)` while a read snapshot is pinned on `db_path` (expert review
-  2026-10-20 #28).
-
-  The pin is a read transaction on its own handle, so no checkpoint can backfill into the
-  `.db` while it is held (the checkpointer takes read-lock 0 exclusively to write pages, and
-  limits itself to the oldest read mark): the main file's bytes are frozen for the duration, and
-  `pin_conn` reads exactly them. `:skipped` if the pin could not be opened.
-
-  Unlike the `:ro` pins of `pinned_flush_checkpoint/4`, this handle is opened READ-WRITE (and only
-  ever reads): the flush's caller may hold no other connection, so this close can be the LAST one,
-  and the last close must run SQLite's close-time checkpoint and unlink `-wal`/`-shm` exactly as
-  the flush's old snapshot connection did. A `:ro` handle leaves a zero-length `-wal` and a stale
-  `-shm` behind (`PoolGraceTest` pins the unlink).
-
-  `release` (expert review 2026-10-21 r7 #23) ends the pin EARLY, once `fun` no longer needs the
-  main file frozen: an encoding backend has captured the body in its own temp before the PUT, and
-  holding the pin through the PUT only stops every checkpoint for the PUT's duration. Idempotent;
-  the pin is released on return regardless.
-  """
-  @spec with_flush_pin(Path.t(), (reference(), (-> :ok) -> result), keyword()) ::
-          result | :skipped
-        when result: var
-  def with_flush_pin(db_path, fun, opts \\ []) when is_function(fun, 2) do
-    with {:ok, _} <- Fathom.FS.stat(db_path),
-         {:ok, pin} <- Connection.open(db_path) do
-      released = :atomics.new(1, [])
-
-      release = fn ->
-        if :atomics.compare_exchange(released, 1, 0, 1) == :ok, do: release_pin(pin)
-        :ok
-      end
-
-      try do
-        # `:before_pin` runs on this handle BEFORE its read transaction begins (expert review
-        # 2026-10-21 #11: the replication-off flush's PASSIVE, moved ahead of the pin so the pin
-        # can find the WAL fully backfilled).
-        if before = opts[:before_pin], do: before.(pin)
-
-        case pin_snapshot(pin) do
-          :ok -> fun.(pin, release)
-          {:error, _} -> :skipped
-        end
-      after
-        release.()
-      end
-    else
-      _ -> :skipped
-    end
-  end
-
-  # Holds a read snapshot on `db_path` around `fun`. The pin's connection is closed only after
-  # `fun` returns, and every caller holds another connection to the same file across it (a stream's,
-  # or the flush's), so this close is never the LAST one — the close that runs SQLite's close-time
-  # checkpoint and unlinks the WAL.
-  defp with_pin(db_path, fun) do
-    case open_pin(db_path) do
-      {:ok, pin} ->
-        try do
-          fun.()
-        after
-          release_pin(pin)
-        end
-
-      _ ->
-        :skipped
-    end
-  end
-
-  defp open_pin(db_path) do
-    with {:ok, _} <- Fathom.FS.stat(db_path),
-         {:ok, conn} <- Connection.open(db_path, scope: :ro) do
-      case pin_snapshot(conn) do
-        :ok ->
-          {:ok, conn}
-
-        {:error, reason} ->
-          Connection.close(conn)
-          {:error, reason}
-      end
-    end
-  end
-
-  defp release_pin(conn) do
-    _ = Connection.rollback_if_open(conn)
-    Connection.close(conn)
   end
 
   # Tell the extension's commit hook to leave this WAL to us. Once per Session, on its first commit
@@ -2898,7 +2665,7 @@ defmodule Fathom.Shard.Replication.Session do
       %{salt1: s, commit_extent: e} = state.last_header
       state = %{state | ckpt_at: {s, e}, last_header: nil}
 
-      case open_pin(String.replace_suffix(wal_path, "-wal", "")) do
+      case Pin.open(String.replace_suffix(wal_path, "-wal", "")) do
         {:ok, pin} -> {pin, state}
         _ -> {nil, state}
       end
@@ -2917,7 +2684,7 @@ defmodule Fathom.Shard.Replication.Session do
   defp start_checkpoint(state, pin, wal_path) do
     case checkpoint_verdict(state) do
       :skip ->
-        release_pin(pin)
+        Pin.release(pin)
         state
 
       # #8: Q-covered, but a connected follower has not been sent everything. Skip this attempt —
@@ -2925,7 +2692,7 @@ defmodule Fathom.Shard.Replication.Session do
       # — and kick the laggard with the catch-up retry, which on a busy shard the next commit
       # pre-empts anyway (a commit re-plans for every follower).
       :deferred ->
-        release_pin(pin)
+        Pin.release(pin)
 
         :telemetry.execute(
           [:fathom, :replication, :checkpoint_deferred],
@@ -3003,7 +2770,7 @@ defmodule Fathom.Shard.Replication.Session do
                 if WalSync.io_error?(result), do: send(parent, {:checkpoint_io_error, result})
                 result
               after
-                release_pin(pin)
+                Pin.release(pin)
                 Fathom.Shard.checkin(coordinator, ref)
               end
 
@@ -3019,7 +2786,7 @@ defmodule Fathom.Shard.Replication.Session do
             )
 
           _ ->
-            release_pin(pin)
+            Pin.release(pin)
             send(parent, {tag, :refused})
         end
       end)
@@ -3048,7 +2815,7 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   defp quietly_release(pin) do
-    release_pin(pin)
+    Pin.release(pin)
   rescue
     _ -> :ok
   catch
@@ -3954,32 +3721,26 @@ defmodule Fathom.Shard.Replication.Session do
   end
 
   # Holds a read transaction on `db_path` for the duration of `fun` — see the note above
-  # `do_seed/6`. `file_size/1` first because a `:ro` `Connection.open/2` materializes an ABSENT
-  # file, and a seed of a shard with no `.db` must fail as it always did, not ship an empty database.
-  # A trusted handle (no `tenant?`): no authorizer, no statement deadline.
+  # `do_seed/6`. A seed of a shard with no `.db` must fail as it always did (`Pin.open/1` stats first),
+  # and a snapshot that cannot be taken is the seed's own `:seed_snapshot_failed`.
   defp with_pinned_snapshot(db_path, fun) do
-    with {:ok, _} <- file_size(db_path),
-         {:ok, conn} <- Connection.open(db_path, scope: :ro) do
-      try do
-        case pin_snapshot(conn) do
-          :ok -> fun.()
-          {:error, reason} -> {:error, {:seed_snapshot_failed, reason}}
-        end
-      after
+    case Pin.open(db_path) do
+      {:ok, conn} ->
         # `conn` used here is also what keeps the handle reachable for the whole stream: a NIF
         # resource nothing references is finalized at the next GC, which releases the snapshot
-        # mid-stream (probed: with these two lines dropped, the snapshot regression test in
+        # mid-stream (probed: with the `after` dropped, the snapshot regression test in
         # seed_pinned_snapshot_test.exs failed in 1 run of 4).
-        _ = Connection.rollback_if_open(conn)
-        Connection.close(conn)
-      end
-    end
-  end
+        try do
+          fun.()
+        after
+          Pin.release(conn)
+        end
 
-  # BEGIN alone takes no snapshot (it is DEFERRED); the read is what acquires the WAL read mark.
-  defp pin_snapshot(conn) do
-    with :ok <- Connection.exec(conn, "BEGIN") do
-      Connection.exec(conn, "SELECT 1 FROM sqlite_schema LIMIT 1")
+      {:error, {:snapshot_failed, reason}} ->
+        {:error, {:seed_snapshot_failed, reason}}
+
+      other ->
+        other
     end
   end
 

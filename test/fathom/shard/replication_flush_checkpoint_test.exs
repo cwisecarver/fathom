@@ -13,7 +13,7 @@ defmodule Fathom.Shard.ReplicationFlushCheckpointTest do
   use ExUnit.Case, async: false
 
   alias Fathom.Shard.Connection
-  alias Fathom.Shard.Replication.{Fleet, Follower, Session, Wal}
+  alias Fathom.Shard.Replication.{Fleet, Follower, FlushCheckpoint, Session, Wal}
   alias Fathom.Shards
   alias Fathom.Test.Env
 
@@ -131,7 +131,7 @@ defmodule Fathom.Shard.ReplicationFlushCheckpointTest do
     {:ok, %{commit_extent: e}} = Wal.read(s.wal)
     assert e < 20 * @frame, "precondition: below the size gate"
 
-    assert :skipped = Session.checkpoint_after_snapshot(s.flush, ctx.id)
+    assert :skipped = FlushCheckpoint.after_snapshot(s.flush, ctx.id)
     assert_receive {:flush_checkpoint, %{result: :skipped_small, replicated: true}}
   end
 
@@ -142,7 +142,7 @@ defmodule Fathom.Shard.ReplicationFlushCheckpointTest do
     assert e >= 20 * @frame, "precondition: past the size gate"
     await_all_current!(s)
 
-    assert {:ok, _} = Session.checkpoint_after_snapshot(s.flush, ctx.id)
+    assert {:ok, _} = FlushCheckpoint.after_snapshot(s.flush, ctx.id)
     assert_receive {:flush_checkpoint, %{result: :ran, replicated: true}}
     {log, ckpt} = backfilled(s)
     assert ckpt == log
@@ -154,7 +154,7 @@ defmodule Fathom.Shard.ReplicationFlushCheckpointTest do
     write!(s, 4)
     await_all_current!(s)
 
-    assert {:ok, _} = Session.checkpoint_after_snapshot(s.flush, ctx.id)
+    assert {:ok, _} = FlushCheckpoint.after_snapshot(s.flush, ctx.id)
     assert_receive {:flush_checkpoint, %{result: :ran, replicated: true}}
   end
 
@@ -165,7 +165,7 @@ defmodule Fathom.Shard.ReplicationFlushCheckpointTest do
     {:ok, _} = Connection.query(conn, "CREATE TABLE t (a INTEGER)", [])
     {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (1)", [])
 
-    assert {:ok, %{rows: [[0, log, log]]}} = Session.checkpoint_after_snapshot(conn, nil)
+    assert {:ok, %{rows: [[0, log, log]]}} = FlushCheckpoint.after_snapshot(conn, nil)
     assert_receive {:flush_checkpoint, %{result: :ran, replicated: false}}
   end
 end

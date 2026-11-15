@@ -286,7 +286,7 @@ defmodule Fathom.Shard.Snapshot do
   #
   # FENCE ORDER UNCHANGED: `pre` is still read before this snapshot (the stamp under-claims), the
   # snapshot still runs after `Fence.check` and before `recheck_before_put` and the pre-PUT intent,
-  # and `checkpoint_after_snapshot/3` still runs after the read transaction ended, on this handle.
+  # and `FlushCheckpoint.after_snapshot/3` still runs after the read transaction ended, on this handle.
   # The temp is written raw with no fsync, the same no-durability argument as `do_snapshot/3`'s
   # synchronous=OFF: it is read back in-process for the digest and the PUT and unlinked after.
   defp serialize_eligible?,
@@ -372,7 +372,7 @@ defmodule Fathom.Shard.Snapshot do
           emit_snapshot_mode(id, :serialize)
           # The read transaction has ended, so this PASSIVE is the same one `do_snapshot/3` runs
           # after its VACUUM (pinned + quorum-gated under A2).
-          Fathom.Shard.Replication.Session.checkpoint_after_snapshot(conn, id)
+          Fathom.Shard.Replication.FlushCheckpoint.after_snapshot(conn, id)
           :ok
 
         {:error, reason} ->
@@ -510,7 +510,7 @@ defmodule Fathom.Shard.Snapshot do
     # log restart then erased it before any replica held it. With replication off this is the same
     # unconditional PASSIVE as before. See "Checkpoints of a replicated WAL" in `Session`.
     if match?({:ok, _}, result),
-      do: Fathom.Shard.Replication.Session.checkpoint_after_snapshot(conn, shard_id)
+      do: Fathom.Shard.Replication.FlushCheckpoint.after_snapshot(conn, shard_id)
 
     case result do
       {:ok, _} -> :ok

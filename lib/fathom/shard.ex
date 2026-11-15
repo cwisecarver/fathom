@@ -5975,7 +5975,7 @@ defmodule Fathom.Shard do
     if Application.get_env(:fathom, :flush_pinned_live_upload, true) and
          (not replicated? or Snapshot.wal_folded?(wal)) do
       result =
-        Fathom.Shard.Replication.Session.with_flush_pin(
+        Fathom.Shard.Replication.Pin.with_flush_pin(
           state.path,
           fn _pin, release ->
             pin_held_hook(state)
@@ -6016,7 +6016,7 @@ defmodule Fathom.Shard do
   # Replication OFF only (see `pinned_live_upload/2`): the flush's PASSIVE, ahead of the pin.
   defp checkpoint_unless_folded(conn, wal) do
     unless Snapshot.wal_folded?(wal),
-      do: Fathom.Shard.Replication.Session.checkpoint_before_pin(conn)
+      do: Fathom.Shard.Replication.FlushCheckpoint.before_pin(conn)
 
     :ok
   end

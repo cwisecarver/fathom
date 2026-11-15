@@ -33,7 +33,7 @@ defmodule Fathom.Shard.Replication.SeedPin do
   """
   use GenServer
 
-  alias Fathom.Shard.Connection
+  alias Fathom.Shard.Replication.Pin
 
   @doc "Start a pin for `db_path`, owned by (monitoring) `session`. Not linked."
   @spec start(pid(), Path.t()) :: GenServer.on_start()
@@ -133,31 +133,22 @@ defmodule Fathom.Shard.Replication.SeedPin do
   defp finish(state, pid), do: %{state | live: MapSet.delete(state.live, pid)}
 
   defp ensure_pinned(%{conn: nil} = state) do
-    # `file_size/1` first: a `:ro` `Connection.open/2` materializes an ABSENT file, and a seed of a
-    # shard with no `.db` must fail as it always did, not ship an empty database. A trusted handle
-    # (no `tenant?`): no authorizer, no statement deadline.
-    with {:ok, _} <- Fathom.FS.stat(state.db_path),
-         {:ok, conn} <- Connection.open(state.db_path, scope: :ro) do
-      case pin_snapshot(conn) do
-        :ok ->
-          :telemetry.execute([:fathom, :replication, :seed_pin, :open], %{count: 1}, %{})
-          {:ok, %{state | conn: conn}}
+    # `Pin.open/1` stats first: a `:ro` open MATERIALIZES an absent file, and a seed of a shard with no
+    # `.db` must fail as it always did, not ship an empty database.
+    case Pin.open(state.db_path) do
+      {:ok, conn} ->
+        :telemetry.execute([:fathom, :replication, :seed_pin, :open], %{count: 1}, %{})
+        {:ok, %{state | conn: conn}}
 
-        {:error, reason} ->
-          Connection.close(conn)
-          {:error, {:seed_snapshot_failed, reason}}
-      end
+      {:error, {:snapshot_failed, reason}} ->
+        {:error, {:seed_snapshot_failed, reason}}
+
+      other ->
+        other
     end
   end
 
   defp ensure_pinned(state), do: {:ok, state}
-
-  # BEGIN alone takes no snapshot (it is DEFERRED); the read is what acquires the WAL read mark.
-  defp pin_snapshot(conn) do
-    with :ok <- Connection.exec(conn, "BEGIN") do
-      Connection.exec(conn, "SELECT 1 FROM sqlite_schema LIMIT 1")
-    end
-  end
 
   # `conn` stays referenced from the state for the whole hold: a NIF resource nothing references is
   # finalized at the next GC, which releases the snapshot mid-stream (probed in
@@ -165,8 +156,7 @@ defmodule Fathom.Shard.Replication.SeedPin do
   defp close(%{conn: nil} = state), do: state
 
   defp close(%{conn: conn} = state) do
-    _ = Connection.rollback_if_open(conn)
-    Connection.close(conn)
+    Pin.release(conn)
     %{state | conn: nil}
   end
 end

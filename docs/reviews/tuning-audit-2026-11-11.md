@@ -146,7 +146,7 @@ Consequences:
   (about 600 shards' replicas). At the run's end the primary WALs went to 0 (idle flush-and-drop folds them),
   but **the replica files stayed at 3,562 MB for the 90 s observed afterwards** (2,601 files).
 - **This is the designed trade, not a missing checkpoint** (`replication/session.ex:2487-2494`, corrected after
-  review). With replication on, the flush's checkpoint runs in `Session.checkpoint_after_snapshot`: pinned,
+  review). With replication on, the flush's checkpoint runs in `Session.checkpoint_after_snapshot` (now `FlushCheckpoint.after_snapshot`): pinned,
   gated on the quorum holding the WAL, and **skipped until the WAL's commit extent reaches
   `flush_checkpoint_min_bytes` (about 4 MB, a quarter of the 4000-frame Session threshold)**; the user decision of
   2026-10-21 is that the replicated flush gains no new checkpoint because each is a WAL-generation reset the

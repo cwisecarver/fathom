@@ -27,6 +27,7 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
 
   alias Fathom.Shard.Connection
   alias Fathom.Shard.Replication.Follower
+  alias Fathom.Shard.Replication.FlushCheckpoint
   alias Fathom.Shard.Replication.Session
   alias Fathom.Shard.Replication.Wal
   alias Fathom.Shards
@@ -329,7 +330,7 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
     s = setup_shard!(ctx)
     flush_conn = open!(s.path)
 
-    Session.checkpoint_after_snapshot(flush_conn, ctx.id,
+    FlushCheckpoint.after_snapshot(flush_conn, ctx.id,
       before_checkpoint: fn ->
         {:ok, _} = Connection.query(s.c1, "INSERT INTO t1 VALUES (1, NULL)", [])
       end
