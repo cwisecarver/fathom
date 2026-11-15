@@ -60,6 +60,7 @@ defmodule Fathom.Shard do
     Connection,
     Fence,
     FlushGate,
+    FlushInput,
     Fork,
     HandlePool,
     Heartbeat,
@@ -2881,38 +2882,11 @@ defmodule Fathom.Shard do
                 nil -> nil
               end
 
-            # `:lineage` is in this list because the flush STAMPS it (expert review 2026-08-20 #8),
-            # and leaving it out is not a subtle failure: `lineage_to_store/1` is reached through a
-            # STRICT `state.lineage`, so an omission raises inside the task and every flush stops
-            # writing a position stamp. That is deliberate. A `Map.get` default here would have
-            # made the same omission silent — a shard flushing with no stamp forever, which is the
-            # `carry_meta` failure mode (a hand-picked key list that quietly loses an entry) one
-            # layer up.
-            # `:wal_salt` / `:wal_ordinal` ride along for the position stamp (expert review
-            # 2026-08-26 #2, step 3). Unlike `:lineage` above these are read with a DEFAULT rather
-            # than strictly, and the difference is not laxity: `flush_position/3` stamps an ordinal
-            # only when the salt it reads off the WAL MATCHES the one in this snapshot, so a
-            # missing key can only ever withhold an ordinal — never invent a wrong one. Withholding
-            # degrades to "unknown ⇒ the stored object wins", which is the pre-A2 answer.
-            # `:put_intents` / `:coordinator` ride along for the 412-reconcile's ownership question
-            # (expert review 2026-11-07 #23): the task sends each attempt's md5 to `:coordinator` from
-            # its `:pre_put` hook, and the reconcile asks `Fork.put_origin/3` with the set so far.
-            # `Map.take` leaves `:put_intents` out when the coordinator holds none.
-            snapshot_state =
-              state
-              |> Map.take([
-                :id,
-                :path,
-                :etag,
-                :lease,
-                :lineage,
-                :wal_salt,
-                :wal_ordinal,
-                :carried_lineage,
-                :touch_pre_etag,
-                :put_intents
-              ])
-              |> Map.put(:coordinator, self())
+            # The task's input is `FlushInput`, built by the same `from_state/2` the drop path uses (its
+            # moduledoc says why each field rides along, and why a missing one is a build error here
+            # rather than a default inside the task: audit 2026-11-13 #28). `:coordinator` is `self()`:
+            # the task sends each attempt's md5 back from its `:pre_put` hook for the 412-reconcile.
+            flush_input = FlushInput.from_state(state, self())
 
             # THE SLOT IS RESERVED BEFORE THE STATE THAT OWNS ITS RELEASE EXISTS (expert review
             # 2026-08-20 #15) — the same class AGENTS.md records for `acquire_lease` → built state.
@@ -2929,7 +2903,7 @@ defmodule Fathom.Shard do
               try do
                 Task.async(fn ->
                   await_sidecar_task(sidecar_pid)
-                  fenced_flush(fence_ctx, snapshot_state)
+                  fenced_flush(fence_ctx, flush_input)
                 end)
               rescue
                 e ->
@@ -4478,11 +4452,11 @@ defmodule Fathom.Shard do
   #   * `:fence_skip` — ownership unconfirmed (transient store error / heartbeat not valid) → retry.
   # The fence stays the hard pre-write guard: no upload happens unless it returns `{:ok, _}`, and the
   # 412-reconcile inside flush_and_reconcile is the second guard on the PUT itself.
-  defp fenced_flush(fence_ctx, snapshot_state) do
+  defp fenced_flush(fence_ctx, %FlushInput{} = input) do
     case fence_check(fence_ctx) do
       {:ok, updates} ->
         # Flush against the fence-refreshed lease (the 412-reconcile re-checks the lock with it).
-        {:fenced, flush_and_reconcile(Map.merge(snapshot_state, updates)), updates}
+        {:fenced, flush_and_reconcile(FlushInput.with_fence(input, updates)), updates}
 
       :superseded ->
         :fence_superseded
@@ -4514,7 +4488,7 @@ defmodule Fathom.Shard do
     result
   end
 
-  defp flush_and_reconcile(state) do
+  defp flush_and_reconcile(%FlushInput{} = state) do
     started = System.monotonic_time()
     # The scan route this flush takes is decided deep inside `snapshot_and_upload/3`;
     # `emit_flush_route/2` leaves it in this (flush task) process's dictionary so the duration
@@ -4620,7 +4594,7 @@ defmodule Fathom.Shard do
   # recoverable, a clobber is not). An unreadable HEAD is a transient error — keep dirty, retry —
   # never a guess in either direction. Costs one HEAD, only on a 412.
   defp reconcile_moved(state) do
-    case Fork.put_origin(state.id, state.path, Map.get(state, :put_intents, [])) do
+    case Fork.put_origin(state.id, state.path, state.put_intents) do
       {:own, etag} -> {:reconciled, etag}
       :fork -> :forked
       :absent -> {:error, :object_vanished}
@@ -4775,7 +4749,7 @@ defmodule Fathom.Shard do
     # snapshot path — this makes that the DECIDED behaviour rather than a lucky one.
     if map_size(state.conns) > 0 do
       emit_drop_route(state, :snapshot)
-      snapshot_and_upload(state)
+      snapshot_and_upload(FlushInput.from_state(state))
     else
       emit_drop_route(state, :checkpoint)
       checkpoint_then_upload(state, pre)
@@ -4862,7 +4836,7 @@ defmodule Fathom.Shard do
           # The checkpoint folded the WAL, so the header counts are current. The VACUUM route
           # compacts; it takes `pre` because the checkpoint already unlinked `-wal`.
           emit_drop_route(state, :snapshot_compact)
-          snapshot_and_upload(state, pre, true)
+          snapshot_and_upload(FlushInput.from_state(state), pre, true)
         else
           # The WAL has just been folded into the database, so the object holds everything through
           # the end of `pre`'s generation — see flush_position/2 for why that is claimed as gen + 1.
@@ -4874,7 +4848,7 @@ defmodule Fathom.Shard do
             Position.lineage_arg(state),
             flush_intent_opts(state.path)
           )
-          |> guard_pre_touch(state)
+          |> guard_pre_touch(FlushInput.from_state(state))
         end
 
       # Integrity failed (expert review 2026-07-14 #4). The checkpoint-then-raw-upload fast path
@@ -4906,7 +4880,7 @@ defmodule Fathom.Shard do
             "shard #{state.id}: pre-drop checkpoint incomplete (#{inspect(reason)}); snapshot-flushing instead"
           )
 
-          snapshot_and_upload(state)
+          snapshot_and_upload(FlushInput.from_state(state))
         end
     end
   end
@@ -5827,7 +5801,7 @@ defmodule Fathom.Shard do
   # `Position.snapshot_position/2`: the position as of `pre`, read BEFORE the snapshot, so the stamp
   # under-claims and never over-claims (expert review 2026-10-15 #5, user decision Q3 = A).
 
-  defp snapshot_and_upload(state, pre_override \\ nil, verified? \\ false) do
+  defp snapshot_and_upload(%FlushInput{} = state, pre_override \\ nil, verified? \\ false) do
     temp = "#{state.path}.snap.#{System.unique_integer([:positive])}"
 
     # THE POSITION THE STAMP CLAIMS, read BEFORE the snapshot (expert review 2026-10-15 #5, user
@@ -5882,7 +5856,7 @@ defmodule Fathom.Shard do
   # answer `:fallback`: the file is mostly free, which is why we are here) and the second
   # `quick_check`; the integrity gate has then run exactly once, BEFORE the upload. Every other
   # caller passes false and keeps both.
-  defp scan_and_upload(state, temp, pre, verified?) do
+  defp scan_and_upload(%FlushInput{} = state, temp, pre, verified?) do
     case if(verified?, do: :fallback, else: pinned_live_upload(state, pre)) do
       :fallback ->
         emit_flush_route(state, :vacuum)
@@ -5898,7 +5872,7 @@ defmodule Fathom.Shard do
     end
   end
 
-  defp upload_flush_object(state, path, pre, extra_opts \\ []) do
+  defp upload_flush_object(%FlushInput{} = state, path, pre, extra_opts \\ []) do
     state.id
     |> Storage.flush(
       path,
@@ -5908,7 +5882,7 @@ defmodule Fathom.Shard do
       flush_intent_opts(
         state.path,
         fn -> recheck_before_put(state) end,
-        Map.get(state, :coordinator)
+        state.coordinator
       ) ++ extra_opts
     )
     |> guard_pre_touch(state)
@@ -5995,7 +5969,7 @@ defmodule Fathom.Shard do
   # `:fallback` (the VACUUM route) when disabled, the WAL holds frames not in the main file at
   # either check, or the pin cannot be opened. Disable with
   # `config :fathom, :flush_pinned_live_upload, false`.
-  defp pinned_live_upload(state, pre) do
+  defp pinned_live_upload(%FlushInput{} = state, pre) do
     wal = state.path <> "-wal"
     replicated? = Fathom.Shard.Replication.Session.enabled?()
 
@@ -6121,8 +6095,9 @@ defmodule Fathom.Shard do
   # the new etag. Zero cost on the normal path (one binary compare); `:none`/`:zlib` encodings are
   # covered too, which the panel's "nonce every flush body" was not. A failed re-touch keeps the
   # durable flush and its etag — failing the flush would only re-flush into the same etag.
-  defp guard_pre_touch({:ok, new_etag, carried}, state) when is_binary(new_etag) do
-    if new_etag == Map.get(state, :touch_pre_etag) do
+  defp guard_pre_touch({:ok, new_etag, carried}, %FlushInput{} = state)
+       when is_binary(new_etag) do
+    if new_etag == state.touch_pre_etag do
       case Storage.retouch(state.id, new_etag) do
         {:ok, rotated} when is_binary(rotated) ->
           {:ok, rotated, carried}
@@ -6259,7 +6234,7 @@ defmodule Fathom.Shard do
   # PUT — a store round trip per flush — so it is skipped there rather than paying network to
   # shorten a network-bound window. (An earlier reading of this finding dismissed the whole fix as
   # "a round trip per flush"; that is true only of the legacy path.)
-  defp recheck_before_put(%{acquire_gen: gen}) when is_integer(gen) do
+  defp recheck_before_put(%FlushInput{acquire_gen: gen}) when is_integer(gen) do
     case heartbeat_recheck(gen) do
       :ok ->
         :ok
@@ -6272,7 +6247,7 @@ defmodule Fathom.Shard do
     end
   end
 
-  defp recheck_before_put(_state), do: :ok
+  defp recheck_before_put(%FlushInput{}), do: :ok
 
   # A DEAD HEARTBEAT PROCESS MUST DEGRADE, NOT CRASH THE FLUSH (expert review 2026-08-24 #18).
   #
