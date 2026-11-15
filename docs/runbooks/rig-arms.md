@@ -46,6 +46,12 @@ instance's EBS limit (`io.max` cannot span devices), so that case stays unmeasur
 | `gp3` | base + `docker-compose.gp3.yml` | the one disk behind `/var/lib/docker`: data, replicas and warm cache share ONE cap |
 | `gp3-split` | base + `replicadisk` + `docker-compose.gp3-split.yml` | the data disk AND the replica disk, the same rate on EACH |
 
+`RIG_LB_VARIANT=workers4` and/or `noaccesslog` (comma-separated) render `nginx.variant.conf` from `nginx.conf` on
+every run and mount it over the LB's config (`docker-compose.lbvariant.yml`); they are the tuning-audit
+2026-11-11 #8 and #5 arms. The variant is generated, not a copy, so an `nginx.conf` edit always reaches it, and the
+script fails loudly if an edit's anchor no longer matches exactly once. Pass the same value to every later command
+of the session, like the other overlays.
+
 Never cap only one side: the uncapped path then absorbs what the capped one sheds and the comparison
 is void (the audit's Trap on #16). `RIG_CAP_MIBPS` (default 125) and `RIG_CAP_IOPS` (default 3000) change
 both devices together.

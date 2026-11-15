@@ -75,6 +75,9 @@ npm-debug.log
 # (expert review 2026-08-01 #23) — a content hash, regenerated per reload, machine-local.
 deploy/chaos/lb-runtime/*.applied
 
+# Rendered by chaos.sh from nginx.conf when RIG_LB_VARIANT is set; regenerated every run.
+deploy/chaos/nginx.variant.conf
+
 # Per-tenant Hrana bearer tokens minted by `TPC_AUTH=required ./chaos.sh <arm>` for the rig's driver
 # (deploy/chaos/docker-compose.auth.yml mounts it). Rig-only secrets; regenerated per run.
 deploy/chaos/tpc-auth/

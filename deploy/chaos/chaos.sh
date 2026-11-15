@@ -184,6 +184,10 @@ exec 3>&2
 #                            the second virtio disk, the same cap on EACH device
 #   TPC_AUTH=required        docker-compose.auth.yml: nodes run HRANA_AUTH=required (the tpc arms then
 #                            mint and send a token per tenant, see tpc_run)
+#   RIG_LB_VARIANT=<v>[,<v>] docker-compose.lbvariant.yml: nginx.conf with an A/B change applied, GENERATED
+#                            from nginx.conf on every run so the arm cannot drift from the LB config.
+#                            workers4 (4 nginx workers, tuning audit 2026-11-11 #8), noaccesslog (no
+#                            per-request access log, #5)
 #
 # Overlays stack on COMPOSE_FILE (docker compose's own mechanism, which the replicadisk header already
 # documents), exported here so every compose call in this script - up, exec, run driver - sees the
@@ -254,6 +258,34 @@ case "${TPC_AUTH:-}" in
   "") ;;
   required) mkdir -p tpc-auth; rig_add_compose_file docker-compose.auth.yml ;;
   *) echo "TPC_AUTH must be 'required' (or unset), got: $TPC_AUTH" >&2; exit 64 ;;
+esac
+
+# RIG_LB_VARIANT=<v>[,<v>...]: render nginx.variant.conf from nginx.conf (never a hand-kept copy: the two
+# variants used to be whole-file copies that silently missed every later nginx.conf edit) and mount it
+# over the LB's config. Each edit must match nginx.conf exactly once, so an nginx.conf change that moves
+# the anchor fails here instead of producing an arm that quietly is not the arm.
+case "${RIG_LB_VARIANT:-}" in
+  "") ;;
+  *)
+    /usr/bin/python3 - "$RIG_LB_VARIANT" <<'PY' || exit 64
+import re, sys
+edits = {
+    "workers4": (r"(?m)^worker_processes auto;", "worker_processes 4;  # RIG_LB_VARIANT=workers4"),
+    "noaccesslog": (r"(?m)^http \{\n", "http {\n  access_log off;  # RIG_LB_VARIANT=noaccesslog\n"),
+}
+conf = open("nginx.conf").read()
+for name in filter(None, sys.argv[1].split(",")):
+    if name not in edits:
+        sys.exit(f"RIG_LB_VARIANT: unknown variant {name!r} (known: {', '.join(sorted(edits))})")
+    pattern, repl = edits[name]
+    conf, n = re.subn(pattern, lambda _m, r=repl: r, conf)
+    if n != 1:
+        sys.exit(f"RIG_LB_VARIANT={name}: expected exactly one match for {pattern!r} in nginx.conf, found {n}")
+open("nginx.variant.conf", "w").write(conf)
+PY
+    rig_add_compose_file docker-compose.lbvariant.yml
+    echo "rig LB variant: $RIG_LB_VARIANT (nginx.variant.conf generated from nginx.conf)" >&3
+    ;;
 esac
 
 now_ms() { /usr/bin/python3 -c 'import time; print(int(time.time()*1000))'; }

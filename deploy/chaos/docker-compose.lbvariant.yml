@@ -1,0 +1,8 @@
+# Opt-in overlay for RIG_LB_VARIANT (see the RIG_ block in chaos.sh): mounts the nginx.variant.conf that
+# chaos.sh GENERATES from nginx.conf (workers4 and/or noaccesslog) over the LB's config. Replaces the
+# hand-kept nginx.workers4.conf / nginx.noaccesslog.conf copies and their one-line overlays.
+#   RIG_LB_VARIANT=noaccesslog ./chaos.sh up
+services:
+  lb:
+    volumes:
+      - ./nginx.variant.conf:/etc/nginx/nginx.conf:ro
