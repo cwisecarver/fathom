@@ -15,7 +15,7 @@ defmodule Fathom.Shard.Replication.SeedGate do
   run in their own task, and the shard's pushes to that follower are already refused until its seed
   lands). A waiting seed is simply a later seed.
 
-  ## Why a GenServer with monitors, unlike `FlushGate`
+  ## Why a monitor-based `Fathom.PermitGate`, unlike `FlushGate`
 
   `FlushGate` is lock-free ETS because it is asked on every flush; a seed is rare and long, so one
   call per seed costs nothing. In exchange the slot is tied to a MONITOR: `Session` kills a wedged
@@ -25,7 +25,7 @@ defmodule Fathom.Shard.Replication.SeedGate do
   `:replication_seed_max_concurrency` sets the cap; `0` or `nil` (the default) disables the gate —
   see `@default_cap` for the measurement that turned it off.
   """
-  use GenServer
+  alias Fathom.PermitGate
 
   # OFF BY DEFAULT, MEASURED (rig, 2026-10-03, 1024 tenants, flush 5 s, valid same-session runs):
   # cap 8 = 2,315 txn/s / 50,837 errors; no cap = 1,983 / 10,769; the pre-#6 build = 2,008 /
@@ -38,7 +38,10 @@ defmodule Fathom.Shard.Replication.SeedGate do
 
   @doc false
   def start_link(opts),
-    do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+    do: PermitGate.start_link(name: Keyword.get(opts, :name, __MODULE__), cap: &permits/0)
+
+  @doc false
+  def child_spec(opts), do: %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}}
 
   @doc """
   Wait for a seed slot, up to `timeout_ms`. `:ok` — the slot is held until `release/1` or until the
@@ -47,100 +50,31 @@ defmodule Fathom.Shard.Replication.SeedGate do
   """
   @spec acquire(non_neg_integer(), GenServer.server()) :: :ok | {:error, :seed_gate_timeout}
   def acquire(timeout_ms, gate \\ __MODULE__) do
-    case cap() do
-      cap when is_integer(cap) and cap > 0 ->
-        try do
-          GenServer.call(gate, {:acquire, cap}, timeout_ms)
-        catch
-          :exit, {:noproc, _} ->
-            :ok
-
-          :exit, {:timeout, _} ->
-            # Withdraw, so a slot granted after we stopped waiting is not held by a caller that
-            # has gone on to fail. Our own exit would free it too; this frees it now.
-            GenServer.cast(gate, {:withdraw, self()})
-            {:error, :seed_gate_timeout}
-        end
-
-      _ ->
-        :ok
+    case PermitGate.acquire(gate, permits(), timeout_ms) do
+      :ok -> :ok
+      :timeout -> {:error, :seed_gate_timeout}
     end
   end
 
   @doc "Give the caller's slot back. A no-op if it holds none."
   @spec release(GenServer.server()) :: :ok
-  def release(gate \\ __MODULE__) do
-    GenServer.cast(gate, {:release, self()})
-  end
+  def release(gate \\ __MODULE__), do: PermitGate.release(gate)
 
   @doc "Slots held and seeds waiting. For tests and the dashboard."
   @spec stats(GenServer.server()) :: %{held: non_neg_integer(), waiting: non_neg_integer()}
-  def stats(gate \\ __MODULE__), do: GenServer.call(gate, :stats)
+  def stats(gate \\ __MODULE__), do: PermitGate.stats(gate)
 
   @doc false
   def cap,
     do: Application.get_env(:fathom, :replication_seed_max_concurrency, @default_cap)
 
-  @impl true
-  def init(_opts), do: {:ok, %{held: %{}, waiting: :queue.new()}}
-
-  @impl true
-  def handle_call({:acquire, cap}, {pid, _} = from, state) do
-    if map_size(state.held) < cap do
-      {:reply, :ok, hold(state, pid)}
-    else
-      {:noreply, %{state | waiting: :queue.in({from, Process.monitor(pid)}, state.waiting)}}
-    end
-  end
-
-  def handle_call(:stats, _from, state),
-    do: {:reply, %{held: map_size(state.held), waiting: :queue.len(state.waiting)}, state}
-
-  @impl true
-  def handle_cast({:release, pid}, state), do: {:noreply, state |> free(pid) |> grant()}
-
-  def handle_cast({:withdraw, pid}, state) do
-    {:noreply, state |> unwait(pid) |> free(pid) |> grant()}
-  end
-
-  @impl true
-  def handle_info({:DOWN, _ref, :process, pid, _}, state) do
-    {:noreply, state |> unwait(pid) |> free(pid) |> grant()}
-  end
-
-  defp hold(state, pid), do: %{state | held: Map.put(state.held, pid, Process.monitor(pid))}
-
-  defp free(state, pid) do
-    case Map.pop(state.held, pid) do
-      {nil, _} ->
-        state
-
-      {ref, held} ->
-        Process.demonitor(ref, [:flush])
-        %{state | held: held}
-    end
-  end
-
-  defp unwait(state, pid) do
-    {gone, keep} =
-      state.waiting |> :queue.to_list() |> Enum.split_with(fn {{p, _}, _} -> p == pid end)
-
-    Enum.each(gone, fn {_, ref} -> Process.demonitor(ref, [:flush]) end)
-    %{state | waiting: :queue.from_list(keep)}
-  end
-
-  # Hand freed slots to waiters, oldest first. Read the cap now: it may have been raised.
-  defp grant(state) do
-    cap = cap()
-
-    if (not is_integer(cap) or cap <= 0 or map_size(state.held) < cap) and
-         not :queue.is_empty(state.waiting) do
-      {{:value, {{pid, _} = from, ref}}, rest} = :queue.out(state.waiting)
-      Process.demonitor(ref, [:flush])
-      GenServer.reply(from, :ok)
-      grant(hold(%{state | waiting: rest}, pid))
-    else
-      state
+  # `cap/0` is the raw env value; PermitGate wants `pos_integer() | nil`. Anything that is not a
+  # positive integer (`0`, `nil`, junk) means UNLIMITED here, which is this gate's own meaning (the
+  # other two gates only ever produce a positive integer or nil from their own `cap/0`).
+  defp permits do
+    case cap() do
+      n when is_integer(n) and n > 0 -> n
+      _ -> nil
     end
   end
 end

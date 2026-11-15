@@ -16,18 +16,21 @@ defmodule Fathom.Shard.ScanGate do
   checkpoints from more frequent flushes. This leaves the upload cap (and so the number of
   flushes that proceed) exactly as it was.
 
-  A GenServer with monitors (like `Fathom.Shard.Replication.SeedGate`): one call per flush, and a
+  A `Fathom.PermitGate` (shared with `BackgroundScanGate` and `SeedGate`): one call per flush, and a
   permit tied to the holder's monitor so a killed flush task cannot leak it. `acquire/1` waits at
   most `timeout_ms`; on timeout (or if the gate is not running) the caller scans WITHOUT a permit
   rather than failing the durability flush.
 
   `:shard_flush_scan_permits` pins the count (`0`/`false` disables the gate).
   """
-  use GenServer
+  alias Fathom.PermitGate
 
   @doc false
   def start_link(opts),
-    do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+    do: PermitGate.start_link(name: Keyword.get(opts, :name, __MODULE__), cap: &cap/0)
+
+  @doc false
+  def child_spec(opts), do: %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}}
 
   @doc """
   The permit count: `:shard_flush_scan_permits` if set to a positive integer, `nil` if set to
@@ -56,28 +59,11 @@ defmodule Fathom.Shard.ScanGate do
   the gate is disabled or not running (nothing held, `release/1` is then a harmless no-op).
   """
   @spec acquire(non_neg_integer(), GenServer.server()) :: :ok | :timeout
-  def acquire(timeout_ms, gate \\ __MODULE__) do
-    case cap() do
-      cap when is_integer(cap) ->
-        try do
-          GenServer.call(gate, {:acquire, cap}, timeout_ms)
-        catch
-          :exit, {:noproc, _} ->
-            :ok
-
-          :exit, {:timeout, _} ->
-            GenServer.cast(gate, {:withdraw, self()})
-            :timeout
-        end
-
-      nil ->
-        :ok
-    end
-  end
+  def acquire(timeout_ms, gate \\ __MODULE__), do: PermitGate.acquire(gate, cap(), timeout_ms)
 
   @doc "Give the caller's permit back. A no-op if it holds none."
   @spec release(GenServer.server()) :: :ok
-  def release(gate \\ __MODULE__), do: GenServer.cast(gate, {:release, self()})
+  def release(gate \\ __MODULE__), do: PermitGate.release(gate)
 
   @doc """
   Run `fun` holding a permit. Waits at most `timeout_ms`; on timeout `fun` runs without one.
@@ -96,65 +82,5 @@ defmodule Fathom.Shard.ScanGate do
 
   @doc "Permits held and callers waiting. For tests and the dashboard."
   @spec stats(GenServer.server()) :: %{held: non_neg_integer(), waiting: non_neg_integer()}
-  def stats(gate \\ __MODULE__), do: GenServer.call(gate, :stats)
-
-  @impl true
-  def init(_opts), do: {:ok, %{held: %{}, waiting: :queue.new()}}
-
-  @impl true
-  def handle_call({:acquire, cap}, {pid, _} = from, state) do
-    if map_size(state.held) < cap do
-      {:reply, :ok, hold(state, pid)}
-    else
-      {:noreply, %{state | waiting: :queue.in({from, Process.monitor(pid)}, state.waiting)}}
-    end
-  end
-
-  def handle_call(:stats, _from, state),
-    do: {:reply, %{held: map_size(state.held), waiting: :queue.len(state.waiting)}, state}
-
-  @impl true
-  def handle_cast({:release, pid}, state), do: {:noreply, state |> free(pid) |> grant()}
-
-  def handle_cast({:withdraw, pid}, state),
-    do: {:noreply, state |> unwait(pid) |> free(pid) |> grant()}
-
-  @impl true
-  def handle_info({:DOWN, _ref, :process, pid, _}, state),
-    do: {:noreply, state |> unwait(pid) |> free(pid) |> grant()}
-
-  defp hold(state, pid), do: %{state | held: Map.put(state.held, pid, Process.monitor(pid))}
-
-  defp free(state, pid) do
-    case Map.pop(state.held, pid) do
-      {nil, _} ->
-        state
-
-      {ref, held} ->
-        Process.demonitor(ref, [:flush])
-        %{state | held: held}
-    end
-  end
-
-  defp unwait(state, pid) do
-    {gone, keep} =
-      state.waiting |> :queue.to_list() |> Enum.split_with(fn {{p, _}, _} -> p == pid end)
-
-    Enum.each(gone, fn {_, ref} -> Process.demonitor(ref, [:flush]) end)
-    %{state | waiting: :queue.from_list(keep)}
-  end
-
-  # Hand freed permits to waiters, oldest first. Reads the cap now: it may have changed.
-  defp grant(state) do
-    cap = cap()
-
-    if (cap == nil or map_size(state.held) < cap) and not :queue.is_empty(state.waiting) do
-      {{:value, {{pid, _} = from, ref}}, rest} = :queue.out(state.waiting)
-      Process.demonitor(ref, [:flush])
-      GenServer.reply(from, :ok)
-      grant(hold(%{state | waiting: rest}, pid))
-    else
-      state
-    end
-  end
+  def stats(gate \\ __MODULE__), do: PermitGate.stats(gate)
 end
