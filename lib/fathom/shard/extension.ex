@@ -386,18 +386,6 @@ defmodule Fathom.Shard.Extension do
   end
 
   @doc """
-  Drops the cached default-path resolution.
-
-  For tests that create or remove the artifact under a running node, and for an operator who
-  installs it without restarting.
-  """
-  @spec refresh() :: :ok
-  def refresh do
-    :persistent_term.erase(@default_key)
-    :ok
-  end
-
-  @doc """
   Where `mix compile.fathom_udf` installs the artifact.
 
   Uses `:code.priv_dir/1` so this resolves inside a release, where `priv/` lives under the
