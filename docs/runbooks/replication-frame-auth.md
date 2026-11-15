@@ -70,7 +70,7 @@ which is the boot guard's failure, and it will refuse to start.
 
 ## What the boot guard catches
 
-`Fathom.Application.check_replication_frame_auth!/0` raises (not warns, and in every environment,
+`Fathom.BootChecks.check_replication_frame_auth!/0` raises (not warns, and in every environment,
 not just prod) on:
 
 - either flag on with **no key configured** — the node would send frames unsigned while believing

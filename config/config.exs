@@ -37,7 +37,7 @@ config :fathom, :fence_writes_when_stealable, config_env() == :prod
 #
 # Those same guards ARE the "not optional" enforcement: a PROD node that boots with these on but
 # without REPLICATION_FOLLOWERS (nothing to ship to — Fleet.validate_quorum!) or REPLICATION_BIND_IP
-# (an unauthenticated port on every interface — Application.check_replication_exposure!) FAILS TO
+# (an unauthenticated port on every interface — Fathom.BootChecks.check_replication_exposure!) FAILS TO
 # BOOT rather than silently serving unreplicated. Configure both on every prod node, or set
 # REPLICATION_ENABLED=false / REPLICATION_LISTEN=false (config/runtime.exs) to deliberately opt a
 # single node out or to lead a rolling upgrade listeners-first.

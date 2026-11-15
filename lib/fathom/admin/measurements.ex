@@ -333,7 +333,7 @@ defmodule Fathom.Admin.Measurements do
     * `[:fathom, :node, :io_pressure]` `some_avg10` / `full_avg10` (`/proc/pressure/io`, PSI, %).
     * `[:fathom, :node, :vm_dirty]` `background_bytes`: the effective `vm.dirty_background_*`
       threshold. Published here rather than at boot because the metric reporters attach after the
-      boot-time preflight (`Fathom.Application.check_vm_dirty_background!/1`) has run.
+      boot-time preflight (`Fathom.BootChecks.check_vm_dirty_background!/1`) has run.
 
   A file that cannot be read (not Linux, PSI compiled out) is skipped silently, as is an event with
   no readable measurement: off Linux this emits nothing.
@@ -866,7 +866,7 @@ defmodule Fathom.Admin.Measurements do
       [{mount, total_kb, avail_kb, _pct} | _] when is_integer(total_kb) and total_kb > 0 ->
         # `mount` identifies the FILESYSTEM, not the path — two directories reporting the same
         # mount share a volume, and therefore share a free-space budget. That is the question
-        # `Application.check_replication_disk!/0` asks, and comparing sizes cannot answer it: two
+        # `Fathom.BootChecks.check_replication_disk!/0` asks, and comparing sizes cannot answer it: two
         # separate volumes of the same size look identical.
         {:ok,
          %{

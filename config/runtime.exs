@@ -190,7 +190,7 @@ env_bool = fn name ->
 end
 
 # Storage backend for shard files. SHARD_STORAGE=s3 selects the S3 backend and reads its
-# connection settings; the boot fence probe (Fathom.Application.check_storage_fence!) then
+# connection settings; the boot fence probe (Fathom.BootChecks.check_storage_fence!) then
 # verifies the store enforces conditional writes before serving a byte.
 case System.get_env("SHARD_STORAGE") do
   nil ->
@@ -838,7 +838,7 @@ end
 # "set TEMPLATE_SHARD_ID" — a knob nothing read.
 #
 # Top-level (not prod-only) so dev/test can override the compiled default too. The two prod boot
-# guards already cover a set template: `Fathom.Application.check_template_default!` refuses
+# guards already cover a set template: `Fathom.BootChecks.check_template_default!` refuses
 # :default_shard == the template (finding #17 — anonymous default traffic would drive fleet-wide
 # capture) and `check_template_auth!` refuses a prod template with :hrana_auth disabled (expert
 # review #9 — an anonymously reachable template is a fleet-wide poisoning vector).
@@ -989,7 +989,7 @@ end
 # new generation, and `Primary.plan/3` then correctly ships the ENTIRE WAL rather than a delta. One
 # variable, same image, 512 tenants (2026-08-18): 5,000 -> 30,000 ms took the run from 22,599
 # errors to 4 and +49% throughput, with `:stale_wal_gen` and `:overloaded` both going to ZERO.
-# `Fathom.Application.check_replication_flush_interval!/0` warns at boot when the two disagree.
+# `Fathom.BootChecks.check_replication_flush_interval!/0` warns at boot when the two disagree.
 # ON BY DEFAULT IN PROD (config/config.exs) — replication is core, not opt-in. This override forces
 # it either way: REPLICATION_ENABLED=false opts a single prod node out (also the first step of a
 # rolling upgrade FROM a fleet that had replication off), =true turns shipping on in dev for a local
@@ -1543,7 +1543,7 @@ admin_pass = System.get_env("ADMIN_PASS")
 
 # A blank value is UNSET (expert review 2026-10-13 #9). `ADMIN_USER=` used to configure "" credentials,
 # which Plug.BasicAuth accepts as ":". Blank values are dropped here, and a prod boot that carried
-# one is refused by Fathom.Application.check_admin_credentials!/0 (the flag below tells it so).
+# one is refused by Fathom.BootChecks.check_admin_credentials!/0 (the flag below tells it so).
 admin_blank? = fn v -> is_binary(v) and String.trim(v) == "" end
 
 if admin_blank?.(admin_user) or admin_blank?.(admin_pass) do
@@ -1589,7 +1589,7 @@ if config_env() == :prod do
   # not restated, so a queue added later raises the POOL_SIZE default with it (expert review
   # 2026-10-21 #11: `tokens` and `erasure` were added without raising the old fixed 25, and the
   # headroom became zero). A queue is an integer or a keyword list with `:limit`; `queues: false`
-  # runs none. `Fathom.Application.oban_queue_limit_sum/1` is the same sum for the boot guard; this
+  # runs none. `Fathom.BootChecks.oban_queue_limit_sum/1` is the same sum for the boot guard; this
   # copy exists because runtime.exs should not call into the application's own modules.
   oban_queue_sum =
     case Keyword.get(Application.get_env(:fathom, Oban, []), :queues, []) do
@@ -1617,7 +1617,7 @@ if config_env() == :prod do
     # The default is that floor + 10 (expert review 2026-10-21 #11, Q10 option A), so it follows
     # `queues:` instead of drifting under it: the fixed 25 equalled the queue sum (25) once `tokens`
     # and `erasure` were added. A POOL_SIZE at or under the queue sum refuses to boot
-    # (`Fathom.Application.check_repo_pool_headroom!/0`); one with less than 10 spare warns.
+    # (`Fathom.BootChecks.check_repo_pool_headroom!/0`); one with less than 10 spare warns.
     pool_size: parse_int!.("POOL_SIZE", System.get_env("POOL_SIZE") || "#{oban_queue_sum + 10}"),
     # DBConnection's defaults (50/1000) were already in force implicitly; they are stated here
     # because they are load-bearing. Past `queue_interval` of saturation, checkouts are DROPPED
@@ -1666,7 +1666,7 @@ if config_env() == :prod do
 
   # Explicit ack for a prod deployment that intends UNANCHORED Host-subdomain routing (no
   # SHARD_BASE_DOMAIN). Without the zone anchor, shard_from_host promotes any attacker-controlled
-  # Host first-label to a shard id, so Fathom.Application.check_shard_base_domain! refuses to boot
+  # Host first-label to a shard id, so Fathom.BootChecks.check_shard_base_domain! refuses to boot
   # an exposed data plane with the zone unset (expert review 2026-07-14 #6) — set this to override.
   if env_bool.("ALLOW_UNANCHORED_ROUTING") == true do
     config :fathom, :allow_unanchored_routing, true

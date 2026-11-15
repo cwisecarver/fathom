@@ -198,7 +198,7 @@ defmodule Fathom.Shard.Extension do
       {:error, _reason} = error ->
         # NOT cached (expert review 2026-11-07 #42): a failure that is not "this artifact predates
         # the control entry point" is retried by the next open, because it may be transient (EMFILE,
-        # ENOMEM while the first tenant opens). `Fathom.Application.check_udf_extension!/0` arms at
+        # ENOMEM while the first tenant opens). `Fathom.BootChecks.check_udf_extension!/0` arms at
         # boot, so a PERMANENT failure (wrong arch, SQLite older than the crate needs, a corrupt
         # file) refuses the boot instead of surfacing as every tenant open failing.
         error
@@ -402,7 +402,7 @@ defmodule Fathom.Shard.Extension do
   @doc """
   Whether Django's UDFs will be available on connections opened from now on.
 
-  Read by `Fathom.Application.check_udf_extension!/0` at boot (expert review 2026-10-10 #8): a prod
+  Read by `Fathom.BootChecks.check_udf_extension!/0` at boot (expert review 2026-10-10 #8): a prod
   node without the artifact refuses to start unless `ALLOW_NO_UDF=true` acknowledges the
   downgrade (no engine PRAGMA authorizer, no deadline backstop, no size limits, no Django UDFs).
   Before that nothing called this, and a node built without cargo degraded silently.

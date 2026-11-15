@@ -633,7 +633,7 @@ defmodule Fathom.HranaAuth do
   defp encode_bumped_at(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
 
   @doc """
-  Boot guard (called from `Fathom.Application.start/2`): refuse to start with a
+  Boot guard (called from `Fathom.BootChecks.run!/0`, which `Fathom.Application.start/2` runs): refuse to start with a
   nonsense `:hrana_auth` value, or with auth required but no usable signing
   secret — better a loud boot failure than a node that 401s all traffic (or,
   worse, one that a typo silently left open).
@@ -669,7 +669,7 @@ defmodule Fathom.HranaAuth do
     # while rotation still meant an outage; it no longer does (`rotate/1` is zero-downtime with a
     # grace window), so there is no longer a good reason to run `:required` with immortal tokens.
     #
-    # Refuse in PROD only, matching `Fathom.Application.check_template_default!`. Dev and test mint
+    # Refuse in PROD only, matching `Fathom.BootChecks.check_template_default!`. Dev and test mint
     # freely, and a deployment that genuinely wants immortal tokens sets HRANA_TOKEN_MAX_AGE to a
     # very large number — an explicit choice recorded in config rather than an unnoticed default.
     if configured == :required and max_age() == :infinity do

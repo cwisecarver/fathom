@@ -10,7 +10,7 @@ defmodule Fathom.Rebalancer.BootConfigTest do
 
   alias Fathom.Test.Env
 
-  defp check, do: capture_log(fn -> Fathom.Application.check_rebalancer_config!() end)
+  defp check, do: capture_log(fn -> Fathom.BootChecks.check_rebalancer_config!() end)
 
   test "prod + rebalancer on + no LB map: warns, and says what to set" do
     Env.put!(:env, :prod)

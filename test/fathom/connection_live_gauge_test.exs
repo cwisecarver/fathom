@@ -8,7 +8,7 @@ defmodule Fathom.ConnectionLiveGaugeTest do
   """
   use ExUnit.Case, async: false
 
-  alias Fathom.Application, as: App
+  alias Fathom.BootChecks
   alias Fathom.Shard.Connection
   alias Fathom.Test.Await
 
@@ -107,15 +107,15 @@ defmodule Fathom.ConnectionLiveGaugeTest do
   test "soft_heap_warnings: cap x 190 KB vs the limit and vs container RAM" do
     gib = 1024 * 1024 * 1024
     # 50k shards x 190 KB = ~9.1 GiB: over an 8 GiB limit and a 4 GiB container.
-    assert [w1, w2] = App.soft_heap_warnings(50_000, 8 * gib, 4 * gib) |> Enum.take(2)
+    assert [w1, w2] = BootChecks.soft_heap_warnings(50_000, 8 * gib, 4 * gib) |> Enum.take(2)
     assert w1 =~ "above :shard_soft_heap_limit_bytes"
     assert w2 =~ "container memory limit"
     # Limit at/above RAM warns even when the cap is small.
-    assert [w3] = App.soft_heap_warnings(1_000, 8 * gib, 8 * gib)
+    assert [w3] = BootChecks.soft_heap_warnings(1_000, 8 * gib, 8 * gib)
     assert w3 =~ "never sheds"
     # Healthy and unknown-RAM configs are silent.
-    assert [] = App.soft_heap_warnings(1_000, 8 * gib, 64 * gib)
-    assert [] = App.soft_heap_warnings(:infinity, nil, nil)
-    assert [] = App.soft_heap_warnings(1_000, 8 * gib, nil)
+    assert [] = BootChecks.soft_heap_warnings(1_000, 8 * gib, 64 * gib)
+    assert [] = BootChecks.soft_heap_warnings(:infinity, nil, nil)
+    assert [] = BootChecks.soft_heap_warnings(1_000, 8 * gib, nil)
   end
 end

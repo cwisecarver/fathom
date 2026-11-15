@@ -1,11 +1,11 @@
 defmodule Fathom.BootSecurityGuardsTest do
   @moduledoc """
   Prod boot-time security guards from expert review 2026-10-12 (#12 throttle proxy posture, #27 S3
-  session-token warning). Each guard is a plain function on `Fathom.Application`, so the tests call
+  session-token warning). Each guard is a plain function on `Fathom.BootChecks`, so the tests call
   it directly with the config it reads set, the same way the template and frame-auth guards are
   tested. Not async: they mutate global application env.
 
-  Also home to the older `Fathom.Application.check_*!` guard tests (template/default shard, NODE_KEY,
+  Also home to the older `Fathom.BootChecks.check_*!` guard tests (template/default shard, NODE_KEY,
   pool fd budget, auth-disabled template, bind guards, flush-interval, ...), moved from
   shard_executor_test.exs in the 2026-11-13 cleanliness audit (#42) so that file models the executor
   binding only.
@@ -31,7 +31,7 @@ defmodule Fathom.BootSecurityGuardsTest do
 
     test "throttles on (the prod default) with no trusted proxy refuses to boot" do
       assert_raise RuntimeError, ~r/shares one throttle bucket/, fn ->
-        Fathom.Application.check_throttle_proxy!()
+        Fathom.BootChecks.check_throttle_proxy!()
       end
     end
 
@@ -40,28 +40,28 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:api_rate_limit, 120)
 
       assert_raise RuntimeError, ~r/shares one throttle bucket/, fn ->
-        Fathom.Application.check_throttle_proxy!()
+        Fathom.BootChecks.check_throttle_proxy!()
       end
     end
 
     test "the explicit opt-out boots (a deployment with no proxy in front of :4000)" do
       Env.put!(:admin_throttle_shared_bucket_ok, true)
-      assert Fathom.Application.check_throttle_proxy!() == nil
+      assert Fathom.BootChecks.check_throttle_proxy!() == nil
     end
 
     test "a trusted proxy satisfies the guard without the opt-out" do
       Env.put!(:trusted_proxies, ["10.0.0.0/8"])
-      assert Fathom.Application.check_throttle_proxy!() == nil
+      assert Fathom.BootChecks.check_throttle_proxy!() == nil
     end
 
     test "throttles disabled (0) need no proxy" do
       Env.put!(:admin_auth_max_failures, 0)
-      assert Fathom.Application.check_throttle_proxy!() == nil
+      assert Fathom.BootChecks.check_throttle_proxy!() == nil
     end
 
     test "dev and test are never refused" do
       Env.put!(:env, :dev)
-      assert Fathom.Application.check_throttle_proxy!() == nil
+      assert Fathom.BootChecks.check_throttle_proxy!() == nil
     end
   end
 
@@ -78,7 +78,7 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:admin_auth, username: "admin", password: "admin")
 
       assert_raise RuntimeError, ~r/under 16 bytes/, fn ->
-        Fathom.Application.check_admin_credentials!()
+        Fathom.BootChecks.check_admin_credentials!()
       end
     end
 
@@ -87,19 +87,19 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:admin_auth, username: user, password: user)
 
       assert_raise RuntimeError, ~r/equal to the\s+username/, fn ->
-        Fathom.Application.check_admin_credentials!()
+        Fathom.BootChecks.check_admin_credentials!()
       end
     end
 
     test "prod boots a 16-byte password that differs from the username" do
       Env.put!(:admin_auth, username: "admin", password: "0123456789abcdef")
-      assert Fathom.Application.check_admin_credentials!() == nil
+      assert Fathom.BootChecks.check_admin_credentials!() == nil
     end
 
     test "the weak-credentials opt-out boots a short password" do
       Env.put!(:admin_auth, username: "admin", password: "admin")
       Env.put!(:admin_weak_credentials_ok, true)
-      assert Fathom.Application.check_admin_credentials!() == nil
+      assert Fathom.BootChecks.check_admin_credentials!() == nil
     end
 
     test "prod refuses a blank env value, and the opt-out does not cover it" do
@@ -107,7 +107,7 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:admin_weak_credentials_ok, true)
 
       assert_raise RuntimeError, ~r/blank value/, fn ->
-        Fathom.Application.check_admin_credentials!()
+        Fathom.BootChecks.check_admin_credentials!()
       end
     end
 
@@ -115,18 +115,18 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:admin_auth, username: "admin", password: nil)
 
       assert_raise RuntimeError, ~r/only one of ADMIN_USER and ADMIN_PASS/, fn ->
-        Fathom.Application.check_admin_credentials!()
+        Fathom.BootChecks.check_admin_credentials!()
       end
     end
 
     test "both unset boots (the dashboard-off posture)" do
-      assert Fathom.Application.check_admin_credentials!() == nil
+      assert Fathom.BootChecks.check_admin_credentials!() == nil
     end
 
     test "dev and test are never refused" do
       Env.put!(:env, :dev)
       Env.put!(:admin_auth, username: "admin", password: "admin")
-      assert Fathom.Application.check_admin_credentials!() == nil
+      assert Fathom.BootChecks.check_admin_credentials!() == nil
     end
   end
 
@@ -136,7 +136,7 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:shard_storage, @s3)
       Env.put!(@s3, token: "FwoGZXIvYXdzEJr-temporary")
 
-      log = capture_log(fn -> assert Fathom.Application.check_s3_static_credentials!() == nil end)
+      log = capture_log(fn -> assert Fathom.BootChecks.check_s3_static_credentials!() == nil end)
       assert log =~ "AWS_SESSION_TOKEN is set"
       assert log =~ "403"
     end
@@ -146,7 +146,7 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:shard_storage, @s3)
       Env.put!(@s3, token: nil)
 
-      log = capture_log(fn -> assert Fathom.Application.check_s3_static_credentials!() == nil end)
+      log = capture_log(fn -> assert Fathom.BootChecks.check_s3_static_credentials!() == nil end)
       refute log =~ "AWS_SESSION_TOKEN"
     end
 
@@ -156,13 +156,13 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:env, :dev)
       Env.put!(:shard_storage, @s3)
 
-      refute capture_log(fn -> Fathom.Application.check_s3_static_credentials!() end) =~
+      refute capture_log(fn -> Fathom.BootChecks.check_s3_static_credentials!() end) =~
                "AWS_SESSION_TOKEN"
 
       Env.put!(:env, :prod)
       Env.put!(:shard_storage, Fathom.Shard.Storage.Local)
 
-      refute capture_log(fn -> Fathom.Application.check_s3_static_credentials!() end) =~
+      refute capture_log(fn -> Fathom.BootChecks.check_s3_static_credentials!() end) =~
                "AWS_SESSION_TOKEN"
     end
   end
@@ -181,7 +181,7 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:replication_followers, [{"n2", "10.0.0.2", 9100}])
 
       assert_raise RuntimeError, ~r/no cross-node single-writer/, fn ->
-        Fathom.Application.check_local_storage_fleet!()
+        Fathom.BootChecks.check_local_storage_fleet!()
       end
     end
 
@@ -189,7 +189,7 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:replication_followers, [{"n2", "10.0.0.2", 9100}])
       Env.put!(:allow_local_storage, true)
 
-      assert Fathom.Application.check_local_storage_fleet!() == nil
+      assert Fathom.BootChecks.check_local_storage_fleet!() == nil
     end
   end
 
@@ -205,7 +205,7 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:shard_data_dir, "/var/lib/fathom/x")
 
       assert_raise RuntimeError, ~r/equals or is nested.*SHARD_DATA_DIR/s, fn ->
-        Fathom.Application.check_replication_disk!()
+        Fathom.BootChecks.check_replication_disk!()
       end
     end
 
@@ -214,14 +214,14 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:shard_data_dir, "/var/lib/fathom/shards")
 
       assert_raise RuntimeError, ~r/equals or is nested/, fn ->
-        Fathom.Application.check_replication_disk!()
+        Fathom.BootChecks.check_replication_disk!()
       end
 
       Env.put!(:replication_dir, "/var/lib/fathom")
       Env.put!(:shard_data_dir, "/var/lib/fathom/shards")
 
       assert_raise RuntimeError, ~r/equals or is nested/, fn ->
-        Fathom.Application.check_replication_disk!()
+        Fathom.BootChecks.check_replication_disk!()
       end
     end
 
@@ -230,11 +230,11 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:shard_data_dir, "/var/lib/fathom/x")
 
       Env.put!(:env, :dev)
-      assert Fathom.Application.check_replication_disk!() == nil
+      assert Fathom.BootChecks.check_replication_disk!() == nil
 
       Env.put!(:env, :prod)
       Env.put!(:replication_listen, false)
-      assert Fathom.Application.check_replication_disk!() == nil
+      assert Fathom.BootChecks.check_replication_disk!() == nil
     end
   end
 
@@ -247,19 +247,19 @@ defmodule Fathom.BootSecurityGuardsTest do
     test "0 warns, a positive interval is silent" do
       Env.put!(:shard_flush_interval_ms, 0)
 
-      log = capture_log(fn -> assert Fathom.Application.check_flush_interval!() == nil end)
+      log = capture_log(fn -> assert Fathom.BootChecks.check_flush_interval!() == nil end)
       assert log =~ "DISABLES the periodic durability flush"
 
       Env.put!(:shard_flush_interval_ms, 300_000)
 
-      refute capture_log(fn -> Fathom.Application.check_flush_interval!() end) =~
+      refute capture_log(fn -> Fathom.BootChecks.check_flush_interval!() end) =~
                "DISABLES the periodic durability flush"
     end
   end
 
   # ---------------------------------------------------------------------------------------------
   # Moved here from shard_executor_test.exs (cleanliness audit 2026-11-13 #42): these exercise
-  # `Fathom.Application.check_*!` guards, not the executor binding, and that file is the one AGENTS.md
+  # `Fathom.BootChecks.check_*!` guards, not the executor binding, and that file is the one AGENTS.md
   # points newcomers at as the shard-test template.
   # ---------------------------------------------------------------------------------------------
 
@@ -272,12 +272,12 @@ defmodule Fathom.BootSecurityGuardsTest do
     Env.put!(:default_shard, "poison")
 
     assert_raise RuntimeError, ~r/finding #17/, fn ->
-      Fathom.Application.check_template_default!()
+      Fathom.BootChecks.check_template_default!()
     end
 
     # A different default (or the fail-closed nil) boots fine.
     Env.put!(:default_shard, "safe")
-    assert Fathom.Application.check_template_default!() == nil
+    assert Fathom.BootChecks.check_template_default!() == nil
   end
 
   # Review 2026-07-09 #1: the rebalancer keys its exception table + dead-node reconciler on
@@ -289,22 +289,22 @@ defmodule Fathom.BootSecurityGuardsTest do
     Env.put!(:node_key, "fathom9")
 
     assert_raise RuntimeError, ~r/not a key of :lb_backends/, fn ->
-      Fathom.Application.check_rebalancer_config!()
+      Fathom.BootChecks.check_rebalancer_config!()
     end
 
     # A matching NODE_KEY boots fine.
     Env.put!(:node_key, "fathom1")
-    assert Fathom.Application.check_rebalancer_config!() == nil
+    assert Fathom.BootChecks.check_rebalancer_config!() == nil
 
     # Inert when :lb_backends is unset (no rebalancer fleet), and outside prod.
     Env.delete!(:lb_backends)
     Env.put!(:node_key, "anything")
-    assert Fathom.Application.check_rebalancer_config!() == nil
+    assert Fathom.BootChecks.check_rebalancer_config!() == nil
 
     Env.put!(:env, :test)
     Env.put!(:lb_backends, %{"fathom1" => "x"})
     Env.put!(:node_key, "mismatch")
-    assert Fathom.Application.check_rebalancer_config!() == nil
+    assert Fathom.BootChecks.check_rebalancer_config!() == nil
   end
 
   # Expert review 2026-09-18 #12: :max_open_shards bounds coordinators, but pooling adds idle handles
@@ -320,7 +320,7 @@ defmodule Fathom.BootSecurityGuardsTest do
     Env.put!(:max_open_shards, 1000)
     Env.put!(:connection_pool_opts, max_per_scope: 2)
 
-    log = capture_log(fn -> assert Fathom.Application.check_pool_fd_budget!() == nil end)
+    log = capture_log(fn -> assert Fathom.BootChecks.check_pool_fd_budget!() == nil end)
     assert log =~ "connection_pool is ON"
 
     # Expert review 2026-10-20-2027 #2: counted in FDS (lsof). 5 connections (1 + 2*2) at 2 fds each,
@@ -331,21 +331,21 @@ defmodule Fathom.BootSecurityGuardsTest do
     # Quiet when the cap is unbounded (nothing to inflate past).
     Env.put!(:max_open_shards, :infinity)
 
-    refute capture_log(fn -> Fathom.Application.check_pool_fd_budget!() end) =~
+    refute capture_log(fn -> Fathom.BootChecks.check_pool_fd_budget!() end) =~
              "connection_pool is ON"
 
     # Quiet when pooling is off.
     Env.put!(:max_open_shards, 1000)
     Env.put!(:connection_pool, false)
 
-    refute capture_log(fn -> Fathom.Application.check_pool_fd_budget!() end) =~
+    refute capture_log(fn -> Fathom.BootChecks.check_pool_fd_budget!() end) =~
              "connection_pool is ON"
 
     # Quiet outside prod.
     Env.put!(:connection_pool, true)
     Env.put!(:env, :test)
 
-    refute capture_log(fn -> Fathom.Application.check_pool_fd_budget!() end) =~
+    refute capture_log(fn -> Fathom.BootChecks.check_pool_fd_budget!() end) =~
              "connection_pool is ON"
   end
 
@@ -360,7 +360,7 @@ defmodule Fathom.BootSecurityGuardsTest do
     Env.put!(:max_open_shards, 1000)
     Env.put!(:replication_enabled, true)
 
-    log = capture_log(fn -> assert Fathom.Application.check_pool_fd_budget!() == nil end)
+    log = capture_log(fn -> assert Fathom.BootChecks.check_pool_fd_budget!() == nil end)
     assert log =~ "replication is ON"
 
     # per_shard = 1 coordinator connection (2 fds) + -shm + the Session's -wal and -shm (2026-10-20-2027
@@ -371,13 +371,13 @@ defmodule Fathom.BootSecurityGuardsTest do
     # Both on: 3 connections (1 + 2*1, default max_per_scope 1) * 2 + -shm + 2 replication fds.
     Env.put!(:connection_pool, true)
     Env.delete!(:connection_pool_opts)
-    log = capture_log(fn -> Fathom.Application.check_pool_fd_budget!() end)
+    log = capture_log(fn -> Fathom.BootChecks.check_pool_fd_budget!() end)
     assert log =~ "9000 fds"
 
     # Replication off and pool off: quiet.
     Env.put!(:connection_pool, false)
     Env.put!(:replication_enabled, false)
-    assert capture_log(fn -> Fathom.Application.check_pool_fd_budget!() end) == ""
+    assert capture_log(fn -> Fathom.BootChecks.check_pool_fd_budget!() end) == ""
   end
 
   # Expert review #9: template capture replays a shard's SQL fleet-wide, and AGENTS.md forbids a
@@ -390,24 +390,24 @@ defmodule Fathom.BootSecurityGuardsTest do
     Env.put!(:hrana_auth, :disabled)
 
     assert_raise RuntimeError, ~r/poisoning vector/, fn ->
-      Fathom.Application.check_template_auth!()
+      Fathom.BootChecks.check_template_auth!()
     end
 
     # An unset :hrana_auth defaults to :disabled — still refused.
     Env.delete!(:hrana_auth)
 
     assert_raise RuntimeError, ~r/poisoning vector/, fn ->
-      Fathom.Application.check_template_auth!()
+      Fathom.BootChecks.check_template_auth!()
     end
 
     # Auth required (or any non-:disabled value, which fails closed to required) boots fine.
     Env.put!(:hrana_auth, :required)
-    assert Fathom.Application.check_template_auth!() == nil
+    assert Fathom.BootChecks.check_template_auth!() == nil
 
     # No template in prod boots fine regardless of auth mode.
     Env.put!(:hrana_auth, :disabled)
     Env.put!(:template_shard_id, nil)
-    assert Fathom.Application.check_template_auth!() == nil
+    assert Fathom.BootChecks.check_template_auth!() == nil
   end
 
   # Finding #3: the Hrana port carries no in-app credential, so the listener's bind interface is
@@ -430,17 +430,17 @@ defmodule Fathom.BootSecurityGuardsTest do
     Env.put!(:lb_backends, %{"fathom1" => "fathom1:8080"})
 
     assert_raise RuntimeError, ~r/no cross-node single-writer guarantee/, fn ->
-      Fathom.Application.check_local_storage_fleet!()
+      Fathom.BootChecks.check_local_storage_fleet!()
     end
 
     # Single-node Local (no fleet) boots fine.
     Env.delete!(:lb_backends)
-    assert Fathom.Application.check_local_storage_fleet!() == nil
+    assert Fathom.BootChecks.check_local_storage_fleet!() == nil
 
     # The S3 backend across a fleet boots fine (it enforces cross-node single-writer).
     Env.put!(:lb_backends, %{"fathom1" => "fathom1:8080"})
     Env.put!(:shard_storage, Fathom.Shard.Storage.S3)
-    assert Fathom.Application.check_local_storage_fleet!() == nil
+    assert Fathom.BootChecks.check_local_storage_fleet!() == nil
   end
 
   # Expert review 2026-07-14 #6: without :shard_base_domain, Fathom.ShardExecutor.shard_from_host
@@ -454,36 +454,36 @@ defmodule Fathom.BootSecurityGuardsTest do
     Env.delete!(:allow_unanchored_routing)
 
     assert_raise RuntimeError, ~r/SHARD_BASE_DOMAIN/, fn ->
-      Fathom.Application.check_shard_base_domain!()
+      Fathom.BootChecks.check_shard_base_domain!()
     end
 
     # A blank/whitespace zone is treated as unset — still refused.
     Env.put!(:shard_base_domain, "   ")
 
     assert_raise RuntimeError, ~r/SHARD_BASE_DOMAIN/, fn ->
-      Fathom.Application.check_shard_base_domain!()
+      Fathom.BootChecks.check_shard_base_domain!()
     end
 
     # An anchored zone boots fine.
     Env.put!(:shard_base_domain, "fathom.example")
-    assert Fathom.Application.check_shard_base_domain!() == :ok
+    assert Fathom.BootChecks.check_shard_base_domain!() == :ok
 
     # The explicit ack lets an unanchored deploy boot even with the zone unset.
     Env.delete!(:shard_base_domain)
     Env.put!(:allow_unanchored_routing, true)
-    assert Fathom.Application.check_shard_base_domain!() == :ok
+    assert Fathom.BootChecks.check_shard_base_domain!() == :ok
 
     # With the data plane NOT exposed (no fleet, Hrana server off), the zone may be unset.
     Env.delete!(:allow_unanchored_routing)
     Env.delete!(:lb_backends)
     Env.put!(:hrana_server, false)
-    assert Fathom.Application.check_shard_base_domain!() == :ok
+    assert Fathom.BootChecks.check_shard_base_domain!() == :ok
 
     # The Hrana listener being enabled ALSO counts as exposed (refused with the zone unset).
     Env.put!(:hrana_server, true)
 
     assert_raise RuntimeError, ~r/SHARD_BASE_DOMAIN/, fn ->
-      Fathom.Application.check_shard_base_domain!()
+      Fathom.BootChecks.check_shard_base_domain!()
     end
   end
 
@@ -494,15 +494,15 @@ defmodule Fathom.BootSecurityGuardsTest do
     Env.put!(:allow_shard_override, true)
 
     assert_raise RuntimeError, ~r/allow_shard_override/, fn ->
-      Fathom.Application.check_shard_override!()
+      Fathom.BootChecks.check_shard_override!()
     end
 
     # Off (the prod default) boots fine, whether explicit or unset.
     Env.put!(:allow_shard_override, false)
-    assert Fathom.Application.check_shard_override!() == nil
+    assert Fathom.BootChecks.check_shard_override!() == nil
 
     Env.delete!(:allow_shard_override)
-    assert Fathom.Application.check_shard_override!() == nil
+    assert Fathom.BootChecks.check_shard_override!() == nil
   end
 
   # Expert review 2026-07-14 #16: a non-nil :default_shard in prod commingles all unresolved
@@ -516,7 +516,7 @@ defmodule Fathom.BootSecurityGuardsTest do
 
     log =
       capture_log(fn ->
-        assert Fathom.Application.check_default_shard!() == nil
+        assert Fathom.BootChecks.check_default_shard!() == nil
       end)
 
     assert log =~ "default_shard"
@@ -526,7 +526,7 @@ defmodule Fathom.BootSecurityGuardsTest do
     Env.put!(:default_shard, nil)
 
     refute capture_log(fn ->
-             assert Fathom.Application.check_default_shard!() == nil
+             assert Fathom.BootChecks.check_default_shard!() == nil
            end) =~ "commingles"
   end
 
@@ -543,7 +543,7 @@ defmodule Fathom.BootSecurityGuardsTest do
 
     log =
       capture_log(fn ->
-        assert Fathom.Application.check_hrana_exposure!() == nil
+        assert Fathom.BootChecks.check_hrana_exposure!() == nil
       end)
 
     assert log =~ "unauthenticated"
@@ -551,13 +551,13 @@ defmodule Fathom.BootSecurityGuardsTest do
 
     # The IPv6 wildcard bind is flagged the same way.
     Env.put!(:hrana_bind_ip, {0, 0, 0, 0, 0, 0, 0, 0})
-    assert capture_log(fn -> Fathom.Application.check_hrana_exposure!() end) =~ "firewall"
+    assert capture_log(fn -> Fathom.BootChecks.check_hrana_exposure!() end) =~ "firewall"
 
     # Auth required silences it (the data path is authenticated).
     Env.put!(:hrana_auth, :required)
 
     refute capture_log(fn ->
-             assert Fathom.Application.check_hrana_exposure!() == nil
+             assert Fathom.BootChecks.check_hrana_exposure!() == nil
            end) =~ "firewall"
 
     # A pinned (non-wildcard) bind silences it (network-isolated to the LB interface).
@@ -565,7 +565,7 @@ defmodule Fathom.BootSecurityGuardsTest do
     Env.put!(:hrana_bind_ip, {127, 0, 0, 1})
 
     refute capture_log(fn ->
-             assert Fathom.Application.check_hrana_exposure!() == nil
+             assert Fathom.BootChecks.check_hrana_exposure!() == nil
            end) =~ "firewall"
   end
 
@@ -581,7 +581,7 @@ defmodule Fathom.BootSecurityGuardsTest do
 
     # Unset bind = wildcard, because Fleet.follower_children/0 simply omits :ip.
     assert_raise RuntimeError, ~r/UNAUTHENTICATED/, fn ->
-      Fathom.Application.check_replication_exposure!()
+      Fathom.BootChecks.check_replication_exposure!()
     end
 
     # Both wildcard forms, spelled out.
@@ -589,23 +589,23 @@ defmodule Fathom.BootSecurityGuardsTest do
       Env.put!(:replication_bind_ip, wildcard)
 
       assert_raise RuntimeError, ~r/REPLICATION_BIND_IP/, fn ->
-        Fathom.Application.check_replication_exposure!()
+        Fathom.BootChecks.check_replication_exposure!()
       end
     end
 
     # A pinned interface is the fix, and passes.
     Env.put!(:replication_bind_ip, {10, 0, 0, 7})
-    assert Fathom.Application.check_replication_exposure!() == nil
+    assert Fathom.BootChecks.check_replication_exposure!() == nil
 
     # Not listening at all is fine however it is bound — the guard is about an OPEN port.
     Env.put!(:replication_listen, false)
     Env.delete!(:replication_bind_ip)
-    assert Fathom.Application.check_replication_exposure!() == nil
+    assert Fathom.BootChecks.check_replication_exposure!() == nil
 
     # And it is prod-only, like every sibling guard.
     Env.put!(:env, :dev)
     Env.put!(:replication_listen, true)
-    assert Fathom.Application.check_replication_exposure!() == nil
+    assert Fathom.BootChecks.check_replication_exposure!() == nil
   end
 
   # Expert review 2026-08-20 #33. The flush interval reads like a pure RPO knob -- docs/durability.md
@@ -629,27 +629,27 @@ defmodule Fathom.BootSecurityGuardsTest do
     Env.put!(:shard_flush_interval_ms, 5_000)
 
     assert capture_log(fn ->
-             assert Fathom.Application.check_replication_flush_interval!() == nil
+             assert Fathom.BootChecks.check_replication_flush_interval!() == nil
            end) =~ "ENTIRE WAL"
 
     # At or above the floor the A/B measured as clean, silence.
     Env.put!(:shard_flush_interval_ms, 30_000)
-    assert capture_log(fn -> Fathom.Application.check_replication_flush_interval!() end) == ""
+    assert capture_log(fn -> Fathom.BootChecks.check_replication_flush_interval!() end) == ""
 
     # 0 is idle-only flushing -- no periodic checkpoint at all, so no generation churn. It has its
     # own (unbounded-RPO) problem, which is not this guard's business.
     Env.put!(:shard_flush_interval_ms, 0)
-    assert capture_log(fn -> Fathom.Application.check_replication_flush_interval!() end) == ""
+    assert capture_log(fn -> Fathom.BootChecks.check_replication_flush_interval!() end) == ""
 
     # Not replicating: the interval is a pure RPO knob again and a tight one is unremarkable.
     Env.put!(:shard_flush_interval_ms, 5_000)
     Env.put!(:replication_enabled, false)
-    assert capture_log(fn -> Fathom.Application.check_replication_flush_interval!() end) == ""
+    assert capture_log(fn -> Fathom.BootChecks.check_replication_flush_interval!() end) == ""
 
     # And prod-only, like every sibling guard.
     Env.put!(:replication_enabled, true)
     Env.put!(:env, :dev)
-    assert capture_log(fn -> Fathom.Application.check_replication_flush_interval!() end) == ""
+    assert capture_log(fn -> Fathom.BootChecks.check_replication_flush_interval!() end) == ""
   end
 
   # Expert review 2026-08-20 #23. The replica store holds a full copy of every shard this node
@@ -679,18 +679,18 @@ defmodule Fathom.BootSecurityGuardsTest do
 
     # Two directories under one tmpdir are the same mount, which is exactly the DEFAULT shape.
     assert capture_log(fn ->
-             assert Fathom.Application.check_replication_disk!() == nil
+             assert Fathom.BootChecks.check_replication_disk!() == nil
            end) =~ "SAME volume"
 
     # Not listening: this node is nobody's follower, so the replica store never grows and the
     # arrangement is irrelevant however the directories are laid out.
     Env.put!(:replication_listen, false)
-    assert capture_log(fn -> Fathom.Application.check_replication_disk!() end) == ""
+    assert capture_log(fn -> Fathom.BootChecks.check_replication_disk!() end) == ""
 
     # And prod-only, like every sibling guard.
     Env.put!(:replication_listen, true)
     Env.put!(:env, :dev)
-    assert capture_log(fn -> Fathom.Application.check_replication_disk!() end) == ""
+    assert capture_log(fn -> Fathom.BootChecks.check_replication_disk!() end) == ""
   end
 
   # All five 2026-07-14 config guards are prod-only: with env != :prod (the dev/test default),
@@ -710,15 +710,15 @@ defmodule Fathom.BootSecurityGuardsTest do
     Env.put!(:hrana_bind_ip, {0, 0, 0, 0})
 
     # No raise from the RAISE guards…
-    assert Fathom.Application.check_local_storage_fleet!() == nil
-    assert Fathom.Application.check_shard_base_domain!() == :ok
-    assert Fathom.Application.check_shard_override!() == nil
+    assert Fathom.BootChecks.check_local_storage_fleet!() == nil
+    assert Fathom.BootChecks.check_shard_base_domain!() == :ok
+    assert Fathom.BootChecks.check_shard_override!() == nil
 
     # …and no warning from the WARN guards.
     log =
       capture_log(fn ->
-        assert Fathom.Application.check_default_shard!() == nil
-        assert Fathom.Application.check_hrana_exposure!() == nil
+        assert Fathom.BootChecks.check_default_shard!() == nil
+        assert Fathom.BootChecks.check_hrana_exposure!() == nil
       end)
 
     refute log =~ "commingles"

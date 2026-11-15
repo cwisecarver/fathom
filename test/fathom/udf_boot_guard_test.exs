@@ -33,7 +33,7 @@ defmodule Fathom.UdfBootGuardTest do
     Application.delete_env(:fathom, :allow_no_udf)
 
     assert_raise RuntimeError, ~r/fathom_udf SQLite extension is not available/, fn ->
-      Fathom.Application.check_udf_extension!()
+      Fathom.BootChecks.check_udf_extension!()
     end
   end
 
@@ -42,7 +42,7 @@ defmodule Fathom.UdfBootGuardTest do
     Application.put_env(:fathom, :sqlite_extension, false)
     Application.put_env(:fathom, :allow_no_udf, true)
 
-    assert Fathom.Application.check_udf_extension!() == nil
+    assert Fathom.BootChecks.check_udf_extension!() == nil
   end
 
   test "ALLOW_NO_UDF does NOT acknowledge a missing extension when replication is on (#24)" do
@@ -52,7 +52,7 @@ defmodule Fathom.UdfBootGuardTest do
     Application.put_env(:fathom, :replication_enabled, true)
 
     assert_raise RuntimeError, ~r/replication is ON/, fn ->
-      Fathom.Application.check_udf_extension!()
+      Fathom.BootChecks.check_udf_extension!()
     end
   end
 
@@ -85,13 +85,13 @@ defmodule Fathom.UdfBootGuardTest do
              "fixture: the garbage file must count as present"
 
       assert_raise RuntimeError, ~r/configured but does not load/, fn ->
-        Fathom.Application.check_udf_extension!()
+        Fathom.BootChecks.check_udf_extension!()
       end
 
       Application.put_env(:fathom, :allow_no_udf, true)
 
       assert_raise RuntimeError, ~r/configured but does not load/, fn ->
-        Fathom.Application.check_udf_extension!()
+        Fathom.BootChecks.check_udf_extension!()
       end
     end
 
@@ -99,13 +99,13 @@ defmodule Fathom.UdfBootGuardTest do
       Application.put_env(:fathom, :sqlite_extension, "")
 
       assert_raise RuntimeError, ~r/configured but does not load/, fn ->
-        Fathom.Application.check_udf_extension!()
+        Fathom.BootChecks.check_udf_extension!()
       end
     end
 
     test "the pure verdict: {:error, _} is refused with the ack, replication off, anything" do
       for allow <- [true, false], repl <- [true, false] do
-        assert Fathom.Application.udf_extension_problem(%{
+        assert Fathom.BootChecks.udf_extension_problem(%{
                  env: :prod,
                  extension: {:error, "dlopen failed"},
                  allow_no_udf: allow,
@@ -113,7 +113,7 @@ defmodule Fathom.UdfBootGuardTest do
                }) =~ "dlopen failed"
       end
 
-      assert Fathom.Application.udf_extension_problem(%{
+      assert Fathom.BootChecks.udf_extension_problem(%{
                env: :dev,
                extension: {:error, "dlopen failed"},
                allow_no_udf: false,
@@ -128,7 +128,7 @@ defmodule Fathom.UdfBootGuardTest do
     Application.delete_env(:fathom, :sqlite_extension)
     Application.delete_env(:fathom, :allow_no_udf)
 
-    assert Fathom.Application.check_udf_extension!() == nil
+    assert Fathom.BootChecks.check_udf_extension!() == nil
   end
 
   test "dev and test never trip the guard" do
@@ -137,7 +137,7 @@ defmodule Fathom.UdfBootGuardTest do
 
     for env <- [:dev, :test] do
       Application.put_env(:fathom, :env, env)
-      assert Fathom.Application.check_udf_extension!() == nil
+      assert Fathom.BootChecks.check_udf_extension!() == nil
     end
   end
 
@@ -157,7 +157,7 @@ defmodule Fathom.UdfBootGuardTest do
 
     test "prod + no extension + replication on is refused even WITH ALLOW_NO_UDF (pre-fix: nil)" do
       message =
-        Fathom.Application.udf_extension_problem(
+        Fathom.BootChecks.udf_extension_problem(
           cfg(allow_no_udf: true, replication_enabled: true)
         )
 
@@ -167,24 +167,24 @@ defmodule Fathom.UdfBootGuardTest do
     end
 
     test "prod + no extension + replication on is refused without the ack too" do
-      assert Fathom.Application.udf_extension_problem(cfg(replication_enabled: true)) =~
+      assert Fathom.BootChecks.udf_extension_problem(cfg(replication_enabled: true)) =~
                "replication is ON"
     end
 
     test "with replication OFF the ack still works, and absent the ack it is refused" do
-      assert Fathom.Application.udf_extension_problem(cfg(allow_no_udf: true)) == nil
+      assert Fathom.BootChecks.udf_extension_problem(cfg(allow_no_udf: true)) == nil
 
-      assert Fathom.Application.udf_extension_problem(cfg([])) =~
+      assert Fathom.BootChecks.udf_extension_problem(cfg([])) =~
                "fathom_udf SQLite extension is not available"
     end
 
     test "a present extension, or a non-prod env, is never refused" do
-      assert Fathom.Application.udf_extension_problem(
+      assert Fathom.BootChecks.udf_extension_problem(
                cfg(extension: :ok, replication_enabled: true)
              ) == nil
 
       for env <- [:dev, :test] do
-        assert Fathom.Application.udf_extension_problem(cfg(env: env, replication_enabled: true)) ==
+        assert Fathom.BootChecks.udf_extension_problem(cfg(env: env, replication_enabled: true)) ==
                  nil
       end
     end

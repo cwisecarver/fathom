@@ -14,7 +14,7 @@ Capture is off by default and is a **poisoning vector** — whatever SQL reaches
 fleet DDL — so in production the template must be reachable **only by you**:
 
 - Set `:template_shard_id` (e.g. `template`) on the nodes that should capture. Never make it equal
-  `:default_shard`, and never leave it anonymously reachable (`Fathom.Application` refuses a prod
+  `:default_shard`, and never leave it anonymously reachable (`Fathom.BootChecks` refuses a prod
   boot where the default shard is the template).
 - Turn on `HRANA_AUTH=required` and mint a token for the template: `mix fathom.token template`.
   Point a **dedicated** Django project (your "migrations" project) at it:

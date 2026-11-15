@@ -101,7 +101,7 @@ Postgres outage (an outage must not lock out known tenants).
 
 `:template_shard_id` (off in prod by default) records a shard's SQL for fleet-wide replay, so if it
 were reachable anonymously an attacker could poison the template every shard is built from.
-`Fathom.Application` refuses two dangerous configs **at prod boot**:
+`Fathom.BootChecks` refuses two dangerous configs **at prod boot**:
 
 - **`:default_shard` must not equal `:template_shard_id`** (`check_template_default!`, finding #17) —
   else an unresolved request would land on, and could write to, the template.

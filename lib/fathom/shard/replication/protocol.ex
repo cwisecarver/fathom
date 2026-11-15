@@ -612,7 +612,7 @@ defmodule Fathom.Shard.Replication.Protocol do
   unwraps on the other side.
 
   A `nil` tag — signing enabled with no key configured — sends the frame UNSIGNED rather than
-  raising on the commit path. `Fathom.Application.check_replication_frame_auth!/0` refuses that
+  raising on the commit path. `Fathom.BootChecks.check_replication_frame_auth!/0` refuses that
   combination at boot, so reaching it means someone changed config at runtime; a peer that
   requires signatures will then refuse the frame, which is the loud, correct failure.
   """

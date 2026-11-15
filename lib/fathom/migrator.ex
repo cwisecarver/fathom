@@ -94,7 +94,7 @@ defmodule Fathom.Migrator do
   # flag is on — so the flag-off case, which is the actual misconfiguration, was completely
   # silent. This is the one moment it can be caught cheaply: releasing is a deliberate operator
   # action, HEAD is right here, and it happens once per release rather than once per checkout. A
-  # boot guard cannot do it — `Fathom.Application`'s guards run before `Fathom.Repo` is up, so
+  # boot guard cannot do it — `Fathom.BootChecks` guards run before `Fathom.Repo` is up, so
   # there is no HEAD to read.
   #
   # Gated on a capture template being configured, and that is not test hygiene — it is the

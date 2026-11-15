@@ -50,7 +50,7 @@ defmodule Fathom.Audit20260801SmallFixesTest do
       Application.delete_env(:fathom, :allow_unanchored_routing)
 
       assert_raise RuntimeError, ~r/shard_base_domain is unset/, fn ->
-        Fathom.Application.check_shard_base_domain!()
+        Fathom.BootChecks.check_shard_base_domain!()
       end
     end
 
@@ -60,7 +60,7 @@ defmodule Fathom.Audit20260801SmallFixesTest do
       Application.put_env(:fathom, :shard_base_domain, "fathom.example")
 
       # The fix must not turn every anchored prod node into a boot failure.
-      assert Fathom.Application.check_shard_base_domain!() == :ok
+      assert Fathom.BootChecks.check_shard_base_domain!() == :ok
     end
 
     test "the explicit ack still opts out" do
@@ -69,7 +69,7 @@ defmodule Fathom.Audit20260801SmallFixesTest do
       Application.delete_env(:fathom, :shard_base_domain)
       Application.put_env(:fathom, :allow_unanchored_routing, true)
 
-      assert Fathom.Application.check_shard_base_domain!() == :ok
+      assert Fathom.BootChecks.check_shard_base_domain!() == :ok
     end
 
     test "one reader, so the default cannot drift again" do

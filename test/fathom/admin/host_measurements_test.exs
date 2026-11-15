@@ -117,7 +117,7 @@ defmodule Fathom.Admin.HostMeasurementsTest do
     test "a default large-RAM host warns once, with the rig evidence and 'measure', not 'lower'" do
       log =
         capture_log(fn ->
-          assert Fathom.Application.check_vm_dirty_background!(reader(@default_host)) == nil
+          assert Fathom.BootChecks.check_vm_dirty_background!(reader(@default_host)) == nil
         end)
 
       assert log =~ "effective vm.dirty_background threshold is 9.2 GiB"
@@ -131,7 +131,7 @@ defmodule Fathom.Admin.HostMeasurementsTest do
     test "a 1 GB cap does not warn" do
       files = Map.put(@default_host, "/proc/sys/vm/dirty_background_bytes", "#{@gib}\n")
 
-      assert capture_log(fn -> Fathom.Application.check_vm_dirty_background!(reader(files)) end) ==
+      assert capture_log(fn -> Fathom.BootChecks.check_vm_dirty_background!(reader(files)) end) ==
                ""
     end
 
@@ -139,16 +139,16 @@ defmodule Fathom.Admin.HostMeasurementsTest do
       at_line = Map.put(@default_host, "/proc/sys/vm/dirty_background_bytes", "#{2 * @gib}\n")
       over = Map.put(@default_host, "/proc/sys/vm/dirty_background_bytes", "#{2 * @gib + 1}\n")
 
-      assert capture_log(fn -> Fathom.Application.check_vm_dirty_background!(reader(at_line)) end) ==
+      assert capture_log(fn -> Fathom.BootChecks.check_vm_dirty_background!(reader(at_line)) end) ==
                ""
 
-      assert capture_log(fn -> Fathom.Application.check_vm_dirty_background!(reader(over)) end) =~
+      assert capture_log(fn -> Fathom.BootChecks.check_vm_dirty_background!(reader(over)) end) =~
                "config warning"
     end
 
     test "missing files (non-Linux) are a silent no-op that never raises" do
       assert capture_log(fn ->
-               assert Fathom.Application.check_vm_dirty_background!(reader(%{})) == nil
+               assert Fathom.BootChecks.check_vm_dirty_background!(reader(%{})) == nil
              end) == ""
     end
 
@@ -156,7 +156,7 @@ defmodule Fathom.Admin.HostMeasurementsTest do
       Application.put_env(:fathom, :env, :dev)
 
       assert capture_log(fn ->
-               Fathom.Application.check_vm_dirty_background!(reader(@default_host))
+               Fathom.BootChecks.check_vm_dirty_background!(reader(@default_host))
              end) == ""
     end
   end

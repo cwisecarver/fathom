@@ -378,7 +378,7 @@ a tenant looping TRUNCATE would churn the replication link.
   **With A2 replication on it is ALSO the biggest throughput dial**, for the checkpoint →
   generation-reset → full-WAL-reship reason spelled out under "Periodic durability flush" above:
   5,000 ms vs 30,000 ms measured as 22,599 errors vs 4, and +49% throughput, at 512 tenants. A
-  boot warning (`Fathom.Application.check_replication_flush_interval!/0`) names this when
+  boot warning (`Fathom.BootChecks.check_replication_flush_interval!/0`) names this when
   replication is enabled and the interval is tight. Do not tune it for RPO alone on a replicating
   fleet, and do not compare replication numbers taken at different intervals. **Keep the alert thresholds coupled:** `FathomUnflushedAgeHigh` (~2×) and
   `FathomManyDirtyShards` (~4×) in [`alert-rules.yml`](../deploy/observability/alert-rules.yml)

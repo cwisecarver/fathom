@@ -8,30 +8,30 @@ defmodule Fathom.ReplicationDirOverlapTest do
   """
   use ExUnit.Case, async: true
 
-  alias Fathom.Application, as: App
+  alias Fathom.BootChecks
 
   test "equal, nested, and containing directories overlap" do
-    assert App.dirs_overlap?("/data/fathom", "/data/fathom")
-    assert App.dirs_overlap?("/data/fathom/", "/data/fathom")
-    assert App.dirs_overlap?("/data/fathom/replicas", "/data/fathom")
-    assert App.dirs_overlap?("/data/fathom", "/data/fathom/replicas")
-    assert App.dirs_overlap?("/data/fathom/../fathom/x", "/data/fathom/x")
+    assert BootChecks.dirs_overlap?("/data/fathom", "/data/fathom")
+    assert BootChecks.dirs_overlap?("/data/fathom/", "/data/fathom")
+    assert BootChecks.dirs_overlap?("/data/fathom/replicas", "/data/fathom")
+    assert BootChecks.dirs_overlap?("/data/fathom", "/data/fathom/replicas")
+    assert BootChecks.dirs_overlap?("/data/fathom/../fathom/x", "/data/fathom/x")
   end
 
   test "siblings, including ones sharing a name prefix, do not overlap" do
-    refute App.dirs_overlap?("/data/fathom_replication", "/data/fathom_shards")
-    refute App.dirs_overlap?("/data/fathom", "/data/fathom2")
-    refute App.dirs_overlap?("/mnt/replicas", "/mnt/shards")
+    refute BootChecks.dirs_overlap?("/data/fathom_replication", "/data/fathom_shards")
+    refute BootChecks.dirs_overlap?("/data/fathom", "/data/fathom2")
+    refute BootChecks.dirs_overlap?("/mnt/replicas", "/mnt/shards")
   end
 
   test "the default dirs (both under TMPDIR) are siblings, so the default boots" do
-    refute App.dirs_overlap?(
+    refute BootChecks.dirs_overlap?(
              Path.join(System.tmp_dir!(), "fathom_replication"),
              Path.join(System.tmp_dir!(), "fathom_shards")
            )
   end
 
   test "the root contains everything" do
-    assert App.dirs_overlap?("/", "/data/fathom")
+    assert BootChecks.dirs_overlap?("/", "/data/fathom")
   end
 end

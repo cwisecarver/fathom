@@ -26,7 +26,7 @@ for a merged fleet view scrape every node.
 
 - A **blank** `ADMIN_USER` or `ADMIN_PASS` (empty or whitespace) is treated as **unset**: the surface
   answers 503. It never authenticates `""` credentials (which would accept `:`).
-- **Prod boot refuses** (`Fathom.Application.check_admin_credentials!/0`) when either variable is
+- **Prod boot refuses** (`Fathom.BootChecks.check_admin_credentials!/0`) when either variable is
   blank, when only one of the pair is set, or when the password is **under 16 bytes or equal to the
   username**. Both unset is the intended "dashboard off" posture and boots with a warning.
 - The weak-password refusal is opt-out with `ADMIN_WEAK_CREDENTIALS_OK=true`. Blank and

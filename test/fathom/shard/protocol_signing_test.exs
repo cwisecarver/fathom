@@ -268,7 +268,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
       require!(false)
 
       assert_raise RuntimeError, ~r/no key is configured/, fn ->
-        Fathom.Application.check_replication_frame_auth!()
+        Fathom.BootChecks.check_replication_frame_auth!()
       end
     end
 
@@ -280,7 +280,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
       require!(true)
 
       assert_raise RuntimeError, ~r/no key is configured/, fn ->
-        Fathom.Application.check_replication_frame_auth!()
+        Fathom.BootChecks.check_replication_frame_auth!()
       end
     end
 
@@ -294,7 +294,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
       assert_raise RuntimeError,
                    ~r/must be enabled fleet-wide BEFORE|before any node requires/i,
                    fn ->
-                     Fathom.Application.check_replication_frame_auth!()
+                     Fathom.BootChecks.check_replication_frame_auth!()
                    end
     end
 
@@ -307,7 +307,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
       sign!(true)
       require!(true)
 
-      assert Fathom.Application.check_replication_frame_auth!() == nil
+      assert Fathom.BootChecks.check_replication_frame_auth!() == nil
     end
 
     # Cleanliness audit 2026-11-13 #5: compose passes `REPLICATION_HMAC_SECRET: "${X:-}"`, which is "" when
@@ -321,7 +321,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
       require!(true)
 
       assert FrameAuth.key_configured?()
-      assert Fathom.Application.check_replication_frame_auth!() == nil
+      assert Fathom.BootChecks.check_replication_frame_auth!() == nil
     end
 
     test "both flags off is always fine, key or no key" do
@@ -331,7 +331,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
       sign!(false)
       require!(false)
 
-      assert Fathom.Application.check_replication_frame_auth!() == nil
+      assert Fathom.BootChecks.check_replication_frame_auth!() == nil
     end
   end
 
@@ -352,7 +352,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
       require!(false)
 
       assert_raise RuntimeError, ~r/under 32 bytes/, fn ->
-        Fathom.Application.check_replication_frame_auth!()
+        Fathom.BootChecks.check_replication_frame_auth!()
       end
     end
 
@@ -363,7 +363,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
       require!(true)
 
       assert_raise RuntimeError, ~r/under 32 bytes/, fn ->
-        Fathom.Application.check_replication_frame_auth!()
+        Fathom.BootChecks.check_replication_frame_auth!()
       end
     end
 
@@ -377,7 +377,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
       require!(false)
 
       assert_raise RuntimeError, ~r/under 32 bytes/, fn ->
-        Fathom.Application.check_replication_frame_auth!()
+        Fathom.BootChecks.check_replication_frame_auth!()
       end
     end
 
@@ -387,7 +387,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
       sign!(true)
       require!(true)
 
-      assert Fathom.Application.check_replication_frame_auth!() == nil
+      assert Fathom.BootChecks.check_replication_frame_auth!() == nil
     end
 
     test "a short secret is not refused while frame auth is off (the key is never used)" do
@@ -396,7 +396,7 @@ defmodule Fathom.Shard.ProtocolSigningTest do
       sign!(false)
       require!(false)
 
-      assert Fathom.Application.check_replication_frame_auth!() == nil
+      assert Fathom.BootChecks.check_replication_frame_auth!() == nil
     end
   end
 
