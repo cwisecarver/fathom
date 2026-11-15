@@ -52,6 +52,10 @@ every run and mount it over the LB's config (`docker-compose.lbvariant.yml`); th
 script fails loudly if an edit's anchor no longer matches exactly once. Pass the same value to every later command
 of the session, like the other overlays.
 
+To reproduce the 2026-11-11 tuning-audit arms (`docs/reviews/tuning-audit-2026-11-11.md`), which named the
+overlays `docker-compose.noaccesslog.yml` (#5) and `docker-compose.nginxworkers4.yml` (#8): those files are gone;
+use `RIG_LB_VARIANT=noaccesslog` and `RIG_LB_VARIANT=workers4`.
+
 Never cap only one side: the uncapped path then absorbs what the capped one sheds and the comparison
 is void (the audit's Trap on #16). `RIG_CAP_MIBPS` (default 125) and `RIG_CAP_IOPS` (default 3000) change
 both devices together.

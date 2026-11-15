@@ -1,0 +1,8 @@
+# Pure moves/regroupings from the 2026-11-13 cleanliness audit: no logic changed, so `git blame`
+# should look through them. Enable once per clone:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# (GitHub reads this file by default.)
+# shard_durability_test regrouped into describe blocks (same multiset of tests)
+7d94c218fc68e5952aceaf189653dc9dc682a82b
+# the boot guards moved from Fathom.Application to Fathom.BootChecks (names and bodies unchanged)
+8039f119f944775374255578d3949e2362ed5670

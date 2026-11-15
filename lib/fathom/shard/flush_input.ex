@@ -26,8 +26,9 @@ defmodule Fathom.Shard.FlushInput do
     * `:touch_pre_etag`: the etag the lease-touch left, so a flush that lands on it re-touches.
     * `:put_intents`: each attempt's md5, for the 412-reconcile's ownership question
       (`Fork.put_origin/3`). `[]` when the coordinator holds none.
-    * `:coordinator`: the pid the flush task reports each attempt's md5 to from its `:pre_put` hook;
-      `nil` on the drop path, which runs in the coordinator and needs no report.
+    * `:coordinator`: the pid the flush task reports each attempt's md5 to from its `:pre_put` hook
+      (the `{:put_intent, _}` messages the 412-reconcile reads). `nil` on the drop path, whose upload
+      runs in a `Task.async` of its own and has no consumer for those messages.
 
   Not the fence context (`fence_ctx/1`: lease/ttl/acquire_gen for `Fence.check/1`), which stays a
   separate, smaller map.
@@ -56,19 +57,24 @@ defmodule Fathom.Shard.FlushInput do
           path: Path.t(),
           etag: String.t() | nil,
           lease: Storage.lease(),
-          lineage: term(),
+          lineage: non_neg_integer() | :unknown | :disabled,
           acquire_gen: non_neg_integer() | nil,
-          wal_salt: term(),
-          wal_ordinal: term(),
-          carried_lineage: term(),
+          wal_salt: integer() | nil,
+          wal_ordinal: non_neg_integer(),
+          carried_lineage: non_neg_integer() | :none | nil,
           touch_pre_etag: String.t() | nil,
           coordinator: pid() | nil,
-          put_intents: [term()]
+          put_intents: [String.t()]
         }
 
   @doc """
   Build the chain's input from the coordinator state. `coordinator` is the pid the flush task reports
   to (`self()` for the periodic flush, `nil` on the drop path).
+
+  `:acquire_gen` is read from the state here, BEFORE the fence runs; on the periodic path
+  `with_fence/2` then overwrites it (and the lease) with the fence's verdict, which is the value
+  `recheck_before_put/1` must see. Callers of the periodic path must therefore apply `with_fence/2`
+  on every `{:ok, updates}`.
 
   The required fields are read STRICTLY (`state.lineage`, not `Map.get`): they exist in every
   coordinator state, and a state that lacks one is a bug to surface here, in the coordinator, rather
