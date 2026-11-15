@@ -291,24 +291,33 @@ esac
 now_ms() { /usr/bin/python3 -c 'import time; print(int(time.time()*1000))'; }
 
 # -- Hrana v2 pipeline over HTTP ------------------------------------------------
-# hrana <base-url> <shard> <sql>  → full pipeline response JSON on stdout.
-# rc 0 ONLY on a genuine success: HTTP 2xx AND a well-formed pipeline whose
-# execute result is type "ok". A refused stream open (lease held / node down)
-# comes back as a non-2xx or an error-shaped body with NO .results — those must
-# read as failure, or a failover experiment would time a false success (the
-# body without .results was silently passing the old per-statement-only check).
+# pipeline_body <sql>: the one request body every rig probe sends: execute <sql>, then close.
+pipeline_body() {
+  printf '{"requests":[{"type":"execute","stmt":{"sql":%s}},{"type":"close"}]}' "$(jq -Rn --arg s "$1" '$s')"
+}
+
+# pipeline_ok <http-code> <body>: THE definition of "the write succeeded" (audit 2026-11-13 #23; there used
+# to be three, with different strictness). rc 0 ONLY on HTTP 200 AND a well-formed pipeline whose execute
+# result is type "ok" AND no error-typed result anywhere. A refused stream open (lease held / node down)
+# comes back as a non-2xx or an error-shaped body with NO .results; a 200 carrying one is a failure too, or
+# a failover experiment would time a false success.
+pipeline_ok() {
+  local code=$1 body=$2
+  [ "$code" = 200 ] || return 1
+  [ "$(printf '%s' "$body" | jq -r 'try (.results[0].type) catch "none"' 2>/dev/null)" = ok ] || return 1
+  [ "$(printf '%s' "$body" | jq -r '[.results[]? | select(.type=="error")] | length' 2>/dev/null)" = 0 ]
+}
+
+# hrana <base-url> <shard> <sql>  → full pipeline response JSON on stdout; rc per pipeline_ok.
 hrana() {
   local base=$1 shard=$2 sql=$3 raw code out
   raw=$(curl -sS --max-time 8 -w $'\n%{http_code}' -X POST "$base/v2/pipeline" \
     -H "Host: $shard.$DOMAIN" -H "Content-Type: application/json" \
-    -d "{\"requests\":[{\"type\":\"execute\",\"stmt\":{\"sql\":$(jq -Rn --arg s "$sql" '$s')}},{\"type\":\"close\"}]}") || return 1
+    -d "$(pipeline_body "$sql")") || return 1
   code=${raw##*$'\n'}   # trailing status line
   out=${raw%$'\n'*}     # body
   echo "$out"
-  [ "$code" = "200" ] || return 1
-  # The execute (first request) must have produced an ok result with a response.
-  [ "$(echo "$out" | jq -r 'try (.results[0].type) catch "none"')" = "ok" ] || return 1
-  [ "$(echo "$out" | jq -r '[.results[]? | select(.type=="error")] | length')" = "0" ]
+  pipeline_ok "$code" "$out"
 }
 
 sql() { hrana "$LB" "$@"; }                      # through the LB
@@ -327,7 +336,7 @@ hrana_status() {
   local shard=$1 sql=$2
   curl -sS --max-time 20 -o /dev/null -w '%{http_code}' -X POST "$LB/v2/pipeline" \
     -H "Host: $shard.$DOMAIN" -H "Content-Type: application/json" \
-    -d "{\"requests\":[{\"type\":\"execute\",\"stmt\":{\"sql\":$(jq -Rn --arg s "$sql" '$s')}},{\"type\":\"close\"}]}" \
+    -d "$(pipeline_body "$sql")" \
     2>/dev/null || echo "ERR"
 }
 val() { jq -r '.results[0].response.result.rows[0][0].value'; } # first row/col
@@ -2082,7 +2091,7 @@ tpc_auth_preflight() {
   # `close` would not reach the authorize step.
   code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 -X POST "$LB/v2/pipeline" \
     -H "Host: authprobe.$DOMAIN" -H "Content-Type: application/json" \
-    -d '{"requests":[{"type":"execute","stmt":{"sql":"SELECT 1"}},{"type":"close"}]}' 2>/dev/null || echo ERR)
+    -d "$(pipeline_body 'SELECT 1')" 2>/dev/null || echo ERR)
   [ "$code" = 401 ] || { echo "TPC_AUTH=required, but a request with no token through the LB answered HTTP $code, not 401: auth is not enforced on this path, so the run would not exercise it" >&3; return 1; }
 }
 
@@ -3114,16 +3123,16 @@ prom_delta() {
 }
 
 # timed_write <shard> <sql> <max_s>: one statement through the LB; prints "<yes|NO> <ms> <http> <err>".
-# yes means HTTP 200 AND an ok execute result (a 200 carrying an error-shaped body is a failure).
+# yes means pipeline_ok (HTTP 200, an ok execute result, no error result).
 timed_write() {
   local shard=$1 stmt=$2 max=$3 body out code t ok=NO err=""
   body=$(mktemp)
   out=$(curl -sS --max-time "$max" -o "$body" -w '%{http_code} %{time_total}' -X POST "$LB/v2/pipeline" \
     -H "Host: $shard.$DOMAIN" -H "Content-Type: application/json" \
-    -d "{\"requests\":[{\"type\":\"execute\",\"stmt\":{\"sql\":$(jq -Rn --arg s "$stmt" '$s')}},{\"type\":\"close\"}]}" 2>/dev/null || true)
+    -d "$(pipeline_body "$stmt")" 2>/dev/null || true)
   read -r code t <<< "$out"
   code=${code:-ERR}; t=${t:-0}
-  if [ "$code" = 200 ] && [ "$(jq -r 'try (.results[0].type) catch "none"' "$body" 2>/dev/null)" = ok ]; then
+  if pipeline_ok "$code" "$(cat "$body" 2>/dev/null)"; then
     ok=yes
   else
     err=$(head -c 160 "$body" 2>/dev/null | tr '\n\t' '  ')
