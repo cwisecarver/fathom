@@ -51,7 +51,7 @@ defmodule Fathom.Shard.InternalDeadlineTest do
     on_exit(fn -> Connection.close(conn) end)
 
     snap = Path.join(dir, "snap.db")
-    assert :ok = Fathom.Shard.do_snapshot(conn, snap)
+    assert :ok = Fathom.Shard.Snapshot.do_snapshot(conn, snap)
     assert File.stat!(snap).size > 1_000_000, "fixture: the snapshot copied almost nothing"
   end
 

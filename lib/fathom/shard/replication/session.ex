@@ -2399,7 +2399,7 @@ defmodule Fathom.Shard.Replication.Session do
   #     threshold, pinning BEFORE the commit's ship and checkpointing after it, in a task that owns
   #     the pin and a checkout grant, off the reply path (`maybe_pin/2`, `start_checkpoint/3`) — so
   #     it pays the open only on a commit that crosses the threshold;
-  #   * the coordinator's post-snapshot PASSIVE (`Fathom.Shard.do_snapshot/3`) calls
+  #   * the coordinator's post-snapshot PASSIVE (`Fathom.Shard.Snapshot.do_snapshot/3`) calls
   #     `checkpoint_after_snapshot/2`, which pins and asks this Session `{:covers, header}`;
   #   * a tenant's own `PRAGMA wal_checkpoint` is refused on a registered file by the extension's
   #     authorizer (`pragma_guard.rs`).

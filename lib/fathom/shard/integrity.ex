@@ -225,7 +225,7 @@ defmodule Fathom.Shard.Integrity do
   # connections to one tenant, one seeing data and one seeing nothing. Worse, the shard is still
   # dirty with an unchanged `etag`, so the next periodic flush snapshots that empty file and PUTs it
   # over the good stored object with a valid If-Match — destroying the only good copy. The serving
-  # path therefore refuses the flush and leaves the file alone; see verify_and_snapshot/2.
+  # path therefore refuses the flush and leaves the file alone; see Snapshot.verify_and_snapshot/4.
   @spec quarantine_corrupt!(Path.t(), String.t(), term()) :: :ok | {:error, term()}
   def quarantine_corrupt!(path, shard_id, reason) do
     # `.corrupt.<ms>-<unique>`, and the -wal/-shm RENAMED alongside — mirroring quarantine_fenced!/

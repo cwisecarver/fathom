@@ -14,7 +14,7 @@ defmodule Fathom.ShardCorruptFlushTest do
        "a corrupt local db is quarantined…" drives it.
     2. The checkpoint comes back BUSY (a lingering reader), so `upload_for_drop/1` short-circuits
        WITHOUT running quick_check and falls through to `snapshot_and_upload/1`, whose
-       `verify_and_snapshot/2` finds the corruption and returns the SAME tuple — deliberately without
+       `Snapshot.verify_and_snapshot/4` finds the corruption and returns the SAME tuple — deliberately without
        quarantining, because that function also serves the live path (the serving test below is
        why). `flush_then_drop/1` could not tell them apart and assumed route 1, so the corrupt
        file was left at the live path with a matching provenance sidecar and the next open SERVED
@@ -34,7 +34,7 @@ defmodule Fathom.ShardCorruptFlushTest do
   fixture can stage.
 
   So the fix rests on reading, not on a red-then-green test. If you are changing
-  `upload_for_drop/1`, `verify_and_snapshot/2` or that branch of `flush_then_drop/1`, note that the
+  `upload_for_drop/1`, `Snapshot.verify_and_snapshot/4` or that branch of `flush_then_drop/1`, note that the
   suite will not catch a regression on route 2.
 
   ## A SECOND PROPERTY WITH NO OBSERVABLE (expert review 2026-08-26 #12)
@@ -63,7 +63,7 @@ defmodule Fathom.ShardCorruptFlushTest do
   pays a full pointless `VACUUM INTO` first. So the cost of an undetected regression here is wasted
   I/O per corrupt shard per interval, not a bad object.
 
-  If you reorder that `with`, nothing will fail. Read `verify_and_snapshot/2`'s comment first.
+  If you reorder that `with`, nothing will fail. Read `Snapshot.verify_and_snapshot/4`'s comment first.
   """
   use ExUnit.Case, async: false
 

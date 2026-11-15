@@ -180,11 +180,11 @@ defmodule Fathom.Shard.FlushPinnedLiveTest do
     on_exit(fn -> Connection.close(conn) end)
 
     {:ok, default} = Connection.pragma(conn, "mmap_size")
-    Fathom.Shard.apply_scan_mmap(conn)
+    Fathom.Shard.Snapshot.apply_scan_mmap(conn)
     assert Connection.pragma(conn, "mmap_size") == {:ok, default}, "applied with the flag unset"
 
     Env.put!(:flush_scan_mmap_bytes, 8 * 1_048_576)
-    Fathom.Shard.apply_scan_mmap(conn)
+    Fathom.Shard.Snapshot.apply_scan_mmap(conn)
     assert {:ok, n} = Connection.pragma(conn, "mmap_size")
     assert n == 8 * 1_048_576 or n == 0, "pragma not applied (n=#{n})"
   end

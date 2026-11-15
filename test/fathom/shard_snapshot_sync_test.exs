@@ -29,7 +29,7 @@ defmodule Fathom.ShardSnapshotSyncTest do
     # do_snapshot sets synchronous=OFF, then the VACUUM step raises (non-binary dest). The raise must
     # NOT leave the connection at OFF.
     try do
-      Fathom.Shard.do_snapshot(conn, :not_a_binary)
+      Fathom.Shard.Snapshot.do_snapshot(conn, :not_a_binary)
       flunk("expected do_snapshot to raise on a non-binary dest")
     rescue
       _ -> :ok

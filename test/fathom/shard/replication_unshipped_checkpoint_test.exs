@@ -19,7 +19,7 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
 
   The checkpoint sources covered are the ones fathom runs itself: a tenant `PRAGMA
   wal_checkpoint(PASSIVE)` (allowed by the executor's pragma guard), the coordinator's
-  post-snapshot PASSIVE (`Fathom.Shard.do_snapshot/2`), and the extension's 4000-frame commit hook
+  post-snapshot PASSIVE (`Fathom.Shard.Snapshot.do_snapshot/2`), and the extension's 4000-frame commit hook
   (`native/fathom_udf/src/wal.rs`). They all reduce to "a PASSIVE checkpoint runs between C1's
   commit and its ship", which is what the first test does directly.
   """
@@ -183,7 +183,7 @@ defmodule Fathom.Shard.ReplicationUnshippedCheckpointTest do
     assert_c1_replicated!(ctx, r)
   end
 
-  # Source 1: the coordinator's post-snapshot PASSIVE (`Fathom.Shard.do_snapshot/3`), reached the
+  # Source 1: the coordinator's post-snapshot PASSIVE (`Fathom.Shard.Snapshot.do_snapshot/3`), reached the
   # way production reaches it — a durability flush of the dirty shard.
   test "the coordinator's flush checkpoint cannot erase an unshipped commit", ctx do
     r =
