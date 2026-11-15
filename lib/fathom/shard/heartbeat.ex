@@ -423,7 +423,12 @@ defmodule Fathom.Shard.Heartbeat do
       renewed_wall_ms: nil,
       generation: generation,
       lapsed: false,
-      timer: nil
+      timer: nil,
+      # The supervisor the off-process work (previous-incarnation recheck, lapse fan-out) is started
+      # under. Production never sets it; a test passes a name nobody registered to exercise the
+      # "no task supervisor" fallback without unregistering the app-global `Fathom.TaskSupervisor`
+      # (cleanliness audit 2026-11-13 #40).
+      task_supervisor: Keyword.get(opts, :task_supervisor, Fathom.TaskSupervisor)
     }
 
     # The lock-free fence-status view (round-2 #26); published on every renew/lapse.
@@ -467,10 +472,10 @@ defmodule Fathom.Shard.Heartbeat do
     # here held it past the TTL while :renew waited in the mailbox, expiring the heartbeat:
     # coordinators read :not_valid, flushes stopped, the write fence armed, and peers legitimately
     # stole every shard the node opened at boot — the failover scenario itself. A supervised child
-    # (like fan_out_lapse/1) keeps the work off the mailbox, and a crash in it no longer crash-loops
+    # (like fan_out_lapse/2) keeps the work off the mailbox, and a crash in it no longer crash-loops
     # the liveness process. The recheck touches no Heartbeat state, so nothing comes back.
     _ =
-      Task.Supervisor.start_child(Fathom.TaskSupervisor, fn ->
+      Task.Supervisor.start_child(state.task_supervisor, fn ->
         recheck_previous_incarnation(prev_owner, prev_exp)
       end)
 
@@ -865,7 +870,7 @@ defmodule Fathom.Shard.Heartbeat do
   defp end_episode(state) do
     gen = state.generation + 1
     :persistent_term.put(gen_key(state.owner), gen)
-    fan_out_lapse(gen)
+    fan_out_lapse(state, gen)
     %{state | generation: gen}
   end
 
@@ -904,15 +909,15 @@ defmodule Fathom.Shard.Heartbeat do
     # against its OWN `acquire_gen`, not against the heartbeat's current generation — so a
     # broadcast landing after the next successful renewal still routes that coordinator to
     # revalidate. The episode is identified by the number, not by the timing.
-    fan_out_lapse(gen)
+    fan_out_lapse(state, gen)
     publish_status(%{state | generation: gen, lapsed: true})
   end
 
   # Best-effort in both directions: if the task supervisor is unavailable (the scale/bench harness
   # runs without the full tree), fall back to broadcasting inline rather than skipping the
   # notification — a slow heartbeat is better than a silent lapse.
-  defp fan_out_lapse(gen) do
-    case Task.Supervisor.start_child(Fathom.TaskSupervisor, fn -> dispatch_lapse(gen, false) end) do
+  defp fan_out_lapse(%{task_supervisor: sup}, gen) do
+    case Task.Supervisor.start_child(sup, fn -> dispatch_lapse(gen, false) end) do
       {:ok, _pid} -> :ok
       _ -> dispatch_lapse(gen, true)
     end

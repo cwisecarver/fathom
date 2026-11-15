@@ -1037,15 +1037,16 @@ defmodule Fathom.Shard.HeartbeatTest do
       # The scale/bench harness runs without the full tree. A lapse that notified nobody would be
       # worse than a slow one, so the fallback is inline rather than skip — and it SAYS so, which
       # is what makes a sustained inline rate alertable rather than invisible.
-      sup = Process.whereis(Fathom.TaskSupervisor)
-
-      if sup do
-        Process.unregister(Fathom.TaskSupervisor)
-
-        on_exit(fn ->
-          if Process.alive?(sup), do: Process.register(sup, Fathom.TaskSupervisor)
-        end)
-      end
+      #
+      # The heartbeat starts its off-process work under `state.task_supervisor` (the `:task_supervisor`
+      # start option, default `Fathom.TaskSupervisor`). Point THIS heartbeat at a name nobody
+      # registered, instead of unregistering the app-global supervisor for the length of the test:
+      # a coordinator that exited in that window got `:noproc` from it (cleanliness audit
+      # 2026-11-13 #40).
+      :sys.replace_state(
+        pid,
+        &Map.put(&1, :task_supervisor, :heartbeat_test_no_such_task_supervisor)
+      )
 
       force_lapse(pid)
 
