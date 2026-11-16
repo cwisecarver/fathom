@@ -62,6 +62,19 @@ Each item names the bug class it buys.
 12. A WebSocket client path, and `:ro` tokens with auth on.
 13. One run against real S3 (conditional DELETE fence).
 
+    **Why it matters now (2026-11-15).** The rig's MinIO ignores `If-Match` on DELETE, so a zombie's
+    release (`fence_skip` → "releasing the lease") deletes the *stealer's* lock. Measured on the
+    pre-batch image `2641b14f`: pause the owner past TTL, steal on a survivor, unpause. The survivor
+    holds the lock (`lease_holder` → `{:held, survivor}`), then within ~10 s of the zombie logging
+    "ownership unconfirmed before flush … releasing the lease" the lock object is gone while the
+    survivor still serves (`mc cat local/fathom-shards/<shard>.lock` → "Object does not exist").
+    Any later opener fresh-creates, computes `next_lineage(object)`, and can reuse the live owner's
+    unstamped lineage. Tier 0 `hard-1` (2026-11-14, HEAD `f4ffb93d`) matches: an open with no
+    "takeover from" line, then "not promoting — the replica's lineage 4 is not below this owner's 4".
+    Real S3 answers the stale conditional DELETE 412, so this is a rig-fidelity gap, not a production
+    path. Until item 13 is done, a hard-mix INVALID where a shard's lock vanished under a live owner
+    is this artifact, not evidence about the change under test.
+
 ## The run tiers
 
 Every run uses a fresh rig, an image built from HEAD (`run.sh` checks), the clock-lag check, `caffeinate -s`, and a `colima restart` every 3rd run. Teardown aborts FUSE connections first (see `logs/ds/lz-a01.sh`).
