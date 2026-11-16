@@ -233,6 +233,13 @@ if env_bool.("SHARD_STORAGE_ALLOW_WEAK_CONDITIONAL_DELETE") do
   config :fathom, :allow_weak_conditional_delete, true
 end
 
+# Lock-lifecycle trace (jepsen 2026-11-14 hard-1 root-cause hunt): logs, at :info, every S3 lock
+# acquire branch (what lock body was read, the claim computed) and every release. Off by default; the
+# chaos rig turns it on. One line per acquire/release, so not for a 1024-tenant fleet.
+if env_bool.("SHARD_ACQUIRE_TRACE") do
+  config :fathom, :acquire_trace, true
+end
+
 # Boot guard override (expert review 2026-10-10 #8): a prod node refuses to boot without the
 # fathom_udf SQLite extension unless this acknowledges the degraded posture.
 if env_bool.("ALLOW_NO_UDF") do

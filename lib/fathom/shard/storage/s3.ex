@@ -2822,10 +2822,41 @@ defmodule Fathom.Shard.Storage.S3 do
     # which costs the same as before. The fence is unchanged: still create-only /
     # conditional, never an unconditional overwrite.
     case create_lock(shard_id, %{owner: owner, epoch: 1, expires_at_ms: now + ttl_ms}) do
-      {:ok, _lease} = ok -> ok
-      :exists -> acquire_existing(shard_id, owner, ttl_ms, now)
-      {:error, _reason} = error -> error
+      {:ok, lease} = ok ->
+        trace_lock(shard_id, "fresh_create", lease, %{})
+        ok
+
+      :exists ->
+        acquire_existing(shard_id, owner, ttl_ms, now)
+
+      {:error, _reason} = error ->
+        error
     end
+  end
+
+  # Lock-lifecycle trace (config `:acquire_trace`, env SHARD_ACQUIRE_TRACE; off by default). Logs which
+  # acquire/release branch ran and the lock body it read or wrote, because a successful lock write or
+  # delete otherwise logs nothing (jepsen 2026-11-14 hard-1: the acquire branch was unrecoverable).
+  defp trace_lock(shard_id, what, lock, extra) do
+    if Application.get_env(:fathom, :acquire_trace, false) == true do
+      fields =
+        lock
+        |> Map.take([
+          :owner,
+          :epoch,
+          :claim,
+          :prev_owner,
+          :released_by,
+          :touch_pending,
+          :dirty,
+          :took_over
+        ])
+        |> Map.merge(extra)
+
+      Logger.info("shard #{shard_id}: lock-trace #{what} #{inspect(fields)}")
+    end
+
+    :ok
   end
 
   # A lock already exists: read it and reclaim (ours), refuse (live, theirs), or
@@ -2838,6 +2869,8 @@ defmodule Fathom.Shard.Storage.S3 do
       # `resume_steal/7`. Must precede the plain reclaim, which would return a bare lease.
       {:ok, %{owner: ^owner, epoch: epoch, touch_pending: true, prev_owner: prev} = existing,
        etag} ->
+        trace_lock(shard_id, "resume_steal", existing, %{})
+
         resume_steal(shard_id, owner, ttl_ms, now, {epoch, prev}, existing, etag)
 
       # A same-owner reclaim is a takeover from a previous coordinator of THIS node that may have
@@ -2845,6 +2878,8 @@ defmodule Fathom.Shard.Storage.S3 do
       # An unreadable claim fails closed BEFORE the write (2026-10-12 #21; see
       # `Storage.with_takeover_claim/3`), so the existing lock and its claim survive for the retry.
       {:ok, %{owner: ^owner, epoch: epoch} = existing, etag} ->
+        trace_lock(shard_id, "reclaim_same_owner", existing, %{})
+
         with {:ok, reclaimed} <-
                Storage.with_takeover_claim(
                  %{owner: owner, epoch: epoch, expires_at_ms: now + ttl_ms},
@@ -2858,6 +2893,8 @@ defmodule Fathom.Shard.Storage.S3 do
       # fallback when they run no heartbeat — see owner_live?/3).
       {:ok, %{owner: other, epoch: epoch, expires_at_ms: lock_exp} = dead_lock, etag} ->
         lock_fp = lock_fingerprint(dead_lock, etag)
+
+        trace_lock(shard_id, "read_other", dead_lock, %{})
 
         case owner_live?(shard_id, other, now, lock_exp, lock_fp) do
           :live ->
@@ -2896,6 +2933,13 @@ defmodule Fathom.Shard.Storage.S3 do
               # close a PUT that is merely DELAYED (the rollback reads the pre-steal lock, no-ops,
               # and the late PUT lands after it), and it fails exactly when its own read fails in
               # the brownout that lost the reply. The rollback below is the belt, not the mechanism.
+              trace_lock(shard_id, "steal", stolen, %{
+                from: other,
+                from_epoch: epoch,
+                from_claim: Map.get(dead_lock, :claim),
+                from_released_by: Map.get(dead_lock, :released_by)
+              })
+
               case put_lock(shard_id, Storage.pending_steal(stolen, other, dead_lock),
                      if_match: etag
                    ) do
@@ -2942,13 +2986,19 @@ defmodule Fathom.Shard.Storage.S3 do
           # final flush that the open's speculative pull (issued before our first create) missed.
           # The open re-checks the pulled etag for this lease only (`Shard.cold_fresh_check/5`);
           # the uncontended first-try create stays 1 RTT.
-          {:ok, lease} -> {:ok, Map.put(lease, :recreated, true)}
+          {:ok, lease} ->
+            trace_lock(shard_id, "recreated", lease, %{})
+            {:ok, Map.put(lease, :recreated, true)}
+
           # Someone else created it in the gap — they hold it now.
           # Neither owner nor instant is known here: the winner's lock was written in the gap and
           # has not been read. `nil` is "no instant", which routes the caller to its ordinary
           # backoff rather than to a fabricated deadline.
-          :exists -> {:error, {:held, :unknown, nil}}
-          {:error, _reason} = error -> error
+          :exists ->
+            {:error, {:held, :unknown, nil}}
+
+          {:error, _reason} = error ->
+            error
         end
 
       # AN UNDECODABLE LOCK IS ITS OWN, LOUD ERROR (expert review 2026-10-15 #23, D14). It used to
@@ -3441,6 +3491,8 @@ defmodule Fathom.Shard.Storage.S3 do
   # semantics are identical: If-Match our own write, and a 412 means the lock is no longer
   # ours (a stealer wrote in the gap — finding #22) so leave it and no-op.
   def release_lease(shard_id, %{lock_etag: etag} = lease) when is_binary(etag) do
+    trace_lock(shard_id, "release_delete", lease, %{if_match: etag})
+
     case Req.delete(req(), url: lock_path(shard_id), headers: [{"if-match", etag}]) do
       {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
       # A 412 means "the lock is not the object I wrote". That is TWO different situations and
@@ -3478,6 +3530,7 @@ defmodule Fathom.Shard.Storage.S3 do
   def release_lease_keeping_claim(shard_id, %{lock_etag: etag} = lease, claim)
       when is_binary(etag) do
     marker = Storage.released_marker(lease, claim)
+    trace_lock(shard_id, "release_marker", lease, %{claim: claim, put_if_match: etag})
 
     case put_lock(shard_id, marker, if_match: etag) do
       {:ok, _} ->
