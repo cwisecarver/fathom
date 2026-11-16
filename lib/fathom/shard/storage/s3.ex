@@ -3094,6 +3094,8 @@ defmodule Fathom.Shard.Storage.S3 do
   # Not a closed window: a PUT that is merely delayed can still land after the read — the marker
   # covers that one.
   defp ambiguous_steal_put(shard_id, stolen, dead_lock, lock_fp, error) do
+    trace_lock(shard_id, "ambiguous_steal_put", dead_lock, %{stolen_epoch: stolen.epoch})
+
     roll_back_steal(shard_id, stolen, dead_lock, lock_fp)
     error
   end
@@ -3131,6 +3133,11 @@ defmodule Fathom.Shard.Storage.S3 do
   # Best-effort: when the rollback itself fails the watch is left alone (a later steal, never an
   # earlier one), and the marker in the stranded lock still makes our own retry safe.
   defp roll_back_steal(shard_id, ours, %{owner: other, epoch: epoch} = dead_lock, from_fp) do
+    trace_lock(shard_id, "roll_back_steal", dead_lock, %{
+      ours_epoch: ours.epoch,
+      ours_claim: Map.get(ours, :claim)
+    })
+
     replacement =
       Map.merge(
         %{owner: other, epoch: epoch + 2, expires_at_ms: dead_lock.expires_at_ms},
@@ -3510,6 +3517,10 @@ defmodule Fathom.Shard.Storage.S3 do
         # the delete could let a stealer write its own lock in the gap, and an unconditional
         # delete would remove THAT lock (finding #22). A 412 means the lock is no longer the
         # one we read — someone else's now — so leave it and no-op.
+        trace_lock(shard_id, "release_delete_by_read", %{owner: owner, epoch: epoch}, %{
+          if_match: etag
+        })
+
         case Req.delete(req(), url: lock_path(shard_id), headers: [{"if-match", etag}]) do
           {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
           {:ok, %{status: 412}} -> :ok
@@ -3569,6 +3580,8 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ok, %{owner: ^owner} = lock, etag} ->
         case Storage.stranded_release(lock) do
           :delete ->
+            trace_lock(shard_id, "release_if_owned_delete", lock, %{if_match: etag})
+
             case Req.delete(req(), url: lock_path(shard_id), headers: [{"if-match", etag}]) do
               {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
               {:ok, %{status: 412}} -> :ok
@@ -3614,6 +3627,8 @@ defmodule Fathom.Shard.Storage.S3 do
 
   # Raced again between the read and this write ⇒ someone else's now; leave it, as the delete does.
   defp put_marker(shard_id, marker, etag) do
+    trace_lock(shard_id, "put_marker", marker, %{if_match: etag})
+
     case put_lock(shard_id, marker, if_match: etag) do
       {:ok, _} -> :ok
       {:error, :precondition_failed} -> :ok
@@ -3640,6 +3655,8 @@ defmodule Fathom.Shard.Storage.S3 do
         end
       end,
       fn fresh_etag ->
+        trace_lock(shard_id, "release_delete_after_412", lease, %{if_match: fresh_etag})
+
         case Req.delete(req(), url: lock_path(shard_id), headers: [{"if-match", fresh_etag}]) do
           {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
           # Raced again — someone took it between the read and this delete. Theirs now; leave it.
@@ -3906,6 +3923,8 @@ defmodule Fathom.Shard.Storage.S3 do
   defp restore_lock(shard_id, ours, replacement, attempts) do
     case get_lock(shard_id) do
       {:ok, %{owner: o, epoch: e}, etag} when o == ours.owner and e == ours.epoch ->
+        trace_lock(shard_id, "restore_lock_put", replacement, %{if_match: etag})
+
         case put_lock(shard_id, replacement, if_match: etag) do
           {:ok, rolled} ->
             {:ok, Map.get(rolled, :lock_etag)}
