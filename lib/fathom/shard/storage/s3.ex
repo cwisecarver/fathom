@@ -2834,30 +2834,9 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
-  # Lock-lifecycle trace (config `:acquire_trace`, env SHARD_ACQUIRE_TRACE; off by default). Logs which
-  # acquire/release branch ran and the lock body it read or wrote, because a successful lock write or
-  # delete otherwise logs nothing (jepsen 2026-11-14 hard-1: the acquire branch was unrecoverable).
-  defp trace_lock(shard_id, what, lock, extra) do
-    if Application.get_env(:fathom, :acquire_trace, false) == true do
-      fields =
-        lock
-        |> Map.take([
-          :owner,
-          :epoch,
-          :claim,
-          :prev_owner,
-          :released_by,
-          :touch_pending,
-          :dirty,
-          :took_over
-        ])
-        |> Map.merge(extra)
-
-      Logger.info("shard #{shard_id}: lock-trace #{what} #{inspect(fields)}")
-    end
-
-    :ok
-  end
+  # Lock-lifecycle trace; see `Storage.trace_lock/4`.
+  defp trace_lock(shard_id, what, lock, extra),
+    do: Storage.trace_lock(shard_id, what, lock, extra)
 
   # A lock already exists: read it and reclaim (ours), refuse (live, theirs), or
   # steal (expired, theirs, epoch+1). A lock that vanished between the failed create

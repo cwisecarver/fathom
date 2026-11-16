@@ -1183,6 +1183,14 @@ defmodule Fathom.Shard do
       # between. `nil` whenever open_lineage/2 would not have read it, so a non-replicating open
       # allocates nothing here.
       lineage = open_lineage(lease, head)
+
+      Storage.trace_lock(shard_id, "open_lineage", lease, fn ->
+        %{
+          lineage: lineage,
+          head_next: if(match?({:ok, _}, head), do: Storage.next_lineage(elem(head, 1)))
+        }
+      end)
+
       # `warm?` was decided BEFORE the lease was held. Revalidation can then quarantine that local
       # file and RE-PULL the object (a fork, a moved object), after which the file is an ordinary
       # cold pull — and promote-on-open's warm skip (2026-09-18 #1, "never promote a peer over a

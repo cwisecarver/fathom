@@ -1668,6 +1668,36 @@ defmodule Fathom.Shard.Storage do
   def steal_margin_ms,
     do: Application.get_env(:fathom, :steal_margin_ms, @default_steal_margin_ms)
 
+  @doc false
+  # Lock-lifecycle trace (config `:acquire_trace`, env SHARD_ACQUIRE_TRACE; off by default). Logs which
+  # acquire/release/open branch ran and the lock body it read or wrote, because a successful lock
+  # write or delete otherwise logs nothing (jepsen 2026-11-14 hard-1: the acquire branch and the
+  # lineage an open chose were unrecoverable from node logs).
+  @spec trace_lock(String.t(), String.t(), map(), map() | (-> map())) :: :ok
+  def trace_lock(shard_id, what, lock, extra) do
+    require Logger
+
+    if Application.get_env(:fathom, :acquire_trace, false) == true do
+      fields =
+        lock
+        |> Map.take([
+          :owner,
+          :epoch,
+          :claim,
+          :prev_owner,
+          :released_by,
+          :touch_pending,
+          :dirty,
+          :took_over
+        ])
+        |> Map.merge(if is_function(extra, 0), do: extra.(), else: extra)
+
+      Logger.info("shard #{shard_id}: lock-trace #{what} #{inspect(fields)}")
+    end
+
+    :ok
+  end
+
   @doc """
   Write `body` to `path` atomically AND durably: write a sibling temp file, `fsync` it, `rename` it
   into place (atomic on POSIX within a filesystem — the temp sits in `path`'s dir), then `fsync` the
