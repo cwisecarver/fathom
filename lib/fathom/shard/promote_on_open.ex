@@ -692,17 +692,34 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # object is stamped with THIS owner's lineage; a replica already holding that lineage or a higher
   # one came from a history this owner does not continue, and stamping over it would give two
   # histories one label. With the takeover claim in the lock (`Storage.takeover_claim/2`) the
-  # canonical failover always opens ABOVE the dead owner's replica, so this should never fire —
-  # it is the guard for anything that reaches here otherwise, and it declines rather than stamping:
-  # serving the stored object is always correct, merely older.
-  defp promote_replica(shard_id, _path, _lease, etag, %{lineage: rl}, _stamp, lineage)
+  # canonical failover always opens ABOVE the dead owner's replica, so this should never fire.
+  #
+  # IT FIRES WHEN THE LOCK DID NOT CARRY THE PREDECESSOR'S CLAIM — a fresh create over a lock that
+  # vanished (Jepsen 2026-11-14 hard-1: lineage 4 chosen against a live owner's claim 4). The
+  # replica is by construction FRESHER than the object (that is why we are here), so it holds
+  # quorum-acked writes the object lacks. This used to log "serving the stored object is always
+  # correct, merely older" and serve it: the acked tail was gone, and this owner then acked new
+  # writes at the SAME lineage on top of the stale base. It now takes the same refuse-and-retry
+  # window as a failed promotion (`:promotion_failed`, Jepsen 2026-10-24).
+  #
+  # THE REFUSAL CARRIES THE COLLIDED LINEAGE AS A CLAIM TO KEEP (`UnderQuorum.claim`, honoured by
+  # `Shard.abandon_open/5`). Releasing a fresh-created lock DELETES it, so the retry would fresh-
+  # create at the same lineage, collide again, and only "converge" by serving the object when the
+  # window expired. Leaving a released marker with the claim sends the retry down the steal path,
+  # whose takeover claim is `max(next_lineage(object), claim + 1)` — strictly above the replica.
+  # With no peers `error_window/3` answers `:none` (no floor to apply) and the object is served.
+  defp promote_replica(shard_id, path, _lease, etag, %{lineage: rl}, _stamp, lineage)
        when is_integer(rl) and is_integer(lineage) and rl >= lineage do
     Logger.warning(
       "shard #{shard_id}: not promoting — the replica's lineage #{rl} is not below this owner's " <>
-        "#{lineage}, so stamping it would reuse a lineage; serving the stored object"
+        "#{lineage}, so stamping it would reuse a lineage; refusing the open so the retry opens " <>
+        "above it rather than serving the older stored object"
     )
 
-    etag
+    case Recovery.error_window(shard_id, {:lineage_collision, rl, lineage}) do
+      {:refuse, refusal} -> refuse_open(path, %{refusal | claim: lineage})
+      _none -> etag
+    end
   end
 
   defp promote_replica(shard_id, path, lease, etag, replica, stamp, lineage) do
@@ -940,8 +957,9 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # `{lineage, ordinal + 1, 0}`, strictly above every replica still at that ordinal (the object holds
   # all of it — it IS that replica, folded). `seed_ordinal_of/1` then starts this coordinator's
   # counter at `ordinal + 1`, so its first WAL numbers `ordinal + 2` and its own frames rank above
-  # the stamp — which matters because in the canonical failover the new owner's lineage EQUALS the
-  # replica's (expert review 2026-09-29 #3), so the ordinal is the only component that separates them.
+  # the stamp. (Since the takeover claim, 2026-09-29 #3, the new owner's lineage is strictly ABOVE
+  # the replica's, so the lineage already separates the histories; the ordinal still orders this
+  # owner's own frames against the stamp it writes at that lineage.)
   defp promoted_stamp_state(lease, temp, lineage, replica) do
     case replica_ordinal(replica) do
       0 -> %{lease: lease, path: temp, lineage: lineage}

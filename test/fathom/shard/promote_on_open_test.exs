@@ -1226,6 +1226,79 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     end
   end
 
+  # JEPSEN 2026-11-14 hard-1. A fresh open chose the lineage a live owner already claimed (the lock
+  # it would have read had vanished), so a quorum-held replica was exactly AT its lineage and
+  # `promote_replica/7` declined to stamp it. It then SERVED THE OLDER OBJECT ("always correct,
+  # merely older"), and the acked writes since the object were lost with new writes acked on top.
+  #
+  # The invariant: a replica fresher than the object is never discarded for a lineage collision.
+  # The open is refused (retryable), and the refusal leaves the collided lineage as a released
+  # claim so the RETRY opens above the replica and promotes it, tail included. Both liveness modes:
+  # the refusal runs through the lease-holding open and the release.
+  describe "a lineage collision refuses the open and the retry promotes (Jepsen 2026-11-14 hard-1)" do
+    setup do
+      prev_running = Fleet.running()
+      on_exit(fn -> Fleet.publish(prev_running) end)
+
+      Application.put_env(:fathom, :replication_promote_on_open, true)
+      Application.put_env(:fathom, :replication_recover_from_peers, true)
+      Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+      :ok
+    end
+
+    for mode <- [:legacy, :heartbeat] do
+      test "(#{mode}) the open is refused, the claim is kept, and the retry recovers the tail",
+           ctx do
+        %{id: id} = ctx
+        LivenessMode.set!(unquote(mode))
+
+        {conn, coordinator} = build_shard(id, 10, 3)
+        LivenessMode.assert!(coordinator, unquote(mode))
+        assert {:ok, stamp} = Storage.object_position(id)
+
+        # The replica holds the lineage the NEXT open will claim: next_lineage(object) = stamp + 1.
+        collided = stamp.epoch + 1
+
+        install_replica(id, %{
+          epoch: collided,
+          wal_gen: stamp.wal_gen,
+          wal_ordinal: stamp.wal_ordinal,
+          offset: stamp.offset + 1
+        })
+
+        tear_down_primary(id, conn, coordinator)
+
+        # THE VANISHED LOCK, which is what makes the open claim `next_lineage(object)` with no
+        # predecessor claim to rise above. (A lock that survives carries its claim, and the steal
+        # opens above it: the case the takeover claim already covers.)
+        File.rm!(Path.join(Fathom.Shard.Storage.Local.dir(), "#{id}.lock"))
+
+        configure_peers!(id, [{"dead1", "127.0.0.1", 1}])
+        refused_or_flunk!(id, "the replica's lineage collided with this owner's")
+
+        marker = stored_lock(id)
+
+        assert marker[:claim] == collided,
+               "the refused open must leave its lineage as a claim, or the retry collides again: " <>
+                 inspect(marker)
+
+        assert marker.owner == Storage.released_owner(),
+               "the refused open must leave a RELEASED marker, not a live lock: #{inspect(marker)}"
+
+        assert open_and_read(id) == Enum.to_list(1..10),
+               "the retry did not open above the replica and recover its acked tail"
+
+        assert {:ok, now} = Shards.ensure(id)
+        LivenessMode.assert!(now, unquote(mode))
+
+        assert {:ok, promoted} = Storage.object_position(id)
+
+        assert promoted.epoch > collided,
+               "the promoted object must carry a lineage above the replica's"
+      end
+    end
+  end
+
   # ONE DECISION READ PER COLD OPEN, NOT TWO (expert review 2026-10-01 perf #3). With shipping on,
   # `open_lineage` HEADs the object to derive this ownership's lineage, and the fleet path then
   # HEADed the SAME object again, back to back under the same lease with nothing served in

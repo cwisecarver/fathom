@@ -9,13 +9,17 @@ defmodule Fathom.Shard.Replication.Recovery.UnderQuorum do
   retryable 503. Nothing is held for the window; each retry is a fresh open that asks again.
   """
 
-  defexception [:shard_id, :answered, :needed, :waited_ms]
+  defexception [:shard_id, :answered, :needed, :waited_ms, :claim]
 
   @type t :: %__MODULE__{
           shard_id: String.t(),
           answered: non_neg_integer(),
           needed: pos_integer(),
-          waited_ms: non_neg_integer()
+          waited_ms: non_neg_integer(),
+          # The lineage the refused open collided at, when the refusal is a lineage collision
+          # (`PromoteOnOpen.promote_replica/7`): `Shard.abandon_open/5` releases the lock KEEPING
+          # it, so the retry opens above the replica. `nil` for a floor refusal.
+          claim: pos_integer() | nil
         }
 
   @impl true

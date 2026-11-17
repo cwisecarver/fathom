@@ -912,7 +912,11 @@ defmodule Fathom.Shard do
         # Retried like every drop-path release (expert review 2026-11-07 #13): this is the same
         # strand-behind-a-live-heartbeat mechanism, and storage misbehaving is why we are here.
         release_with_retry(%{id: shard_id}, :abandoned_open, fn ->
-          Storage.release_lease(shard_id, refusal_release_lease(lease, reason), lease[:claim])
+          Storage.release_lease(
+            shard_id,
+            refusal_release_lease(lease, reason),
+            refusal_claim(lease, reason)
+          )
         end)
       rescue
         e -> {:error, e}
@@ -964,6 +968,15 @@ defmodule Fathom.Shard do
     do: Storage.with_clean_touch(lease)
 
   defp refusal_release_lease(lease, _reason), do: lease
+
+  # The claim an abandoned open's release keeps. A lineage-collision refusal names the lineage it
+  # collided at (`UnderQuorum.claim`), which a FRESH-created lease does not carry: without it the
+  # release would delete the lock and the retry would fresh-create at the same lineage.
+  defp refusal_claim(_lease, %Fathom.Shard.Replication.Recovery.UnderQuorum{claim: claim})
+       when is_integer(claim),
+       do: claim
+
+  defp refusal_claim(lease, _reason), do: lease[:claim]
 
   # Stop an in-flight overlapped fork check on the no-open paths. Its only side effect
   # (quarantining a diverged copy) is one the sequential pre-lease check also produced
