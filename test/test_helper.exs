@@ -46,8 +46,6 @@ for sub <- ["tombstones", "tokenfloors"], do: File.rm_rf(Path.join(remote_dir, s
 # Locks and shard objects are per-run state by definition — at test_helper time no coordinator has
 # started — so clearing them is always correct, never merely convenient. `heartbeats/` is left
 # alone: the app is already booted here and the Heartbeat process owns that key for THIS run.
-for f <- Path.wildcard(Path.join(remote_dir, "*.lock")), do: File.rm(f)
-for f <- Path.wildcard(Path.join(remote_dir, "*.db")), do: File.rm(f)
 
 # The `.db.pos` (position) and `.db.lineage` sidecars were never swept, and the lineage one is the
 # dangerous kind: `Local.write_lineage(_, nil)` deliberately LEAVES a previous value ("lineage must
@@ -57,7 +55,19 @@ for f <- Path.wildcard(Path.join(remote_dir, "*.db")), do: File.rm(f)
 # separate counter from the position stamp's epoch), and failed ~1 run in 5 depending on which ids
 # collided. Found 2026-11-17 with 28,610 leftover files (21,322 `.db.pos`, 7,024 `.db.lineage`).
 # Per-run state by definition, like the locks and objects above.
-for f <- Path.wildcard(Path.join(remote_dir, "*.db.{pos,lineage}")), do: File.rm(f)
+#
+# SWEEP EVERYTHING BUT `heartbeats/`, NOT A LIST OF KINDS. This block enumerated `*.lock`, then
+# `*.db`, and the `.db.pos` / `.db.lineage` sidecars (and anything the next feature adds) leaked for
+# months for exactly the reason the local-dir comment below gives: a sweep that enumerates kinds is
+# one new kind away from leaking again. Locks, objects, sidecars and snapshot copies are all per-run
+# state; `heartbeats/` is the one thing the already-booted app owns for THIS run.
+case File.ls(remote_dir) do
+  {:ok, entries} ->
+    for entry <- entries, entry != "heartbeats", do: File.rm_rf(Path.join(remote_dir, entry))
+
+  {:error, _} ->
+    :ok
+end
 
 # The LOCAL shard dir has the same "per-run state by definition" property, and the same failure
 # mode one step earlier: a leftover `<shard>.db` is treated as an authoritative un-flushed local

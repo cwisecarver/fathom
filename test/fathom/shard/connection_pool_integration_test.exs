@@ -375,9 +375,19 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
     # then its monitor fires :noproc and the grant is released.
     send(pid, {:"$gen_call", {dead, make_ref()}, {:checkout, make_ref(), :rw}})
     _ = :sys.get_state(pid)
-    _ = :sys.get_state(pid)
+    %{closing: closer} = :sys.get_state(pid)
 
     assert HandlePool.count(pool_of(pid), :rw) == 0, "fixture: the pooled handle was not taken"
+
+    # THE CLOSE IS ASYNCHRONOUS: `close_lent/2` hands the handle to `start_close/2`, which spawns a
+    # closer and records it in `state.closing`, so `:sys.get_state/1` only proves the coordinator
+    # has SPAWNED it. Asserting `closed?/1` right then raced the closer under full-suite load (it
+    # failed on seed 374113 and once on 2026-09-30). Wait for the closer to finish; a monitor on an
+    # already-finished pid answers `:noproc` at once, so this is never a sleep.
+    assert is_pid(closer), "fixture: no closer was spawned for the lent handle"
+    closer_ref = Process.monitor(closer)
+    assert_receive {:DOWN, ^closer_ref, :process, ^closer, _}, 2_000
+
     assert closed?(h), "the handle lent to a dead caller was never closed"
   end
 
