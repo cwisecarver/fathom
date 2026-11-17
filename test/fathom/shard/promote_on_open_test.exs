@@ -1111,13 +1111,13 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
     end
 
     defp refused_or_flunk!(id, what) do
-      {result, _log} = ExUnit.CaptureLog.with_log(fn -> ShardExecutor.open(id) end)
+      {result, log} = ExUnit.CaptureLog.with_log(fn -> ShardExecutor.open(id) end)
 
       case result do
         {:ok, served} ->
           rows = rows(served)
           ShardExecutor.close(served)
-          flunk("the open served the stored object (#{inspect(rows)}) after #{what}")
+          flunk("the open served the stored object (#{inspect(rows)}) after #{what}\n#{log}")
 
         {:error, _} ->
           :ok
@@ -1246,8 +1246,17 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
       :ok
     end
 
-    for mode <- [:legacy, :heartbeat] do
-      test "(#{mode}) the open is refused, the claim is kept, and the retry recovers the tail",
+    # `ahead` is how far above the owner's lineage the replica sits. With 0 it collides exactly; with
+    # 1 it is AHEAD, and a claim kept at only the owner's own lineage would need two refusals (the
+    # retry would claim `lineage + 1 == rl` and collide again). `window_ms: 0` is a refusal window
+    # already spent by an earlier refusal in the same outage: the collision must refuse anyway.
+    for mode <- [:legacy, :heartbeat],
+        {name, ahead, window_ms} <- [
+          {"equal", 0, 60_000},
+          {"ahead", 1, 60_000},
+          {"equal with the refusal window already spent", 0, 0}
+        ] do
+      test "(#{mode}, replica #{name}) the open is refused, the claim is kept, and ONE retry recovers the tail",
            ctx do
         %{id: id} = ctx
         LivenessMode.set!(unquote(mode))
@@ -1256,11 +1265,17 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
         LivenessMode.assert!(coordinator, unquote(mode))
         assert {:ok, stamp} = Storage.object_position(id)
 
-        # The replica holds the lineage the NEXT open will claim: next_lineage(object) = stamp + 1.
-        collided = stamp.epoch + 1
+        # The replica holds the lineage the NEXT open will claim, or sits `ahead` above it. That is
+        # `next_lineage(object head)`, NOT `stamp.epoch + 1`: the head's lineage metadata and the
+        # position stamp's epoch are separate counters, and a fixture that assumed they agree
+        # collided only when they happened to (the open then rose above the replica, served the
+        # tail, and the test flunked: ~1 run in 5).
+        assert {:ok, head} = Storage.object_head(id)
+        collided = Storage.next_lineage(head)
+        replica_lineage = collided + unquote(ahead)
 
         install_replica(id, %{
-          epoch: collided,
+          epoch: replica_lineage,
           wal_gen: stamp.wal_gen,
           wal_ordinal: stamp.wal_ordinal,
           offset: stamp.offset + 1
@@ -1268,19 +1283,26 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
         tear_down_primary(id, conn, coordinator)
 
+        # The object must still be what the replica is ahead of. A flush landing between the stamp
+        # read and the kill would put the whole tail in the object, and the "refused" open below
+        # would then serve it legitimately: a fixture race that reads as a product failure.
+        assert {:ok, ^stamp} = Storage.object_position(id),
+               "fixture: the stored object moved after the stamp was read"
+
         # THE VANISHED LOCK, which is what makes the open claim `next_lineage(object)` with no
         # predecessor claim to rise above. (A lock that survives carries its claim, and the steal
         # opens above it: the case the takeover claim already covers.)
         File.rm!(Path.join(Fathom.Shard.Storage.Local.dir(), "#{id}.lock"))
 
         configure_peers!(id, [{"dead1", "127.0.0.1", 1}])
+        Env.put!(:replication_recovery_underquorum_window_ms, unquote(window_ms))
         refused_or_flunk!(id, "the replica's lineage collided with this owner's")
 
         marker = stored_lock(id)
 
-        assert marker[:claim] == collided,
-               "the refused open must leave its lineage as a claim, or the retry collides again: " <>
-                 inspect(marker)
+        assert marker[:claim] == replica_lineage,
+               "the refused open must leave the REPLICA's lineage as a claim, or the retry " <>
+                 "collides again: " <> inspect(marker)
 
         assert marker.owner == Storage.released_owner(),
                "the refused open must leave a RELEASED marker, not a live lock: #{inspect(marker)}"
@@ -1293,7 +1315,7 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
         assert {:ok, promoted} = Storage.object_position(id)
 
-        assert promoted.epoch > collided,
+        assert promoted.epoch > replica_lineage,
                "the promoted object must carry a lineage above the replica's"
       end
     end

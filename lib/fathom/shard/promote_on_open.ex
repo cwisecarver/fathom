@@ -699,16 +699,24 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # replica is by construction FRESHER than the object (that is why we are here), so it holds
   # quorum-acked writes the object lacks. This used to log "serving the stored object is always
   # correct, merely older" and serve it: the acked tail was gone, and this owner then acked new
-  # writes at the SAME lineage on top of the stale base. It now takes the same refuse-and-retry
-  # window as a failed promotion (`:promotion_failed`, Jepsen 2026-10-24).
+  # writes at the SAME lineage on top of the stale base. It now refuses the open, retryably, like a
+  # failed promotion (`:promotion_failed`, Jepsen 2026-10-24) — but without that path's time window.
   #
-  # THE REFUSAL CARRIES THE COLLIDED LINEAGE AS A CLAIM TO KEEP (`UnderQuorum.claim`, honoured by
-  # `Shard.abandon_open/5`). Releasing a fresh-created lock DELETES it, so the retry would fresh-
-  # create at the same lineage, collide again, and only "converge" by serving the object when the
-  # window expired. Leaving a released marker with the claim sends the retry down the steal path,
-  # whose takeover claim is `max(next_lineage(object), claim + 1)` — strictly above the replica.
-  # With no peers `error_window/3` answers `:none` (no floor to apply) and the object is served.
-  defp promote_replica(shard_id, path, _lease, etag, %{lineage: rl}, _stamp, lineage)
+  # THE REFUSAL CARRIES A CLAIM TO KEEP (`UnderQuorum.claim`, honoured by `Shard.abandon_open/5`),
+  # and the claim is `rl`, the REPLICA's lineage (`rl >= lineage` here): releasing a fresh-created
+  # lock DELETES it, so without a kept claim the retry would fresh-create at the same lineage and
+  # collide again. A released marker carrying `rl` sends the retry down the steal path, whose
+  # takeover claim is `max(next_lineage(object), rl + 1)` — strictly above the replica in ONE retry,
+  # even when the replica is several lineages ahead (a claim of only `lineage` would take
+  # `rl - lineage + 1` refusals).
+  #
+  # THIS REFUSAL IS NOT ROUTED THROUGH `Recovery.error_window/3`, and that is deliberate. The window
+  # is a per-shard TIME budget that an earlier refusal in the same outage (an object-HEAD error, a
+  # failed promotion) may already have spent, after which `error_window/3` answers `:none` and this
+  # clause would serve the stale object on its first try: hard-1 again. It needs no time limit — every
+  # refusal raises the kept claim, so the retry settles in one open — and it needs no peer set,
+  # because the replica it protects is already in hand.
+  defp promote_replica(shard_id, path, _lease, _etag, %{lineage: rl}, _stamp, lineage)
        when is_integer(rl) and is_integer(lineage) and rl >= lineage do
     Logger.warning(
       "shard #{shard_id}: not promoting — the replica's lineage #{rl} is not below this owner's " <>
@@ -716,10 +724,13 @@ defmodule Fathom.Shard.PromoteOnOpen do
         "above it rather than serving the older stored object"
     )
 
-    case Recovery.error_window(shard_id, {:lineage_collision, rl, lineage}) do
-      {:refuse, refusal} -> refuse_open(path, %{refusal | claim: lineage})
-      _none -> etag
-    end
+    refuse_open(path, %Recovery.UnderQuorum{
+      shard_id: shard_id,
+      answered: 0,
+      needed: 1,
+      waited_ms: 0,
+      claim: rl
+    })
   end
 
   defp promote_replica(shard_id, path, lease, etag, replica, stamp, lineage) do
