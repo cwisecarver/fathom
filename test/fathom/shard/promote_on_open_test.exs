@@ -1267,9 +1267,11 @@ defmodule Fathom.Shard.PromoteOnOpenTest do
 
         # The replica holds the lineage the NEXT open will claim, or sits `ahead` above it. That is
         # `next_lineage(object head)`, NOT `stamp.epoch + 1`: the head's lineage metadata and the
-        # position stamp's epoch are separate counters, and a fixture that assumed they agree
-        # collided only when they happened to (the open then rose above the replica, served the
-        # tail, and the test flunked: ~1 run in 5).
+        # position stamp's epoch are separate counters. They disagreed ~1 run in 5 because a stale
+        # `<id>.db.lineage` from an earlier VM's run (ids are `System.unique_integer/1`, which
+        # restarts per VM, and `Local` keeps a lineage on a nil write) survived in the remote dir
+        # until `test_helper.exs` began sweeping `*.db.{pos,lineage}` (2026-11-17). The head read
+        # keeps this fixture honest even if a stale sidecar ever returns.
         assert {:ok, head} = Storage.object_head(id)
         collided = Storage.next_lineage(head)
         replica_lineage = collided + unquote(ahead)

@@ -49,6 +49,16 @@ for sub <- ["tombstones", "tokenfloors"], do: File.rm_rf(Path.join(remote_dir, s
 for f <- Path.wildcard(Path.join(remote_dir, "*.lock")), do: File.rm(f)
 for f <- Path.wildcard(Path.join(remote_dir, "*.db")), do: File.rm(f)
 
+# The `.db.pos` (position) and `.db.lineage` sidecars were never swept, and the lineage one is the
+# dangerous kind: `Local.write_lineage(_, nil)` deliberately LEAVES a previous value ("lineage must
+# only go up"), and test ids are `System.unique_integer/1` values that restart with every VM, so a
+# colliding id inherits the previous run's lineage. The promote-on-open lineage-collision test then
+# saw an object head at lineage 3, 5, 9 ... for a shard it had just built (the head's lineage is a
+# separate counter from the position stamp's epoch), and failed ~1 run in 5 depending on which ids
+# collided. Found 2026-11-17 with 28,610 leftover files (21,322 `.db.pos`, 7,024 `.db.lineage`).
+# Per-run state by definition, like the locks and objects above.
+for f <- Path.wildcard(Path.join(remote_dir, "*.db.{pos,lineage}")), do: File.rm(f)
+
 # The LOCAL shard dir has the same "per-run state by definition" property, and the same failure
 # mode one step earlier: a leftover `<shard>.db` is treated as an authoritative un-flushed local
 # copy (`Fathom.Shard` pulls only on cold start), so a colliding id from a previous run serves that
