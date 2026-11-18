@@ -3595,13 +3595,29 @@ defmodule Fathom.Shard.Storage.S3 do
     )
   end
 
-  defp read_own_lock(shard_id, %{owner: owner}) do
+  defp read_own_lock(shard_id, lease) do
     case get_lock(shard_id) do
-      {:ok, %{owner: ^owner}, etag} -> {:ours, etag}
-      {:ok, _other, _etag} -> :not_ours
+      {:ok, lock, etag} -> if own_lock?(lock, lease), do: {:ours, etag}, else: :not_ours
       :not_found -> :not_ours
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  # WHICH LOCK A 412'D RELEASE MAY STILL ACT ON. This used to match the OWNER STRING alone, so an
+  # older lease of the same incarnation (a coordinator that released late, after a newer one had
+  # re-acquired) read the newer one's lock as "still ours at a different etag" and DELETED it, or
+  # overwrote it with a released marker carrying its own, lower claim (Jepsen 2026-11-14 hard-1
+  # hunt, H6; the shape is a live owner whose lock vanished or regressed, so the next opener
+  # fresh-creates at a lineage the live owner already claims). The cases `Storage.resolve_stale_release/4`
+  # exists for keep their identity: our own legacy `renew_lease/3` rewrites the lock with the SAME
+  # epoch and claim (`do_renew_lease` carries `:claim`), so it still resolves to ours. A same-owner
+  # RECLAIM by another coordinator raises the claim (`with_takeover_claim/4` claims above the
+  # existing one), so under replication the claim tells the two leases apart. With replication off
+  # there are no claims, so owner and epoch cannot tell a reclaim from its predecessor; that gap is
+  # unchanged, and no lineage is at stake there.
+  defp own_lock?(lock, lease) do
+    lock.owner == lease.owner and lock.epoch == lease.epoch and
+      Map.get(lock, :claim) == Map.get(lease, :claim)
   end
 
   # Raced again between the read and this write ⇒ someone else's now; leave it, as the delete does.
@@ -3621,17 +3637,12 @@ defmodule Fathom.Shard.Storage.S3 do
   # `Fathom.Shard.Storage.resolve_stale_release/4` so every etag-carrying backend makes it
   # identically and the default test suite can exercise it — see that function for why a 412 is
   # two different situations.
-  defp resolve_412_release(shard_id, %{owner: owner} = lease) do
+  defp resolve_412_release(shard_id, lease) do
     Storage.resolve_stale_release(
       shard_id,
       lease,
       fn ->
-        case get_lock(shard_id) do
-          {:ok, %{owner: ^owner}, etag} -> {:ours, etag}
-          {:ok, _other, _etag} -> :not_ours
-          :not_found -> :not_ours
-          {:error, reason} -> {:error, reason}
-        end
+        read_own_lock(shard_id, lease)
       end,
       fn fresh_etag ->
         trace_lock(shard_id, "release_delete_after_412", lease, %{if_match: fresh_etag})
