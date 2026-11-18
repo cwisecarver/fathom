@@ -4355,6 +4355,35 @@ defmodule Fathom.Shard do
 
   defp unstamped_claim(_state), do: nil
 
+  # `SHARD_ACQUIRE_TRACE` only (a no-op otherwise; the extra HEAD is evaluated lazily): what a release
+  # was ABOUT TO DO, with the facts that make a lock DELETE safe or not. Deleting a claimed lock is
+  # safe only when the object already carries that lineage (`lineage_stamped?` true AND the object's
+  # stamp at or above the claim); the release path decides on the flag alone, so a flag that is true
+  # without the stamp (Jepsen 2026-11-14 hard-1, hypothesis H1) is invisible without the HEAD.
+  defp trace_release_decision(state, kind) do
+    Storage.trace_lock(state.id, "release_decision", Map.get(state, :lease) || %{}, fn ->
+      %{
+        kind: kind,
+        lineage_stamped: Map.get(state, :lineage_stamped?),
+        state_lineage: Map.get(state, :lineage),
+        object: trace_object_stamp(state.id)
+      }
+    end)
+  end
+
+  defp trace_object_stamp(shard_id) do
+    case Storage.object_head(shard_id) do
+      {:ok, nil} ->
+        :absent
+
+      {:ok, head} ->
+        %{lineage: Map.get(head, :lineage), position_epoch: get_in(head, [:position, :epoch])}
+
+      {:error, reason} ->
+        {:head_error, reason}
+    end
+  end
+
   # THE LEASE RELEASE IS RETRIED, AND A FAILURE THAT OUTLASTS THE RETRIES IS SURFACED (expert review
   # 2026-11-07 #13). Every drop path ends in ONE conditional DELETE (or the conditional released-
   # marker PUT) whose `{:error, _}` the helpers above returned to callers that ignored it. `Req`
@@ -4387,6 +4416,7 @@ defmodule Fathom.Shard do
   @release_retry_ms [50, 200, 800]
 
   defp release_with_retry(state, kind, release_fun) do
+    trace_release_decision(state, kind)
     task = Task.async(fn -> retry_release(release_fun, @release_retry_ms) end)
 
     result =
