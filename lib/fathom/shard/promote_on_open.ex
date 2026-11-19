@@ -716,8 +716,30 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # clause would serve the stale object on its first try: hard-1 again. It needs no time limit — every
   # refusal raises the kept claim, so the retry settles in one open — and it needs no peer set,
   # because the replica it protects is already in hand.
-  defp promote_replica(shard_id, path, _lease, _etag, %{lineage: rl}, _stamp, lineage)
+  defp promote_replica(shard_id, path, lease, _etag, %{lineage: rl} = replica, stamp, lineage)
        when is_integer(rl) and is_integer(lineage) and rl >= lineage do
+    # NOT GATED, because this is the hard-1 moment and it is rare: everything the next investigation
+    # needs about HOW this open got a lineage the replica already holds. A `recreated` or fresh lease
+    # with no claim and no `prev_owner` means the lock was absent or claimless when this open read it
+    # (the previous holder's claim never reached `next_lineage`); `took_over` with a claim means the
+    # steal itself computed a colliding claim. The lock history (versioned bucket) names the writer.
+    Logger.warning(
+      "shard #{shard_id}: lineage collision context: lease=" <>
+        inspect(
+          Map.take(lease, [
+            :owner,
+            :epoch,
+            :claim,
+            :took_over,
+            :recreated,
+            :prev_owner,
+            :released_by,
+            :touch_pending
+          ])
+        ) <>
+        " lineage=#{lineage} replica=#{inspect(replica)} object_stamp=#{inspect(stamp)}"
+    )
+
     Logger.warning(
       "shard #{shard_id}: not promoting — the replica's lineage #{rl} is not below this owner's " <>
         "#{lineage}, so stamping it would reuse a lineage; refusing the open so the retry opens " <>

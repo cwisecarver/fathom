@@ -1677,7 +1677,7 @@ defmodule Fathom.Shard.Storage do
   def trace_lock(shard_id, what, lock, extra) do
     require Logger
 
-    if Application.get_env(:fathom, :acquire_trace, false) == true do
+    if Application.get_env(:fathom, :acquire_trace, false) in [true, :debug] do
       fields =
         lock
         |> Map.take([
@@ -1693,6 +1693,38 @@ defmodule Fathom.Shard.Storage do
         |> Map.merge(if is_function(extra, 0), do: extra.(), else: extra)
 
       Logger.info("shard #{shard_id}: lock-trace #{what} #{inspect(fields)}")
+    end
+
+    :ok
+  end
+
+  @doc false
+  # The VERBOSE tier of the lock-lifecycle trace: emitted at `:debug`, only when `:acquire_trace` is
+  # `:debug` (env `SHARD_ACQUIRE_TRACE=debug`), and `Fathom.Application` then lowers THIS module's log
+  # level to `:debug` (`Logger.put_module_level/2`, the calls below log from here) so the node does not
+  # have to run every subsystem at debug. `extra` is a map or a 0-arity fun, evaluated only when the
+  # line is emitted. What it adds over `trace_lock/4`: coordinator timeline (open begin/summary, flush
+  # verdict, terminate) and the S3 side's acquire outcomes, liveness verdict inputs and the store's
+  # answer to every lock write and delete (Jepsen 2026-11-14 hard-1 hunt).
+  @spec trace_debug(String.t(), String.t(), map(), map() | (-> map())) :: :ok
+  def trace_debug(shard_id, what, lock, extra) do
+    require Logger
+
+    if Application.get_env(:fathom, :acquire_trace, false) == :debug do
+      fields =
+        lock
+        |> Map.take([
+          :owner,
+          :epoch,
+          :claim,
+          :prev_owner,
+          :released_by,
+          :touch_pending,
+          :took_over
+        ])
+        |> Map.merge(if is_function(extra, 0), do: extra.(), else: extra)
+
+      Logger.debug("shard #{shard_id}: lock-debug #{what} #{inspect(fields)}")
     end
 
     :ok

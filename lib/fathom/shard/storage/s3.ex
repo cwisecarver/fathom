@@ -2812,6 +2812,37 @@ defmodule Fathom.Shard.Storage.S3 do
 
   @impl true
   def acquire_lease(shard_id, owner, ttl_ms) do
+    Storage.trace_debug(shard_id, "acquire_begin", %{owner: owner}, %{ttl_ms: ttl_ms})
+    result = do_acquire_lease(shard_id, owner, ttl_ms)
+
+    Storage.trace_debug(shard_id, "acquire_result", %{owner: owner}, fn ->
+      acquire_outcome(result)
+    end)
+
+    result
+  end
+
+  defp acquire_outcome({:ok, lease}),
+    do:
+      Map.merge(
+        %{outcome: :ok},
+        Map.take(lease, [
+          :epoch,
+          :claim,
+          :took_over,
+          :recreated,
+          :touch_pre_etag,
+          :touch_post_etag
+        ])
+      )
+
+  defp acquire_outcome({:error, {:held, holder, instant}}),
+    do: %{outcome: :held, holder: holder, steal_instant: instant}
+
+  defp acquire_outcome({:error, reason}),
+    do: %{outcome: :error, reason: inspect(reason, limit: 8)}
+
+  defp do_acquire_lease(shard_id, owner, ttl_ms) do
     now = Storage.now_ms()
 
     # Optimistic single-request create: the common cold-open has no prior lock (a
@@ -3188,10 +3219,22 @@ defmodule Fathom.Shard.Storage.S3 do
   # steal_margin absorbs inter-node clock skew (see Storage.steal_margin_ms/0): only
   # steal once the heartbeat is expired by more than the margin.
   defp owner_live?(shard_id, other, now, lock_expires_at_ms, lock_fp) do
-    case stealable_at(shard_id, other, now, lock_expires_at_ms, lock_fp) do
-      {:ok, at, ref_now} -> if ref_now <= at, do: :live, else: :dead
-      {:error, _} = error -> error
-    end
+    verdict =
+      case stealable_at(shard_id, other, now, lock_expires_at_ms, lock_fp) do
+        {:ok, at, ref_now} -> if ref_now <= at, do: :live, else: :dead
+        {:error, _} = error -> error
+      end
+
+    Storage.trace_debug(shard_id, "owner_live", %{owner: other}, fn ->
+      %{
+        verdict:
+          if(is_atom(verdict), do: verdict, else: {:error, inspect(elem(verdict, 1), limit: 6)}),
+        lock_expires_in_ms: lock_expires_at_ms - now,
+        lock_epoch: elem(lock_fp, 0)
+      }
+    end)
+
+    verdict
   end
 
   # Everything about the lock that the owner rewrites when it renews it (legacy mode) or a peer
@@ -3479,7 +3522,7 @@ defmodule Fathom.Shard.Storage.S3 do
   def release_lease(shard_id, %{lock_etag: etag} = lease) when is_binary(etag) do
     trace_lock(shard_id, "release_delete", lease, %{if_match: etag})
 
-    case Req.delete(req(), url: lock_path(shard_id), headers: [{"if-match", etag}]) do
+    case lock_delete(shard_id, etag) do
       {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
       # A 412 means "the lock is not the object I wrote". That is TWO different situations and
       # collapsing them to :ok is how a lock gets stranded silently — see resolve_412_release/2.
@@ -3500,7 +3543,7 @@ defmodule Fathom.Shard.Storage.S3 do
           if_match: etag
         })
 
-        case Req.delete(req(), url: lock_path(shard_id), headers: [{"if-match", etag}]) do
+        case lock_delete(shard_id, etag) do
           {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
           {:ok, %{status: 412}} -> :ok
           {:ok, %{status: status}} -> {:error, {:s3_delete_status, status}}
@@ -3561,7 +3604,7 @@ defmodule Fathom.Shard.Storage.S3 do
           :delete ->
             trace_lock(shard_id, "release_if_owned_delete", lock, %{if_match: etag})
 
-            case Req.delete(req(), url: lock_path(shard_id), headers: [{"if-match", etag}]) do
+            case lock_delete(shard_id, etag) do
               {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
               {:ok, %{status: 412}} -> :ok
               {:ok, %{status: status}} -> {:error, {:s3_delete_status, status}}
@@ -3593,6 +3636,25 @@ defmodule Fathom.Shard.Storage.S3 do
       fn -> read_own_lock(shard_id, lease) end,
       fn fresh_etag -> put_marker(shard_id, marker, fresh_etag) end
     )
+  end
+
+  # The one lock DELETE the release paths share: logs (verbose tier) the store's answer, which the
+  # intent line (`release_delete`) cannot, then returns the raw `Req` result unchanged.
+  defp lock_delete(shard_id, etag) do
+    result = Req.delete(req(), url: lock_path(shard_id), headers: [{"if-match", etag}])
+
+    Storage.trace_debug(shard_id, "lock_delete_result", %{}, fn ->
+      %{
+        if_match: etag,
+        result:
+          case result do
+            {:ok, %{status: status}} -> status
+            {:error, reason} -> {:error, inspect(reason, limit: 6)}
+          end
+      }
+    end)
+
+    result
   end
 
   defp read_own_lock(shard_id, lease) do
@@ -3647,7 +3709,7 @@ defmodule Fathom.Shard.Storage.S3 do
       fn fresh_etag ->
         trace_lock(shard_id, "release_delete_after_412", lease, %{if_match: fresh_etag})
 
-        case Req.delete(req(), url: lock_path(shard_id), headers: [{"if-match", fresh_etag}]) do
+        case lock_delete(shard_id, fresh_etag) do
           {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
           # Raced again — someone took it between the read and this delete. Theirs now; leave it.
           {:ok, %{status: 412}} -> :ok
@@ -3847,6 +3909,19 @@ defmodule Fathom.Shard.Storage.S3 do
   # Conditional update of an existing lock (`If-Match: <etag>`), for reclaim / steal
   # / renew. Lock *creation* goes through `create_lock/2`.
   defp put_lock(shard_id, lease, if_match: etag) do
+    result = do_put_lock(shard_id, lease, etag)
+
+    Storage.trace_debug(shard_id, "put_lock_result", lease, fn ->
+      %{if_match: etag, result: put_outcome(result)}
+    end)
+
+    result
+  end
+
+  defp put_outcome({:ok, _}), do: :ok
+  defp put_outcome({:error, reason}), do: {:error, inspect(reason, limit: 6)}
+
+  defp do_put_lock(shard_id, lease, etag) do
     case Req.put(req(),
            url: lock_path(shard_id),
            body: Storage.encode_lease(lease),

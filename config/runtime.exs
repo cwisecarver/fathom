@@ -236,8 +236,17 @@ end
 # Lock-lifecycle trace (jepsen 2026-11-14 hard-1 root-cause hunt): logs, at :info, every S3 lock
 # acquire branch (what lock body was read, the claim computed) and every release. Off by default; the
 # chaos rig turns it on. One line per acquire/release, so not for a 1024-tenant fleet.
-if env_bool.("SHARD_ACQUIRE_TRACE") do
-  config :fathom, :acquire_trace, true
+case System.get_env("SHARD_ACQUIRE_TRACE") do
+  nil ->
+    :ok
+
+  value ->
+    if String.downcase(String.trim(value)) == "debug" do
+      # `debug` = the info tier plus the verbose `lock-debug` lines (`Storage.trace_debug/4`).
+      config :fathom, :acquire_trace, :debug
+    else
+      if env_bool.("SHARD_ACQUIRE_TRACE"), do: config(:fathom, :acquire_trace, true)
+    end
 end
 
 # Boot guard override (expert review 2026-10-10 #8): a prod node refuses to boot without the

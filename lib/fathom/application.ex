@@ -21,6 +21,11 @@ defmodule Fathom.Application do
 
     Fathom.BootChecks.run!()
 
+    # `SHARD_ACQUIRE_TRACE=debug`: let the verbose lock-lifecycle lines through without lowering the
+    # node's global level (see `Fathom.Shard.Storage.trace_debug/4`).
+    if Application.get_env(:fathom, :acquire_trace) == :debug,
+      do: Logger.put_module_level(Fathom.Shard.Storage, :debug)
+
     # Node-wide SQLite page-cache bound (expert review 2026-10-08 #8). Before the tree, so no tenant
     # connection opens ahead of it; process-global, so this one trusted `:memory:` connection covers
     # every connection the node will ever open. Unset (dev/test default) ⇒ untouched.

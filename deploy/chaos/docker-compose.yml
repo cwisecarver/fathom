@@ -34,8 +34,8 @@ x-fathom-env: &fathom-env
   # the guard refuses a store the lock-release fence (#22) cannot trust. The lock-release fence is
   # degraded on this rig; scenarios here validate replication lineage/ack/skew, not that fence.
   SHARD_STORAGE_ALLOW_WEAK_CONDITIONAL_DELETE: "${SHARD_STORAGE_ALLOW_WEAK_CONDITIONAL_DELETE:-true}"
-  # Lock-lifecycle trace (Fathom.Shard.Storage.S3 `trace_lock/4`): which acquire/release branch ran and the lock body. A successful lock write/delete otherwise logs nothing. Rig only.
-  SHARD_ACQUIRE_TRACE: "${SHARD_ACQUIRE_TRACE:-true}"
+  # Lock-lifecycle trace (`Storage.trace_lock/4`, and with `debug` the verbose `trace_debug/4` tier): which acquire/release branch ran, the lock body, the store's answer to each lock write/delete, and the coordinator timeline. A successful lock write/delete otherwise logs nothing. Rig only.
+  SHARD_ACQUIRE_TRACE: "${SHARD_ACQUIRE_TRACE:-debug}"
   AWS_ACCESS_KEY_ID: fathom
   AWS_SECRET_ACCESS_KEY: fathom-secret
   SHARD_DATA_DIR: /data/shards

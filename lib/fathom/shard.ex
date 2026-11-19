@@ -704,6 +704,11 @@ defmodule Fathom.Shard do
     # stolen (liveness check + epoch bump), never silently reclaimed at the same
     # epoch, and the epoch stays a real fencing token across incarnations.
     owner = Heartbeat.owner()
+
+    Storage.trace_debug(shard_id, "open_begin", %{owner: owner}, fn ->
+      %{file: file?, acquire_gen: acquire_gen}
+    end)
+
     ttl = lease_ttl_ms()
 
     # Overlap the lease acquire with the storage pull to cut the cold-open toward
@@ -1227,6 +1232,22 @@ defmodule Fathom.Shard do
       # leave its marker beside a file this coordinator is about to serve and write.
       :ok = PromoteOnOpen.finish_prefetch(prefetch, path)
       etag = PromoteOnOpen.etag_of(promoted)
+
+      Storage.trace_debug(shard_id, "open_summary", lease, fn ->
+        %{
+          warm: warm?,
+          local_writes: local_writes?,
+          revalidate: verdict,
+          etag_pulled: trace_etag(etag0),
+          etag_revalidated: trace_etag(etag1),
+          promoted: trace_etag(promoted),
+          lineage: lineage,
+          lineage_stamped_at_open: etag != etag1,
+          recreated: Map.get(lease, :recreated, false),
+          touch_pre: trace_etag(lease[:touch_pre_etag]),
+          touch_post: trace_etag(lease[:touch_post_etag])
+        }
+      end)
 
       # Arm the coalesced idle timer at open too (expert review 2026-08-31 #13). It used to be
       # armed ONLY when the last connection checked back in, on the assumption "a coordinator is
@@ -3030,6 +3051,8 @@ defmodule Fathom.Shard do
   # in the mailbox); a live stream's lent handle is in use and is closed by that stream's own
   # teardown when it sees us go down, as on every other terminate path.
   def terminate({:shutdown, :registry_lost}, state) do
+    trace_state_event(state, "terminate", %{clause: :registry_lost, reason: :registry_lost})
+
     close_pool(state)
     close_abandoned_lent(state)
     state = shutdown_orphan_tasks(state)
@@ -3037,7 +3060,11 @@ defmodule Fathom.Shard do
     :ok
   end
 
-  def terminate(_reason, %{lease_lost: true} = state) do
+  def terminate(reason, %{lease_lost: true} = state) do
+    trace_state_event(state, "terminate", fn ->
+      %{clause: :lease_lost, reason: inspect(reason, limit: 6)}
+    end)
+
     # The lease is gone: stop refusing the new owner's replication frames (2026-10-12 #20).
     unmark_lease_held(state.id)
 
@@ -3101,7 +3128,11 @@ defmodule Fathom.Shard do
     :ok
   end
 
-  def terminate(_reason, %{conns: conns} = state) when map_size(conns) == 0 do
+  def terminate(reason, %{conns: conns} = state) when map_size(conns) == 0 do
+    trace_state_event(state, "terminate", fn ->
+      %{clause: :no_conns, reason: inspect(reason, limit: 6)}
+    end)
+
     closes = close_pool(state)
 
     # Settle any in-flight flush task FIRST (expert review #27): its conditional PUT
@@ -3160,8 +3191,12 @@ defmodule Fathom.Shard do
   # even if the tombstone hasn't reached this node's ETS yet; worst case is one wasted upload purge
   # then deletes). `tombstoned?` is an O(1) public-ETS read that rescues a missing table to `false`,
   # so a shutdown-ordering edge (Tombstones dies first) fails toward flushing — the safe direction.
-  def terminate(_reason, %{conns: conns, lease: lease} = state)
+  def terminate(reason, %{conns: conns, lease: lease} = state)
       when map_size(conns) > 0 and not is_nil(lease) do
+    trace_state_event(state, "terminate", fn ->
+      %{clause: :with_conns, reason: inspect(reason, limit: 6)}
+    end)
+
     # Refuse NEW writes for the duration of the shutdown (expert review 2026-08-20 #9). Streams do
     # not learn this coordinator is going away until its `:DOWN` fires, which is after terminate/2
     # returns — so without this they keep committing through a checkpoint + VACUUM INTO + PUT that
@@ -3226,7 +3261,11 @@ defmodule Fathom.Shard do
   # Stopping from an early pre-open state (init/handle_continue failed before a lease/conns were set,
   # so the state is the minimal `%{id: ...}` that matches no clause above) — always drop the shard's
   # load row so a stopped shard never leaks a counter.
-  def terminate(_reason, state) do
+  def terminate(reason, state) do
+    trace_state_event(state, "terminate", fn ->
+      %{clause: :default, reason: inspect(reason, limit: 6)}
+    end)
+
     close_pool(state)
 
     # A pre-open stop that had claimed a retained clean copy puts it back under the budget
@@ -4042,6 +4081,8 @@ defmodule Fathom.Shard do
   end
 
   defp flush_then_drop(state) do
+    trace_state_event(state, "drop_begin", %{})
+
     if Fathom.FS.exists?(state.path) do
       # Fence the flush: confirm we still own the shard right before uploading, so a
       # lease lost between acquire and now can't clobber a newer owner. See
@@ -4368,6 +4409,25 @@ defmodule Fathom.Shard do
         state_lineage: Map.get(state, :lineage),
         object: trace_object_stamp(state.id)
       }
+    end)
+  end
+
+  # Verbose-tier (`Storage.trace_debug/4`) coordinator timeline helpers. All lazy: nothing here runs
+  # unless `SHARD_ACQUIRE_TRACE=debug`.
+  defp trace_etag({:promoted, etag, _ordinal}), do: {:promoted, trace_etag(etag)}
+  defp trace_etag(etag) when is_binary(etag), do: etag |> String.trim("\"") |> binary_part(0, 8)
+  defp trace_etag(other), do: other
+
+  defp trace_state_event(state, what, extra) do
+    Storage.trace_debug(state.id, what, Map.get(state, :lease) || %{}, fn ->
+      Map.merge(
+        %{
+          lineage: Map.get(state, :lineage),
+          lineage_stamped: Map.get(state, :lineage_stamped?),
+          lease_lost: Map.get(state, :lease_lost)
+        },
+        if(is_function(extra, 0), do: extra.(), else: extra)
+      )
     end)
   end
 
@@ -6307,6 +6367,10 @@ defmodule Fathom.Shard do
   # Storage I/O already ran in the task — so both the live handler and the terminate-path
   # settle can call it. Returns `{status, state}`.
   defp apply_flush_verdict(state, {:ok, new_etag, carried}) do
+    trace_state_event(state, "flush_ok", fn ->
+      %{new_etag: trace_etag(new_etag), carried: inspect(carried, limit: 4)}
+    end)
+
     # Uploaded; advance the fence etag and the flushed watermark captured when the task started
     # (clears dirty up to that point). The provenance sidecar was already stamped by the flush
     # task (`stamp_sidecar/2`, expert review 2026-10-17 #5) — the verdict's arrival is the proof.
