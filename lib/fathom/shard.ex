@@ -6367,9 +6367,7 @@ defmodule Fathom.Shard do
   # Storage I/O already ran in the task — so both the live handler and the terminate-path
   # settle can call it. Returns `{status, state}`.
   defp apply_flush_verdict(state, {:ok, new_etag, carried}) do
-    trace_state_event(state, "flush_ok", fn ->
-      %{new_etag: trace_etag(new_etag), carried: inspect(carried, limit: 4)}
-    end)
+    stamped_before = Map.get(state, :lineage_stamped?)
 
     # Uploaded; advance the fence etag and the flushed watermark captured when the task started
     # (clears dirty up to that point). The provenance sidecar was already stamped by the flush
@@ -6387,6 +6385,17 @@ defmodule Fathom.Shard do
         # `{:carried, :unknown}` to whatever backend runs next.
         carried_lineage: cache_carried(state.carried_lineage, carried)
     }
+
+    # AFTER the update: `lineage_stamped` here is the post-flush value (true), and the pre-flush one is
+    # named `lineage_stamped_before`, so a reader of a post-mortem cannot take a stale `false` for
+    # "this flush never stamped the lineage".
+    trace_state_event(state, "flush_ok", fn ->
+      %{
+        new_etag: trace_etag(new_etag),
+        carried: inspect(carried, limit: 4),
+        lineage_stamped_before: stamped_before
+      }
+    end)
 
     # Advance the published watermark (clears dirty up to flush_pending for the RPO reader).
     FlushWatermark.record(state.id, state.flushed_through, state.counter_gen)
