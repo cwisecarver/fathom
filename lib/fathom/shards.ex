@@ -113,12 +113,10 @@ defmodule Fathom.Shards do
     # request-path callers are covered again in Fathom.ShardExecutor.open/1 (cast is idempotent).
     case Fathom.ShardId.cast(shard_id) do
       {:ok, id} ->
-        # A `:telemetry.span` so each checkout is an OpenTelemetry trace span (cold-open cost shows
-        # up here on a cold checkout) and a duration metric, tagged by outcome. See Fathom.Telemetry.
-        :telemetry.span([:fathom, :shards, :checkout], %{shard_id: id}, fn ->
-          result = do_checkout(id, 3)
-          {result, %{shard_id: id, outcome: checkout_outcome(result)}}
-        end)
+        # Each checkout is an OpenTelemetry trace span when tracing is on (cold-open cost shows up
+        # here on a cold checkout) and a duration metric, tagged by outcome, always. See
+        # `checkout_span/2` and Fathom.Telemetry.
+        checkout_span(id, fn -> do_checkout(id, 3) end)
 
       :error ->
         {:error, :invalid_shard_id}
@@ -143,10 +141,7 @@ defmodule Fathom.Shards do
     # the second. Same validation + telemetry span as `checkout/1`, via the shared `do_checkout/4`.
     case Fathom.ShardId.cast(shard_id) do
       {:ok, id} ->
-        :telemetry.span([:fathom, :shards, :checkout], %{shard_id: id}, fn ->
-          result = do_checkout(id, 3, nil, scope)
-          {result, %{shard_id: id, outcome: checkout_outcome(result)}}
-        end)
+        checkout_span(id, fn -> do_checkout(id, 3, nil, scope) end)
 
       :error ->
         {:error, :invalid_shard_id}
@@ -472,6 +467,39 @@ defmodule Fathom.Shards do
   @doc false
   @spec retry_checkout?(term()) :: boolean()
   def retry_checkout?(reason), do: reason in [:unavailable, :normal]
+
+  # The checkout's telemetry. `:telemetry.span/3` emits `:start`, `:stop` and `:exception`, but the
+  # only handler on `:start` and `:exception` is the OpenTelemetry bridge, attached only when
+  # `:otel_spans` is on (`Fathom.Telemetry.attach_otel_span_bridge/0`, off by default); the metric
+  # (`FastHistogram`) consumes `:stop` alone. Without the bridge the span paid, per checkout, a
+  # `make_ref`, a `system_time`, two list appends, two metadata merges, a handler-miss `execute` for
+  # `:start` and a try frame, for events nobody received (perf audit 2026-11-19 #6).
+  #
+  # So: with tracing on, the full span, unchanged; with it off, time the call and emit only `:stop`
+  # with the same measurements (`duration`, `monotonic_time`) and metadata (`shard_id`, `outcome`).
+  # A raise propagates exactly as before: with no `:exception` handler attached it only ever
+  # reached the caller. Not `:persistent_term`: the flag is an `Application.get_env` read, which
+  # measured equal to it (`Fathom.FS`, `fs.ex:226-228`).
+  defp checkout_span(id, checkout) do
+    if Fathom.Telemetry.otel_spans?() do
+      :telemetry.span([:fathom, :shards, :checkout], %{shard_id: id}, fn ->
+        result = checkout.()
+        {result, %{shard_id: id, outcome: checkout_outcome(result)}}
+      end)
+    else
+      started = System.monotonic_time()
+      result = checkout.()
+      stopped = System.monotonic_time()
+
+      :telemetry.execute(
+        [:fathom, :shards, :checkout, :stop],
+        %{duration: stopped - started, monotonic_time: stopped},
+        %{shard_id: id, outcome: checkout_outcome(result)}
+      )
+
+      result
+    end
+  end
 
   defp checkout_outcome({:ok, _, _, _}), do: :ok
   # The folded scope-carrying checkout (#18) returns the reuse handle as a 5th element.
