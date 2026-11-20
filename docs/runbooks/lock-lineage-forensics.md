@@ -5,14 +5,17 @@ shard's lock vanishes or regresses under a live owner. This is the Jepsen 2026-1
 Elle `G2-item-realtime` in one shard, acked appends lost, and a node log line
 `not promoting — the replica's lineage N is not below this owner's N`.
 
-**Status: the cause of hard-1 is unattributed.** About 46 traced hard-mix runs since the tracing went
-in did not reproduce it. This page is how a recurrence explains itself. It is not a diagnosis.
+**Status: the cause of hard-1 is unattributed.** It was seen once, in the 2026-11-14 hard-mix batch;
+about 46 traced hard-mix runs since the tracing went in did not reproduce it. The original failing run's
+store (`jepsen/fathom/store/fathom-mixed-hard-power/2026-11-14T23:37:16.369487-05:00`) is the only record
+of it: keep it when pruning old stores. This page is how a recurrence explains itself. It is not a
+diagnosis.
 
 ## What is in place
 
 | Piece | What it gives you |
 |---|---|
-| **Fail-closed refusal** (`PromoteOnOpen.promote_replica/7`) | A replica fresher than the object whose lineage is not below the owner's lineage now REFUSES the open (retryable 503) and keeps the replica's lineage as a claim, so the retry opens above it. It no longer serves the older object and loses the acked tail. A recurrence therefore shows up as a log line, not as lost writes. |
+| **Fail-closed refusal** (`PromoteOnOpen.promote_replica/7`) | A replica fresher than the object whose lineage is not below the owner's lineage now REFUSES the open (retryable 503) and keeps the replica's lineage as a claim, so the retry opens above it. It no longer serves the older object and loses the acked tail. A recurrence therefore shows up as a log line, not as lost writes. **It has never fired on the rig** (no collision was reproduced), so it is covered by unit tests only (`promote_on_open_test.exs`, both liveness modes), not by a rig run. |
 | **Always-on collision warning** | Same place: `lineage collision context: lease=%{owner, epoch, claim, took_over, recreated, prev_owner, released_by, touch_pending} lineage=… replica=… object_stamp=…`. No flag needed. |
 | **Stale-release identity** (`S3.own_lock?/2`) | A 412'd release resolves to "ours" only for the same owner, epoch AND claim. Closes the older-lease-clobbers-newer-lock shape on the real conditional contract. |
 | **`SHARD_ACQUIRE_TRACE`** | `true`: `lock-trace` lines for every acquire branch, release, marker, rollback and the lineage each open chose (`open_lineage`), plus `release_decision` (what a release is about to do, with the object's stamp). `debug`: adds `lock-debug` lines: coordinator timeline (open begin/summary, flush ok, drop, terminate), acquire outcomes, liveness-check inputs, and the store's answer to every lock write and delete. Off by default; the chaos rig sets `debug`. |
