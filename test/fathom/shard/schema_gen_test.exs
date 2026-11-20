@@ -217,4 +217,35 @@ defmodule Fathom.Shard.SchemaGenTest do
     :ok = Fathom.ShardExecutor.close(a)
     :ok = Fathom.ShardExecutor.close(b)
   end
+
+  # The counter must never go BACKWARDS across a SchemaGen restart. Its ETS table died with the
+  # process and `init/1` re-inserted 1, so a connection that cached a statement under an early
+  # generation, then sat idle through later DDL (generation moved on), would match that early
+  # generation again after a restart and keep a stale COLUMN LIST: the two-columns-three-values
+  # mis-mapping this module exists to prevent. Restarts are rare (the process does nothing), which
+  # is why this sat unnoticed, but the failure is silent wrong data on the wire. Found in the perf
+  # audit 2026-11-19 follow-up review; pre-existing, not introduced by that audit.
+  test "a SchemaGen restart does not move the generation backwards" do
+    Fathom.Shard.SchemaGen.bump()
+    Fathom.Shard.SchemaGen.bump()
+    before = Fathom.Shard.SchemaGen.current()
+    assert before > 1, "precondition: the generation has moved past its initial value"
+
+    pid = Process.whereis(Fathom.Shard.SchemaGen)
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _}, 2_000
+
+    Fathom.Test.Await.until(
+      fn ->
+        new = Process.whereis(Fathom.Shard.SchemaGen)
+        is_pid(new) and new != pid
+      end,
+      "the supervisor never restarted SchemaGen",
+      2_000
+    )
+
+    assert Fathom.Shard.SchemaGen.current() >= before,
+           "the generation went backwards across a restart: a stale cached column list would match again"
+  end
 end
