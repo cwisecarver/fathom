@@ -128,8 +128,7 @@ defmodule Fathom.ShardExecutor do
             # The scope rides the handle so execute/2 can enforce read-only across baton-resumes
             # and every stream on the connection.
             {:ok,
-             {pid, ref, conn, shard_id, scope, token_version,
-              stream_opts(template?, deferred?, shard_id)}}
+             {pid, ref, conn, shard_id, scope, token_version, stream_opts(template?, deferred?)}}
 
           {:error, reason} ->
             Shard.checkin(pid, ref)
@@ -574,13 +573,20 @@ defmodule Fathom.ShardExecutor do
         latency = System.monotonic_time() - started
 
         # Per-shard load + tail latency: the "which shard is hot / slow" signals for the
-        # rebalancer. Lock-free `:counters` bumps on the two blocks the stream resolved at open
-        # (`stream_opts/3`): no env read and no ETS lookup per statement. Before this, the gate was
-        # read here and again inside `record_query/3` and `ShardLatency.record/2`, with two ETS
-        # lookups (perf audit 2026-11-19 #1; and review 2026-07-23 #7 before it). ShardLatency's
-        # per-shard histogram is deliberately NOT a metric tag (a per-shard Prometheus label is
-        # cardinality death); the read API is the interface.
-        record_load(opts, shard_id, stmt_result, latency)
+        # rebalancer. Lock-free ETS bumps, riding one :shard_load gate check here (the two
+        # modules each re-reading the same key was a doubled env lookup on every query —
+        # review 2026-07-23 #7). ShardLatency's per-shard ETS histogram is deliberately NOT a
+        # metric tag (a per-shard Prometheus label is cardinality death); the read API is the
+        # interface.
+        if Fathom.ShardLoad.enabled?() do
+          Fathom.ShardLoad.record_query(
+            shard_id,
+            stmt_result.rows_read,
+            stmt_result.rows_written
+          )
+
+          Fathom.ShardLatency.record(shard_id, latency)
+        end
 
         # Node-wide query latency for the metrics layer (Prometheus distribution / the dashboard's
         # latency chart). Deliberately UN-tagged, for the same cardinality reason. On success only,
@@ -1878,55 +1884,8 @@ defmodule Fathom.ShardExecutor do
   # operator config — a stream seeing a consistent value for its lifetime is the correct
   # semantic (the DDL guard / template identity never flip mid-stream), and every existing
   # test configures them before opening.
-  #
-  # Perf audit 2026-11-19 #1 adds one more per-stream constant that every statement used to re-read:
-  # `load`, the shard's `ShardLoad` and `ShardLatency` counter blocks (`nil` when `:shard_load` is
-  # off at open). A `:shard_load` change therefore reaches the NEXT stream, not the next statement of
-  # a live one, and a django-libsql stream can live for hours; the flag is boot-static in prod
-  # (`config/runtime.exs`). `record_load/4` falls back to the gated recorders for a handle built
-  # without the key, because tests build handles by hand (see `deferred_sync?/1`).
-  #
-  # NOT captured here, deliberately: `Session.enabled?/0` (`nif_dispatch_test.exs` flips
-  # `:replication_enabled` on an OPEN handle, after its autocommit DDL, so a per-stream copy breaks
-  # the dispatch-count tests it exists for), the `fathom_udf` availability read behind the
-  # `fts3_tokenizer` text gate (a security gate whose plumbing `blocked_statement/2` shares with
-  # the B8 classification findings), and `Connection`'s `:query_timeout_ms` / `:query_max_rows`
-  # (`connection_watchdog_test.exs` flips the timeout live, and `row_cap` sits eight arguments
-  # deep in `do_query/9`).
-  defp stream_opts(template?, deferred?, shard_id) do
-    load =
-      case {Fathom.ShardLoad.stream_block(shard_id), Fathom.ShardLatency.stream_block(shard_id)} do
-        {load, latency} when load != nil and latency != nil -> {load, latency}
-        _ -> nil
-      end
-
-    %{
-      template?: template?,
-      block_ddl?: block_tenant_ddl?(),
-      deferred_sync?: deferred?,
-      load: load
-    }
-  end
-
-  # Count one statement into the stream's resolved blocks. A handle built without the `:load` key
-  # (a hand-built test handle) falls back to the per-call gated recorders.
-  defp record_load(opts, shard_id, stmt_result, latency) do
-    case opts do
-      %{load: {load, latency_block}} ->
-        Fathom.ShardLoad.add_query(load, stmt_result.rows_read, stmt_result.rows_written)
-        Fathom.ShardLatency.add(latency_block, latency)
-
-      %{load: nil} ->
-        :ok
-
-      _ ->
-        if Fathom.ShardLoad.enabled?() do
-          Fathom.ShardLoad.record_query(shard_id, stmt_result.rows_read, stmt_result.rows_written)
-          Fathom.ShardLatency.record(shard_id, latency)
-        end
-    end
-
-    :ok
+  defp stream_opts(template?, deferred?) do
+    %{template?: template?, block_ddl?: block_tenant_ddl?(), deferred_sync?: deferred?}
   end
 
   # `shard_id` here is already canonical (normalized in open/1), so normalize the configured

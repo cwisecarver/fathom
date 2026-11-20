@@ -88,28 +88,12 @@ defmodule Fathom.ShardLatency do
           :ok
 
         ref ->
-          add(ref, dt_native)
+          us = System.convert_time_unit(dt_native, :native, :microsecond)
+          :counters.add(ref, 1 + bucket_index(us), 1)
       end
     end
 
     :ok
-  end
-
-  @doc """
-  The shard's histogram block for a stream to hold, or `nil` when recording is disabled or the table
-  is not up. Resolved ONCE at stream open and counted into with `add/2` (perf audit 2026-11-19 #1;
-  see `Fathom.ShardLoad.stream_block/1`, which this pairs with).
-  """
-  @spec stream_block(String.t()) :: :counters.counters_ref() | nil
-  def stream_block(shard_id) do
-    if enabled?(), do: block(shard_id)
-  end
-
-  @doc "Counts one query's latency (native units) into a block from `stream_block/1`."
-  @spec add(:counters.counters_ref(), integer()) :: :ok
-  def add(ref, dt_native) do
-    us = System.convert_time_unit(dt_native, :native, :microsecond)
-    :counters.add(ref, 1 + bucket_index(us), 1)
   end
 
   # The shard's histogram block — an ETS READ once it exists; created on first touch with

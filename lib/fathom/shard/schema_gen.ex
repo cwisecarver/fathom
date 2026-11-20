@@ -37,25 +37,20 @@ defmodule Fathom.Shard.SchemaGen do
   parse per cached statement). SQLite recompiles a statement whose own schema moved at step, so
   the statement itself is kept.
 
-  ## Why an `:atomics` cell behind ONE `:persistent_term`, not a `:persistent_term` per bump
+  ## Why ETS and not `:persistent_term`
 
   `:persistent_term.put/2` triggers a global scan of processes holding persistent-term references.
   DDL can be tenant-issued whenever `:block_tenant_ddl` is off, which is the default, so a tenant
-  looping `CREATE TABLE`/`DROP TABLE` would be issuing node-wide GC pressure on demand if every bump
-  were a `put`. So the counter itself is an `:atomics` cell, bumped with `:atomics.add/3` (no global
-  effect), and `:persistent_term` holds only the cell's REFERENCE, put once per node (the first
-  `init/1`; a supervisor restart finds it and keeps counting).
+  looping `CREATE TABLE`/`DROP TABLE` would be issuing node-wide GC pressure on demand. An ETS
+  counter has no such global effect.
 
-  The read is on the hottest cache path: once per executed statement and once per describe, so twice
-  per SDK statement (perf audit 2026-11-19 #4). It used to be an ETS lookup inside a `rescue` frame,
-  measured at ~0.32 µs (against a ~7.7 µs raw query and a ~123 µs Hrana round trip). It is now a
-  `:persistent_term.get/2` plus an `:atomics.get/2`, the same pair `Connection.busy_waiters?/0` uses.
-  Atomics are sequentially consistent, so a sibling stream still sees a bump made before its next
-  statement (expert review 2026-08-26 #7).
+  Measured on this machine: the read is ~0.32 µs against a ~7.7 µs raw query and a ~123 µs Hrana
+  round trip, i.e. ~0.26% of a request.
   """
   use GenServer
 
-  @ref_key {__MODULE__, :ref}
+  @table __MODULE__
+  @key :gen
 
   @doc false
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -63,17 +58,16 @@ defmodule Fathom.Shard.SchemaGen do
   @doc """
   The current schema generation for this node.
 
-  Returns `0` when the counter is absent — a caller outside the supervision tree (the migrator's own
+  Returns `0` when the table is absent — a caller outside the supervision tree (the migrator's own
   copy connections, `mix fathom.shard`, the bench harness). `0` is stable, so entries cached under
   it never invalidate, which is exactly the pre-review behaviour and correct for a caller that owns
   its connection exclusively.
   """
   @spec current() :: non_neg_integer()
   def current do
-    case :persistent_term.get(@ref_key, nil) do
-      nil -> 0
-      ref -> :atomics.get(ref, 1)
-    end
+    :ets.lookup_element(@table, @key, 2)
+  rescue
+    ArgumentError -> 0
   end
 
   @doc """
@@ -84,23 +78,18 @@ defmodule Fathom.Shard.SchemaGen do
   """
   @spec bump() :: :ok
   def bump do
-    case :persistent_term.get(@ref_key, nil) do
-      nil -> :ok
-      ref -> :atomics.add(ref, 1, 1)
-    end
+    :ets.update_counter(@table, @key, {2, 1})
+    :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   @impl true
   def init(_opts) do
-    # The cell is created once per node and never replaced: a restarted SchemaGen keeps counting
-    # rather than returning to 1, which can only cause extra column refreshes, never fewer. The
-    # `put` happens here, at boot, not per DDL (see the moduledoc).
-    if :persistent_term.get(@ref_key, nil) == nil do
-      ref = :atomics.new(1, signed: false)
-      :atomics.put(ref, 1, 1)
-      :persistent_term.put(@ref_key, ref)
-    end
-
+    # Public + read_concurrency: every stream process reads this per statement off its own
+    # scheduler; writes are rare (DDL only) and go through update_counter.
+    :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
+    :ets.insert(@table, {@key, 1})
     {:ok, %{}}
   end
 end
