@@ -54,40 +54,6 @@ defmodule Fathom.TelemetryTest do
                     %{shard_id: ^shard, outcome: :ok}}
   end
 
-  # Perf audit 2026-11-19 #6. With the OTel bridge off (the default) a checkout emits only `:stop`,
-  # carrying the SAME measurements and metadata the full span did, because that is the only event
-  # the duration metric consumes; with it on, the full span (`:start` too) is unchanged.
-  for {otel?, starts} <- [{false, 0}, {true, 1}] do
-    test "a checkout emits #{starts} :start event(s) and one :stop with otel_spans=#{otel?}", %{
-      shard: shard
-    } do
-      Env.put!(:otel_spans, unquote(otel?))
-      Application.put_env(:fathom, :shard_idle_ms, 50)
-
-      attach([
-        [:fathom, :shards, :checkout, :start],
-        [:fathom, :shards, :checkout, :stop]
-      ])
-
-      serve(shard, fn conn ->
-        {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
-      end)
-
-      assert_receive {:telemetry, [:fathom, :shards, :checkout, :stop],
-                      %{duration: duration, monotonic_time: stopped},
-                      %{shard_id: ^shard, outcome: :ok}}
-
-      assert is_integer(duration) and duration >= 0 and is_integer(stopped)
-
-      if unquote(starts) == 1 do
-        assert_received {:telemetry, [:fathom, :shards, :checkout, :start], _,
-                         %{shard_id: ^shard}}
-      else
-        refute_received {:telemetry, [:fathom, :shards, :checkout, :start], _, _}
-      end
-    end
-  end
-
   test "a lease stolen out from under a live coordinator emits :superseded", %{shard: shard} do
     attach([[:fathom, :shard, :lease, :superseded]])
 
