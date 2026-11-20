@@ -99,13 +99,32 @@ defmodule Fathom.ShardLoad do
           :ok
 
         ref ->
-          :counters.add(ref, @ix_queries, 1)
-          :counters.add(ref, @ix_rows_read, rows_read)
-          :counters.add(ref, @ix_rows_written, rows_written)
+          add_query(ref, rows_read, rows_written)
       end
     end
 
     :ok
+  end
+
+  @doc """
+  The shard's counter block for a stream to hold, or `nil` when recording is disabled or the table is
+  not up. A stream resolves this ONCE at open and then counts with `add_query/3`, so a statement pays
+  no `:shard_load` env read and no ETS lookup (perf audit 2026-11-19 #1: `record_query/3` plus
+  `ShardLatency.record/2` read the gate three times and looked up two rows per statement). A block
+  that outlives `forget/1` is orphaned and counts into nothing the readers see: a dropped sample, the
+  same contract as a `forget/1` racing a first touch (see `create_block/1`).
+  """
+  @spec stream_block(String.t()) :: :counters.counters_ref() | nil
+  def stream_block(shard_id) do
+    if enabled?(), do: block(shard_id)
+  end
+
+  @doc "Counts one query into a block from `stream_block/1`."
+  @spec add_query(:counters.counters_ref(), non_neg_integer(), non_neg_integer()) :: :ok
+  def add_query(ref, rows_read, rows_written) do
+    :counters.add(ref, @ix_queries, 1)
+    :counters.add(ref, @ix_rows_read, rows_read)
+    :counters.add(ref, @ix_rows_written, rows_written)
   end
 
   # The shard's counter block: an ETS READ on the hot path, never a write once the block exists.

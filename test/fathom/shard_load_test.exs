@@ -223,6 +223,43 @@ defmodule Fathom.ShardLoadTest do
     Shards.drain(id)
   end
 
+  # Perf audit 2026-11-19 #1: a stream resolves its ShardLoad/ShardLatency blocks and the gate ONCE
+  # at open, so a statement no longer re-reads `:shard_load` or looks the rows up. That makes the
+  # flag a per-STREAM decision, deliberately (a django-libsql stream can live for hours): flipping it
+  # affects the next stream, and both sides of that are pinned here, with the latency histogram
+  # counted by the same stream.
+  test "the :shard_load gate is decided per stream at open" do
+    Env.put!(:shard_idle_ms, 5_000)
+    id = uniq("loadstream")
+    on_exit(fn -> clean_shard(id) end)
+
+    {:ok, on} = ShardExecutor.open(id)
+    Env.put!(:shard_load, false)
+    {:ok, _} = ShardExecutor.execute(on, stmt("CREATE TABLE kv (v TEXT)"))
+    {:ok, _} = ShardExecutor.execute(on, stmt("SELECT v FROM kv"))
+
+    assert ShardLoad.get(id).queries == 2,
+           "a stream opened with the gate on keeps counting after the flag flips off"
+
+    assert id |> Fathom.ShardLatency.histogram() |> Enum.sum() == 2
+
+    {:ok, off} = ShardExecutor.open(id)
+    before = ShardLoad.get(id).queries
+    {:ok, _} = ShardExecutor.execute(off, stmt("SELECT 1"))
+
+    assert ShardLoad.get(id).queries == before,
+           "a stream opened with the gate off counts nothing"
+
+    Env.put!(:shard_load, true)
+    {:ok, _} = ShardExecutor.execute(off, stmt("SELECT 1"))
+
+    assert ShardLoad.get(id).queries == before,
+           "flipping the gate on does not enrol a live stream that opened with it off"
+
+    for h <- [on, off], do: ShardExecutor.close(h)
+    Shards.drain(id)
+  end
+
   defp local_dir, do: Fathom.Shard.data_dir()
   defp remote_dir, do: Fathom.Shard.Storage.Local.dir()
 end
