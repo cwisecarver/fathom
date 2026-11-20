@@ -1270,16 +1270,6 @@ defmodule Fathom.Shard do
         id: shard_id,
         path: path,
         conns: %{},
-        # Boot-static config read ONCE here instead of inside the mailbox on every grant and every
-        # pooled checkin (perf audit 2026-11-19 #3): `max_checkouts` is the per-shard stream cap
-        # (`:max_checkouts_per_shard`, nil = unlimited) and `idle_budget` the node-wide idle-handle
-        # budget (`PoolBudget.budget/0`). Each was an `Application.get_env` in the shard's single
-        # serialized lock, on every checkout / checkin of the shard. A runtime change therefore
-        # applies to shards opened afterwards, not to live coordinators; `:fathom` sets both in
-        # `config/runtime.exs` at boot and nothing flips them in production. (`persistent_term` was
-        # measured equal to `get_env`, `fs.ex:226-228`, so the win is not reading at all.)
-        max_checkouts: max_checkouts(),
-        idle_budget: PoolBudget.budget(),
         # Idle (checked-in) SQLite handles reusable by the next stream of THIS shard — connection
         # pooling (docs/pooling-spike-plan.md). `nil` unless `:connection_pool` is on — OFF in
         # dev/test but ON IN PROD (config/config.exs sets it to `config_env() == :prod`), so this is
@@ -3348,7 +3338,7 @@ defmodule Fathom.Shard do
     # combined with the timeout/row caps, can't wedge the shard un-drainable). Off by default
     # (`:max_checkouts_per_shard` unset ⇒ unlimited); the caller maps the refusal to a 503.
     # `capped?` false is the internal grant (`checkout_internal/1`, 2026-10-20 #13): exempt.
-    case state.max_checkouts do
+    case max_checkouts() do
       cap when capped? and is_integer(cap) and cap > 0 and map_size(state.conns) >= cap ->
         {:error, :shard_at_stream_capacity, state}
 
@@ -3359,16 +3349,7 @@ defmodule Fathom.Shard do
         # Clearing idle_since (not cancelling the timer) is what defers idle-stop: a
         # pending timer fires as a cheap no-op/re-arm instead of paying a
         # cancel_timer + send_after pair per stream cycle (review 2026-07-23 #17).
-        # Written only when set: an exact-value `%{state | k: v}` on this 50+ key map still copies
-        # the path to the key, and a busy shard's `idle_since` is already nil (perf audit
-        # 2026-11-19 #5).
-        conns = Map.put(state.conns, ref, {caller, op})
-
-        state =
-          case state.idle_since do
-            nil -> %{state | conns: conns}
-            _ -> %{state | conns: conns, idle_since: nil}
-          end
+        state = %{state | conns: Map.put(state.conns, ref, {caller, op}), idle_since: nil}
 
         # Re-arm the durability timer if the idle+clean state disarmed it (review 2026-07-24 #10).
         # Deliberately on the GRANT, not on checkin: the timer must be live for the whole window in
@@ -3401,11 +3382,9 @@ defmodule Fathom.Shard do
         :telemetry.execute([:fathom, :shard, :pool_take], %{count: 1}, %{result: :hit})
         {{:reuse, conn}, put_pool(state, pool)}
 
-      # A miss leaves the pool exactly as it was (`HandlePool.take/2`), so the state is returned
-      # untouched rather than rewritten with the same pool (perf audit 2026-11-19 #5).
-      {:miss, _pool} ->
+      {:miss, pool} ->
         :telemetry.execute([:fathom, :shard, :pool_take], %{count: 1}, %{result: :miss})
-        {:open, state}
+        {:open, %{state | pool: pool}}
     end
   end
 
@@ -3415,13 +3394,7 @@ defmodule Fathom.Shard do
 
   # The stream checked its grant back in: whatever it was lent is its own business again (it either
   # hands the handle back to the pool with this very checkin, or closed it itself).
-  #
-  # Only when the ref WAS lent a handle: a plain (non-pooled) checkout, or a pool miss, never enters
-  # `lent`, and the unconditional delete + rewrite then changed nothing (perf audit 2026-11-19 #5).
-  defp returned(%{lent: lent} = state, ref) when is_map_key(lent, ref),
-    do: %{state | lent: Map.delete(lent, ref)}
-
-  defp returned(state, _ref), do: state
+  defp returned(state, ref), do: %{state | lent: Map.delete(state.lent, ref)}
 
   # The grant ended WITHOUT a checkin (the caller died, or its checkout timed out): close the handle
   # it was lent, which nothing else will ever do.
@@ -3480,7 +3453,7 @@ defmodule Fathom.Shard do
   # pooled, through the same chain as a draining checkin; the checkout itself was never at stake.
   # See `Fathom.Shard.PoolBudget` for why it is the incoming handle and not the node's oldest.
   defp pool_checkin(%{pool: pool} = state, conn, scope) do
-    if PoolBudget.admit?(state.idle_budget) do
+    if PoolBudget.admit?() do
       {pool, evicted} = HandlePool.put(pool, scope, conn, System.monotonic_time(:millisecond))
       # Evicted handles close OFF the coordinator, on the same chain as the other closes (expert
       # review 2026-10-17 #19). K concurrent streams on one shard against a small `max_per_scope`
@@ -3625,7 +3598,7 @@ defmodule Fathom.Shard do
 
       # Standing down: don't arm idle — stop_when_drained will stop us.
       state.draining ->
-        clear_wrote_during_checkout(state)
+        %{state | wrote_during_checkout?: false}
 
       true ->
         # Last connection gone, so the next checkout starts a fresh "has this stream written?"
@@ -3641,14 +3614,9 @@ defmodule Fathom.Shard do
         # fresh open and a close-time checkpoint on every request. It now keeps the pool for
         # `drain_grace_ms` (perf review 2026-10-14 #4) and every barrier that relies on "idle ⇒ no
         # SQLite connections" drains it first — see THE POOL DRAIN GRACE above drain_pool/1.
-        schedule_idle(release_pool_on_idle(clear_wrote_during_checkout(state)))
+        schedule_idle(release_pool_on_idle(%{state | wrote_during_checkout?: false}))
     end
   end
-
-  # The flag is false on every serial read-only cycle; skip the map rewrite then (perf audit
-  # 2026-11-19 #5).
-  defp clear_wrote_during_checkout(%{wrote_during_checkout?: false} = state), do: state
-  defp clear_wrote_during_checkout(state), do: %{state | wrote_during_checkout?: false}
 
   # THE POOL DRAIN GRACE (perf review 2026-10-14 #4). On the idle transition the pool is kept for
   # `drain_grace_ms` (HandlePool, default 2000 ms since 2026-10-31, was 250; 0 is the old drain-on-close), so a serial client's
@@ -3680,7 +3648,7 @@ defmodule Fathom.Shard do
 
   defp release_pool_on_idle(%{pool: %HandlePool{drain_grace_ms: grace} = pool} = state) do
     # A NEW idle transition: whatever the last ask was about, a stream has written since.
-    state = if state.idle_close == nil, do: state, else: %{state | idle_close: nil}
+    state = %{state | idle_close: nil}
 
     cond do
       HandlePool.count(pool) == 0 ->
