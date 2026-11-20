@@ -710,9 +710,9 @@ defmodule Fathom.Admin.MetricsCollector do
   @spec hot_shards(%{optional(String.t()) => {integer(), integer(), integer()}}, number()) ::
           {[map()], %{optional(String.t()) => {integer(), integer(), integer()}}}
   def hot_shards(prev, window_s) do
-    {heap, next_prev} =
-      Enum.reduce(ShardLoad.snapshot_tuples(), {[], %{}}, fn
-        {id, _checkouts, queries, rows_read, rows_written}, {heap, next} ->
+    {{heap, _size, _min_q}, next_prev} =
+      ShardLoad.fold({{[], 0, nil}, %{}}, fn
+        {id, _checkouts, queries, rows_read, rows_written}, {top, next} ->
           {pq, prr, prw} = Map.get(prev, id, {0, 0, 0})
           q_per_s = rate(queries, pq, window_s)
 
@@ -724,18 +724,18 @@ defmodule Fathom.Admin.MetricsCollector do
           # of the old 5-key map, which is per-row and does not depend on the filter.
           next = Map.put(next, id, {queries, rows_read, rows_written})
 
-          heap =
+          top =
             if q_per_s > 0.0 do
               keep_top(
-                heap,
+                top,
                 {q_per_s, id, queries, rate(rows_read, prr, window_s),
                  rate(rows_written, prw, window_s)}
               )
             else
-              heap
+              top
             end
 
-          {heap, next}
+          {top, next}
       end)
 
     hot =
@@ -756,11 +756,31 @@ defmodule Fathom.Admin.MetricsCollector do
 
   # A bounded "keep the N largest" list. At most @hot_n elements are ever retained, so the
   # sort at the end is over 20 items rather than the whole resident set.
-  defp keep_top(heap, entry) when length(heap) < @hot_n, do: [entry | heap]
+  #
+  # The accumulator is `{heap, size, min_q}`: the size and the smallest retained rate are CARRIED, not
+  # recomputed per row. This used to call `length(heap)` and `Enum.min_by/2` over the 20 retained
+  # entries on every row of a full heap (about 40 list steps per resident shard with a positive rate,
+  # perf audit 2026-11-19 #34), although all but a handful of rows are rejected. Now a rejected row is
+  # one comparison; the O(20) rescan happens only when a row actually displaces the minimum. `min_q` is
+  # `nil` until the heap is full, and the second clause is only reachable with a full heap. Equal
+  # rates never displace (`q <= min_q`), as before.
+  defp keep_top({heap, size, _min_q}, entry) when size < @hot_n do
+    heap = [entry | heap]
+    size = size + 1
+    {heap, size, if(size == @hot_n, do: heap_min_q(heap))}
+  end
 
-  defp keep_top(heap, {q, _, _, _, _} = entry) do
-    {min_q, _, _, _, _} = min = Enum.min_by(heap, fn {hq, _, _, _, _} -> hq end)
-    if q > min_q, do: [entry | List.delete(heap, min)], else: heap
+  defp keep_top({_heap, _size, min_q} = top, {q, _, _, _, _}) when q <= min_q, do: top
+
+  defp keep_top({heap, size, _min_q}, entry) do
+    min = Enum.min_by(heap, fn {hq, _, _, _, _} -> hq end)
+    heap = [entry | List.delete(heap, min)]
+    {heap, size, heap_min_q(heap)}
+  end
+
+  defp heap_min_q(heap) do
+    {min_q, _, _, _, _} = Enum.min_by(heap, fn {hq, _, _, _, _} -> hq end)
+    min_q
   end
 
   # Diff the tracked cumulative counters (S3 ops/bytes by method, checkout counts by outcome,

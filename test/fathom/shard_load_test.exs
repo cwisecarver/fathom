@@ -142,6 +142,31 @@ defmodule Fathom.ShardLoadTest do
       assert ["reader" | _] = ShardLoad.top(2, :rows_read) |> Enum.map(& &1.shard_id)
       assert ["writer" | _] = ShardLoad.top(2, :rows_written) |> Enum.map(& &1.shard_id)
     end
+
+    # Perf audit 2026-11-19 #34: the heap carries its size and minimum instead of recomputing them per
+    # row. The shapes that break a carried minimum are a stale `min` after a displacement and a tie
+    # at the boundary, so rates are shuffled, include a long run of equal values, and n is well under
+    # the shard count.
+    test "a full heap with a carried minimum still returns the true top n (shuffled, with ties)" do
+      values = Enum.shuffle(Enum.to_list(1..60) ++ List.duplicate(30, 15))
+
+      for {v, i} <- Enum.with_index(values), do: ShardLoad.record_query("s#{i}", v, 0)
+
+      expected =
+        ShardLoad.snapshot() |> Enum.map(& &1.rows_read) |> Enum.sort(:desc) |> Enum.take(20)
+
+      assert ShardLoad.top(20, :rows_read) |> Enum.map(& &1.rows_read) == expected
+      assert ShardLoad.top(1, :rows_read) |> Enum.map(& &1.rows_read) == [60]
+    end
+
+    test "fold visits every row once and leaves the accumulator untouched when nothing is recorded" do
+      assert ShardLoad.fold(:untouched, fn _row, _acc -> :visited end) == :untouched
+
+      for i <- 1..7, do: ShardLoad.record_query("f#{i}", 1, 0)
+
+      assert ShardLoad.fold(0, fn {_id, _c, queries, _rr, _rw}, acc -> acc + queries end) == 7
+      assert length(ShardLoad.snapshot_tuples()) == 7
+    end
   end
 
   test "forget drops a shard's row" do

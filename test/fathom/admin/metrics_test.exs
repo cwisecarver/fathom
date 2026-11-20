@@ -346,6 +346,29 @@ defmodule Fathom.Admin.MetricsTest do
            "the RPO walk never re-ran after its interval elapsed — this is a freeze, not a throttle"
   end
 
+  # Perf audit 2026-11-19 #34: `hot_shards/2` carries the heap's size and minimum instead of
+  # recomputing them per row. The pass must still return exactly the 20 largest rates (descending),
+  # keep a baseline for EVERY resident shard, and not let a boundary tie displace a retained entry.
+  test "hot_shards keeps the true top 20 by rate and a baseline for every shard (#34)" do
+    Env.put!(:shard_load, true)
+    Fathom.ShardLoad.reset()
+    on_exit(fn -> Fathom.ShardLoad.reset() end)
+
+    counts = Enum.shuffle(Enum.to_list(1..80) ++ List.duplicate(61, 10))
+
+    # Shard i takes `n` queries, so its rate is n; the 11 copies of 61 straddle the top-20 boundary.
+    for {n, i} <- Enum.with_index(counts), _ <- 1..n do
+      Fathom.ShardLoad.record_query("hs_#{i}", 0, 0)
+    end
+
+    {hot, next_prev} = Fathom.Admin.MetricsCollector.hot_shards(%{}, 1)
+
+    assert length(hot) == 20
+    assert map_size(next_prev) == length(counts)
+
+    assert Enum.map(hot, & &1.queries) == counts |> Enum.sort(:desc) |> Enum.take(20)
+  end
+
   # ── expert review 2026-10-17 #1: the per-shard hot-set pass is NOT a per-tick walk ──
 
   # `:shard_load` is ON in prod, so `ShardLoad.snapshot_tuples/0` is an O(resident shards) copy.

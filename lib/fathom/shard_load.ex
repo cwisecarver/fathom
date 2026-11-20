@@ -180,9 +180,22 @@ defmodule Fathom.ShardLoad do
   @doc false
   @spec snapshot_tuples() :: [tuple()]
   def snapshot_tuples do
-    @table |> :ets.tab2list() |> Enum.map(&to_tuple/1)
+    fold([], fn row, acc -> [row | acc] end)
+  end
+
+  # Folds `fun.(row_tuple, acc)` over every shard's `{shard_id, checkouts, queries, rows_read,
+  # rows_written}` with no intermediate list: `tab2list` copied the whole table onto the heap and a
+  # second `Enum.map` built a full-length list of the tuples (about 3-4 MB of garbage per 20k-row
+  # walk in a `fullsweep_after: 0` process; perf audit 2026-11-19 #35). Same shape as
+  # `Fathom.Admin.FlushWatermark.fold/2`. Rows are visited once each, in no order; a shard created or
+  # forgotten mid-walk may or may not be seen, which every caller (hot-shard ranking, the reporter's
+  # per-window diff) already tolerates. Returns `acc` unchanged when the table is not running.
+  @doc false
+  @spec fold(acc, (tuple(), acc -> acc)) :: acc when acc: term()
+  def fold(acc, fun) do
+    :ets.foldl(fn stored, acc -> fun.(to_tuple(stored), acc) end, acc, @table)
   rescue
-    ArgumentError -> []
+    ArgumentError -> acc
   end
 
   @doc """
@@ -200,16 +213,12 @@ defmodule Fathom.ShardLoad do
     # is), exactly as the old sort-then-take was over arbitrary tab2list order.
     idx = dim_index(dimension)
 
-    @table
-    |> :ets.tab2list()
-    |> Enum.reduce([], fn stored, heap ->
-      row = to_tuple(stored)
-      keep_top(heap, n, elem(row, idx), row)
-    end)
+    {heap, _size, _min_v} =
+      fold({[], 0, nil}, fn row, top -> keep_top(top, n, elem(row, idx), row) end)
+
+    heap
     |> Enum.sort_by(fn {v, _row} -> v end, :desc)
     |> Enum.map(fn {_v, row} -> to_map(row) end)
-  rescue
-    ArgumentError -> []
   end
 
   # Tuple position of a dimension in `{shard_id, checkouts, queries, rows_read, rows_written}`.
@@ -218,14 +227,29 @@ defmodule Fathom.ShardLoad do
   defp dim_index(:rows_read), do: 3
   defp dim_index(:rows_written), do: 4
 
-  # Keep at most `n` `{value, row}` entries — the largest by `value`. `length(heap) < n` fills the
-  # heap; once full, a new row displaces the current minimum only when strictly greater (so equal
-  # values never churn the set), mirroring `MetricsCollector.keep_top/2`.
-  defp keep_top(heap, n, value, row) when length(heap) < n, do: [{value, row} | heap]
+  # Keep at most `n` `{value, row}` entries — the largest by `value`. The accumulator is
+  # `{heap, size, min_v}`, carrying the size and the smallest retained value so a rejected row costs
+  # one comparison instead of `length/1` plus `Enum.min_by/2` over the heap (perf audit 2026-11-19 #34).
+  # `min_v` is `nil` until the heap holds `n` entries; the second clause is only reachable with a full
+  # heap. A new row displaces the minimum only when strictly greater (equal values never churn the
+  # set), mirroring `MetricsCollector.keep_top/2`.
+  defp keep_top({heap, size, _min_v}, n, value, row) when size < n do
+    heap = [{value, row} | heap]
+    size = size + 1
+    {heap, size, if(size == n, do: heap_min(heap))}
+  end
 
-  defp keep_top(heap, _n, value, row) do
-    {min_v, _} = min_entry = Enum.min_by(heap, fn {v, _} -> v end)
-    if value > min_v, do: [{value, row} | List.delete(heap, min_entry)], else: heap
+  defp keep_top({_heap, _size, min_v} = top, _n, value, _row) when value <= min_v, do: top
+
+  defp keep_top({heap, size, _min_v}, _n, value, row) do
+    min_entry = Enum.min_by(heap, fn {v, _} -> v end)
+    heap = [{value, row} | List.delete(heap, min_entry)]
+    {heap, size, heap_min(heap)}
+  end
+
+  defp heap_min(heap) do
+    {min_v, _} = Enum.min_by(heap, fn {v, _} -> v end)
+    min_v
   end
 
   @doc "Clears all load counters (test/ops helper)."

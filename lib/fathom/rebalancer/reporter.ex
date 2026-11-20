@@ -257,9 +257,8 @@ defmodule Fathom.Rebalancer.Reporter do
   # copy (tens of MB transient at 100k resident shards; review 2026-07-23 #29).
   # rows_written isn't reported, so it's dropped at ingestion.
   defp snapshot_map do
-    ShardLoad.snapshot_tuples()
-    |> Map.new(fn {id, checkouts, queries, rows_read, _rows_written} ->
-      {id, {checkouts, queries, rows_read}}
+    ShardLoad.fold(%{}, fn {id, checkouts, queries, rows_read, _rows_written}, acc ->
+      Map.put(acc, id, {checkouts, queries, rows_read})
     end)
   end
 
