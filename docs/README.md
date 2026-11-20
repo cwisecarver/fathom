@@ -156,6 +156,10 @@ what actually shipped (some plan assumptions were superseded).
 - **[runbooks/disaster-recovery.md](runbooks/disaster-recovery.md)** — cross-store (Postgres + S3)
   restore coherence: recovering from a directory point-in-time restore without resurrecting deleted
   tenants or revoked tokens.
+- **[runbooks/lock-lineage-forensics.md](runbooks/lock-lineage-forensics.md)** — a shard that opens at a lineage a
+  live owner already holds, or a lock that vanishes under a live owner (Jepsen hard-1 class, cause
+  unattributed): the fail-closed refusal, `SHARD_ACQUIRE_TRACE`, the scanner and timeline tools, and what
+  to collect and read when it recurs.
 - **[runbooks/lock-repair.md](runbooks/lock-repair.md)** — a shard whose lease lock is undecodable
   fails closed on both backends; repairing it with `mix fathom.lock.repair` (epoch never moves back).
 - **[runbooks/replication-frame-auth.md](runbooks/replication-frame-auth.md)** — the staged rollout of A2
