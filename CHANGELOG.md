@@ -18,6 +18,10 @@ against. To co-develop both repos, set `FILO_PATH=../filo` (no `mix.exs` edit).
 
 ## [Unreleased]
 
+### Performance
+
+- The admin collector's 10 s hot-shard pass no longer re-derives its top-20 heap's size and minimum for every shard, and `ShardLoad` is walked with `:ets.foldl` instead of `tab2list` + `Enum.map`: `observability_tick_us` 14.4 → 11.2 ms at 20k shards (perf audit 2026-11-19 #34/#35). The audit's other micro-optimizations were measured and dropped (each moved its metric by 2% or less); see `docs/component-notes.md`.
+
 ## [0.4.0] - 2026-11-19
 
 Live WAL replication (A2) became the production default, Jepsen joined the chaos rig, and roughly
