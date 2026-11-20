@@ -177,6 +177,15 @@ what actually shipped (some plan assumptions were superseded).
 Point-in-time measurement writeups and expert reviews (dated; relative numbers, single-host unless
 noted).
 
+- **[jepsen-run-plan.md](jepsen-run-plan.md)** — the Jepsen harness plan and the run tiers; **Tier 0 is
+  the push gate for any change touching lease, flush or replication**.
+- **Jepsen run reports** (Elle list-append plus a liveness check under combined faults, five nodes,
+  replication on): [reviews/jepsen-2026-10-24.md](reviews/jepsen-2026-10-24.md) (the first campaign and
+  its bugs), [reviews/jepsen-2026-10-27.md](reviews/jepsen-2026-10-27.md),
+  [reviews/jepsen-2026-10-29.md](reviews/jepsen-2026-10-29.md) (Tier 0 green; the 11 bugs) and
+  [reviews/jepsen-2026-11-09.md](reviews/jepsen-2026-11-09.md) (Tier 0 green after the 2026-11-07
+  review). The one anomaly since (2026-11-14, unattributed) is handled in
+  [runbooks/lock-lineage-forensics.md](runbooks/lock-lineage-forensics.md).
 - **[reviews/competitive-oltp-2026-07-10.md](reviews/competitive-oltp-2026-07-10.md)** — fathom vs
   raw SQLite vs Postgres on the same box, both durability modes; the `synchronous=FULL` finding.
 - **[reviews/turso-headtohead-2026-07-10.md](reviews/turso-headtohead-2026-07-10.md)** — fathom vs

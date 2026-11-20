@@ -6,8 +6,9 @@ full working agreement — architecture, principles, and the detailed component 
 
 ## 1. Prerequisites & first checkout
 
-- **Elixir ≥ 1.15** on a compatible OTP. The project builds and tests on **Elixir 1.19 / OTP 27**
-  (the version the release image pins); there is no `.tool-versions` yet, so match that if you use a
+- **Elixir ≥ 1.15** on a compatible OTP. CI builds and tests on **Elixir 1.20 with OTP 28 and 29**
+  (OTP 28 is the minimum), and the release images pin Elixir 1.20.4 / OTP 28 (see
+  `deploy/compose/Dockerfile`); there is no `.tool-versions` yet, so match that if you use a
   version manager.
 - **A C toolchain** — the `exqlite` SQLite NIF compiles from source (`build-essential` on Linux,
   Xcode Command Line Tools on macOS).
@@ -16,14 +17,14 @@ full working agreement — architecture, principles, and the detailed component 
   `PGUSER` / `PGPASSWORD` / `PGHOST` / `PGDATABASE` to override, or edit `config/dev.exs` /
   `config/test.exs`. You need a role that can create databases (`mix setup` creates `fathom_dev`;
   `mix test` creates `fathom_test`).
-- **The `filo` sibling repo.** fathom depends on [Filo](https://github.com/cwisecarver/filo) — the
-  Hrana/libSQL protocol server — as a **path dependency at `../filo`**, so check both out side by
-  side. A clone of `fathom` alone fails `mix deps.get`:
+- **Filo comes from Hex.** fathom depends on [Filo](https://github.com/cwisecarver/filo) — the
+  Hrana/libSQL protocol server — as a Hex package (`{:filo, "~> 0.4.4"}`), so a clone of `fathom`
+  alone builds with `mix deps.get`. If you are co-developing both repos, check Filo out beside this
+  one and point `FILO_PATH` at it — no `mix.exs` edit, so the path dependency can never be committed
+  by accident:
 
-  ```
-  parent/
-  ├── fathom/   # this repo
-  └── filo/     # git clone https://github.com/cwisecarver/filo
+  ```bash
+  FILO_PATH=../filo mix test
   ```
 
 ## 2. Set up, run, and see a round-trip

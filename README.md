@@ -57,7 +57,7 @@ docs say so.
 |---|---|---|
 | Tenant density | **29,956 shards held across 3 nodes** (of 30,000 minted — 0.15% drops), ~16 KiB RSS each idle, spread 1.22×; stress-pushed to 105,530 held | [`fleet-density-2026-07-10.md`](docs/reviews/fleet-density-2026-07-10.md), [`served-data-2026-07-23.md`](docs/reviews/served-data-2026-07-23.md) |
 | Throughput, replication on | **1,024 tenants, 4,343 txn/s, zero errors, p99 385 ms**, every commit quorum-replicated (5-node rig on one VM) | [`tpc-fleet-repl-on-2026-10-30.md`](docs/reviews/tpc-fleet-repl-on-2026-10-30.md) |
-| Correctness under faults | Our own Jepsen test (Elle, strict serializability) with power loss, kills, pauses, partitions and S3 cuts: **clean**, every tenant writing again within 10.5 s of the faults healing. It found 11 bugs on the way; all are fixed | [`jepsen-2026-10-29.md`](docs/reviews/jepsen-2026-10-29.md) |
+| Correctness under faults | Our own Jepsen test (Elle, strict serializability) with power loss, kills, pauses, partitions and S3 cuts: **clean on the latest Tier 0 gate**, every tenant writing again within 3 s of the faults healing. It has found 11 bugs on the way; all are fixed. One later single-run lineage anomaly (2026-11-14) is unattributed and has not recurred in about 46 traced hard-mix runs; it now fails closed instead of losing writes, and is traced for next time: [`runbooks/lock-lineage-forensics.md`](docs/runbooks/lock-lineage-forensics.md) | [`jepsen-2026-11-09.md`](docs/reviews/jepsen-2026-11-09.md), [`jepsen-2026-10-29.md`](docs/reviews/jepsen-2026-10-29.md) |
 | Autonomous rebalancing | Against a genuine imbalance, the policy proposed a move and the control loop ran the handoff **autonomously** (warm → pin → LB flip → drain), isolation intact | [`chaos-run-2026-07-09.md`](docs/reviews/chaos-run-2026-07-09.md) |
 | Node-loss RPO | **~0 with replication on**: `chaos.sh rpo` kills the owner of an acked write that never reached S3, and the new owner pulls it from a follower | [`a2-quorum-replication.md`](docs/a2-quorum-replication.md) |
 | Cold-open latency | **~1 S3 round-trip** — 26 / 70 / 133 ms at 10 / 30 / 60 ms one-way | [`latency-cost-2026-07-23.md`](docs/reviews/latency-cost-2026-07-23.md) |
@@ -89,13 +89,7 @@ One `docker compose up` brings up fathom + PostgreSQL + MinIO (as S3) + nginx wi
 - **Elixir ≥ 1.15** on a compatible OTP (CI builds and tests on Elixir 1.20 with OTP 28 and 29; OTP 28 is the minimum).
 - A **C toolchain** — the `exqlite` SQLite NIF compiles from source (`build-essential` on Linux, Xcode Command Line Tools on macOS).
 - A running local **PostgreSQL** — the control-plane / directory store (shard *data* is SQLite). By default fathom connects as your OS user with no password; set `PGUSER` / `PGPASSWORD` / `PGHOST` / `PGDATABASE` to override, or edit `config/dev.exs`.
-- **The `filo` sibling repo.** fathom depends on [Filo](https://github.com/cwisecarver/filo) (the Hrana/libSQL protocol server) as a **path dependency at `../filo`**, so check both out side by side — a clone of `fathom` alone will fail `mix deps.get`:
-
-  ```
-  parent/
-  ├── fathom/   # this repo
-  └── filo/     # git clone https://github.com/cwisecarver/filo
-  ```
+- **Filo comes from Hex.** fathom depends on [Filo](https://github.com/cwisecarver/filo) (the Hrana/libSQL protocol server) as a Hex package (`{:filo, "~> 0.4.4"}`), so a clone of `fathom` alone builds with `mix deps.get`. Co-developing both repos? Check Filo out beside this one and run with `FILO_PATH=../filo mix test`; no `mix.exs` edit is needed, so a path dependency can never be committed by accident.
 
 **Set up and run**
 
@@ -142,7 +136,7 @@ The S3 backend runs a dedicated, config-driven Finch connection pool (default 20
 
 ### Cross-node single-writer (lease + epoch fence + heartbeat)
 
-`Fathom.Shard.Storage` carries a per-shard lock (`{owner, epoch}`) and a per-node liveness object renewed by `Fathom.Shard.Heartbeat` every `ttl/3`. Heartbeat cost is O(nodes), not O(shards). A shard's owner is live iff its heartbeat is fresh; `acquire_lease` consults the owner's heartbeat to distinguish held-vs-steal and fails closed on a read error. Before a flush, coordinators fence via `Heartbeat.valid_for_write?/1` and self-fence if superseded — a remapped shard never double-writes. All cross-node coordination goes through S3; there is no BEAM mesh. Full story: [`docs/single-writer.md`](docs/single-writer.md).
+`Fathom.Shard.Storage` carries a per-shard lock (`{owner, epoch}`, plus the lineage `claim` a takeover makes so a new owner always opens above the old one's replica) and a per-node liveness object renewed by `Fathom.Shard.Heartbeat` every `ttl/3`. Heartbeat cost is O(nodes), not O(shards). A shard's owner is live iff its heartbeat is fresh; `acquire_lease` consults the owner's heartbeat to distinguish held-vs-steal and fails closed on a read error. Before a flush, coordinators fence via `Heartbeat.valid_for_write?/1` and self-fence if superseded — a remapped shard never double-writes. All cross-node coordination goes through S3; there is no BEAM mesh. Full story: [`docs/single-writer.md`](docs/single-writer.md).
 
 ### Cluster layer
 
