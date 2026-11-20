@@ -442,7 +442,7 @@ defmodule Fathom.Shard.PoolGraceTest do
       shard: shard
     } do
       # A negative total (an earlier test mutated a pool without PoolBudget.adjust) is under ANY
-      # budget, so admit?/0 would say yes here; name that instead of timing out below.
+      # budget, so admit?/1 would say yes here; name that instead of timing out below.
       assert PoolBudget.total() >= 0,
              "PoolBudget.total went negative: a test pooled a handle without accounting for it"
 

@@ -67,12 +67,16 @@ defmodule Fathom.Shard.PoolBudget do
     end
   end
 
-  @doc "True while the node holds fewer idle pooled handles than `budget/0`."
-  @spec admit?() :: boolean()
-  def admit? do
+  @doc """
+  True while the node holds fewer idle pooled handles than `budget`. The coordinator passes the
+  budget it captured at open (`budget/0` is boot-static), so a checkin pays no config read inside its
+  mailbox (perf audit 2026-11-19 #3).
+  """
+  @spec admit?(non_neg_integer()) :: boolean()
+  def admit?(budget) when is_integer(budget) do
     case :persistent_term.get(@total, nil) do
       nil -> true
-      ref -> :counters.get(ref, 1) < budget()
+      ref -> :counters.get(ref, 1) < budget
     end
   end
 

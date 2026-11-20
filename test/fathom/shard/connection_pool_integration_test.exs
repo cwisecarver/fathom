@@ -45,7 +45,7 @@ defmodule Fathom.Shard.ConnectionPoolIntegrationTest do
   # takes/sweeps/drains that handle (which does adjust) it subtracts a share it never added, and
   # `PoolBudget.total/0` goes negative for the rest of the run. Symptom (full suite, seed 860035):
   # `pool_grace_test` "node-wide idle budget (#16)" never saw :pool_budget_full, because a total
-  # of -1 is under a budget of 0, so `admit?/0` said yes. The library accounting was right; the
+  # of -1 is under a budget of 0, so `admit?/1` said yes. The library accounting was right; the
   # fixtures were not.
   defp inject_pooled(pid, h, at) do
     :sys.replace_state(pid, fn s ->
