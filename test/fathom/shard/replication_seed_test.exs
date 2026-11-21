@@ -1064,8 +1064,21 @@ defmodule Fathom.Shard.ReplicationSeedTest do
       {:ok, _} = Connection.query(conn, "INSERT INTO t VALUES (2)", [])
       assert :ok = Session.commit(id, wal, coordinator)
       await_held!(peer, "the laggard never answered the commit that was supposed to be held")
-      first = :sys.get_state(session).inflight[lag_shipper]
-      assert first
+
+      # CI 2026-11-21 (OTP 29) saw `first` nil here once; not reproduced in 11 local runs. By the code,
+      # `Session` writes `inflight[shipper]` when it SENDS the push (session.ex, the `Map.merge(
+      # expectations(...), state.inflight)` in the send path), i.e. before the frame reaches the
+      # peer, so `await_held!` already orders it, and `Fleet.shippers/0` keeps the configured order
+      # (`Fleet.endpoints/0` maps the list; `Membership.apply_set!/1` preserves it), so `List.last`
+      # is the PausablePeer follower. So a nil means the entry was cleared, or the round never
+      # reached this shipper. The message carries what a second occurrence needs to say which.
+      state = :sys.get_state(session)
+      first = state.inflight[lag_shipper]
+
+      assert first,
+             "no in-flight round for the held laggard #{inspect(lag_shipper)}; " <>
+               "shippers=#{inspect(Fleet.shippers())} inflight=#{inspect(state.inflight)} " <>
+               "inflight_at=#{inspect(state.inflight_at)}"
 
       flush_rejects()
 

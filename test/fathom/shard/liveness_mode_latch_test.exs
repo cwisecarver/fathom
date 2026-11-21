@@ -52,7 +52,13 @@ defmodule Fathom.Shard.LivenessModeLatchTest do
     assert {:error, {:heartbeat_unavailable, :down}} = Shards.checkout(shard)
 
     assert Storage.lease_holder(shard) == :free, "a refused open must hold no lease"
-    assert Registry.lookup(Fathom.ShardRegistry, shard) == []
+
+    # The refused coordinator exits, and the Registry drops its entry on that exit asynchronously, so
+    # an immediate lookup can still see the dying pid (CI 2026-11-21, OTP 28: left `[{#PID<...>, nil}]`).
+    Await.until(
+      fn -> Registry.lookup(Fathom.ShardRegistry, shard) == [] end,
+      "the refused open's coordinator never left the registry"
+    )
   end
 
   test "the Hrana open answers a RETRYABLE 503 for it", %{shard: shard} do
