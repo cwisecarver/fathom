@@ -359,11 +359,15 @@ defmodule Fathom.Rebalancer.CommandPollerTest do
     send(poller, :poll)
     assert MapSet.member?(:sys.get_state(poller).in_flight, drain_cmd.id)
 
-    # Kill every TaskSupervisor child with an exit SIGNAL (the batch task included) — a
-    # TaskSupervisor restart. try/after does NOT run, so no {:batch_done} is ever sent.
-    children = Task.Supervisor.children(Fathom.Rebalancer.TaskSupervisor)
-    assert children != [], "the blocked batch task must be alive to kill"
-    for pid <- children, do: Process.exit(pid, :kill)
+    # Kill the poller's OWN batch task with an exit SIGNAL (what a TaskSupervisor restart does).
+    # try/after does NOT run, so no {:batch_done} is ever sent. The poller monitors exactly the tasks
+    # it dispatched, so those are the pids to kill. This used to kill EVERY child of the shared
+    # `Fathom.Rebalancer.TaskSupervisor`, which could include another test's task; on CI (OTP 29,
+    # 2026-11-21) that surfaced as a `DBConnection.OwnershipError` in this test process.
+    {:monitors, monitors} = Process.info(poller, :monitors)
+    batch_tasks = for {:process, pid} <- monitors, do: pid
+    assert batch_tasks != [], "the blocked batch task must be alive to kill"
+    for pid <- batch_tasks, do: Process.exit(pid, :kill)
 
     # Pre-fix: the id stayed in in_flight forever. Now the monitor's DOWN frees it.
     Await.until(
