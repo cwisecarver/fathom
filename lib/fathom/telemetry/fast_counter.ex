@@ -26,7 +26,11 @@ defmodule Fathom.Telemetry.FastCounter do
     [:fathom, :shard, :pool_take, :count],
     [:fathom, :replication, :checkpoint, :count],
     # One per follower append (expert review 2026-10-19 #16); tag `result` is :hit | :miss.
-    [:fathom, :replication, :held_fd, :count]
+    [:fathom, :replication, :held_fd, :count],
+    # One per checkin once the node-wide idle-handle budget is full (perf audit 2026-11-19 #20),
+    # emitted INSIDE the shard coordinator; on Core every coordinator contended on one node-global
+    # key (0.45-9 µs per event). Untagged.
+    [:fathom, :shard, :pool_budget_full, :count]
   ]
 
   @doc "True for the metrics this module records instead of `TelemetryMetricsPrometheus.Core`."

@@ -75,11 +75,17 @@ defmodule Fathom.Telemetry.FastHistogramTest do
     for {v, outcome} <- [{0.8, :ok}, {30, :ok}, {2600, :timeout}, {9000, :no_quorum}],
         do: commit(v, outcome)
 
+    # Perf audit 2026-11-19 #20: the close-chain depth (UNTAGGED, emitted inside the shard
+    # coordinator on every close) moved onto FastHistogram. Depths on and between its bounds.
+    for d <- [1, 2, 3, 8, 9, 300],
+        do: :telemetry.execute([:fathom, :shard, :close_chain], %{depth: d}, %{})
+
     core_text = IO.iodata_to_binary(TelemetryMetricsPrometheus.Core.scrape(core))
     fast_text = FastHistogram.render(fast)
 
     assert fast_text != ""
     assert normalize(fast_text) == normalize(core_text)
+    assert fast_text =~ "fathom_shard_close_chain_depth_count 6"
 
     # Byte-level shape: HELP/TYPE headers and a trailing newline per family, like Core's export.
     assert fast_text =~ "# TYPE fathom_shard_query_duration histogram\n"
@@ -262,14 +268,16 @@ defmodule Fathom.Telemetry.FastHistogramTest do
                [:fathom, :shards, :checkout, :stop, :duration],
                [:fathom, :replication, :commit, :duration],
                [:fathom, :replication, :commit_total, :duration],
-               [:fathom, :replication, :commit_stage, :duration]
+               [:fathom, :replication, :commit_stage, :duration],
+               [:fathom, :shard, :close_chain, :depth]
              ])
 
     assert Enum.sort(counters) ==
              Enum.sort([
                [:fathom, :shard, :pool_take, :count],
                [:fathom, :replication, :checkpoint, :count],
-               [:fathom, :replication, :held_fd, :count]
+               [:fathom, :replication, :held_fd, :count],
+               [:fathom, :shard, :pool_budget_full, :count]
              ])
 
     all = [core, fast, counters]

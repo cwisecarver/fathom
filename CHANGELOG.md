@@ -21,6 +21,7 @@ against. To co-develop both repos, set `FILO_PATH=../filo` (no `mix.exs` edit).
 ### Performance
 
 - The admin collector's 10 s hot-shard pass no longer re-derives its top-20 heap's size and minimum for every shard, and `ShardLoad` is walked with `:ets.foldl` instead of `tab2list` + `Enum.map`: `observability_tick_us` 14.4 → 11.2 ms at 20k shards (perf audit 2026-11-19 #34/#35). The audit's other micro-optimizations were measured and dropped (each moved its metric by 2% or less); see `docs/component-notes.md`.
+- `pool_budget_full` and `close_chain.depth`, emitted inside the shard coordinator on every budget-full checkin and every close, moved from `TelemetryMetricsPrometheus.Core` to `FastCounter`/`FastHistogram`: with 18 processes on one event name, 36.4 and 151.9 µs per event became 1.0 and 0.6 µs (throwaway probe; no gated bench arm reaches this path). The `/metrics` text is unchanged apart from the float `_sum` the Fast reporters already print (perf audit 2026-11-19 #20).
 
 ## [0.4.0] - 2026-11-19
 

@@ -37,7 +37,10 @@ defmodule Fathom.Telemetry.FastHistogram do
     # Also one-per-commit (+ per round for commit_stage), added by round-1 #10 as Core distributions
     # (expert review 2026-10-17 #4). Tags `outcome`/`stage` are bounded; buckets match telemetry.ex.
     [:fathom, :replication, :commit_total, :duration],
-    [:fathom, :replication, :commit_stage, :duration]
+    [:fathom, :replication, :commit_stage, :duration],
+    # One per close-chain link (perf audit 2026-11-19 #20), emitted inside the shard coordinator on
+    # every pool-off, draining or budget-full close. Untagged; buckets match telemetry.ex.
+    [:fathom, :shard, :close_chain, :depth]
   ]
   @sum_scale 1000
 

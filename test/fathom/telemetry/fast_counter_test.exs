@@ -36,10 +36,11 @@ defmodule Fathom.Telemetry.FastCounterTest do
 
   defp normalize(text), do: text |> PrometheusScrape.parse() |> Enum.sort()
 
-  test "the two hot counters are exactly the ones FastCounter claims" do
+  test "the hot counters are exactly the ones FastCounter claims" do
     assert hot_metrics() |> Enum.map(& &1.name) |> Enum.sort() == [
              [:fathom, :replication, :checkpoint, :count],
              [:fathom, :replication, :held_fd, :count],
+             [:fathom, :shard, :pool_budget_full, :count],
              [:fathom, :shard, :pool_take, :count]
            ]
   end
@@ -54,6 +55,12 @@ defmodule Fathom.Telemetry.FastCounterTest do
     for v <- [:covered, :covered, :forced],
         do: :telemetry.execute(@checkpoint, %{}, %{verdict: v})
 
+    # Perf audit 2026-11-19 #20: the UNTAGGED budget-full counter moved onto FastCounter too (it ran
+    # inside the shard coordinator on Core). One unlabeled series, shard_id only in the metadata.
+    for sid <- ["a", "b", "a"],
+        do:
+          :telemetry.execute([:fathom, :shard, :pool_budget_full], %{count: 1}, %{shard_id: sid})
+
     core_text = IO.iodata_to_binary(TelemetryMetricsPrometheus.Core.scrape(core))
     fast_text = FastCounter.render(fast)
 
@@ -61,6 +68,7 @@ defmodule Fathom.Telemetry.FastCounterTest do
     assert fast_text =~ "# TYPE fathom_shard_pool_take_count counter\n"
     assert fast_text =~ ~s(fathom_shard_pool_take_count{result="hit"} 3)
     assert fast_text =~ ~s(fathom_replication_checkpoint_count{verdict="forced"} 1)
+    assert fast_text =~ "fathom_shard_pool_budget_full_count 3"
     assert String.ends_with?(fast_text, "\n")
   end
 
