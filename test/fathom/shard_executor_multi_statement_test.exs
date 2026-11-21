@@ -90,6 +90,40 @@ defmodule Fathom.ShardExecutorMultiStatementTest do
     assert count(h) == 8
   end
 
+  # Security review of the fast path (2026-11-20): the fast path keys on the first `;` BYTE, so a `;`
+  # inside a quote or comment, or a byte just outside the blank set, must still reach the scanner.
+  test "the fast path still hands quoted/commented first `;` and non-blank tails to the scanner",
+       %{h: h} do
+    for sql <- [
+          "SELECT ';' ; SELECT 2",
+          ~s(SELECT 1 AS "a;b"; SELECT 2),
+          "SELECT 1 /* ; */; SELECT 2",
+          "INSERT INTO t VALUES (1);\0SELECT 1",
+          "SELECT 1;\x1F SELECT 1"
+        ] do
+      assert {:error, %Error{code: "FILO_MULTIPLE_STATEMENTS"}} = run(h, sql), inspect(sql)
+    end
+
+    # An unterminated quote/comment/bracket holding the only `;` is ONE statement: SQLite decides its
+    # fate (an error for the quote and bracket, a plain SELECT for an unterminated comment), and the
+    # multi-statement gate must not be the one to refuse it.
+    for sql <- ["SELECT 'x; ", "SELECT [x; ", "SELECT 1 /* ; "] do
+      res = run(h, sql)
+      refute match?({:error, %Error{code: "FILO_MULTIPLE_STATEMENTS"}}, res), inspect(sql)
+    end
+
+    assert count(h) == 0
+  end
+
+  test "describe accepts a `;` with a whitespace tail and still refuses a second statement", %{
+    h: h
+  } do
+    assert {:ok, _} = ShardExecutor.describe(h, "SELECT v FROM t; \n\t")
+
+    assert {:error, %Error{code: "FILO_MULTIPLE_STATEMENTS"}} =
+             ShardExecutor.describe(h, "SELECT v FROM t;\nSELECT 1")
+  end
+
   # Perf audit 2026-11-19 #2, hot-path floor (AGENTS.md: ratio, not an exact latency). Before the
   # fast path a trailing `;` on a ~1 KB statement cost about 8x the same statement without it
   # (4.0 vs 32.6 µs through `execute/2`, throwaway probe); after, the two share one path. A 3x
