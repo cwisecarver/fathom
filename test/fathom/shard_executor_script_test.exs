@@ -230,6 +230,12 @@ defmodule Fathom.ShardExecutorScriptTest do
       test "#{label}" do
         reason = unquote(Macro.escape(reason))
 
+        # The retryable-open line is rate-limited per node (`LogLimiter`, 5 per 1 s window, key
+        # `:open_retryable`), and other tests refuse opens through the same path. On CI (OTP 29,
+        # 2026-11-21) the window was already spent, so the line was suppressed and this assertion
+        # failed. Start from a fresh window.
+        Fathom.LogLimiter.reset(:open_retryable)
+
         log =
           capture_log([level: :warning], fn ->
             assert %Error{code: "FILO_UNAVAILABLE", status: 503} =
