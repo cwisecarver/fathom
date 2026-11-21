@@ -1621,12 +1621,33 @@ defmodule Fathom.ShardExecutor do
   # a literal, identifier or comment is not a separator (the scanner tracks every quote form), and a
   # trailing `;`, empty statements and a trailing comment do not make a second statement
   # (`statement_fragments/1`).
+  #
+  # The common ORM/SDK shape is ONE statement ending in `;` (the libSQL Rust SDK appends one to every
+  # statement), and the scanner walks the whole string byte by byte, trims with Unicode rules and
+  # downcases the whole statement for the trigger check: a measured ~28.6 µs per 1 KB statement, 8x
+  # the same statement without the `;` (perf audit 2026-11-19 #2, throwaway probe through
+  # `execute/2`: 4.0 µs without, 32.6 µs with). So: when the FIRST `;` is followed only by ASCII
+  # whitespace, the string has exactly one `;` and nothing after it, hence at most one non-empty
+  # fragment, so it is one statement, with no scan. The proof leans on `;` being the only separator
+  # (a `;` inside a quote is one too, which only lowers the count). Everything else, a comment or any
+  # other byte after the `;`, falls through to the scanner unchanged, and the ASCII whitespace set is
+  # a subset of what `String.trim/1` drops, so the scanner would have discarded the same tail.
   defp multiple_statements?(sql) do
     case :binary.match(sql, ";") do
-      :nomatch -> false
-      _ -> match?([_, _ | _], statement_fragments(sql))
+      :nomatch ->
+        false
+
+      {pos, 1} ->
+        rest = binary_part(sql, pos + 1, byte_size(sql) - pos - 1)
+        not ascii_blank?(rest) and match?([_, _ | _], statement_fragments(sql))
     end
   end
+
+  defp ascii_blank?(<<c, rest::binary>>) when c in [?\s, ?\t, ?\n, ?\r, ?\v, ?\f],
+    do: ascii_blank?(rest)
+
+  defp ascii_blank?(<<>>), do: true
+  defp ascii_blank?(_), do: false
 
   defp multiple_statements_error do
     {:error,

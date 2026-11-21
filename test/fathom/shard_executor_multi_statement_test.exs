@@ -65,6 +65,62 @@ defmodule Fathom.ShardExecutorMultiStatementTest do
     assert count(h) == 6
   end
 
+  # Perf audit 2026-11-19 #2: a string whose first `;` is followed only by ASCII whitespace skips the
+  # scanner. The boundary is what matters: whitespace-only tails are one statement, and ANY other
+  # byte after the `;` (a second statement, a comment, a non-ASCII space, a second `;`) must still
+  # go through the scanner and be counted exactly as before.
+  test "the one-statement fast path stops exactly at a non-whitespace tail", %{h: h} do
+    for tail <- ["", " ", "\n", "\t\r\n \v\f", "      \n\n"] do
+      assert {:ok, _} = run(h, "INSERT INTO t VALUES (1);" <> tail), "tail #{inspect(tail)}"
+    end
+
+    assert count(h) == 5
+
+    for tail <- [" INSERT INTO t VALUES (9)", "\nSELECT 1", "\tSELECT 1;", " ; SELECT 1"] do
+      assert {:error, %Error{code: "FILO_MULTIPLE_STATEMENTS"}} =
+               run(h, "INSERT INTO t VALUES (9);" <> tail),
+             "tail #{inspect(tail)}"
+    end
+
+    # A comment after the `;` is not a statement (scanner path), a second `;` after it is still none.
+    assert {:ok, _} = run(h, "INSERT INTO t VALUES (2); -- trailing")
+    assert {:ok, _} = run(h, "INSERT INTO t VALUES (3);  ;")
+    # A U+00A0 (not ASCII whitespace) after the `;` takes the scanner, which trims it: still one.
+    assert {:ok, _} = run(h, "INSERT INTO t VALUES (4);\u00A0")
+    assert count(h) == 8
+  end
+
+  # Perf audit 2026-11-19 #2, hot-path floor (AGENTS.md: ratio, not an exact latency). Before the
+  # fast path a trailing `;` on a ~1 KB statement cost about 8x the same statement without it
+  # (4.0 vs 32.6 µs through `execute/2`, throwaway probe); after, the two share one path. A 3x
+  # ceiling is loose against noise and still an order of magnitude under the old ratio.
+  @tag :bench
+  @tag timeout: 120_000
+  test "a trailing `;` on a 1 KB statement costs no more than 3x the same statement without it",
+       %{h: h} do
+    cols = Enum.map_join(1..40, ", ", fn i -> "v AS col_#{i}_name_long" end)
+
+    base =
+      "SELECT " <>
+        cols <>
+        " FROM t WHERE v = 1 AND v IS NOT NULL AND v < 100 AND v > -5 ORDER BY v LIMIT 10"
+
+    assert byte_size(base) > 900
+
+    time = fn sql ->
+      for _ <- 1..1_000, do: run(h, sql)
+      t0 = System.monotonic_time(:microsecond)
+      for _ <- 1..10_000, do: {:ok, _} = run(h, sql)
+      (System.monotonic_time(:microsecond) - t0) / 10_000
+    end
+
+    without = time.(base)
+    with_semi = time.(base <> ";")
+
+    assert with_semi < without * 3,
+           "a trailing `;` costs #{Float.round(with_semi, 1)} µs vs #{Float.round(without, 1)} µs without"
+  end
+
   test "a semicolon inside a literal, identifier or comment is not a separator", %{h: h} do
     for sql <- [
           "SELECT ';'",
