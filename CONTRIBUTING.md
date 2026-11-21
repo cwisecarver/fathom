@@ -6,7 +6,7 @@ full working agreement — architecture, principles, and the detailed component 
 
 ## 1. Prerequisites & first checkout
 
-- **Elixir ≥ 1.15** on a compatible OTP. CI builds and tests on **Elixir 1.20 with OTP 28 and 29**
+- **Elixir ≥ 1.20** on a compatible OTP. CI builds and tests on **Elixir 1.20 with OTP 28 and 29**
   (OTP 28 is the minimum), and the release images pin Elixir 1.20.4 / OTP 28 (see
   `deploy/compose/Dockerfile`); there is no `.tool-versions` yet, so match that if you use a
   version manager.

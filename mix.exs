@@ -12,7 +12,7 @@ defmodule Fathom.MixProject do
     [
       app: :fathom,
       version: "0.4.0",
-      elixir: "~> 1.15",
+      elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
