@@ -75,6 +75,12 @@ defmodule Fathom.Shards.PreEvictTest do
   end
 
   # The shard's coordinator pid, by id, for `LivenessMode.assert!/2`.
+  defp assert_shard_mode!(id, mode) do
+    [{pid, _}] = Registry.lookup(Fathom.ShardRegistry, id)
+    LivenessMode.assert!(pid, mode)
+  end
+
+  # Stops every shard registered before this test and waits for it to go down.
   defp stop_leftover_shards do
     for {id, pid} <-
           Registry.select(Fathom.ShardRegistry, [{{:"$1", :"$2", :_}, [], [{{:"$1", :"$2"}}]}]) do
@@ -84,16 +90,14 @@ defmodule Fathom.Shards.PreEvictTest do
       receive do
         {:DOWN, ^ref, :process, ^pid, _} -> :ok
       after
-        5_000 -> Process.demonitor(ref, [:flush])
+        5_000 ->
+          flunk(
+            "leftover shard #{id} did not stop within 5 s; the test would run with the state it must rule out"
+          )
       end
     end
 
     :ok
-  end
-
-  defp assert_shard_mode!(id, mode) do
-    [{pid, _}] = Registry.lookup(Fathom.ShardRegistry, id)
-    LivenessMode.assert!(pid, mode)
   end
 
   defp uniq, do: "preev_#{System.unique_integer([:positive])}"
