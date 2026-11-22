@@ -39,6 +39,14 @@ defmodule Fathom.Shards.PreEvictTest do
 
   setup do
     prev = Map.new(@env, &{&1, Application.get_env(:fathom, &1)})
+
+    # Coordinators left over from EARLIER tests count toward `Registry.count/1` and are the coldest
+    # candidates the evictor sees, so it can drain those and leave this test's own shards alone: the
+    # count assertion then passes while "no idle shard was evicted" fails (CI OTP 28, 2026-11-21, run
+    # 44878558360: `lru_*` shards from the LRU tests were still alive and self-fencing during this
+    # test). Start from an empty registry so the test's shards are the only evictable ones. This is
+    # the mechanism the failing log implies; the failure did not reproduce locally.
+    stop_leftover_shards()
     Lru.reset()
     test_pid = self()
     handler = "pre_evict_test_#{System.unique_integer([:positive])}"
@@ -67,6 +75,22 @@ defmodule Fathom.Shards.PreEvictTest do
   end
 
   # The shard's coordinator pid, by id, for `LivenessMode.assert!/2`.
+  defp stop_leftover_shards do
+    for {id, pid} <-
+          Registry.select(Fathom.ShardRegistry, [{{:"$1", :"$2", :_}, [], [{{:"$1", :"$2"}}]}]) do
+      ref = Process.monitor(pid)
+      _ = Shards.stop(id)
+
+      receive do
+        {:DOWN, ^ref, :process, ^pid, _} -> :ok
+      after
+        5_000 -> Process.demonitor(ref, [:flush])
+      end
+    end
+
+    :ok
+  end
+
   defp assert_shard_mode!(id, mode) do
     [{pid, _}] = Registry.lookup(Fathom.ShardRegistry, id)
     LivenessMode.assert!(pid, mode)
