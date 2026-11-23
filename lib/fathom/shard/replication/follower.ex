@@ -953,10 +953,33 @@ defmodule Fathom.Shard.Replication.Follower do
         :ok
 
       {:error, reason} ->
-        Logger.warning("replication accept failed: #{inspect(reason)}")
+        # Rate-limited, and PAUSED on resource exhaustion (audit 2026-11-22 #15). On `emfile` and its
+        # kin the kernel leaves the pending connection in the backlog, so the very next accept fails
+        # the same way: the loop spun a scheduler flat out and wrote a warning per pass, and the
+        # logger's overload protection then dropped the lines that explained the incident. A short
+        # sleep turns that into a handful of passes a second (Ranch's acceptor does the same).
+        Fathom.LogLimiter.log(:follower_accept_failed, :warning, fn ->
+          "replication accept failed: #{inspect(reason)}"
+        end)
+
+        case accept_backoff_ms(reason) do
+          0 -> :ok
+          ms -> Process.sleep(ms)
+        end
+
         accept_loop(lsock, name, handlers)
     end
   end
+
+  @doc false
+  # How long the accept loop waits after an accept error. Only the resource-exhaustion reasons pause:
+  # they repeat until something frees a descriptor or a port; any other error is a one-off.
+  @spec accept_backoff_ms(term()) :: non_neg_integer()
+  def accept_backoff_ms(reason)
+      when reason in [:emfile, :enfile, :system_limit, :enobufs, :enomem],
+      do: 100
+
+  def accept_backoff_ms(_reason), do: 0
 
   defp max_connections, do: Application.get_env(:fathom, :replication_max_connections, 256)
 

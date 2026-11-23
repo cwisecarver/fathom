@@ -93,4 +93,18 @@ defmodule Fathom.Shard.ReplicationListenerLimitsTest do
     assert {:ok, _reject} = :gen_tcp.recv(peer, 0, 2_000)
     for s <- idle, do: :gen_tcp.close(s)
   end
+
+  # Audit 2026-11-22 #15. A repeating accept error from resource exhaustion left the accept loop
+  # spinning (the kernel keeps the pending connection queued, so the next accept fails identically).
+  # The pause is chosen by reason; the loop itself cannot be driven into `emfile` portably here, so
+  # this pins the classification the loop's sleep rests on (which reasons pause, which must not).
+  test "only the resource-exhaustion accept errors pause the accept loop" do
+    for reason <- [:emfile, :enfile, :system_limit, :enobufs, :enomem] do
+      assert Follower.accept_backoff_ms(reason) > 0, inspect(reason)
+    end
+
+    for reason <- [:econnaborted, :timeout, :einval, {:tls_alert, :x}, :closed] do
+      assert Follower.accept_backoff_ms(reason) == 0, inspect(reason)
+    end
+  end
 end
