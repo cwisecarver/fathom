@@ -67,10 +67,37 @@ defmodule Fathom.ShardExecutor do
     case Fathom.ShardId.cast(shard_id) do
       {:ok, id} ->
         {scope, token_version} = context_of(context)
-        do_open(id, scope, token_version)
+
+        # A stream open is a statement-grade event: it takes a checkout (and may cold-pull and take the
+        # lease) on the shard, and an `open_stream` rides the context captured at the WebSocket hello.
+        # `authorize/2` checked the token once, then every STATEMENT re-checks expiry and the
+        # revocation floor, but the open itself did not, so a revoked or expired token on a live socket
+        # could keep opening streams and fill `:max_checkouts_per_shard` (audit 2026-11-22 #10). Same
+        # two cache-only reads the per-statement check uses; a context-less open (`nil`) passes.
+        case token_denied(id, token_version) do
+          nil -> do_open(id, scope, token_version)
+          denied -> {:error, denied}
+        end
 
       :error ->
         {:error, open_error(:invalid_shard_id)}
+    end
+  end
+
+  defp token_denied(shard_id, token_version) do
+    cond do
+      HranaAuth.expired?(token_version) ->
+        token_expired(shard_id)
+
+      not HranaAuth.version_current?(shard_id, token_version) ->
+        %Error{
+          message: "the token for shard \"#{shard_id}\" has been revoked",
+          code: "FILO_UNAUTHORIZED",
+          status: 401
+        }
+
+      true ->
+        nil
     end
   end
 
@@ -2761,8 +2788,17 @@ defmodule Fathom.ShardExecutor do
     end
   end
 
+  # SQLite ends a keyword at the first byte that cannot be part of an identifier, NOT only at
+  # whitespace: `EXPLAIN/**/PRAGMA x=1`, `EXPLAIN--c\nPRAGMA x=1` and `EXPLAIN QUERY/**/PLAN PRAGMA ...` all
+  # parse as EXPLAIN [QUERY PLAN] <inner>. Accepting only whitespace here made those read as
+  # `:not_explain`, so the text gate allowed an inner PRAGMA that SQLite then ran at prepare time
+  # (audit 2026-11-22 #9; with the extension loaded the engine authorizer still refused it). An
+  # identifier character (ASCII alphanumeric, `_`, `$`, any byte >= 0x80) keeps the word going, which
+  # is what keeps `EXPLAINX` an identifier.
   defp word_boundary?(""), do: true
-  defp word_boundary?(<<c, _::binary>>), do: c in [?\s, ?\t, ?\n, ?\r, ?\f, ?\v]
+
+  defp word_boundary?(<<c, _::binary>>),
+    do: not (c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_ or c == ?$ or c >= 0x80)
 
   # `PRAGMA [schema.]name = value` / `PRAGMA [schema.]name(value)` is an assignment;
   # `PRAGMA [schema.]name` alone is a read. SQLite accepts both setter forms, so both are

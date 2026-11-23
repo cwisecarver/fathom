@@ -115,14 +115,52 @@ defmodule Fathom.HranaAuthTest do
     assert {:ok, _} = Fathom.ShardExecutor.execute(h, stmt)
     :ok = Fathom.ShardExecutor.close(h)
 
-    # The same session shape, but its token's deadline has passed since `hello`.
-    {:ok, h2} = Fathom.ShardExecutor.open(shard, {:rw, {1, System.system_time(:second) - 1}})
+    # The same session shape, but its token's deadline has passed since `hello`. The handle is
+    # rebuilt with the expired context (element 5 is the token ref) because an OPEN with an expired
+    # context is now refused outright (audit 2026-11-22 #10, below); a live session whose token
+    # lapses mid-flight is exactly this handle.
+    {:ok, live_handle} = Fathom.ShardExecutor.open(shard, {:rw, {1, live}})
+    h2 = put_elem(live_handle, 5, {1, System.system_time(:second) - 1})
 
     assert {:error, %Filo.Error{status: 401, code: "FILO_TOKEN_EXPIRED"}} =
              Fathom.ShardExecutor.execute(h2, stmt),
            "an expired token kept running statements on an already-open session"
 
-    :ok = Fathom.ShardExecutor.close(h2)
+    :ok = Fathom.ShardExecutor.close(live_handle)
+  end
+
+  # Audit 2026-11-22 #10. The per-statement checks above left the OPEN itself unchecked: a revoked or
+  # expired token on a live WebSocket kept calling `open_stream`, each call taking a checkout (and a
+  # possible cold pull and lease), until `:max_checkouts_per_shard` was full and the legitimate
+  # tenant got FILO_SHARD_BUSY. The open runs the same two cache-only checks.
+  test "a stream open with an expired or revoked token is refused before any checkout (#10)" do
+    shard = "open_denied_#{System.unique_integer([:positive])}"
+
+    on_exit(fn ->
+      Fathom.Shards.drain(shard, 2_000)
+      for s <- ["", "-wal", "-shm"], do: File.rm(Fathom.Shard.db_path(shard) <> s)
+    end)
+
+    assert {:error, %Filo.Error{status: 401, code: "FILO_TOKEN_EXPIRED"}} =
+             Fathom.ShardExecutor.open(shard, {:rw, {1, System.system_time(:second) - 1}})
+
+    Fathom.HranaAuth.Revocations.put(shard, 5, nil)
+
+    assert {:error, %Filo.Error{status: 401, code: "FILO_UNAUTHORIZED"}} =
+             Fathom.ShardExecutor.open(shard, {:rw, 4})
+
+    assert {:error, %Filo.Error{status: 401}} =
+             Fathom.ShardExecutor.open(shard, {:ro, {4, System.system_time(:second) + 60}})
+
+    # Nothing was checked out for the refused opens: no coordinator was even started for them.
+    assert Registry.lookup(Fathom.ShardRegistry, shard) == [],
+           "a refused open still took a checkout (started a coordinator)"
+
+    # At and above the floor, and a context-less open, still open.
+    for ctx <- [{:rw, 5}, {:rw, 6}, nil] do
+      assert {:ok, h} = Fathom.ShardExecutor.open(shard, ctx)
+      :ok = Fathom.ShardExecutor.close(h)
+    end
   end
 
   # Expert review 2026-10-17 #17: the signature/expiry result is cached per token, but the shard
@@ -463,11 +501,14 @@ defmodule Fathom.HranaAuthTest do
       # 1 and the test would prove the opposite of what it claims. The property under test is the
       # floor COMPARISON, and these are the two sides of it.
       floor = 7
-      Fathom.HranaAuth.Revocations.put(shard, floor, nil)
-
+      #
+      # The three handles are opened BEFORE the floor is raised: an open below the floor is now refused
+      # at the door (audit 2026-11-22 #10), so a "stale" handle is exactly one opened while its token was
+      # still valid and revoked since.
       {:ok, stale} = Fathom.ShardExecutor.open(shard, {:rw, floor - 1})
       {:ok, current} = Fathom.ShardExecutor.open(shard, {:rw, floor})
       {:ok, newer} = Fathom.ShardExecutor.open(shard, {:rw, floor + 1})
+      Fathom.HranaAuth.Revocations.put(shard, floor, nil)
 
       assert {:error, %Filo.Error{status: 401}} =
                Fathom.ShardExecutor.execute(stale, %Filo.Stmt{sql: "SELECT 1", args: []})

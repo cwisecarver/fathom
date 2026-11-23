@@ -162,6 +162,90 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
     :ok = ShardExecutor.close(conn)
   end
 
+  # Audit 2026-11-22 #4. The revalidation is a plain `Task.async`: a link does not carry a `:normal`
+  # exit, so after an idle stop or a drain the task kept running its renew PUT and could land it over
+  # the NEXT coordinator's lock. Every `terminate` clause now SETTLES it first (yield up to
+  # `settle_yield_ms/0`, then kill), because killing a process does not recall a request already on
+  # the wire. Two halves, both held at the storage call exactly as above:
+  #   * a task that finishes inside the settle window finishes BEFORE the coordinator is gone (so its
+  #     PUT cannot land after the release and a successor's acquire);
+  #   * a task that never finishes is killed when the window ends (it cannot outlive the coordinator).
+  # NOTE the hook blocks BEFORE the PUT, so this proves the ordering and the kill, not that an
+  # already-sent request is recalled (nothing can).
+  for {name, release_after_ms} <- [
+        {"settles a revalidation that finishes in time", 150},
+        {"kills one that never finishes", nil}
+      ] do
+    test "a coordinator that stops normally #{name}", %{shard: shard, hb: hb} do
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+      Application.put_env(:fathom, :shard_idle_ms, 60_000)
+      # settle_yield_ms = min(30_000, shutdown / 3) = 1 s here.
+      Env.put!(:shard_shutdown_ms, 3_000)
+
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+      {:ok, coordinator} = Shards.ensure(shard)
+      :ok = ShardExecutor.close(conn)
+      :ok = Shards.flush(shard)
+
+      assert is_integer(:sys.get_state(coordinator).acquire_gen),
+             "fixture: the coordinator must be in HEARTBEAT mode, or the lapse path is unreachable"
+
+      test_pid = self()
+
+      Env.put!(:faulty_renew_lease, fn ->
+        send(test_pid, {:renew_started, self()})
+
+        receive do
+          :release ->
+            send(test_pid, :task_finished)
+            :ok
+        after
+          15_000 -> :ok
+        end
+      end)
+
+      :sys.replace_state(hb, fn st ->
+        Heartbeat.publish_status(%{st | generation: st.generation + 1, lapsed: true})
+      end)
+
+      send(coordinator, :revalidate_lapse)
+      assert_receive {:renew_started, task_pid}, 2_000
+      refute task_pid == coordinator
+      task_ref = Process.monitor(task_pid)
+      coordinator_ref = Process.monitor(coordinator)
+
+      if unquote(release_after_ms) do
+        Process.send_after(task_pid, :release, unquote(release_after_ms))
+      end
+
+      capture_log(fn -> GenServer.stop(coordinator, :normal, 10_000) end)
+
+      # Mailbox order is the proof: with the settle, the task's last act (`:task_finished`, sent from
+      # inside the storage call) precedes the coordinator's exit; without it the coordinator is gone
+      # first and the task only finishes later.
+      first =
+        receive do
+          :task_finished -> :task_finished
+          {:DOWN, ^coordinator_ref, :process, ^coordinator, _} -> :coordinator_down
+        after
+          5_000 -> :timeout
+        end
+
+      assert_receive {:DOWN, ^task_ref, :process, ^task_pid, _},
+                     2_000,
+                     "the lapse revalidation outlived its coordinator and can still write the lock"
+
+      if unquote(release_after_ms) do
+        assert first == :task_finished,
+               "the coordinator exited before its in-flight revalidation settled (first: #{inspect(first)})"
+      else
+        assert first == :coordinator_down
+        refute_received :task_finished
+      end
+    end
+  end
+
   # A FAILED LAPSE RE-CHECK IS RETRIED (Jepsen 2026-10-29, Tier 0 hard-3). The broadcast arms one
   # re-check per episode. When that one renew failed just after a partition healed, nothing retried
   # it on a clean shard, so `acquire_gen` stayed behind a VALID heartbeat for good, and every commit

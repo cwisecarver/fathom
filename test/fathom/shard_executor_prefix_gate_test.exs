@@ -80,6 +80,13 @@ defmodule Fathom.ShardExecutorPrefixGateTest do
     {"semicolon then BOM", ";﻿"},
     {"EXPLAIN", "EXPLAIN "},
     {"EXPLAIN QUERY PLAN", "EXPLAIN QUERY PLAN "},
+    # Audit 2026-11-22 #9: SQLite ends the EXPLAIN keyword at ANY non-identifier byte, so a comment
+    # right after it still parses as EXPLAIN <inner>. The gate used to want whitespace and read these
+    # as `:not_explain` (allow).
+    {"EXPLAIN block comment", "EXPLAIN/**/"},
+    {"EXPLAIN line comment", "EXPLAIN--c\n"},
+    {"EXPLAIN QUERY PLAN with comments", "EXPLAIN QUERY/**/PLAN/**/"},
+    {"EXPLAIN QUERY PLAN with a line comment", "EXPLAIN QUERY--c\nPLAN--c\n"},
     {"comment then EXPLAIN", "/* c */ EXPLAIN "},
     {"semicolon then EXPLAIN", ";EXPLAIN "}
   ]
