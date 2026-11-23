@@ -1530,6 +1530,29 @@ defmodule Fathom.ShardExecutor do
     do_split(rest, acc <> "/*" <> chunk, out)
   end
 
+  # SQLite's variable token (`$name`, `:name`, `@name`, `#name`), INCLUDING its TCL-style
+  # `name(...)` form, which swallows every byte up to whitespace or `)` with no quote or comment
+  # meaning at all: in `SELECT $a('); DROP TABLE t; SELECT $b(')` the `'` is part of a variable, so
+  # SQLite runs three statements where a scanner that opens a string at that `'` sees one (perf-free
+  # security finding, audit 2026-11-22 #1). The splitter must end a fragment exactly where SQLite does.
+  defp do_split(<<v, rest::binary>>, acc, out) when v in [?:, ?@, ?#] do
+    {tok, rest} = variable_token(rest, 0, "")
+    do_split(rest, acc <> <<v>> <> tok, out)
+  end
+
+  # `$` is an identifier character in SQLite, so it starts a variable only when it does NOT continue an
+  # identifier: `t$x('a b;' TEXT)` is the identifier `t$x` followed by a real string literal, and
+  # scanning `x(...)` as a TCL variable there would hide the statement after the literal (found in
+  # review of the first version of this clause). `:`, `@`, `#` are not identifier characters.
+  defp do_split(<<?$, rest::binary>>, acc, out) do
+    if id_tail?(acc) do
+      do_split(rest, acc <> "$", out)
+    else
+      {tok, rest} = variable_token(rest, 0, "")
+      do_split(rest, acc <> "$" <> tok, out)
+    end
+  end
+
   defp do_split(<<c::utf8, rest::binary>>, acc, out),
     do: do_split(rest, acc <> <<c::utf8>>, out)
 
@@ -1547,6 +1570,51 @@ defmodule Fathom.ShardExecutor do
   defp quoted(<<c, rest::binary>>, q, acc), do: quoted(rest, q, acc <> <<c>>)
   # Unterminated: return what we have. The fragment is still gated, and SQLite will reject it.
   defp quoted(<<>>, _q, acc), do: {acc, <<>>}
+
+  # Does the text so far end in an identifier character (ASCII alphanumeric, `_`, `$`, or a byte >=
+  # 0x80, SQLite's `IdChar`)? Then a following `$` continues that identifier instead of starting a
+  # variable.
+  #
+  # A UTF-8 byte order mark (EF BB BF) is the exception to "bytes >= 0x80 are identifier characters":
+  # SQLite's tokenizer returns it as WHITESPACE when it begins a token (`CC_BOM`), and only folds it
+  # into an identifier that is already running. So a trailing BOM is judged by what precedes it:
+  # nothing or a non-identifier character means it was a space (the `$` starts a variable); an
+  # identifier character means it belonged to that identifier. Found by the security review of this
+  # fix: `SELECT <BOM>$a('); CREATE TABLE evil(x); SELECT $b(')` hid the middle statement.
+  defp id_tail?(<<>>), do: false
+
+  defp id_tail?(acc)
+       when byte_size(acc) >= 3 and binary_part(acc, byte_size(acc), -3) == <<0xEF, 0xBB, 0xBF>>,
+       do: id_tail?(binary_part(acc, 0, byte_size(acc) - 3))
+
+  defp id_tail?(acc) do
+    c = :binary.last(acc)
+    c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_ or c == ?$ or c >= 0x80
+  end
+
+  # What follows the sigil of an SQLite variable, mirroring `sqlite3GetToken`'s CC_DOLLAR/CC_VARALPHA
+  # branch (sqlite3.c, built WITHOUT SQLITE_OMIT_TCL_VARIABLE): identifier characters (ASCII
+  # alphanumerics, `_`, `$`, any byte >= 0x80) extend the name; `::` is skipped over inside it; and a
+  # `(` after at least one name character starts the TCL form, which consumes bytes up to the first
+  # whitespace or `)` (the `)` is part of the token; hitting whitespace first makes the token illegal,
+  # which makes SQLite stop with an error, so over- or under-consuming there cannot hide a statement
+  # that would have run). Anything else ends the token without being consumed.
+  defp variable_token(<<c, rest::binary>>, n, acc)
+       when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_ or c == ?$ or c >= 0x80,
+       do: variable_token(rest, n + 1, acc <> <<c>>)
+
+  defp variable_token(<<"::", rest::binary>>, n, acc), do: variable_token(rest, n, acc <> "::")
+
+  defp variable_token(<<?(, rest::binary>>, n, acc) when n > 0, do: tcl_variable(rest, acc <> "(")
+  defp variable_token(rest, _n, acc), do: {acc, rest}
+
+  defp tcl_variable(<<?), rest::binary>>, acc), do: {acc <> ")", rest}
+
+  defp tcl_variable(<<c, rest::binary>>, acc) when c in [?\s, ?\t, ?\n, ?\v, ?\f, ?\r],
+    do: {acc, <<c, rest::binary>>}
+
+  defp tcl_variable(<<c, rest::binary>>, acc), do: tcl_variable(rest, acc <> <<c>>)
+  defp tcl_variable(<<>>, acc), do: {acc, <<>>}
 
   defp until(bin, delim, acc) do
     case :binary.match(bin, delim) do
@@ -2874,6 +2942,21 @@ defmodule Fathom.ShardExecutor do
   defp this_statement_code(<<?[, rest::binary>>, acc) do
     {chunk, rest} = until(rest, "]", "")
     this_statement_code(rest, acc <> "[" <> chunk)
+  end
+
+  # The same variable-token rule as `do_split/3`: its `(...)` form hides quotes, comments and `;`.
+  defp this_statement_code(<<v, rest::binary>>, acc) when v in [?:, ?@, ?#] do
+    {tok, rest} = variable_token(rest, 0, "")
+    this_statement_code(rest, acc <> <<v>> <> tok)
+  end
+
+  defp this_statement_code(<<?$, rest::binary>>, acc) do
+    if id_tail?(acc) do
+      this_statement_code(rest, acc <> "$")
+    else
+      {tok, rest} = variable_token(rest, 0, "")
+      this_statement_code(rest, acc <> "$" <> tok)
+    end
   end
 
   defp this_statement_code(<<c::utf8, rest::binary>>, acc),

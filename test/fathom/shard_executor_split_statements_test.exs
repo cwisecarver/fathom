@@ -141,4 +141,110 @@ defmodule Fathom.ShardExecutorSplitStatementsTest do
       assert List.last(stmts) =~ "SELECT 2"
     end
   end
+
+  # Audit 2026-11-22 #1. SQLite's tokenizer reads `$name(...)`, `:name(...)` and `@name(...)` as ONE
+  # variable token whose parenthesised part swallows every byte up to whitespace or `)`, quotes and
+  # comment openers included (sqlite3.c, CC_DOLLAR/CC_VARALPHA, no SQLITE_OMIT_TCL_VARIABLE). A scanner
+  # that opens a string at that `'` is inside-out for the rest of the script: exactly the under-split
+  # this module exists to prevent. Probed on the unfixed code first: `execute_sequence` ran the hidden
+  # CREATE TABLE.
+  describe "SQLite's TCL-style variable token" do
+    test "a quote inside $name(...) does not open a string" do
+      for sigil <- ["$", ":", "@"] do
+        stmts = split("SELECT #{sigil}a('); CREATE TABLE evil(x); SELECT #{sigil}b(')")
+
+        assert length(stmts) == 3, "sigil #{sigil}: #{inspect(stmts)}"
+        assert Enum.at(stmts, 1) == "CREATE TABLE evil(x)"
+      end
+    end
+
+    test "comment openers and brackets inside the parentheses are not comments or identifiers" do
+      assert ["SELECT $a(--)", "PRAGMA synchronous=OFF", "SELECT $b(/*)"] =
+               split("SELECT $a(--); PRAGMA synchronous=OFF; SELECT $b(/*)")
+
+      assert ["SELECT $a([)", "DROP TABLE t", "SELECT $b(])"] =
+               split("SELECT $a([); DROP TABLE t; SELECT $b(])")
+    end
+
+    test "a `;` inside the parentheses is part of the token, as in SQLite" do
+      assert ["SELECT $a(x;y)", "SELECT 2"] = split("SELECT $a(x;y); SELECT 2")
+    end
+
+    test "whitespace before the `)` ends the token, so the quote after it IS a string again" do
+      # SQLite makes this token illegal and stops with an error, so nothing after it runs; what matters
+      # is that the splitter does not hide what comes after the string.
+      assert ["SELECT $a( 'x;y')", "SELECT 2"] = split("SELECT $a( 'x;y'); SELECT 2")
+    end
+
+    test "`$` inside an identifier is an identifier character, not a variable start" do
+      # Review of the first version of the fix: `t$x('a b;' TEXT)` is the identifier `t$x` followed by a
+      # real string literal. Scanning `x(...)` as a TCL variable ended at the space, split at the `;`
+      # INSIDE the literal and reopened a quote at its tail, hiding the PRAGMA after it.
+      assert ["CREATE TABLE t$x('a b;' TEXT)", "PRAGMA writable_schema=ON", "SELECT 1"] =
+               split("CREATE TABLE t$x('a b;' TEXT); PRAGMA writable_schema=ON; SELECT 1")
+
+      assert ["SELECT abc$x('a;b')"] = split("SELECT abc$x('a;b')")
+      assert ["SELECT a_1$b('x;y')", "SELECT 2"] = split("SELECT a_1$b('x;y'); SELECT 2")
+
+      # ...while a `$` that starts a token (after a space, a comma, an operator) is still a variable.
+      assert ["SELECT 1,$a('), (SELECT 2", "SELECT 3"] ==
+               split("SELECT 1,$a('), (SELECT 2; SELECT 3")
+    end
+
+    test "a UTF-8 BOM before `$` is whitespace, unless it continues an identifier" do
+      # Security review of the fix: the BOM's last byte (0xBF) is >= 0x80, an identifier character, but
+      # SQLite's tokenizer reads a BOM that begins a token as whitespace (CC_BOM), so the `$` after it
+      # starts a variable. Judged as an identifier tail it hid the middle statement.
+      bom = <<0xEF, 0xBB, 0xBF>>
+      tail = "('); CREATE TABLE evil(x); SELECT $b(')"
+
+      for prefix <- ["SELECT ", "SELECT 1, ", "SELECT 1; SELECT ", ""] do
+        stmts = split(prefix <> bom <> "$a" <> tail)
+        assert Enum.any?(stmts, &(&1 == "CREATE TABLE evil(x)")), inspect(prefix)
+      end
+
+      # ...and a BOM inside a running identifier is part of it, so the `$` continues the identifier.
+      assert ["CREATE TABLE t" <> _, "PRAGMA writable_schema=ON", "SELECT 1"] =
+               split(
+                 "CREATE TABLE t" <> bom <> "$x('a b;' TEXT); PRAGMA writable_schema=ON; SELECT 1"
+               )
+    end
+
+    test "a variable that starts after every kind of token boundary still hides nothing" do
+      rest = "('); CREATE TABLE e(x); SELECT $b(')"
+
+      for lead <- [~s("q"), "[q]", "`q`", "/*c*/", "--c\n", "x'00'", "(", "1,", " "] do
+        stmts = split("SELECT " <> lead <> "$a" <> rest)
+        assert "CREATE TABLE e(x)" in stmts, inspect(lead)
+      end
+
+      for sigil <- ["#", "$", ":", "@"] do
+        assert "CREATE TABLE e(x)" in split("SELECT #{sigil}a" <> rest), sigil
+      end
+    end
+
+    test "name edge cases: $$( ::a( a::( non-ASCII, and `$(` with no name" do
+      for name <- ["$", "::a", "a::", "\u00E9", "a$b"] do
+        stmts = split("SELECT $#{name}" <> "('); CREATE TABLE e(x); SELECT $b(')")
+        assert "CREATE TABLE e(x)" in stmts, name
+      end
+
+      assert ["SELECT $a((x))", "SELECT 2"] = split("SELECT $a((x)); SELECT 2")
+    end
+
+    test "ordinary variables and `::` names keep their old behaviour" do
+      assert ["SELECT :a, $b, @c, ?1", "SELECT 2"] = split("SELECT :a, $b, @c, ?1; SELECT 2")
+      assert ["SELECT $a::b", "SELECT 'x;y'"] = split("SELECT $a::b; SELECT 'x;y'")
+      assert ["SELECT 'a:b(' , \"c\"", "SELECT 2"] = split("SELECT 'a:b(' , \"c\"; SELECT 2")
+    end
+
+    test "a statement hidden behind the token is still refused by the sequence gate" do
+      # ATTACH is a blocked verb. Before the fix the gate saw one fragment (`select ...`) and passed it
+      # to SQLite, which ran the hidden ATTACH (or its authorizer refused it, never the gate).
+      assert Enum.any?(
+               split("SELECT $a('); ATTACH DATABASE ':memory:' AS x; SELECT $b(')"),
+               &String.starts_with?(&1, "ATTACH")
+             )
+    end
+  end
 end

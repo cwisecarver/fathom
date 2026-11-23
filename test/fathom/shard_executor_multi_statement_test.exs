@@ -124,6 +124,24 @@ defmodule Fathom.ShardExecutorMultiStatementTest do
              ShardExecutor.describe(h, "SELECT v FROM t;\nSELECT 1")
   end
 
+  # Audit 2026-11-22 #1: statements hidden behind SQLite's `$name(...)` variable token. Unfixed, the
+  # splitter saw ONE fragment, so `execute` ran the first statement and silently dropped the rest (the
+  # 2026-11-07 #19 class) and `sequence` ran all three with the middle one never gated.
+  test "statements hidden behind a $name(...) variable are counted and gated", %{h: h} do
+    hidden = "SELECT $a('); INSERT INTO t VALUES (7); SELECT $b(')"
+
+    assert {:error, %Error{code: "FILO_MULTIPLE_STATEMENTS"}} = run(h, hidden)
+    assert {:error, %Error{code: "FILO_MULTIPLE_STATEMENTS"}} = ShardExecutor.describe(h, hidden)
+
+    assert {:error, %Error{code: "FILO_STATEMENT_BLOCKED"}} =
+             ShardExecutor.execute_sequence(
+               h,
+               "SELECT $a('); ATTACH DATABASE ':memory:' AS x; SELECT $b(')"
+             )
+
+    assert count(h) == 0, "nothing hidden may have run"
+  end
+
   # Perf audit 2026-11-19 #2, hot-path floor (AGENTS.md: ratio, not an exact latency). Before the
   # fast path a trailing `;` on a ~1 KB statement cost about 8x the same statement without it
   # (4.0 vs 32.6 µs through `execute/2`, throwaway probe); after, the two share one path. A 3x
