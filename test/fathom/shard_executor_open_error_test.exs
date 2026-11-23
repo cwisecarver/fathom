@@ -114,6 +114,9 @@ defmodule Fathom.ShardExecutorOpenErrorTest do
     # lease-holding region, so the client sees `{:open_failed, exception}` (a deliberate 500: a raw
     # exception is a code/data fault, see open_error/1).
     "aside_failed" => "raised, surfaces as {:open_failed, exception}",
+    # `PromoteOnOpen.restore_pre_promotion/2`'s result, consumed by `restore_or_refuse/3` in the same
+    # module, which turns it into the existing retryable `UnderQuorum` refusal (FILO_RECOVERING).
+    "restore_failed" => "consumed inside promote_on_open, surfaces as the UnderQuorum refusal",
     # A `File.rename/2` result MATCHED in promote_on_open (`{:error, :enoent} ->`), not minted.
     "enoent" => "a matched File result"
   }

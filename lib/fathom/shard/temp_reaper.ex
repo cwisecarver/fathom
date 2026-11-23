@@ -227,19 +227,38 @@ defmodule Fathom.Shard.TempReaper do
   # pull's temp costs an open. The unlink itself is also made harmless on the other side:
   # `Materializer.promote_pull/3` refuses a vanished temp instead of reading it as "brand-new".
   #
-  # Not extended to the other temp families (`.snap`, `.z`, `.promote`...): their writers are
-  # tasks that finish inside one flush, and a killed one is exactly the orphan this reaper exists for.
+  # EXTENDED to the promotion families (audit 2026-11-22 #2): `<id>.db.prepromote*` (the cold-pulled
+  # `.db` moved ASIDE for the whole of a promote-on-open publish) and `<id>.db.promote.*` (the staged
+  # copy). The earlier note here declined them on the grounds that their writers finish inside one
+  # flush; `.prepromote` does not. A rename keeps the mtime of the download, and between the aside
+  # and the publish PUT sit a lease acquire, a peer ask, a peer pull, a pre-promotion snapshot CopyObject
+  # and `Promote.stage`, so the aside copy can be older than the 120 s gate while its owner is mid-open.
+  # If the reaper unlinks it and the PUT then fails, `restore_pre_promotion` finds nothing to restore and
+  # the open would serve an empty database fenced on the real object's etag. An orphan of a DEAD
+  # coordinator is still reaped (no Registry entry), which the crash-safety tests pin.
+  #
+  # Not extended to the other temp families (`.snap`, `.z`, ...): their writers are tasks that finish
+  # inside one flush, and a killed one is exactly the orphan this reaper exists for.
+  @owned_families [".db.pull", ".db.prepromote", ".db.promote."]
+
   defp pull_temp_owned?(name) do
-    case :binary.split(name, ".db.pull") do
-      [id, _suffix] ->
+    case Enum.find_value(@owned_families, &owned_family_id(name, &1)) do
+      nil ->
+        false
+
+      id ->
         try do
           Registry.lookup(Fathom.ShardRegistry, id) != []
         rescue
           ArgumentError -> true
         end
+    end
+  end
 
-      _not_a_pull_family_name ->
-        false
+  defp owned_family_id(name, marker) do
+    case :binary.split(name, marker) do
+      [id, _suffix] when id != "" -> id
+      _not_this_family -> nil
     end
   end
 

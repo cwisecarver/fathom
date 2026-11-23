@@ -20,6 +20,7 @@ defmodule Fathom.Shard.OpenCrashSafetyTest do
 
   alias Fathom.Shard.Connection
   alias Fathom.Shard.PromoteOnOpen
+  alias Fathom.Shard.Provenance
   alias Fathom.Shard.Replication.{Fleet, Follower, Recovery}
   alias Fathom.Shard.Storage
   alias Fathom.Shard.Storage.S3
@@ -280,6 +281,45 @@ defmodule Fathom.Shard.OpenCrashSafetyTest do
 
         refute File.exists?(PromoteOnOpen.recovering_path(path)),
                "the decision cleared the marker"
+      end
+
+      # Audit 2026-11-22 #2. If the aside copy is gone when the PUT fails (the TempReaper unlinked it:
+      # its mtime is the download's), there is nothing to restore, and serving the pulled object's etag
+      # means a path with no `.db`: an EMPTY database fenced on the real object's etag, replaced over it
+      # by the first write or idle flush. The open must refuse (retryable) and leave no sidecar, so the
+      # retry is a plain cold pull. Unfixed, the open succeeded and the tenant read zero rows.
+      test "a failed promotion PUT with the aside copy gone refuses the open, never serves empty (#2)",
+           %{id: id, dir: dir} do
+        Application.put_env(:fathom, :shard_storage, Fathom.Test.FaultyStorage)
+        failover_fixture!(id, dir)
+        local_path!()
+        path = Fathom.Shard.db_path(id)
+
+        Application.put_env(:fathom, :storage_fault, :flush)
+
+        Application.put_env(:fathom, :faulty_before, {
+          :flush,
+          fn
+            ^id -> File.rm(path <> ".prepromote")
+            _other -> :ok
+          end
+        })
+
+        result = ShardExecutor.open(id)
+        Application.delete_env(:fathom, :storage_fault)
+        Application.delete_env(:fathom, :faulty_before)
+
+        assert {:error, _} = result,
+               "the open served a path with no .db (an empty database fenced on the real etag)"
+
+        refute File.exists?(path), "no live .db may be left behind"
+
+        refute File.exists?(Provenance.sidecar_path(path)),
+               "the sidecar must go, so the retry cold-pulls"
+
+        # The retry starts from nothing (cold pull, then the promotion runs again with the fault gone)
+        # and serves the replica's full ten rows; what it must never serve is the empty database.
+        assert open_and_read(id, unquote(mode)) == Enum.to_list(1..10)
       end
     end
   end

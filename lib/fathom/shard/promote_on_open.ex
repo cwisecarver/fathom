@@ -872,13 +872,13 @@ defmodule Fathom.Shard.PromoteOnOpen do
   # of the WRONG bytes (the pulled file, not the temp being published). The aside is deleted by the
   # caller once the sidecar and the rename have landed.
   defp publish_promoted(shard_id, path, temp, etag, position, lineage_store) do
-    with :ok <- aside_pre_promotion(path) do
+    with {:ok, moved?} <- aside_pre_promotion(path) do
       result =
         try do
           Storage.flush(shard_id, temp, etag, position, lineage_store)
         catch
           kind, reason ->
-            restore_pre_promotion(path)
+            restore_or_refuse(shard_id, path, moved?)
             :erlang.raise(kind, reason, __STACKTRACE__)
         end
 
@@ -888,7 +888,7 @@ defmodule Fathom.Shard.PromoteOnOpen do
           result
 
         other ->
-          restore_pre_promotion(path)
+          restore_or_refuse(shard_id, path, moved?)
           other
       end
     end
@@ -942,24 +942,59 @@ defmodule Fathom.Shard.PromoteOnOpen do
     Enum.each(["-wal", "-shm"], &Fathom.FS.rename(path <> &1, prepromote(path) <> &1))
 
     case Fathom.FS.rename(path, prepromote(path)) do
+      # `moved?` records that a `.db` really went aside, so a failed restore is told apart from "there
+      # was nothing pulled to put back".
       :ok ->
-        :ok
+        {:ok, true}
 
       {:error, :enoent} ->
-        :ok
+        {:ok, false}
 
       {:error, reason} ->
-        restore_pre_promotion(path)
+        _ = restore_pre_promotion(path, false)
         {:error, {:aside_failed, reason}}
     end
   end
 
-  defp restore_pre_promotion(path) do
-    for suffix <- ["", "-wal", "-shm"] do
-      Fathom.FS.rename(prepromote(path) <> suffix, path <> suffix)
-    end
+  # Put the aside copy back. Returns :ok, or `{:error, reason}` when a `.db` WAS moved aside and cannot
+  # be moved back (it vanished or the rename failed): the caller must not serve a path with no `.db`.
+  # The -wal/-shm renames stay best-effort (they need not exist). The results used to be ignored
+  # (audit 2026-11-22 #2).
+  defp restore_pre_promotion(path, moved?) do
+    results =
+      for suffix <- ["", "-wal", "-shm"] do
+        {suffix, Fathom.FS.rename(prepromote(path) <> suffix, path <> suffix)}
+      end
 
-    :ok
+    case {moved?, List.keyfind(results, "", 0)} do
+      {true, {"", {:error, reason}}} -> {:error, {:restore_failed, reason}}
+      _ -> :ok
+    end
+  end
+
+  # A failed publish whose aside copy cannot be restored leaves the pulled object's sidecar with no
+  # `.db` under it. Serving that (the fallback after the under-quorum window, or with no peers) would
+  # create an empty database fenced on the real object's etag, and its first write or idle flush would
+  # replace the object with it. So refuse the open as retryable instead: `refuse_open/2` removes
+  # whatever is left, including the sidecar, so the retry is a plain cold pull of the published object.
+  defp restore_or_refuse(shard_id, path, moved?) do
+    case restore_pre_promotion(path, moved?) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "shard #{shard_id}: the pre-promotion copy could not be restored after a failed " <>
+            "publish (#{inspect(reason)}); refusing the open so the retry cold-pulls the object"
+        )
+
+        refuse_open(path, %Recovery.UnderQuorum{
+          shard_id: shard_id,
+          answered: 0,
+          needed: 1,
+          waited_ms: 0
+        })
+    end
   end
 
   # Test seam for the crash window between the publish and the sidecar write (expert review

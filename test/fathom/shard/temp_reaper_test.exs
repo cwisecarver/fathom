@@ -71,6 +71,39 @@ defmodule Fathom.Shard.TempReaperTest do
   # drill, reconcile, migration, export, S3 restore temp) leaked forever after a brutal kill. They
   # all live under TempReaper.scratch_dir/0 now, which the sweep reaps with an age gate. Entries may
   # be files or directories (a tenant export is a 0700 dir).
+  # Audit 2026-11-22 #2. The `.prepromote` aside copy keeps the DOWNLOAD's mtime and lives for the whole
+  # promote-on-open publish (lease, peer ask, peer pull, snapshot, stage, PUT). Once past the 120 s gate
+  # the reaper unlinked it under a live coordinator, and a failed PUT then had nothing to restore. Like
+  # the `.pull` family, it is not an orphan while a coordinator is registered for its shard.
+  test "the aside and staged promotion temps are spared while a coordinator owns the shard", %{
+    path: path
+  } do
+    id = Path.basename(path, ".db")
+    aside = [path <> ".prepromote", path <> ".prepromote-wal", path <> ".prepromote-shm"]
+    staged = path <> ".promote.2"
+    all = aside ++ [staged]
+    on_exit(fn -> Enum.each(all, &File.rm/1) end)
+
+    start_supervised!(TempReaper)
+    _ = TempReaper.sweep()
+
+    for f <- all do
+      File.write!(f, "promotion in flight")
+      File.touch!(f, {{2020, 1, 1}, {0, 0, 0}})
+    end
+
+    {:ok, _} = Registry.register(Fathom.ShardRegistry, id, nil)
+    _ = TempReaper.sweep()
+
+    for f <- all, do: assert(File.exists?(f), "reaped under an open coordinator: #{f}")
+
+    :ok = Registry.unregister(Fathom.ShardRegistry, id)
+    assert TempReaper.sweep() >= length(all)
+
+    for f <- all,
+        do: refute(File.exists?(f), "an unowned stale promotion temp must be reaped: #{f}")
+  end
+
   test "a sweep reaps an aged orphan in the scratch dir, file or dir, and keeps a fresh one" do
     start_supervised!(TempReaper)
     _ = TempReaper.sweep()
