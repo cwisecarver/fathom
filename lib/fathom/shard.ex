@@ -3061,7 +3061,7 @@ defmodule Fathom.Shard do
   end
 
   def terminate(reason, %{lease_lost: true} = state) do
-    settle_lapse_task(state)
+    state = settle_lapse_task(state)
 
     trace_state_event(state, "terminate", fn ->
       %{clause: :lease_lost, reason: inspect(reason, limit: 6)}
@@ -3131,7 +3131,7 @@ defmodule Fathom.Shard do
   end
 
   def terminate(reason, %{conns: conns} = state) when map_size(conns) == 0 do
-    settle_lapse_task(state)
+    state = settle_lapse_task(state)
 
     trace_state_event(state, "terminate", fn ->
       %{clause: :no_conns, reason: inspect(reason, limit: 6)}
@@ -3197,7 +3197,7 @@ defmodule Fathom.Shard do
   # so a shutdown-ordering edge (Tombstones dies first) fails toward flushing — the safe direction.
   def terminate(reason, %{conns: conns, lease: lease} = state)
       when map_size(conns) > 0 and not is_nil(lease) do
-    settle_lapse_task(state)
+    state = settle_lapse_task(state)
 
     trace_state_event(state, "terminate", fn ->
       %{clause: :with_conns, reason: inspect(reason, limit: 6)}
@@ -3268,7 +3268,7 @@ defmodule Fathom.Shard do
   # so the state is the minimal `%{id: ...}` that matches no clause above) — always drop the shard's
   # load row so a stopped shard never leaks a counter.
   def terminate(reason, state) do
-    settle_lapse_task(state)
+    state = settle_lapse_task(state)
 
     trace_state_event(state, "terminate", fn ->
       %{clause: :default, reason: inspect(reason, limit: 6)}
@@ -3449,16 +3449,31 @@ defmodule Fathom.Shard do
   #
   # SETTLE, THEN KILL, not a bare kill: killing the process does not recall a request already on the
   # wire, so a PUT in flight can still land after this coordinator releases and a successor acquires.
-  # Waiting up to `settle_yield_ms/0` first (the shape `settle_renew_task/1` and the flush settle use)
-  # lets a PUT that is about to complete land BEFORE the release that follows, and only a task that is
-  # still stuck is killed. Every terminate clause does this first, before anything releases or
-  # renames. The verdict has no reader once this process is exiting, so it is dropped.
-  defp settle_lapse_task(%{lapse_revalidate_pending: %Task{} = task}) do
-    _ = Task.yield(task, settle_yield_ms()) || Task.shutdown(task, :brutal_kill)
-    :ok
+  # Waiting first lets a PUT that is about to complete land BEFORE the release that follows, and only
+  # a task that is still stuck is killed. Every terminate clause does this first, before anything
+  # releases or renames.
+  #
+  # THE BUDGET is `release_budget_ms/0` (a quarter of the settle), not `settle_yield_ms/0`: the revalidation
+  # is one small conditional PUT, and the flush settle that follows already takes the full third of the
+  # shutdown budget, so two full settles back to back would eat two thirds of it before the drop-flush
+  # began (the round-2 #18 brutal-kill-mid-PUT on a rolling deploy).
+  #
+  # THE VERDICT HAS A READER: the release and drop-flush that follow. Folded the way `settle_renew_task/1`
+  # folds a renew: `:superseded` sets `lease_lost` so `flush_and_drop/1` takes its quarantine clause
+  # instead of flushing and releasing a lock a peer now owns (on a weak-conditional-delete store that
+  # release is the rig's lock-deletion path), and an ok verdict's updates (the lease it renewed) are
+  # merged so the release names the lease actually held.
+  defp settle_lapse_task(%{lapse_revalidate_pending: %Task{} = task} = state) do
+    state = %{state | lapse_revalidate_pending: false}
+
+    case Task.yield(task, release_budget_ms()) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {:ok, updates}} when is_map(updates) -> Map.merge(state, updates)
+      {:ok, :superseded} -> %{state | lease_lost: true}
+      _ -> state
+    end
   end
 
-  defp settle_lapse_task(_state), do: :ok
+  defp settle_lapse_task(state), do: state
 
   defp shutdown_orphan_tasks(state) do
     for key <- [:flush_task, :renew_task, :lapse_revalidate_pending, :lineage_task, :sidecar_task],

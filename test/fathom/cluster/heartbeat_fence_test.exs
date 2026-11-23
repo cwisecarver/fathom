@@ -179,7 +179,8 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
     test "a coordinator that stops normally #{name}", %{shard: shard, hb: hb} do
       Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
       Application.put_env(:fathom, :shard_idle_ms, 60_000)
-      # settle_yield_ms = min(30_000, shutdown / 3) = 1 s here.
+
+      # settle_yield_ms = min(30_000, shutdown / 3) = 1 s here; the lapse settle gets a quarter of that.
       Env.put!(:shard_shutdown_ms, 3_000)
 
       {:ok, conn} = ShardExecutor.open(shard)
@@ -242,6 +243,68 @@ defmodule Fathom.Cluster.HeartbeatFenceTest do
       else
         assert first == :coordinator_down
         refute_received :task_finished
+      end
+    end
+  end
+
+  # The settled verdict has a reader: the release and drop-flush that follow. A revalidation that
+  # comes back `:superseded` means a peer owns the shard, and a normal stop must then NOT release (on a
+  # weak-conditional-delete store that release deletes the peer's lock). The ok case is the control: the
+  # same stop, same hook, DOES release, so the refusal below is the verdict's doing and not a stop that
+  # never reaches the release.
+  for {name, verdict, released?} <- [
+        {"an ok verdict still releases", :ok, true},
+        {"a superseded verdict does not release", {:error, :superseded}, false}
+      ] do
+    test "a coordinator stopping normally: #{name}", %{shard: shard, hb: hb} do
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+      Application.put_env(:fathom, :shard_idle_ms, 60_000)
+      Env.put!(:shard_shutdown_ms, 3_000)
+
+      {:ok, conn} = ShardExecutor.open(shard)
+      {:ok, _} = ShardExecutor.execute(conn, stmt("CREATE TABLE kv (v TEXT)"))
+      {:ok, coordinator} = Shards.ensure(shard)
+      :ok = ShardExecutor.close(conn)
+      :ok = Shards.flush(shard)
+      assert is_integer(:sys.get_state(coordinator).acquire_gen)
+
+      test_pid = self()
+
+      Env.put!(:faulty_renew_lease, fn ->
+        send(test_pid, {:renew_started, self()})
+
+        receive do
+          :release -> :ok
+        after
+          15_000 -> :ok
+        end
+      end)
+
+      if unquote(verdict) != :ok, do: Env.put!(:faulty_renew_lease_result, unquote(verdict))
+
+      :sys.replace_state(hb, fn st ->
+        Heartbeat.publish_status(%{st | generation: st.generation + 1, lapsed: true})
+      end)
+
+      send(coordinator, :revalidate_lapse)
+      assert_receive {:renew_started, task_pid}, 2_000
+      Process.send_after(task_pid, :release, 50)
+
+      Env.put!(:faulty_before, {
+        :release,
+        fn
+          ^shard -> send(test_pid, :released)
+          _other -> :ok
+        end
+      })
+
+      capture_log(fn -> GenServer.stop(coordinator, :normal, 10_000) end)
+
+      if unquote(released?) do
+        assert_received :released
+      else
+        refute_received :released,
+                        "a coordinator whose revalidation came back superseded released a lock a peer owns"
       end
     end
   end
