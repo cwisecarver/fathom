@@ -18,6 +18,16 @@ against. To co-develop both repos, set `FILO_PATH=../filo` (no `mix.exs` edit).
 
 ## [Unreleased]
 
+### Fixed (expert audit 2026-11-22)
+
+- **Security: a `sequence` can no longer hide statements from the per-statement gates behind a TCL-style variable.** The script splitter did not know SQLite's `$name(...)` variable token, so `$a(')` (and `t$x(...)`, and a UTF-8 BOM before `$`) made it read a quote that SQLite does not. The splitter now models the token; a 400,000-script differential fuzz against real SQLite found no violation.
+- **Security: a revoked or expired token can no longer keep opening streams on a live WebSocket.** `ShardExecutor.open/2` now runs the same expiry and revocation-floor checks the per-statement path does, before taking a checkout. **`EXPLAIN` followed directly by a comment** (`EXPLAIN/**/PRAGMA ...`) no longer reads as "not an EXPLAIN" in the text gate.
+- `TempReaper` no longer deletes the `.prepromote` aside copy of a promotion in progress, and a promotion that cannot restore it now refuses the open instead of serving an empty database.
+- A coordinator that stops normally now settles its in-flight lapse revalidation before releasing, so the task cannot rewrite the next coordinator's lock.
+- A chain-jump revert retried after its cutover landed re-enqueues the climb instead of quarantining a healthy shard.
+- Shippers are restarted when their supervisor is restarted empty (previously every replicated commit waited out its deadline until a node restart); the replication accept loop pauses on `emfile`-class errors; a departed follower's stale position no longer counts toward coverage or lag; restore-drill scratch forks can no longer be re-inserted by the Recorder as permanent `active` rows.
+- `BLOCK_TENANT_DDL` can now be set from the environment (it had no reader). Off by default; see `docs/configuration.md`.
+
 ### Performance
 
 - The admin collector's 10 s hot-shard pass no longer re-derives its top-20 heap's size and minimum for every shard, and `ShardLoad` is walked with `:ets.foldl` instead of `tab2list` + `Enum.map`: `observability_tick_us` 14.4 → 11.2 ms at 20k shards (perf audit 2026-11-19 #34/#35; a watch-only, worst-case arm where every one of the 20k rows is active, so a real node gains less). The audit's other micro-optimizations were measured and dropped (each moved its metric by 2% or less); see `docs/component-notes.md`.
