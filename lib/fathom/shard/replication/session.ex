@@ -884,7 +884,7 @@ defmodule Fathom.Shard.Replication.Session do
     {behind, bytes} =
       case state.seen do
         [{gen, salt, extent} | _] ->
-          Enum.reduce(state.followers, {0, 0}, fn
+          Enum.reduce(current_followers(state), {0, 0}, fn
             {_, %{wal_gen: ^gen, salt1: ^salt, offset: o}}, {n, b} when is_integer(o) ->
               if o < extent, do: {n + 1, max(b, extent - o)}, else: {n, b}
 
@@ -2846,6 +2846,18 @@ defmodule Fathom.Shard.Replication.Session do
     end
   end
 
+  # The follower records of the CURRENT shipper set (audit 2026-11-22 #16). `followers` is keyed by
+  # shipper name, which comes from the endpoint, and nothing deletes from it: after a roster change
+  # the departed member's last position kept counting toward Q-coverage (a checkpoint could run with
+  # fewer than Q live followers holding the frames), kept `laggards/2` answering `:wait` for a
+  # follower that can never ack, and was reported as behind for the life of the Session. The map is
+  # filtered at READ rather than pruned at write because the shipper list changes in `Membership`, not
+  # here, and a read of `Fleet.shippers/0` is one `:persistent_term` lookup over a handful of names.
+  defp current_followers(state) do
+    shippers = Fleet.shippers()
+    Enum.filter(state.followers, fn {shipper, _} -> shipper in shippers end)
+  end
+
   # Does a write quorum of followers hold everything up to `header`'s commit extent, in its
   # generation? Read from the per-follower ack positions, so it means exactly "acked".
   defp covered?(_state, :empty), do: true
@@ -2853,7 +2865,7 @@ defmodule Fathom.Shard.Replication.Session do
 
   defp covered?(state, %{ckpt_seq: gen, salt1: salt, commit_extent: extent}) do
     held =
-      for %{wal_gen: ^gen, salt1: ^salt, offset: o} <- Map.values(state.followers),
+      for {_shipper, %{wal_gen: ^gen, salt1: ^salt, offset: o}} <- current_followers(state),
           is_integer(o),
           do: o
 
@@ -2877,7 +2889,7 @@ defmodule Fathom.Shard.Replication.Session do
   # behind it, so the follower holds those bytes by the time it judges the reset. What makes a
   # follower short is bytes never SENT — a push skipped `:already_in_flight` or refused locally.
   defp laggards(state, %{ckpt_seq: gen, salt1: salt, commit_extent: extent}) do
-    for {shipper, %{wal_gen: ^gen, salt1: ^salt, offset: o}} <- state.followers,
+    for {shipper, %{wal_gen: ^gen, salt1: ^salt, offset: o}} <- current_followers(state),
         is_integer(o),
         not Map.has_key?(state.seeding, shipper),
         sent_through(state, shipper, gen, salt, o) < extent,
