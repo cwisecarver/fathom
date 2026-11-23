@@ -510,6 +510,44 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
     assert log =~ "migrating forward v1 -> v2"
   end
 
+  # Audit 2026-11-22 #8. The test above runs the chain-jump revert ONCE. The retry after a cutover that
+  # already landed (the job died before its ack) recomputed the landing from `retained_version`, which
+  # the cutover had just set to 3 (the version it came from); 3 is not below the target 2, so it asked
+  # for a `<shard>@2` that never existed and quarantined a correctly reverted shard.
+  test "a chain-jump revert retried after its cutover landed re-enqueues the climb, not quarantine",
+       %{shard: shard} do
+    seed_v1!(shard)
+    :ok = Storage.retain(shard, 1)
+    seed_v1!(shard, 3, "bob-on-v3")
+    live = Path.join(remote_dir(), "#{shard}.db")
+    {:ok, _} = Directory.cutover(shard, 3, 1)
+
+    capture_log(fn ->
+      assert :ok = perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 2}, attempt: 1)
+    end)
+
+    assert {:ok, %{schema_version: 1, status: "active", retained_version: 3}} =
+             Directory.get(shard)
+
+    # The job died before the ack: Oban runs it again, with the directory and the object landed.
+    # (The climb enqueued by the first attempt is cleared so the second one must enqueue its own.)
+    Oban.Job |> Fathom.Repo.delete_all()
+    retained_v3 = File.read!(Path.join(remote_dir(), "#{shard}@3.db"))
+
+    capture_log(fn ->
+      assert :ok = perform_job(RevertJob, %{"shard_id" => shard, "to_version" => 2}, attempt: 2),
+             "the retry of a landed chain-jump revert must succeed"
+    end)
+
+    assert {:ok, %{schema_version: 1, status: "active"}} = Directory.get(shard),
+           "the retry quarantined a correctly reverted shard"
+
+    assert object_facts(live) == {1, ["alice"]}
+    assert File.read!(Path.join(remote_dir(), "#{shard}@3.db")) == retained_v3
+
+    assert_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => shard, "target" => 2})
+  end
+
   # Round-2 #30: a RevertJob dying between the cutover and the Oban ack retries with
   # the revert ALREADY complete — and the re-run took the destructive path again:
   # retain(current == to_version) copied live over the retained @to_version backup,

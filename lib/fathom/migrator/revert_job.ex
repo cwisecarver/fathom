@@ -153,7 +153,7 @@ defmodule Fathom.Migrator.RevertJob do
           "shard #{shard_id}: revert to v#{to_version} FAILED — no retained copy at " <>
             "#{shard_id}@#{landing}, and no retry can create one. The chain-jump case is now " <>
             "handled before this point: shards.retained_version says " <>
-            "#{inspect(retained_version(shard_id))}, and a value BELOW the target would have been " <>
+            "#{inspect(elem(directory_versions(shard_id), 1))}, and a value BELOW the target would have been " <>
             "restored and then migrated forward. Reaching here means the column is NULL (a " <>
             "pre-column row, or RetirementJob dropped the copy past its retention window) or it " <>
             "named a version storage does not actually have. This shard is still on its " <>
@@ -242,17 +242,35 @@ defmodule Fathom.Migrator.RevertJob do
   # still lands in the absent-object branch with its diagnosis. A retained version ABOVE the target
   # is not a landing site either: restoring it would move the shard to a version newer than the
   # fleet asked for, which is not a revert.
+  #
+  # A RETRY AFTER THE CUTOVER ALREADY LANDED is the one case that goes back UP (audit 2026-11-22 #8).
+  # The first attempt of a chain-jump revert (live v3, retained v1, asked for v2) lands on v1 and its
+  # cutover records `retained_version = 3` (the version it came FROM). If the job then dies before
+  # the ack (a Postgres blip on the climb's `Oban.insert`, a deploy kill, Lifeline), the retry saw a
+  # retained version ABOVE the target, so it recomputed the landing as v2, missed the completed-revert
+  # no-op, tried to restore a `<shard>@2` that never existed, and QUARANTINED a correctly reverted
+  # shard (a false `revert_no_retained_version` alarm in the middle of an emergency revert). The
+  # evidence a prior attempt landed is: the directory is BELOW the target and the retained version is
+  # ABOVE it. Then the landing is where the shard already is, which takes the `:ok` no-op branch and
+  # re-enqueues the climb.
   defp landing_version(shard_id, to_version) do
-    case retained_version(shard_id) do
-      r when is_integer(r) and r < to_version -> r
-      _ -> to_version
+    case directory_versions(shard_id) do
+      {live, r}
+      when is_integer(live) and is_integer(r) and live < to_version and r > to_version ->
+        live
+
+      {_live, r} when is_integer(r) and r < to_version ->
+        r
+
+      _ ->
+        to_version
     end
   end
 
-  defp retained_version(shard_id) do
+  defp directory_versions(shard_id) do
     case Fathom.Directory.get(shard_id) do
-      {:ok, %{retained_version: r}} -> r
-      :error -> nil
+      {:ok, %{schema_version: live, retained_version: r}} -> {live, r}
+      :error -> {nil, nil}
     end
   end
 
