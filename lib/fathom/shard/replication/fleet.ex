@@ -330,7 +330,18 @@ defmodule Fathom.Shard.Replication.Fleet do
         # restart. `Membership` starts them, and starts the first set inside its own `init/1` — so
         # by the time this supervisor reports started, the shippers a commit will read already
         # exist. Ordering matters: the DynamicSupervisor must precede Membership.
-        {DynamicSupervisor, name: @shippers_sup, strategy: :one_for_one}
+        #
+        # AN EXPLICIT BUDGET (audit 2026-11-22 #12). Shippers are `:permanent` and reconnect-driven,
+        # and replication tests call their restarts under load routine; the DynamicSupervisor default
+        # (3 in 5 s, shared by ALL shippers) let a fourth crash kill the supervisor itself. `Fleet`
+        # restarted it EMPTY, and nothing started the shippers again: every published name was dead
+        # and every commit waited out its deadline. Same budget as this supervisor's own; and
+        # `Membership` now monitors it and restarts the shippers if it dies anyway.
+        {DynamicSupervisor,
+         name: @shippers_sup,
+         strategy: :one_for_one,
+         max_restarts: Application.get_env(:fathom, :replication_max_restarts, 30),
+         max_seconds: Application.get_env(:fathom, :replication_max_seconds, 10)}
       ] ++ follower_children() ++ membership_children()
 
     # AN EXPLICIT RESTART BUDGET (expert review 2026-08-20 #21). This defaulted to OTP's 3-in-5s,
@@ -350,6 +361,10 @@ defmodule Fathom.Shard.Replication.Fleet do
   defp membership_children do
     if replicating?(), do: [Fathom.Shard.Replication.Membership], else: []
   end
+
+  @doc "The registered name of the shipper `DynamicSupervisor` (what `Membership` monitors)."
+  @spec shippers_supervisor() :: atom()
+  def shippers_supervisor, do: @shippers_sup
 
   @doc """
   Start one shipper under the dynamic supervisor. Raises on failure — the only caller is

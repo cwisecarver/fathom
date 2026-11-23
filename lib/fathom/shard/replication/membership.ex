@@ -97,7 +97,7 @@ defmodule Fathom.Shard.Replication.Membership do
     case resolve() do
       {:ok, desired} ->
         apply_set!(desired)
-        {:ok, %{current: desired}, {:continue, :schedule}}
+        {:ok, %{current: desired, sup_ref: monitor_shippers_supervisor()}, {:continue, :schedule}}
 
       {:refused, reason} ->
         {:stop, boot_error(reason)}
@@ -124,6 +124,48 @@ defmodule Fathom.Shard.Replication.Membership do
       end
 
     {:noreply, schedule(next)}
+  end
+
+  # THE SHIPPER SUPERVISOR DIED AND `Fleet` RESTARTED IT EMPTY (audit 2026-11-22 #12). Membership is the
+  # only thing that starts shippers, and it only acts when the desired members differ from the current ones, so after such a
+  # restart every published shipper name was dead for good: `shippers/0` kept naming them, casts to the
+  # unregistered names are silently dropped, and every replicated commit waited out its deadline. So it
+  # watches the supervisor and, once a new one is up, starts whichever of the current set is not
+  # running. (The set itself is unchanged, so `Fleet.publish/1` is not called again.)
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{sup_ref: ref} = state) do
+    Logger.error(
+      "replication: the shipper supervisor died (#{inspect(reason)}); restarting its shippers"
+    )
+
+    send(self(), {:resupervise, 0})
+    {:noreply, %{state | sup_ref: nil}}
+  end
+
+  def handle_info({:resupervise, attempt}, state) do
+    case Process.whereis(Fleet.shippers_supervisor()) do
+      nil when attempt < 100 ->
+        Process.send_after(self(), {:resupervise, attempt + 1}, 50)
+        {:noreply, state}
+
+      nil ->
+        Logger.error("replication: the shipper supervisor did not come back; giving up")
+        {:noreply, state}
+
+      _pid ->
+        for {node_key, host, port} <- state.current do
+          name = shipper_name(node_key, host, port)
+          if Process.whereis(name) == nil, do: Fleet.start_shipper!(name, host, port)
+        end
+
+        {:noreply, %{state | sup_ref: monitor_shippers_supervisor()}}
+    end
+  end
+
+  defp monitor_shippers_supervisor do
+    case Process.whereis(Fleet.shippers_supervisor()) do
+      nil -> nil
+      pid -> Process.monitor(pid)
+    end
   end
 
   # UNPUBLISH ON AN ORDERLY SHUTDOWN, because this process is the only thing that ever publishes a
