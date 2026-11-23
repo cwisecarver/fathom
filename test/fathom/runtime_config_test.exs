@@ -141,6 +141,23 @@ defmodule Fathom.RuntimeConfigTest do
     assert Keyword.get(fathom_config(%{"SHARD_LOAD" => "1"}), :shard_load) == true
   end
 
+  # Audit 2026-11-22 #20: the lever the executor's comments tell operators to enable in prod had no
+  # environment reader at all.
+  test "BLOCK_TENANT_DDL=true|1|false|0 sets :block_tenant_ddl; unset leaves it unwritten" do
+    assert Keyword.fetch!(fathom_config(%{"BLOCK_TENANT_DDL" => "true"}), :block_tenant_ddl) ==
+             true
+
+    assert Keyword.fetch!(fathom_config(%{"BLOCK_TENANT_DDL" => "1"}), :block_tenant_ddl) == true
+
+    assert Keyword.fetch!(fathom_config(%{"BLOCK_TENANT_DDL" => "false"}), :block_tenant_ddl) ==
+             false
+
+    assert Keyword.fetch!(prod_config(%{"BLOCK_TENANT_DDL" => "0"}), :block_tenant_ddl) == false
+
+    refute Keyword.has_key?(fathom_config(%{}), :block_tenant_ddl)
+    refute Keyword.has_key?(prod_config(%{}), :block_tenant_ddl)
+  end
+
   test "SHARD_LOAD unset outside prod leaves :shard_load off (module default)" do
     # Unset: the key isn't written, so Application falls back to the false default.
     refute Keyword.has_key?(fathom_config(%{}), :shard_load)

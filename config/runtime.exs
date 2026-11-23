@@ -785,6 +785,19 @@ case env_bool.("SHARD_LOAD") do
     config :fathom, :shard_load, on?
 end
 
+# BLOCK_TENANT_DDL=true|1 refuses schema-changing statements (CREATE/ALTER/DROP, tenant `user_version`
+# writes, ...) from tenant streams, so schema evolution has to go through the migration engine (audit
+# 2026-11-22 #20). `ShardExecutor`'s comments always said to enable this in prod, but nothing set
+# `:block_tenant_ddl`: it was an app-env default (false) with no environment reader, so an operator
+# could not turn it on without rebuilding the release. Unset leaves the key unwritten (false), so
+# nothing changes for a node that does not set it: Django tenants run DDL through `migrate`, which is
+# why this stays opt-in. The template shard is exempt in the executor (it IS where DDL is captured).
+# Read live per stream open (`stream_opts/2`), so the value at open applies to that stream.
+case env_bool.("BLOCK_TENANT_DDL") do
+  nil -> :ok
+  on? -> config :fathom, :block_tenant_ddl, on?
+end
+
 # Host-level tail attribution (expert review 2026-10-29 #17; docs/deploy-cluster.md "Host writeback").
 # SYSTEM_MONITOR: the `:erlang.system_monitor` long_schedule (20 ms) / long_gc (50 ms) counters. On in
 # prod, off elsewhere (the monitor is VM-global, so dev/test must not own it). `false` leaves the
