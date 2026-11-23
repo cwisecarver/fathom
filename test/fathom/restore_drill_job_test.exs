@@ -171,6 +171,23 @@ defmodule Fathom.RestoreDrillJobTest do
              "a drill fork was left behind; repeated runs would grow the directory unbounded"
     end
 
+    # Audit 2026-11-22 #13. The drill checks the fork out twice and each checkout buffers a Recorder
+    # touch; a flush landing AFTER `hard_delete` re-inserts the row as an ordinary `active` v0 shard
+    # (scratch = false), which the sweep and `exclude_scratch` never match. Test config turns
+    # `:directory_touch` off, which is why the test above could not see it: this one runs with touch ON
+    # and flushes the Recorder after the drill, as the 1 s tick does in production.
+    test "the Recorder cannot resurrect a scratch fork after the drill dropped it", %{id: id} do
+      seed(id, ["CREATE TABLE kv (v TEXT)", "INSERT INTO kv VALUES ('a')"])
+      Env.put!(:directory_touch, true)
+
+      before = drill_scratch_rows()
+      assert {:ok, _} = RestoreDrillJob.run_full_drill(5)
+      _ = Fathom.Directory.Recorder.flush()
+
+      assert drill_scratch_rows() == before,
+             "a buffered touch re-inserted the dropped scratch fork as a permanent active row"
+    end
+
     # Off by default: a fork is a full object copy, so this costs real storage I/O per sample where
     # the read-only drill costs a GET. Raising read-only coverage must not silently multiply that.
     test "it is inert unless :restore_drill_full_sample is set", %{id: id} do

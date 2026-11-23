@@ -821,6 +821,7 @@ defmodule Fathom.RestoreDrillJob do
   defp drop_scratch(scratch) do
     _ = Fathom.Shards.stop(scratch)
     _ = Storage.purge_shard(scratch)
+    drain_recorder()
     _ = Directory.hard_delete(scratch)
     :ok
   rescue
@@ -829,6 +830,21 @@ defmodule Fathom.RestoreDrillJob do
   catch
     :exit, r ->
       Logger.warning("restore drill (FULL): scratch cleanup of #{scratch} exited: #{inspect(r)}")
+  end
+
+  # The fork was checked out twice, and every checkout buffers a `Directory.Recorder` touch (and the
+  # coordinator's stop buffers a flush stamp). Those are upserts: a tick landing AFTER `hard_delete`
+  # re-inserts the row as an ordinary `active` v0 shard with `scratch = false`, which neither the
+  # scratch sweep nor `exclude_scratch` matches (audit 2026-11-22 #13). Draining the buffer first
+  # (the flush is a serialized call, so any tick in flight finishes before it answers) leaves
+  # nothing to resurrect it; both checkouts and the coordinator are done by now, so nothing new is
+  # buffered for this id. Best-effort, like the rest of the cleanup: no Recorder running means no
+  # buffer to drain.
+  defp drain_recorder do
+    _ = Fathom.Directory.Recorder.flush()
+    :ok
+  catch
+    :exit, _ -> :ok
   end
 
   # A table NAME cannot be a bound parameter in SQLite, so this is the one place the drill builds
