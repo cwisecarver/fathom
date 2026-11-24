@@ -252,6 +252,47 @@ defmodule Fathom.Migrator.ShardMigrationJobTest do
            "a chain-jump revert's restore source (a landing version below to_version) was dropped"
   end
 
+  # Audit 2026-11-22 #21. The guard above is deliberately over-broad (any in-flight revert), and it
+  # CANCELS: "the copy leaks until the retirement re-drive". But the re-drive sweep
+  # (`Directory.retirement_overdue/2`) can only name the shard's CURRENT `retained_version`, so a
+  # retirement of any OLDER version (v1 after v1->v2->v3) that came due while a revert was queued was
+  # never retried and the copy leaked for ever. The cancelled job now re-arms one at the normal
+  # retention, which is the copy's real due date.
+  test "a retirement cancelled for a revert in flight re-arms itself", %{shard: shard} do
+    seed_v1!(shard)
+    :ok = Storage.retain(shard, 1)
+    {:ok, _} = Directory.cutover(shard, 3)
+    {:ok, _} = Oban.insert(RevertJob.new(%{shard_id: shard, to_version: 2}))
+
+    assert {:cancel, :revert_in_flight} =
+             perform_job(RetirementJob, %{"shard_id" => shard, "version" => 1})
+
+    assert [job] =
+             all_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1})
+
+    assert job.state == "scheduled"
+
+    assert_in_delta DateTime.diff(job.scheduled_at, DateTime.utc_now()),
+                    RetirementJob.retention_seconds(),
+                    60
+  end
+
+  # The re-arm creates a row it may already have run past: a re-armed retirement of @1, then a later
+  # forward migration retains a FRESH @1 and schedules its own, would let the re-armed one fire first
+  # and drop the fresh backup early. `cancel_pending/2` runs in the cutover's transaction so exactly
+  # one live retirement per (shard, version) ever exists.
+  test "a cutover supersedes an older pending retirement of the same version", %{shard: shard} do
+    seed_v1!(shard)
+    {:ok, _} = Migrator.release(2, "v2", @v2_statements)
+    {:ok, _} = Oban.insert(RetirementJob.new(%{shard_id: shard, version: 1}, schedule_in: 60))
+
+    assert :ok = perform_job(ShardMigrationJob, %{"shard_id" => shard, "target" => 2})
+
+    assert [_one] =
+             all_enqueued(worker: RetirementJob, args: %{"shard_id" => shard, "version" => 1}),
+           "the old retirement survived next to the fresh one and can drop the new backup early"
+  end
+
   # The other half of #17: RevertJob cancels the pending retirement at the TOP of
   # perform (before restore), not in the :ok branch — so the restore source is
   # protected even when the revert itself then fails and retries.

@@ -14,8 +14,12 @@ defmodule Fathom.Migrator.RolloutTest do
   alias Fathom.Directory
   alias Fathom.Test.Env
 
+  # Fixtures below release v1 before v2 even where the test is about v2: a shard stamped v0 needs a
+  # BUILDABLE chain (1, 2) to be selected at all (audit 2026-11-22 #14; `run/3` would cancel it as
+  # `unknown_version` otherwise). A fixture with only v2 released described a rollout nothing can run.
   describe "rollout/1" do
     test "enqueues a migration job for each active shard behind HEAD" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = resolve_flushed("a")
       {:ok, _} = resolve_flushed("b")
@@ -36,6 +40,7 @@ defmodule Fathom.Migrator.RolloutTest do
     test "the capture template is excluded from the rollout sweep" do
       Env.put!(:template_shard_id, "tmpl_ex")
 
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = resolve_flushed("tmpl_ex")
       {:ok, _} = resolve_flushed("tenant_x")
@@ -44,6 +49,71 @@ defmodule Fathom.Migrator.RolloutTest do
       assert_enqueued(migration_job_args("tenant_x"))
       refute_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "tmpl_ex"})
       assert Directory.count_laggards(2) == 1
+    end
+
+    # Audit 2026-11-22 #14. v2 is yanked AFTER v3 was captured on top of it, so it is not skippable and
+    # every shard still at v1 has no buildable chain (`run/3`'s pre-flight cancels each one as
+    # `unknown_version`, and a cancelled job is not a live state). The selection used to offer them
+    # anyway, hottest first: each reconcile run re-inserted the same doomed jobs, the loop never saw a
+    # short chunk, and the buildable tail (shards at v2, one step from v3) sat behind them. Buildability
+    # depends only on (version, HEAD), so the unbuildable versions are left out of the SELECTION.
+    test "the sweep skips shards whose chain cannot be built, so the buildable tail is reached (#14)" do
+      dm = "INSERT INTO django_migrations (app, name, applied) VALUES "
+      {:ok, _} = Migrator.release(1, "v1", [], 1)
+      {:ok, _} = Migrator.release(2, "v2", [dm <> "('app', '0002', 'now')"], 2)
+      {:ok, _} = Migrator.release(3, "v3", [dm <> "('app', '0003', 'now')"], 3)
+      :ok = Migrator.yank(2)
+      assert Migrator.head() == 3
+
+      # Cold and buildable (v2 -> v3 needs only v3), created FIRST so they are the least active.
+      for id <- ~w(buildable_a buildable_b) do
+        {:ok, _} = resolve_flushed(id)
+        {:ok, _} = Directory.cutover(id, 2)
+      end
+
+      # Hot and unbuildable (v1 -> v3 needs the yanked v2), created LAST so they sort first.
+      for id <- ~w(doomed_a doomed_b doomed_c) do
+        {:ok, _} = resolve_flushed(id)
+        {:ok, _} = Directory.cutover(id, 1)
+      end
+
+      assert {:ok, 2} = Migrator.rollout(2)
+
+      for id <- ~w(buildable_a buildable_b),
+          do: assert_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => id, "target" => 3})
+
+      for id <- ~w(doomed_a doomed_b doomed_c),
+          do: refute_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => id})
+
+      # The gauge still counts them: an unbuildable shard IS behind, and `converged` must not lie.
+      assert Directory.count_laggards(3) == 5
+    end
+
+    # The same filter must not strand a shard that CAN jump a yanked version: v2 walked back before
+    # v3 was captured is skippable, so v1 -> v3 is buildable and v1 shards stay in the selection.
+    test "a yanked version that is skippable does not hide the shards below it (#14)" do
+      dm = "INSERT INTO django_migrations (app, name, applied) VALUES "
+      {:ok, _} = Migrator.release(1, "v1", [], 1)
+      {:ok, _} = Migrator.release(2, "v2", [dm <> "('app', '0002', 'now')"], 2)
+      :ok = Migrator.yank(2)
+
+      # Template walked back to v1 and the fix captured again: post-capture count 2, pre-capture 1.
+      {:ok, _} =
+        Migrator.release(
+          3,
+          "v3",
+          ["ALTER TABLE app_thing ADD COLUMN good TEXT", dm <> "('app', '0003', 'now')"],
+          2
+        )
+
+      assert Migrator.skippable_yanked(1, 3) == MapSet.new([2]),
+             "fixture: v2 must be skippable for this test to mean anything"
+
+      {:ok, _} = resolve_flushed("jumper")
+      {:ok, _} = Directory.cutover("jumper", 1)
+
+      assert {:ok, 1} = Migrator.rollout()
+      assert_enqueued(worker: ShardMigrationJob, args: %{"shard_id" => "jumper", "target" => 3})
     end
 
     test "is a no-op when no version is released (HEAD 0)" do
@@ -60,6 +130,7 @@ defmodule Fathom.Migrator.RolloutTest do
       # Watermark <= batch size is the pre-2026-10-14 one-chunk-per-run behaviour.
       Env.put!(:reconcile_watermark, 2)
 
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       for id <- ~w(rb_a rb_b rb_c rb_d), do: resolve_flushed(id)
 
@@ -76,6 +147,7 @@ defmodule Fathom.Migrator.RolloutTest do
       Env.put!(:reconcile_batch_size, 2)
       Env.put!(:reconcile_watermark, 5)
 
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       for n <- 1..10, do: resolve_flushed("wm_#{n}")
 
@@ -93,6 +165,7 @@ defmodule Fathom.Migrator.RolloutTest do
     test "the chunk loop ends when the laggards run out, and the time budget cuts it after chunk 1" do
       Env.put!(:reconcile_batch_size, 2)
       Env.put!(:reconcile_watermark, 1_000)
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       for n <- 1..5, do: resolve_flushed("ex_#{n}")
 
@@ -110,6 +183,7 @@ defmodule Fathom.Migrator.RolloutTest do
     # does NOT honor the worker's per-shard :unique. Without the manual dedup, every hourly
     # reconcile would re-enqueue already-queued shards and pile up jobs. Pin idempotency.
     test "is idempotent: a second sweep re-enqueues nothing while jobs are in flight" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = resolve_flushed("a")
       {:ok, _} = resolve_flushed("b")
@@ -175,6 +249,7 @@ defmodule Fathom.Migrator.RolloutTest do
     # rollout limit above that hits at real fleet size. `BulkEnqueue.unique/1` must chunk both the
     # dedup pre-check and the insert.
     test "a sweep bigger than the bind-parameter cap enqueues in chunks, not one statement" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
@@ -200,6 +275,7 @@ defmodule Fathom.Migrator.RolloutTest do
 
   describe "reconcile" do
     test "re-runs the rollout sweep" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = resolve_flushed("a")
 
@@ -240,6 +316,7 @@ defmodule Fathom.Migrator.RolloutTest do
     end
 
     test "yank cancels pending forward jobs targeting the version" do
+      {:ok, _} = Migrator.release(1, "good", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "bad", ["SELECT 1"])
       {:ok, _} = resolve_flushed("c")
       assert {:ok, 1} = Migrator.rollout()
@@ -270,6 +347,7 @@ defmodule Fathom.Migrator.RolloutTest do
     # `executing` state (a bare Repo.update_all, no running Task) that could not exercise the brutal
     # kill it claimed was safe.
     test "yank does NOT cancel an executing forward job (it completes cleanly), only pending ones" do
+      {:ok, _} = Migrator.release(1, "good", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "bad", ["SELECT 1"])
       {:ok, _} = resolve_flushed("e")
       {:ok, _} = resolve_flushed("p")
@@ -425,6 +503,7 @@ defmodule Fathom.Migrator.RolloutTest do
   # deploy gate green over a fleet slice stuck at vN-1, with nothing ever requeueing it.
   describe "quarantined shards and the deploy gate" do
     test "converged is false while a migration_failed shard sits below head" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = resolve_flushed("cg")
       {:ok, _} = Directory.cutover("cg", 2)
@@ -440,6 +519,7 @@ defmodule Fathom.Migrator.RolloutTest do
     # Expert review 2026-10-12 #6. Symptom: a revert that failed left its shard `migration_failed` at
     # head+1 (the yanked schema); count_failed_below only saw < head, so the gate read converged.
     test "converged is false while a migration_failed shard sits ABOVE head" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = Migrator.release(3, "v3", ["SELECT 1"])
       {:ok, _} = resolve_flushed("cg_hi")
@@ -455,6 +535,7 @@ defmodule Fathom.Migrator.RolloutTest do
     end
 
     test "ReconcileJob requeues a migration_failed shard only after the cool-off" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = resolve_flushed("cf")
       {:ok, _} = Directory.mark_failed("cf")
@@ -485,6 +566,7 @@ defmodule Fathom.Migrator.RolloutTest do
     end
 
     test "a quarantined shard that is still being touched cools off on quarantined_at" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = resolve_flushed("hot")
       {:ok, _} = Directory.mark_failed("hot")
@@ -498,6 +580,7 @@ defmodule Fathom.Migrator.RolloutTest do
     end
 
     test "a shard quarantined just now is not requeued even if its updated_at is old" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = resolve_flushed("fresh")
       {:ok, _} = Directory.mark_failed("fresh")
@@ -508,6 +591,7 @@ defmodule Fathom.Migrator.RolloutTest do
     end
 
     test "automatic requeues are capped; retry_failed/0 resets the cap; a cutover resets it" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = resolve_flushed("flap")
 
@@ -532,6 +616,7 @@ defmodule Fathom.Migrator.RolloutTest do
     end
 
     test "ReconcileJob survives a failing cool-off requeue and still runs the rollout" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = resolve_flushed("lag")
 
@@ -545,6 +630,7 @@ defmodule Fathom.Migrator.RolloutTest do
 
   describe "retry_failed/0" do
     test "un-quarantines failed shards and re-enqueues their migration to HEAD" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
       {:ok, _} = resolve_flushed("fq")
       {:ok, _} = Directory.mark_failed("fq")
@@ -571,6 +657,7 @@ defmodule Fathom.Migrator.RolloutTest do
     # was measured and is false; see `Directory.requeue_failed/1` and
     # `directory_bind_parameter_test.exs`.
     test "the whole quarantined slice is swept in chunks, and each chunk converges as it goes" do
+      {:ok, _} = Migrator.release(1, "v1", ["SELECT 1"])
       {:ok, _} = Migrator.release(2, "v2", ["SELECT 1"])
 
       # More than one chunk's worth would take 5 001 shards; the invariant that is actually worth

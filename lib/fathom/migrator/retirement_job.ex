@@ -110,9 +110,14 @@ defmodule Fathom.Migrator.RetirementJob do
       # as landed). Over-matching an unrelated retirement is the SAFE direction: RevertJob's
       # up-front cancel can't reach a retirement that already dequeued (executing is uncancellable),
       # so this side must check. Cancelled, not snoozed: if the revert lands the version is live
-      # (drop would be wrong); if it fails, or the retirement was unrelated, the copy leaks until
-      # the retirement re-drive (`ErasureSweepJob`) — the recoverable direction.
+      # (drop would be wrong); if it fails, or the retirement was unrelated, the copy would leak, so
+      # it RE-ARMS itself first (audit 2026-11-22 #21): the sweep (`ErasureSweepJob` via
+      # `Directory.retirement_overdue/2`) can only re-drive the shard's CURRENT `retained_version`, so
+      # an OLDER version's retirement (v1 after v1 -> v2 -> v3) was never retried and its copy leaked
+      # for ever. If the revert then restores this version it is live and the re-armed job cancels
+      # `:version_live`; if the revert is still queued at the next due date this branch re-arms again.
       revert_in_flight?(shard_id) ->
+        rearm(shard_id, version)
         {:cancel, :revert_in_flight}
 
       true ->
@@ -136,6 +141,38 @@ defmodule Fathom.Migrator.RetirementJob do
       _ = Directory.clear_retained_version(shard_id, version)
       :ok
     end
+  end
+
+  # Best-effort: a Postgres blip here must not turn a cancel into a crash; the worst case is the leak
+  # this exists to close, no worse than before.
+  defp rearm(shard_id, version) do
+    _ = Oban.insert(schedule_changeset(shard_id, version))
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  @doc """
+  Cancel every PENDING (not yet executing) retirement of `version`'s retained copy for `shard_id`;
+  returns how many. A forward cutover calls this in its own transaction before scheduling the fresh
+  retirement for the copy it just retained, so a re-armed or stale older job cannot drop the new
+  backup early (audit 2026-11-22 #21); a revert calls it for its landing version (restore source).
+  """
+  @spec cancel_pending(String.t(), non_neg_integer()) :: non_neg_integer()
+  def cancel_pending(shard_id, version) do
+    {:ok, n} =
+      Oban.cancel_all_jobs(
+        from(j in Oban.Job,
+          where: j.worker == "Fathom.Migrator.RetirementJob",
+          where: j.state in ["scheduled", "available", "retryable"],
+          where: fragment("?->>'shard_id' = ?", j.args, ^shard_id),
+          where: fragment("(?->>'version')::bigint = ?", j.args, ^version)
+        )
+      )
+
+    n
   end
 
   defp version_live?(shard_id, version) do

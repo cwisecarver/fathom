@@ -28,8 +28,6 @@ defmodule Fathom.Migrator.RevertJob do
 
   require Logger
 
-  import Ecto.Query, only: [from: 2]
-
   alias Fathom.Migrator.ShardMigration
   alias Fathom.Migrator.ShardMigrationJob
   alias Fathom.Shard.Storage
@@ -397,17 +395,6 @@ defmodule Fathom.Migrator.RevertJob do
     end
   end
 
-  defp cancel_retirement(shard_id, version) do
-    {:ok, n} =
-      Oban.cancel_all_jobs(
-        from(j in Oban.Job,
-          where: j.worker == "Fathom.Migrator.RetirementJob",
-          where: j.state in ["scheduled", "available", "retryable"],
-          where: fragment("?->>'shard_id' = ?", j.args, ^shard_id),
-          where: fragment("(?->>'version')::bigint = ?", j.args, ^version)
-        )
-      )
-
-    n
-  end
+  defp cancel_retirement(shard_id, version),
+    do: Fathom.Migrator.RetirementJob.cancel_pending(shard_id, version)
 end

@@ -1308,9 +1308,29 @@ defmodule Fathom.Migrator do
         {:ok, 0}
 
       head ->
+        # Versions whose chain to HEAD cannot be built (a yanked or unreleased intermediate that is
+        # not skippable) are left out of the SELECTION, not just cancelled afterwards (audit
+        # 2026-11-22 #14). `run/3`'s pre-flight cancels each such shard as `unknown_version`, a
+        # cancelled job is not a live state, and so the same hottest-first shards were offered and
+        # cancelled again on every chunk of every run: the loop never saw a short chunk, the watermark
+        # never filled, and the buildable tail behind them was starved. Buildability is a property of
+        # (version, HEAD), so it is asked once per stale version, with the same function the
+        # pre-flight uses; a shard that CAN jump a yanked version (`skippable_yanked/2`) stays in.
+        unbuildable =
+          head
+          |> Directory.stale_versions()
+          |> Enum.reject(&Fathom.Migrator.ShardMigration.chain_buildable?(&1, head))
+
+        if unbuildable != [] do
+          Fathom.LogLimiter.log(:rollout_unbuildable, :warning, fn ->
+            "rollout: shards at version(s) #{inspect(unbuildable)} have no buildable chain to " <>
+              "HEAD #{head} (a yanked or unreleased intermediate); not enqueuing them"
+          end)
+        end
+
         count =
           head
-          |> Directory.laggards(limit)
+          |> Directory.laggards(limit, except_versions: unbuildable)
           |> Enum.map(
             &{&1.shard_id, ShardMigrationJob.new(%{shard_id: &1.shard_id, target: head})}
           )

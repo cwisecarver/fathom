@@ -1338,8 +1338,13 @@ defmodule Fathom.Directory do
   The rollout sweep cursor: active shards behind `head_version`, most-recently-used
   first (hot shards migrate first), capped at `limit`.
   """
-  @spec laggards(non_neg_integer(), pos_integer()) :: [Shard.t()]
-  def laggards(head_version, limit) do
+  @spec laggards(non_neg_integer(), pos_integer(), keyword()) :: [Shard.t()]
+  def laggards(head_version, limit, opts \\ []) do
+    # `:except_versions`: stale versions the ROLLOUT must not offer (audit 2026-11-22 #14), the ones
+    # whose chain to HEAD cannot be built. Selection only: `count_laggards/1` never takes it, an
+    # unbuildable shard is still behind and `converged` must not say otherwise.
+    except = Keyword.get(opts, :except_versions, [])
+
     # PER VERSION (expert review 2026-10-13 #28). One `schema_version < head ORDER BY last_active_at`
     # query cannot be answered from the `(schema_version, last_active_at)` index in order, so
     # Postgres sorted every laggard on each sweep. An equality on `schema_version` can: each probe
@@ -1347,6 +1352,7 @@ defmodule Fathom.Directory do
     # version (normally two or three versions are live during a rollout).
     head_version
     |> stale_versions()
+    |> Enum.reject(&(&1 in except))
     |> Enum.flat_map(fn v ->
       head_version |> laggards_at_version_query(v, limit) |> Repo.all()
     end)
@@ -1370,7 +1376,9 @@ defmodule Fathom.Directory do
   # The distinct active `schema_version`s below `head_version`, via a recursive "loose index scan":
   # one index probe per DISTINCT version rather than a pass over every laggard row. Postgres has no
   # skip scan before 18, and a plain SELECT DISTINCT would read each laggard.
-  defp stale_versions(head_version) do
+  @doc false
+  @spec stale_versions(non_neg_integer()) :: [non_neg_integer()]
+  def stale_versions(head_version) do
     %{rows: rows} =
       Repo.query!(
         """

@@ -934,6 +934,13 @@ defmodule Fathom.Migrator.ShardMigration do
   defp ledger_mode,
     do: Application.get_env(:fathom, :migration_ledger_check, :enforce)
 
+  @doc false
+  # Whether a shard stamped `current` has a buildable chain to `target`: exactly `run/3`'s pre-flight
+  # answer, which depends on the release rows and the two versions and on nothing about the shard.
+  # The rollout uses it to leave unbuildable versions out of its selection (audit 2026-11-22 #14).
+  @spec chain_buildable?(non_neg_integer(), non_neg_integer()) :: boolean()
+  def chain_buildable?(current, target), do: match?({:ok, _}, statement_chain(current, target))
+
   defp statement_chain(current, target) do
     versions = Enum.to_list((current + 1)..target//1)
 
@@ -1166,6 +1173,11 @@ defmodule Fathom.Migrator.ShardMigration do
   # the shard does not have.
   defp cutover_with_retirement(shard_id, cutover_to, retire_version, opts \\ []) do
     Repo.transaction(fn ->
+      # An OLDER pending retirement of the same `@retire_version` (re-armed by `RetirementJob` after a
+      # revert guard, or left from an earlier cycle) would fire before the fresh one and drop the
+      # backup this cutover just retained: one live retirement per (shard, version) (audit 2026-11-22 #21).
+      _ = RetirementJob.cancel_pending(shard_id, retire_version)
+
       with {:ok, row} <- Directory.cutover(shard_id, cutover_to, retire_version, opts),
            {:ok, _job} <- Oban.insert(RetirementJob.schedule_changeset(shard_id, retire_version)) do
         row
