@@ -38,9 +38,11 @@ LB remap window there is exactly one writer.
   new node steals it (epoch+1). If the old node is briefly still alive, it self-fences the
   moment its renewal comes back `:superseded` (`Fathom.Shard`, `shard.ex`). Two nodes can
   never both write `acme`. Worst case is a **TTL-bounded** handoff stall, not a double-write.
-- **Isolation** (the release-blocker invariant) is the LB partition (one subdomain → one
-  node) **plus** the lease (one writer per shard). A query for shard A can never reach shard
-  B's node and can never write B's file.
+- **Routing and writer isolation** (the release-blocker invariant) is the LB partition (one
+  subdomain → one node) **plus** the lease (one writer per shard). A query *for* shard A can never
+  reach shard B's node and can never write B's file. This is not tenant authorization: with
+  `HRANA_AUTH=disabled` a client picks the shard by picking the `Host`, so every LB client can reach
+  every shard (see [auth.md](auth.md)).
 
 This was validated end-to-end by the S1 spike (2026-06-30, `scratchpad/s1-lb-spike`):
 deterministic subdomain→node, **WS routes identically to HTTP**, ~1/N remap on node add,
@@ -49,7 +51,7 @@ and in-request failover on node death.
 ## Trust boundary and authentication
 
 **By default the Hrana data path (port 8080) carries no in-app credential.** A request's
-shard is taken from the `Host` subdomain the LB sets — no bearer token, no JWT check, no
+shard is taken from the `Host` subdomain the client sends and the LB forwards — no bearer token, no JWT check, no
 per-tenant secret. Isolation is **placement + lease** (above), not identity. In-app
 per-shard auth exists and is opt-in — see "Per-tenant credentials" below.
 

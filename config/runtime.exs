@@ -933,8 +933,9 @@ end
 #
 # TRUST ASSUMPTION (expert review #17): the pin decision trusts q_per_s, a signal a tenant
 # fully controls from the data path. Enabling the rebalancer presumes the Hrana trust
-# boundary is enforced — either the network boundary (LB-only reachability; the default
-# `:hrana_auth` disabled posture — see docs/deploy-cluster.md) or `HRANA_AUTH=required`.
+# boundary is enforced: `HRANA_AUTH=required`, or `disabled` with EVERY LB client trusted (a single
+# trust domain; LB-only reachability keeps outsiders off the port but does not separate LB clients
+# from each other — see docs/auth.md).
 # Without it, any LB-reachable caller could drive a shard they don't own over the hot bar to
 # induce a handoff (a brief drain blip on the victim). The move is bounded by confirm_windows,
 # cooldown_ms, max_moves (1/tick), and the improvement guard, but the boundary is the
@@ -1749,8 +1750,8 @@ if config_env() == :prod do
     raise """
     environment variable HRANA_AUTH is missing.
     Set it explicitly: HRANA_AUTH=required (every stream presents a per-shard token) or
-    HRANA_AUTH=disabled (the network is the trust boundary: :8080 reachable only via the LB —
-    see docs/auth.md). Prod no longer defaults to an unauthenticated data plane.
+    HRANA_AUTH=disabled (the network is the trust boundary: :8080 reachable only via the LB, and
+    EVERY LB client can open EVERY shard — a single trust domain only; see docs/auth.md). Prod no longer defaults to an unauthenticated data plane.
     """
   end
 

@@ -16,6 +16,9 @@ fleet DDL — so in production the template must be reachable **only by you**:
 - Set `:template_shard_id` (e.g. `template`) on the nodes that should capture. Never make it equal
   `:default_shard`, and never leave it anonymously reachable (`Fathom.BootChecks` refuses a prod
   boot where the default shard is the template).
+- Once every tenant is forked from the template and migrations ship by rollout, set
+  `BLOCK_TENANT_DDL=true` so ad-hoc tenant DDL cannot outrun the version stamp (leave it off while
+  tenants are born empty: their first `manage.py migrate` is tenant DDL).
 - Turn on `HRANA_AUTH=required` and mint a token for the template: `mix fathom.token template`.
   Point a **dedicated** Django project (your "migrations" project) at it:
 

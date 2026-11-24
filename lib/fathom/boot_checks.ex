@@ -960,7 +960,8 @@ defmodule Fathom.BootChecks do
       Logger.warning(
         "config warning: the Hrana data plane is enabled, unauthenticated (:hrana_auth :disabled), " <>
           "AND bound to all interfaces — the only tenant-isolation control is an external " <>
-          "firewall/security-group. Set HRANA_AUTH=required or pin HRANA_BIND_IP to the private " <>
+          "firewall/security-group, and with auth disabled every LB client can open every shard. " <>
+          "Set HRANA_AUTH=required or pin HRANA_BIND_IP to the private " <>
           "interface the LB reaches (expert review 2026-07-14 #18)."
       )
     end

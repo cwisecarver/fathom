@@ -255,6 +255,13 @@ firewall / security group / private subnet and pin the interface with `HRANA_BIN
 binds a public one. A client that can reach the port can open any shard; the whole security model in
 this mode is "only the LB can reach the port."
 
+`disabled` is a **single-trust-domain** posture. The `Host` header is the only shard selector
+(`ShardExecutor.shard_from_conn/1`), and the LB hashes on and forwards the `Host` the client sent
+(`hash $host`, `proxy_set_header Host $host`); it cannot do otherwise, since the `Host` is what names
+the shard. Therefore **every client that can reach the LB can open every shard.** Use `disabled` only
+when all LB clients belong to one operator's trust domain (for example one organisation's own Django
+apps); tenants that are mutually untrusted MUST run `HRANA_AUTH=required`.
+
 ## `/api` CSRF: state-changing calls must declare JSON
 
 `/api` accepts either a Bearer API key or the shared admin BasicAuth. Browsers cache Basic
@@ -284,4 +291,5 @@ header.
 Auth is a per-shard `Phoenix.Token` presented as libSQL's native `authToken` (Bearer over HTTP,
 `hello.jwt` over WS) and checked on Filo's `:authorize` callback — required or disabled via a runtime,
 fail-closed `:hrana_auth` mode — so an unchanged client authenticates per tenant with no oracle; when
-it's disabled, the trust boundary is LB-only network reachability.
+it's disabled, the trust boundary is LB-only network reachability, which makes it a
+single-trust-domain posture (every LB client can open every shard).
