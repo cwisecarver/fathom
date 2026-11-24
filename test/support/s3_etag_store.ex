@@ -34,9 +34,19 @@ defmodule Fathom.Test.S3EtagStore do
       # PUT against a missing key answers (`set_missing_if_match_status/2`).
       faults: [],
       fired: %{},
-      missing_if_match: 412
+      missing_if_match: 412,
+      # MinIO's behaviour: a conditional DELETE ignores `If-Match` and deletes (204). See
+      # `set_weak_delete/2` and the `:allow_weak_conditional_delete` escape hatch in `S3`.
+      weak_delete: false
     }
   end
+
+  @doc """
+  Model a store whose conditional DELETE is not enforced (MinIO): every DELETE succeeds with 204
+  whatever `If-Match` says. The real S3 answers 412, which is what the default double does; this is
+  the other half of the contract (audit 2026-11-22 #7).
+  """
+  def set_weak_delete(agent, on?), do: Agent.update(agent, &Map.put(&1, :weak_delete, on?))
 
   @doc "Set the store's reported `Date` clock (epoch-ms), or nil for no Date header (#13)."
   def set_date_ms(agent, ms), do: Agent.update(agent, &%{&1 | date_ms: ms})
@@ -712,9 +722,10 @@ defmodule Fathom.Test.S3EtagStore do
   defp delete_object(conn, agent, key) do
     if_match = Plug.Conn.get_req_header(conn, "if-match")
     current = Agent.get(agent, &Map.get(&1.objects, key))
+    weak? = Agent.get(agent, &Map.get(&1, :weak_delete, false))
 
     cond do
-      if_match == [] ->
+      if_match == [] or weak? ->
         Agent.update(agent, &%{&1 | objects: Map.delete(&1.objects, key)})
         Plug.Conn.send_resp(conn, 204, "")
 

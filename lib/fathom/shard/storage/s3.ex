@@ -3459,7 +3459,7 @@ defmodule Fathom.Shard.Storage.S3 do
           {:ok, _} = ok -> ok
           # The re-read lock names OUR OWN owner string — `owner` carries this node's boot
           # incarnation, so this cannot be another node. Confirm the epoch and retry.
-          {:error, {:held, ^owner, _at}} -> renew_after_own_write(shard_id, renewed, owner, epoch)
+          {:error, {:held, ^owner, _at}} -> renew_after_own_write(shard_id, renewed, lease)
           {:error, {:held, _, _at}} -> {:error, :superseded}
           {:error, :precondition_failed} -> {:error, :superseded}
           err -> err
@@ -3469,16 +3469,19 @@ defmodule Fathom.Shard.Storage.S3 do
       # store omitted the header): read the lock to learn it, then fence the PUT.
       _ ->
         case get_lock(shard_id) do
-          {:ok, %{owner: ^owner, epoch: ^epoch}, etag} ->
-            case put_lock(shard_id, renewed, if_match: etag) do
-              {:ok, _} = ok -> ok
-              {:error, {:held, _, _at}} -> {:error, :superseded}
-              {:error, :precondition_failed} -> {:error, :superseded}
-              err -> err
+          {:ok, lock, etag} ->
+            # `own_lock?/2`, not owner+epoch: a same-owner reclaim keeps the epoch (see
+            # `renew_after_own_write/3`), and renewing OVER it would regress its claim.
+            if own_lock?(lock, lease) do
+              case put_lock(shard_id, renewed, if_match: etag) do
+                {:ok, _} = ok -> ok
+                {:error, {:held, _, _at}} -> {:error, :superseded}
+                {:error, :precondition_failed} -> {:error, :superseded}
+                err -> err
+              end
+            else
+              {:error, :superseded}
             end
-
-          {:ok, _other, _etag} ->
-            {:error, :superseded}
 
           :not_found ->
             {:error, :superseded}
@@ -3496,13 +3499,18 @@ defmodule Fathom.Shard.Storage.S3 do
   # being told it was superseded.
   #
   # SAFE AGAINST A GENUINE TAKEOVER, which is the whole question. `owner` carries this node's
-  # boot incarnation, so a different node cannot match it; and a steal always BUMPS the epoch
-  # (`acquire_lease`'s steal path), so a lock at our owner and our epoch cannot be a peer's. If
-  # either differs we fall through to `:superseded` exactly as before. Bounded: one extra
-  # GET + PUT, no loop — a second 412 here means the object really is moving under us.
-  defp renew_after_own_write(shard_id, renewed, owner, epoch) do
-    case get_lock(shard_id) do
-      {:ok, %{owner: ^owner, epoch: ^epoch}, fresh_etag} ->
+  # boot incarnation, so a different node cannot match it. A steal bumps the epoch, but a same-owner
+  # RECLAIM (`acquire_existing/4`) keeps the epoch and only raises the CLAIM (`with_takeover_claim/4`),
+  # so owner and epoch alone cannot tell a newer coordinator's lock from our own earlier write (audit
+  # 2026-11-22 #4: this comment said a steal always bumps the epoch, which is false for a reclaim).
+  # The lock must therefore be OURS by `own_lock?/2`: owner, epoch AND claim, the identity the
+  # release side already uses (Jepsen 2026-11-14 H6). The coordinator never changes `lease.claim`
+  # after acquire, so a legitimate owner's lock always matches, including the legacy self-race this
+  # function exists for. If anything differs we fall through to `:superseded` exactly as before.
+  # Bounded: one extra GET + PUT, no loop; a second 412 here means the object really is moving under us.
+  defp renew_after_own_write(shard_id, renewed, lease) do
+    case read_own_lock(shard_id, lease) do
+      {:ours, fresh_etag} ->
         case put_lock(shard_id, renewed, if_match: fresh_etag) do
           {:ok, _} = ok -> ok
           _ -> {:error, :superseded}
@@ -3520,6 +3528,15 @@ defmodule Fathom.Shard.Storage.S3 do
   # semantics are identical: If-Match our own write, and a 412 means the lock is no longer
   # ours (a stealer wrote in the gap — finding #22) so leave it and no-op.
   def release_lease(shard_id, %{lock_etag: etag} = lease) when is_binary(etag) do
+    if allow_weak_conditional_delete?(),
+      do: release_lease_by_read(shard_id, lease),
+      else: release_lease_conditional(shard_id, lease, etag)
+  end
+
+  def release_lease(shard_id, %{owner: _owner, epoch: _epoch} = lease),
+    do: release_lease_by_read(shard_id, lease)
+
+  defp release_lease_conditional(shard_id, lease, etag) do
     trace_lock(shard_id, "release_delete", lease, %{if_match: etag})
 
     case lock_delete(shard_id, etag) do
@@ -3532,9 +3549,16 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
-  def release_lease(shard_id, %{owner: owner, epoch: epoch}) do
-    case get_lock(shard_id) do
-      {:ok, %{owner: ^owner, epoch: ^epoch}, etag} ->
+  # READ FIRST, then delete the etag just read. The only path when the lease carries no etag, and
+  # under `:allow_weak_conditional_delete` also the path for one that does: a store that ignores
+  # `If-Match` on DELETE (MinIO, the chaos rig) would delete a PEER's lock on a superseded
+  # coordinator's clean idle drop, which real S3 refuses with a 412 (audit 2026-11-22 #7: a plausible
+  # Jepsen hard-1 cause, and a false data-loss signal in the lineage scan). Reading first narrows the
+  # rig's window from "any time after the steal" to the GET->DELETE gap and still exercises the
+  # delete -> fresh-create reopen path a marker PUT would bypass. Prod never sets the flag.
+  defp release_lease_by_read(shard_id, %{owner: owner, epoch: epoch} = lease) do
+    case read_own_lock(shard_id, lease) do
+      {:ours, etag} ->
         # Conditional delete (If-Match the object we just read): a stall between this read and
         # the delete could let a stealer write its own lock in the gap, and an unconditional
         # delete would remove THAT lock (finding #22). A 412 means the lock is no longer the
@@ -3582,9 +3606,9 @@ defmodule Fathom.Shard.Storage.S3 do
     end
   end
 
-  def release_lease_keeping_claim(shard_id, %{owner: owner, epoch: epoch} = lease, claim) do
-    case get_lock(shard_id) do
-      {:ok, %{owner: ^owner, epoch: ^epoch}, etag} ->
+  def release_lease_keeping_claim(shard_id, %{owner: _owner, epoch: _epoch} = lease, claim) do
+    case read_own_lock(shard_id, lease) do
+      {:ours, etag} ->
         put_marker(shard_id, Storage.released_marker(lease, claim), etag)
 
       _ ->
