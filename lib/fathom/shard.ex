@@ -1821,6 +1821,8 @@ defmodule Fathom.Shard do
 
       {:ok, false} ->
         if Fathom.Shard.Retained.claimed?(path) do
+          # Preserved as a `.forked` copy, not deleted: the object is gone, so this is the last copy
+          # (audit 2026-11-22 #19). Still not served and not re-created from.
           if Fork.quarantine!(shard_id, path, :object_absent) == :ok,
             do: repull(shard_id, path),
             else: {:error, :quarantine_failed}

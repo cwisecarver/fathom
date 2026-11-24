@@ -175,6 +175,32 @@ defmodule Fathom.Shard.ErasedOpenGateTest do
 
         :ok = ShardExecutor.close(conn)
       end
+
+      # Audit 2026-11-22 #19. "Not served, not re-created" stands, but the retained copy used to be
+      # DELETED here (`Retained.discard`), on the grounds that it holds nothing the store lacks. When
+      # the object itself is gone that is false: the store lacks everything, and this is the last
+      # copy of the tenant on the node (an operator delete, a lifecycle rule or a bucket restore, with
+      # no tombstone marker). It is quarantined to `.forked.*` for recovery instead, where a real
+      # delete's `on_tombstoned` sweep still erases it and the TempReaper ages it out.
+      test "a claimed CLEAN-RETAINED copy whose object vanished is PRESERVED for recovery",
+           %{id: id, path: path} do
+        residue!(id, path, unquote(mode))
+        assert :ok = Storage.purge_shard(id)
+
+        assert {:ok, pid, ref, _path} = Shards.checkout(id)
+        Shard.checkin(pid, ref)
+
+        assert [forked] = Path.wildcard(path <> ".forked.*"),
+               "the last copy of a tenant whose object vanished was deleted, not quarantined"
+
+        {:ok, c} = Fathom.Shard.Connection.open(forked)
+
+        assert {:ok, %{rows: [["erased-person"]]}} =
+                 Fathom.Shard.Connection.query(c, "SELECT v FROM t", [])
+
+        Fathom.Shard.Connection.close(c)
+        on_exit(fn -> for f <- Path.wildcard(path <> ".forked.*"), do: File.rm_rf(f) end)
+      end
     end
   end
 

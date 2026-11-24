@@ -313,9 +313,28 @@ defmodule Fathom.Shard.Fork do
     # A claimed CLEAN-RETAINED copy (expert review 2026-10-20-2027 #22) holds nothing the store
     # lacks: its drop made the object durable first. A mismatch there means the lineage moved on
     # elsewhere, so delete it and let the caller pull — a `.forked` copy would only leak disk.
-    if Fathom.Shard.Retained.claimed?(path),
-      do: Fathom.Shard.Retained.discard(shard_id, path, reason),
-      else: quarantine_copy!(shard_id, path, reason)
+    #
+    # EXCEPT `:object_absent` (audit 2026-11-22 #19): there the store lacks EVERYTHING, because the
+    # object itself is gone under our lease with no tombstone marker (an operator delete, a lifecycle
+    # rule, a bucket restore), so "it holds nothing the store lacks" is false and this clean copy is
+    # the last one of the tenant on the node. It is still not served and the object is still not
+    # re-created from it (the pinned 2026-11-07 #14 stance); it is preserved as a `.forked` copy
+    # instead of deleted. A real tenant delete still wins: the tombstone broadcast and the DeleteJob
+    # erase `.forked.*` families, and the TempReaper ages the rest out.
+    cond do
+      reason == :object_absent and Fathom.Shard.Retained.claimed?(path) ->
+        with :ok <- quarantine_copy!(shard_id, path, reason) do
+          # The stored object this etag named is gone; a stale one would only mislead the re-pull.
+          Fathom.FS.rm(path <> ".etag")
+          :ok
+        end
+
+      Fathom.Shard.Retained.claimed?(path) ->
+        Fathom.Shard.Retained.discard(shard_id, path, reason)
+
+      true ->
+        quarantine_copy!(shard_id, path, reason)
+    end
   end
 
   defp quarantine_copy!(shard_id, path, reason) do
@@ -356,6 +375,11 @@ defmodule Fathom.Shard.Fork do
             :orphaned ->
               "recorded as born against NO stored object, but an object now exists — a peer " <>
                 "created the lineage while this node was down (expert review 2026-08-01 #2)"
+
+            :object_absent ->
+              "the stored object is GONE under our lease with no tombstone marker (an operator " <>
+                "delete, lifecycle rule or bucket restore); this clean-retained copy is the last " <>
+                "copy of the tenant on this node, kept for recovery, not served (audit 2026-11-22 #19)"
           end
 
         Logger.error(
