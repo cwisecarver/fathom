@@ -95,15 +95,21 @@ defmodule Fathom.HranaWsHibernateTest do
 
     {:memory, before} = :erlang.process_info(handler, :memory)
 
+    # Wait for the heap to SHRINK, not just for the process to be parked in `hibernate`. CI 2026-11-23
+    # (OTP 28) read `current_function == erlang:hibernate/3` and then the same 4,120,360 bytes it
+    # had before: the process is already in the BIF while the hibernation's garbage collection has
+    # not yet replaced the heap, so the two reads straddled it. Both conditions together are the
+    # property under test; a handler that never hibernates still fails here, by timeout.
     Await.until(
-      fn -> hibernated?(handler) end,
-      "the WS connection process never hibernated (no hibernate_after on the handler)"
+      fn ->
+        {:memory, now} = :erlang.process_info(handler, :memory)
+        hibernated?(handler) and now < before
+      end,
+      "the WS connection process never hibernated and shrank its heap (before: #{before} bytes)"
     )
 
     {:memory, after_mem} = :erlang.process_info(handler, :memory)
-
-    assert after_mem < before,
-           "hibernation must shrink the heap: #{before} -> #{after_mem}"
+    assert after_mem < before
 
     # Still serves after waking.
     {:ok, c, res} = HranaClient.execute(c, "SELECT count(*) FROM t")
