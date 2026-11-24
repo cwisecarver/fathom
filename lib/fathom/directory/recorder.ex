@@ -196,6 +196,17 @@ defmodule Fathom.Directory.Recorder do
   @spec flush() :: non_neg_integer()
   def flush, do: GenServer.call(__MODULE__, :flush, flush_timeout_ms())
 
+  @doc """
+  Forget everything buffered for `shard_id` (touch, flush stamp, owner, quiet window) WITHOUT writing
+  it, and return `:ok`. For a shard that is being removed from the directory on purpose: a touch
+  still buffered after the row is deleted is an upsert, and the next tick re-inserts the shard as an
+  ordinary `active` row (audit 2026-11-22 #13). A serialized call, so a flush already running (and
+  its failure path, which puts taken entries back) has finished first; and, unlike `flush/0`, it
+  writes nothing for any OTHER shard.
+  """
+  @spec discard(String.t()) :: :ok
+  def discard(shard_id), do: GenServer.call(__MODULE__, {:discard, shard_id}, flush_timeout_ms())
+
   # The flush is a Postgres write over an unbounded buffer, so the default 5 s call timeout could
   # expire mid-flush under load (expert review 2026-10-12 #35), and the revert guard's caller then
   # read a directory the Recorder had not finished writing. `:recorder_flush_timeout_ms` is the
@@ -273,6 +284,13 @@ defmodule Fathom.Directory.Recorder do
   @impl true
   def handle_call(:flush, _from, state) do
     {:reply, do_flush(), state}
+  end
+
+  def handle_call({:discard, shard_id}, _from, state) do
+    for table <- [@table, @flush_table, @owner_table, @quiet_table],
+        do: :ets.delete(table, shard_id)
+
+    {:reply, :ok, state}
   end
 
   def handle_call({:flush, opts}, _from, state) do

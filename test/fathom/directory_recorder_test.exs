@@ -30,6 +30,24 @@ defmodule Fathom.Directory.RecorderTest do
     assert {:ok, %{shard_id: ^b, schema_version: 0, status: "active"}} = Directory.get(b)
   end
 
+  # Audit 2026-11-22 #13. A shard removed on purpose (the restore drill's scratch fork) must not be
+  # resurrected by its own buffered touch, and discarding it must not write anyone else's.
+  test "discard/1 drops one shard's buffered touch and flush stamp and writes nothing else" do
+    gone = uniq()
+    kept = uniq()
+
+    assert :ok = Recorder.record(gone)
+    assert :ok = Recorder.record_flush(gone)
+    assert :ok = Recorder.record(kept)
+
+    assert :ok = Recorder.discard(gone)
+
+    # Only the other shard's entry is left to write, and the discarded one never reaches the directory.
+    assert Recorder.flush() == 1
+    assert {:ok, %{shard_id: ^kept}} = Directory.get(kept)
+    assert :error = Directory.get(gone)
+  end
+
   # Expert review 2026-10-08 #24: a flush (t1) and a later access (t2, inside the 30 s re-touch
   # window) buffered in the SAME tick. Accesses were written first, so the touch was skipped against
   # the OLD flush stamp, then the flush stamp moved past `last_active_at` — and `flush_lag_report/1`
