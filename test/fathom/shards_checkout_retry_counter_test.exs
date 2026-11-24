@@ -40,15 +40,24 @@ defmodule Fathom.ShardsCheckoutRetryCounterTest do
           do: File.rm(Path.join(dir, shard <> suffix))
     end)
 
-    Env.put!(:shard_idle_ms, 1)
-
     %{shard: shard}
   end
 
   test "a checkout that lands while the coordinator is idle-stopping is counted", %{shard: shard} do
+    # The coordinator is OPENED with a long idle window. It used to open with `:shard_idle_ms` 1, but
+    # the coordinator arms its own idle timer at open (`schedule_idle`), so a 1 ms window let the REAL
+    # timer stop it between `ensure` returning and the suspend below whenever the open was slow, as it
+    # is when this test runs alone (~5 of 6 runs). The checkout then met no stopping coordinator: it
+    # resolved a fresh one and emitted no retry, which the assertion read as a missing event. The
+    # stop-ready state is staged on the suspended process instead, so nothing can fire early.
+    Env.put!(:shard_idle_ms, 60_000)
     {:ok, pid} = Shards.ensure(shard)
     ref = Process.monitor(pid)
     :ok = :sys.suspend(pid)
+
+    :sys.replace_state(pid, fn st ->
+      %{st | idle_ms: 1, idle_since: System.monotonic_time(:millisecond) - 10}
+    end)
 
     # Ahead of the checkout in the mailbox, so the stop wins the race.
     send(pid, :idle_timeout)
