@@ -143,7 +143,7 @@ defmodule Fathom.Shards.AdmissionFlightTest do
     test "#{mode}: K concurrent checkouts of one cold shard at the cap evict one tenant",
          %{mode: mode} do
       LivenessMode.set!(mode)
-      {filled, cap} = fill_to_cap()
+      {filled, _cap} = fill_to_cap()
       assert_shard_mode!(hd(filled), mode)
       hot = uniq()
       on_exit(fn -> cleanup([hot | filled]) end)
@@ -160,7 +160,15 @@ defmodule Fathom.Shards.AdmissionFlightTest do
       assert length(evicted) == 1,
              "one admission must evict one tenant, evicted #{length(evicted)}: #{inspect(evicted)}"
 
-      assert Shards.open_count() == cap
+      # The population stays at the cap, read as "every shard this test opened survived except the one
+      # evicted". It used to be `Shards.open_count() == cap`, but `open_count/0` is NODE-wide: `cap` was
+      # sampled from it after the fill, so any other test's lingering shard that idle-stopped between
+      # the fill and here read as the node "falling below the cap" (CI 2026-11-20, OTP 28: 61 vs 62).
+      # Pre-fix this still fails: 16 evictions leave 15 of the survivors closed.
+      survivors = [hot | filled] -- evicted
+
+      assert Enum.all?(survivors, &match?([{_, _}], Registry.lookup(Fathom.ShardRegistry, &1))),
+             "a tenant other than the one evicted was closed: #{inspect(survivors)}"
     end
   end
 

@@ -306,7 +306,34 @@ defmodule Fathom.ShardLifecycleDeferralTest do
 
     Application.put_env(:fathom, :shard_object_encoding, :zstd)
     ShardFlush.flush!(pid)
-    assert_receive {[:fathom, :shard, :flush, :no_space], _, %{need: need_zstd}, _}, 2_000
+
+    # CI 2026-11-19 (OTP 28) saw this second event never arrive (`flush!` returned at once, so the
+    # tick was deferred or skipped rather than refused); not reproduced locally in 18 runs under CPU
+    # load. The first event is consumed above, so the coordinator's state at the miss is what says
+    # which branch of `handle_info(:durability_flush, ...)` took the tick.
+    need_zstd =
+      receive do
+        {[:fathom, :shard, :flush, :no_space], _, %{need: need}, _} -> need
+      after
+        2_000 ->
+          st = :sys.get_state(pid)
+
+          flunk(
+            "no :no_space event for the zstd flush: " <>
+              inspect(
+                Map.take(st, [
+                  :flush_task,
+                  :flush_failures,
+                  :flush_retry_ms,
+                  :closing,
+                  :lapse_revalidate_pending,
+                  :renew_task,
+                  :flush_timer
+                ]),
+                limit: 20
+              )
+          )
+      end
 
     assert need_zstd > need_none,
            "the encoder temp was not counted (#{need_zstd} vs #{need_none})"

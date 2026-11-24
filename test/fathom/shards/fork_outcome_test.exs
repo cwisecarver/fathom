@@ -71,7 +71,9 @@ defmodule Fathom.Shards.ForkOutcomeTest do
 
   test "the two benign refusals stay silent", %{shard: id} do
     for outcome <- [{:ok, :forked}, {:error, :template_shard}, {:error, :dst_exists}] do
-      assert capture_log(fn -> assert :ok = Shards.report_fork(outcome, id) end) == ""
+      # Node-wide capture: assert on THIS shard's lines, not on the node being quiet.
+      log = capture_log(fn -> assert :ok = Shards.report_fork(outcome, id) end)
+      refute log =~ id, "a benign fork refusal logged for #{id}: #{log}"
       refute_received {:fork_event, _, %{shard_id: ^id}}
     end
   end

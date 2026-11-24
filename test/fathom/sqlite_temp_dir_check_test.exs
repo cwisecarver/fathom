@@ -114,7 +114,13 @@ defmodule Fathom.SqliteTempDirCheckTest do
     test "not prod: silent" do
       Env.put!(:env, :dev)
 
-      assert capture_log([level: :warning], fn -> BootChecks.check_sqlite_temp_dir!() end) == ""
+      # `capture_log` is node-wide: it also collects any warning a coordinator from ANOTHER test logs
+      # while this runs (CI 2026-11-20 saw "shard dropbudget_...: lost lease before flush" here). So
+      # the assertion is that THIS check says nothing, not that the whole node was quiet.
+      log = capture_log([level: :warning], fn -> BootChecks.check_sqlite_temp_dir!() end)
+
+      refute log =~ "SQLite's temp directory"
+      refute log =~ "SHARD_DATA_DIR"
     end
   end
 end

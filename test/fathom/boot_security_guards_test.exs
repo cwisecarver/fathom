@@ -377,7 +377,7 @@ defmodule Fathom.BootSecurityGuardsTest do
     # Replication off and pool off: quiet.
     Env.put!(:connection_pool, false)
     Env.put!(:replication_enabled, false)
-    assert capture_log(fn -> Fathom.BootChecks.check_pool_fd_budget!() end) == ""
+    assert quiet_log(fn -> Fathom.BootChecks.check_pool_fd_budget!() end) == ""
   end
 
   # Expert review #9: template capture replays a shard's SQL fleet-wide, and AGENTS.md forbids a
@@ -634,22 +634,22 @@ defmodule Fathom.BootSecurityGuardsTest do
 
     # At or above the floor the A/B measured as clean, silence.
     Env.put!(:shard_flush_interval_ms, 30_000)
-    assert capture_log(fn -> Fathom.BootChecks.check_replication_flush_interval!() end) == ""
+    assert quiet_log(fn -> Fathom.BootChecks.check_replication_flush_interval!() end) == ""
 
     # 0 is idle-only flushing -- no periodic checkpoint at all, so no generation churn. It has its
     # own (unbounded-RPO) problem, which is not this guard's business.
     Env.put!(:shard_flush_interval_ms, 0)
-    assert capture_log(fn -> Fathom.BootChecks.check_replication_flush_interval!() end) == ""
+    assert quiet_log(fn -> Fathom.BootChecks.check_replication_flush_interval!() end) == ""
 
     # Not replicating: the interval is a pure RPO knob again and a tight one is unremarkable.
     Env.put!(:shard_flush_interval_ms, 5_000)
     Env.put!(:replication_enabled, false)
-    assert capture_log(fn -> Fathom.BootChecks.check_replication_flush_interval!() end) == ""
+    assert quiet_log(fn -> Fathom.BootChecks.check_replication_flush_interval!() end) == ""
 
     # And prod-only, like every sibling guard.
     Env.put!(:replication_enabled, true)
     Env.put!(:env, :dev)
-    assert capture_log(fn -> Fathom.BootChecks.check_replication_flush_interval!() end) == ""
+    assert quiet_log(fn -> Fathom.BootChecks.check_replication_flush_interval!() end) == ""
   end
 
   # Expert review 2026-08-20 #23. The replica store holds a full copy of every shard this node
@@ -685,12 +685,12 @@ defmodule Fathom.BootSecurityGuardsTest do
     # Not listening: this node is nobody's follower, so the replica store never grows and the
     # arrangement is irrelevant however the directories are laid out.
     Env.put!(:replication_listen, false)
-    assert capture_log(fn -> Fathom.BootChecks.check_replication_disk!() end) == ""
+    assert quiet_log(fn -> Fathom.BootChecks.check_replication_disk!() end) == ""
 
     # And prod-only, like every sibling guard.
     Env.put!(:replication_listen, true)
     Env.put!(:env, :dev)
-    assert capture_log(fn -> Fathom.BootChecks.check_replication_disk!() end) == ""
+    assert quiet_log(fn -> Fathom.BootChecks.check_replication_disk!() end) == ""
   end
 
   # All five 2026-07-14 config guards are prod-only: with env != :prod (the dev/test default),
@@ -723,5 +723,18 @@ defmodule Fathom.BootSecurityGuardsTest do
 
     refute log =~ "commingles"
     refute log =~ "firewall"
+  end
+
+  # The log a boot check wrote, MINUS other tests' shard-coordinator lines. `capture_log` is node-wide,
+  # so a "silent" assertion on the bare capture also fails when an unrelated coordinator logs inside the
+  # window (CI 2026-11-22: "shard adm_...: lease superseded by another node" inside a `== ""`). Boot
+  # checks never log in the `shard <id>: ...` form, so dropping that form leaves exactly their output.
+  defp quiet_log(fun) do
+    import ExUnit.CaptureLog
+
+    capture_log(fun)
+    |> String.split("\n")
+    |> Enum.reject(&(&1 == "" or &1 =~ ~r/\[\w+\] shard [^\s:]+: /))
+    |> Enum.join("\n")
   end
 end
