@@ -3574,8 +3574,13 @@ defmodule Fathom.Shard.Storage.S3 do
           {:error, reason} -> {:error, reason}
         end
 
-      _ ->
+      :not_ours ->
         :ok
+
+      # A failed READ is not "not ours": the caller's retries and its `release_failed` log ("the lock
+      # may still name this node") depend on the error surfacing, which the etag fast path always did.
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -3611,8 +3616,12 @@ defmodule Fathom.Shard.Storage.S3 do
       {:ours, etag} ->
         put_marker(shard_id, Storage.released_marker(lease, claim), etag)
 
-      _ ->
+      :not_ours ->
         :ok
+
+      # A failed read is not "not ours" (see `release_lease_by_read/2`).
+      {:error, _reason} = error ->
+        error
     end
   end
 

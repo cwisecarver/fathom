@@ -89,6 +89,26 @@ defmodule Fathom.Shard.Storage.S3ReclaimIdentityTest do
     assert lock_claim(store) == 7
   end
 
+  # A failed READ of the lock is not "not ours". The no-etag release used to fold it into `:ok`, so a
+  # GET blip reported the release as done while the lock still named this node; the coordinator's retry
+  # ladder and its `release_failed` log ("the lock may still name this node") only run on an error,
+  # which the etag fast path always returned. Both by-read releases now surface it.
+  test "a failed read of the lock surfaces as an error, not as a completed release", %{
+    store: store
+  } do
+    id =
+      S3EtagStore.inject(store, %{method: "GET", key: @lock_key}, {:status, 500},
+        times: :infinity
+      )
+
+    assert {:error, _} = S3.release_lease(@shard, old_lease(7))
+    assert {:error, _} = S3.release_lease_keeping_claim(@shard, old_lease(7), 7)
+    assert S3EtagStore.fired(store, id) >= 2, "the fault never fired: this tested the happy path"
+
+    S3EtagStore.clear_faults(store)
+    assert lock_claim(store) == 7, "the lock was touched while the read was failing"
+  end
+
   test "release by read of the CURRENT lease still releases", %{store: store} do
     assert :ok = S3.release_lease(@shard, old_lease(7))
     assert S3EtagStore.body_of(store, @lock_key) == nil
