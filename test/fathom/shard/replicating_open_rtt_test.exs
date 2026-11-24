@@ -236,7 +236,15 @@ defmodule Fathom.Shard.ReplicatingOpenRttTest do
 
         {:ok, pid} = Shards.ensure(shard)
         ref = Process.monitor(pid)
-        assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, {:pull_failed, :boom}}}, 5_000
+
+        # The pull fails after 10 ms, and `ensure` returns as soon as the coordinator is registered, so
+        # on a slow runner the coordinator can be gone before this monitor is set: the DOWN then
+        # carries `:noproc`, not the shutdown reason (CI 2026-11-24, OTP 29: the whole open ran and
+        # released its lease, and the assert on the exact reason timed out). The failure itself is
+        # pinned by the `pull` storage call below, which must have run and failed.
+        assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 5_000
+        assert reason in [{:shutdown, {:pull_failed, :boom}}, :noproc]
+        assert_received {:storage_call, :pull, _, _}
 
         assert_receive {:storage_object_head_started, head_pid}, 1_000
         head_ref = Process.monitor(head_pid)
