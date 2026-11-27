@@ -5656,7 +5656,7 @@ defmodule Fathom.Shard do
   defp note_not_valid(state) do
     if fence_writes_when_stealable?() do
       now = System.monotonic_time(:millisecond)
-      since = state.not_valid_since || now
+      since = state.not_valid_since || episode_start(state, now)
 
       state =
         if not Fathom.Shard.WriteFence.fenced?(state.id) and
@@ -5685,6 +5685,26 @@ defmodule Fathom.Shard do
       state
     end
   end
+
+  # WHERE AN EPISODE STARTS (audit 2026-11-22 #6). `stealable_after_ms/1` counts `margin + steal_margin`
+  # from the instant `valid_for_write?/1` first said `:not_valid`, which is `deadline - margin`. A
+  # coordinator usually first LOOKS later (the heartbeat edge-detects a lapse at or after `deadline`),
+  # so starting the clock at "now" armed the fence a full `margin` after a peer could steal. Heartbeat
+  # mode anchors to `min(now, deadline - margin)` when the status row carries an integer deadline.
+  # It cannot arm earlier than the store-clock steal instant, and the `write_fence_check` re-read still
+  # closes an episode whose heartbeat recovered. A restart's row carries NO deadline (the status
+  # table dies with the process and `init` publishes nil) and a suspend trip is detected while the
+  # deadline is still ahead; both fall back to `now`, unchanged, because anchoring earlier there would
+  # fence a healthy node whose first renew is slow (the outage the original rejection protected against,
+  # `apply_lapse_verdict(:skip, _)`). Legacy mode has no heartbeat row: `now`.
+  defp episode_start(%{acquire_gen: gen}, now) when is_integer(gen) do
+    case Heartbeat.not_valid_since_ms() do
+      since when is_integer(since) -> min(now, since)
+      nil -> now
+    end
+  end
+
+  defp episode_start(_state, now), do: now
 
   # ARM THE BREAKER ON TIME, NOT ON THE NEXT TICK (expert review 2026-10-12 #9). `note_not_valid/1`
   # publishes the fence only when it is CALLED past `stealable_after_ms`, and it is called only from
@@ -5980,7 +6000,7 @@ defmodule Fathom.Shard do
     try do
       # Integrity BEFORE the snapshot: quarantine_corrupt!/2 renames the live path, so checking
       # after would spend a full VACUUM on a file we are about to refuse and move aside.
-      with :ok <- Snapshot.flush_space_preflight(state.id, state.path),
+      with :ok <- Snapshot.flush_space_preflight(state.id, state.path, :upload),
            {:ok, new_etag, carried} <- scan_and_upload(state, temp, pre, verified?) do
         {:ok, new_etag, carried}
       else
@@ -6017,7 +6037,9 @@ defmodule Fathom.Shard do
       :fallback ->
         emit_flush_route(state, :vacuum)
 
-        with :ok <- Snapshot.verify_and_snapshot(state.id, state.path, temp, verified?),
+        # The snapshot temp is written only here; the upfront `:upload` charge did not cover it.
+        with :ok <- Snapshot.flush_space_preflight(state.id, state.path, :snapshot),
+             :ok <- Snapshot.verify_and_snapshot(state.id, state.path, temp, verified?),
              :ok <- after_snapshot_hook(state),
              :ok <- recheck_before_put(state) do
           upload_flush_object(state, temp, pre)

@@ -28,6 +28,7 @@ defmodule Fathom.BootChecks do
     check_sqlite_temp_dir!()
     check_vm_dirty_background!()
     check_replication_flush_interval!()
+    check_skew_defer_to_steal_watch!()
     check_flush_interval!()
     check_pool_fd_budget!()
     check_soft_heap_budget!()
@@ -716,6 +717,31 @@ defmodule Fathom.BootChecks do
           "#{@replication_flush_floor_ms} ms unless you are deliberately buying RPO with " <>
           "throughput (expert review 2026-08-20 #33)."
       )
+    end
+
+    nil
+  end
+
+  # `:skew_defer_to_steal_watch` lets a node whose clock lags the store keep WRITING instead of
+  # self-lapsing (audit 2026-11-22 #3). That is safe only because a stealer must first see the owner's
+  # heartbeat unchanged for a whole steal-watch window; a node that opts in with its OWN watch shorter
+  # than `ttl + steal_margin` (or off) has no such protection and would write while a peer may steal.
+  # Heartbeat falls back to the self-lapse in that case, so the setting would silently do nothing: refuse
+  # to boot, so the config says what it means. Prod-only like every sibling. It cannot see OTHER nodes'
+  # watch width: the fleet-wide assumption stays the operator's (docs/single-writer.md).
+  @doc false
+  def check_skew_defer_to_steal_watch! do
+    ttl = Fathom.Shard.Storage.lease_ttl_ms()
+
+    if Application.get_env(:fathom, :env) == :prod and
+         Application.get_env(:fathom, :skew_defer_to_steal_watch, false) == true and
+         not Fathom.Shard.Heartbeat.skew_deferred_to_steal_watch?(ttl) do
+      raise "config error: SKEW_DEFER_TO_STEAL_WATCH is on but this node's steal watch " <>
+              "(#{Fathom.Shard.Storage.steal_watch_window_ms()} ms) is shorter than ttl + steal_margin " <>
+              "(#{ttl + Fathom.Shard.Storage.steal_margin_ms()} ms). The watch is what makes a lagging " <>
+              "owner safe to keep writing, so without it the node would still self-lapse and the " <>
+              "setting would do nothing. Widen :steal_watch_ms (unset = ttl + steal_margin) or unset " <>
+              "SKEW_DEFER_TO_STEAL_WATCH (audit 2026-11-22 #3, docs/single-writer.md)."
     end
 
     nil

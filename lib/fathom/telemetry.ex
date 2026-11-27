@@ -254,6 +254,10 @@ defmodule Fathom.Telemetry do
         description:
           "Heartbeat self-lapses because this node's clock lags the store; once per episode"
       ),
+      counter("fathom.shard.heartbeat.skew_alarm.count",
+        description:
+          "This node's clock lags the store past the self-lapse bound but the steal watch protects it, so writes continue; once per episode"
+      ),
       counter("fathom.shard.heartbeat.renew_failed.count",
         description: "Failed node-heartbeat renewals"
       ),

@@ -246,6 +246,15 @@ data-loss event). So the TTL trades failover speed against how long a node may f
 wrongly stolen; tune it to your infra's worst-case pause, not below. `steal_margin_ms` is the
 clock-skew guard on top (see `docs/single-writer.md` steady-state fence and audit #13).
 
+**A clock that lags the store.** By default an owner whose clock lags the store past
+`ttl - renew - steal_margin` self-lapses (the write fence arms) because, by the store-clock rule alone, a
+peer would see its lease as stealable. A steal also needs the stealer to have seen the owner's heartbeat
+unchanged for a whole steal-watch window, which a renewing owner prevents every cycle, so with the watch
+on everywhere that self-lapse only costs the node its writes for as long as the lag lasts. Setting
+`SKEW_DEFER_TO_STEAL_WATCH=true` replaces it with an alarm (`clock lags the store`, once per episode).
+It is opt-in because one node cannot see the other nodes' watch width: a fleet where any node has the
+watch off or narrower than `ttl + steal_margin` can steal from a lagging owner that is still writing.
+
 **What softens it today.** `Fathom.Shards.checkout` **holds + retries** a `{:held}` from a *crashed*
 owner (heartbeat frozen and aging out within the budget) for `:crash_failover_hold_ms` (default `5s`,
 0 disables), converting the **tail** of the TTL window into latency instead of client `503`s

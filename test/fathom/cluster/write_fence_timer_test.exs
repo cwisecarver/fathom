@@ -141,11 +141,24 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
   } do
     hb = enter_mode!(:heartbeat)
 
+    # The episode is anchored at `deadline - margin` (audit 2026-11-22 #6), so the deadline has to be
+    # barely past for there to be any timer left to recover before: a deadline 100 ms ago with a 50 ms
+    # margin and a 1.5 s steal margin leaves ~1.4 s, independent of how slow the runner's first fence
+    # verdict is (the previous fixture left ~0.5 s and would have become a CI flake).
+    Env.put!(:steal_margin_ms, 1_500)
+
     capture_log(fn ->
       {conn, coordinator} = open_dirty!(shard)
       LivenessMode.assert!(coordinator, :heartbeat)
 
-      go_not_valid!(:heartbeat, hb)
+      :sys.replace_state(hb, fn st ->
+        Heartbeat.publish_status(%{
+          st
+          | mono_deadline_ms: System.monotonic_time(:millisecond) - 100,
+            margin_ms: 50
+        })
+      end)
+
       first_not_valid!(coordinator)
 
       # Recovered at the SAME generation (no lapse broadcast will come to clear it).
@@ -157,7 +170,7 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
         })
       end)
 
-      refute_receive :write_fenced, 500
+      refute_receive :write_fenced, 1_800
       refute WriteFence.fenced?(shard)
       assert :sys.get_state(coordinator).not_valid_since == nil
       ShardExecutor.close(conn)
@@ -200,6 +213,76 @@ defmodule Fathom.Cluster.WriteFenceTimerTest do
 
       assert :sys.get_state(coordinator).lapse_revalidate_pending == true,
              "the fixture must not have run the (ten-minute-jittered) revalidation"
+    end)
+  end
+
+  # Audit 2026-11-22 #6 (Fable decision). The episode started at the instant the lapse was OBSERVED,
+  # which on a clean shard is the heartbeat's edge-detection at or after `deadline`, but
+  # `valid_for_write?/1` has said `:not_valid` since `deadline - margin`. The breaker's formula
+  # (`margin + steal_margin - skew`) assumes it starts counting at `deadline - margin`, so it armed
+  # `margin` late: a peer may steal at `deadline + steal_margin`, the fence published at
+  # `deadline + margin + steal_margin`. The episode now starts at `min(now, deadline - margin)`.
+  # The restart edge (deadline `nil`: a restarted heartbeat has no deadline to anchor to) and the
+  # suspend edge (deadline still ahead) keep starting at `now`, which is why the panel's
+  # "steal_margin - skew" formula was NOT adopted: it would have fenced ~20 s early there.
+  test "heartbeat mode: the clock starts at deadline - margin, not when the lapse was seen", %{
+    shard: shard
+  } do
+    hb = enter_mode!(:heartbeat)
+    Env.put!(:lapse_revalidate_jitter_ms, 600_000)
+
+    capture_log(fn ->
+      {:ok, coordinator} = Shards.ensure(shard)
+      LivenessMode.assert!(coordinator, :heartbeat)
+      gen = :sys.get_state(coordinator).acquire_gen
+
+      # The deadline passed 1 s ago with a 2 s margin: `:not_valid` since 3 s ago. Stealable-after is
+      # margin + steal_margin = 2.05 s, already elapsed against the anchored start; measured from
+      # "now" it would be 2 s away.
+      :sys.replace_state(hb, fn s ->
+        Heartbeat.publish_status(%{
+          s
+          | generation: gen + 1,
+            mono_deadline_ms: System.monotonic_time(:millisecond) - 1_000,
+            margin_ms: 2_000
+        })
+      end)
+
+      send(coordinator, {:heartbeat_lapsed, gen + 1})
+
+      assert_receive :write_fenced,
+                     500,
+                     "the breaker armed a full margin after the shard became stealable"
+    end)
+  end
+
+  test "heartbeat mode: a restarted heartbeat (no deadline) still starts the clock at now", %{
+    shard: shard
+  } do
+    hb = enter_mode!(:heartbeat)
+    Env.put!(:lapse_revalidate_jitter_ms, 600_000)
+
+    capture_log(fn ->
+      {:ok, coordinator} = Shards.ensure(shard)
+      LivenessMode.assert!(coordinator, :heartbeat)
+      gen = :sys.get_state(coordinator).acquire_gen
+
+      # The restart edge: `init` publishes a nil deadline, so there is nothing to anchor to and the
+      # stored heartbeat may be only `renew_ms` old. Fencing early here is the outage the original
+      # rejection protected against; this must hold before and after the change.
+      :sys.replace_state(hb, fn s ->
+        Heartbeat.publish_status(%{
+          s
+          | generation: gen + 1,
+            mono_deadline_ms: nil,
+            margin_ms: 2_000
+        })
+      end)
+
+      send(coordinator, {:heartbeat_lapsed, gen + 1})
+
+      refute_receive :write_fenced, 1_000
+      refute WriteFence.fenced?(shard)
     end)
   end
 

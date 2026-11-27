@@ -266,6 +266,25 @@ defmodule Fathom.Shard.Heartbeat do
   end
 
   @doc """
+  The monotonic instant the published status first read `:not_valid`: `deadline - margin`. Nil when
+  there is no integer deadline to derive it from (the heartbeat is down, or a restart's initial row
+  carries none) or the heartbeat is not running.
+
+  The write breaker anchors its episode here, never later than "now" (audit 2026-11-22 #6), so it
+  counts `margin + steal_margin` from when the shard BECAME `:not_valid` and not from when a
+  coordinator first looked. Only a REAL deadline qualifies: a restart's `nil` row and the suspend
+  trip-wire (deadline still ahead) fall back to "now", which is why this is not simply "the deadline".
+  """
+  # `number()`: dialyzer cannot rule out a float margin from the status row's untyped slot.
+  @spec not_valid_since_ms() :: number() | nil
+  def not_valid_since_ms do
+    case status() do
+      {_gen, deadline, margin, _wall, _skew} when is_integer(deadline) -> deadline - margin
+      _ -> nil
+    end
+  end
+
+  @doc """
   A lock-free read of this node's lease health for the admin Cluster page (expert review
   2026-10-15 #9): the status row only, never a call into the heartbeat process.
 
@@ -417,6 +436,8 @@ defmodule Fathom.Shard.Heartbeat do
       wall_deadline_ms: nil,
       # Last measured owner-behind-store skew, clamped >= 0 (0 = unknown); `measured_skew_ms/0`.
       skew_ms: 0,
+      # The skew alarm fired for the current episode (`note_protected_skew/4`); cleared when it ends.
+      skew_alarmed: false,
       # The mono/wall instants of the last SUCCESSFUL renew start — read only by the suspend
       # trip-wire (`suspend_forces_lapse?/3`), never to compute validity.
       renewed_mono_ms: nil,
@@ -584,7 +605,26 @@ defmodule Fathom.Shard.Heartbeat do
           # self-lapse here, arming the write fence + revalidation BEFORE a peer is entitled to steal.
           # mark_lapse ONLY on the transition, so a persistent skew does not churn the generation
           # every cycle; while it persists we hold the deadline in the past without recovering.
-          if skew_forces_lapse?(skew, state.ttl_ms, state.renew_ms, Storage.steal_margin_ms()) do
+          #
+          # EXCEPT WHEN THE STEAL WATCH PROTECTS US (audit 2026-11-22 #3). Since Jepsen 2026-10-24
+          # finding 3 the store-clock rule above is an AND, never a replacement: a peer also has to
+          # have seen our heartbeat unchanged for a whole watch window on ITS monotonic clock, and a
+          # renewing owner rewrites `exp` every cycle. With the watch at (at least) `ttl + steal_margin`
+          # a renewing owner cannot be stolen from however far its clock lags, so the self-lapse
+          # protected nothing and cost the node every write for as long as the lag lasted, with no
+          # failover. It alarms instead (`note_protected_skew/4`: same phrase, because the rig's
+          # run.sh/chaos.sh grep it to invalidate a clock-stepped run) and keeps the skew published
+          # for the write breaker. OPT-IN (`:skew_defer_to_steal_watch`, default off), because the
+          # safety rests on every STEALER running the watch at that width while this node can only
+          # read its OWN setting: a fleet that is not uniform (a node with the watch off, a rolling
+          # config change) would leave a lagging owner writing while a peer may steal. With the
+          # setting off, or this node's watch shorter, the self-lapse is exactly as before.
+          skew_forced? =
+            skew_forces_lapse?(skew, state.ttl_ms, state.renew_ms, Storage.steal_margin_ms())
+
+          watch_protects? = skew_deferred_to_steal_watch?(state.ttl_ms)
+
+          if skew_forced? and not watch_protects? do
             lapsed = %{renewed | mono_deadline_ms: now - 1, wall_deadline_ms: wall - 1}
 
             if state.lapsed do
@@ -617,7 +657,7 @@ defmodule Fathom.Shard.Heartbeat do
             # makes them :revalidate. Bumping at the END extends that to everyone opened during the
             # episode, through the existing revalidate herd (one cheap check_lease each).
             recovered = %{
-              renewed
+              note_protected_skew(renewed, state, skew, skew_forced?)
               | mono_deadline_ms: now + state.ttl_ms,
                 wall_deadline_ms: wall + state.ttl_ms,
                 lapsed: false
@@ -642,6 +682,40 @@ defmodule Fathom.Shard.Heartbeat do
 
     publish_status(state)
     schedule_renew(state, now)
+  end
+
+  @doc """
+  Whether a skew past the self-lapse bound is left to the steal watch instead (audit 2026-11-22 #3).
+  True only when the operator opted in (`:skew_defer_to_steal_watch`) AND this node's own watch is at
+  least `ttl + steal_margin` wide; `Fathom.BootChecks.check_skew_defer_to_steal_watch!/0` refuses a
+  boot with the first and not the second. Public for the boot check and the tests.
+  """
+  @spec skew_deferred_to_steal_watch?(pos_integer()) :: boolean()
+  def skew_deferred_to_steal_watch?(ttl_ms) do
+    Application.get_env(:fathom, :skew_defer_to_steal_watch, false) == true and
+      Storage.steal_watch_window_ms() >= ttl_ms + Storage.steal_margin_ms()
+  end
+
+  # The skew bound is crossed but the steal watch protects the lease (see the comment in `do_renew/1`):
+  # say so, ONCE per episode, and keep the writes. `skew_alarmed` is cleared when the skew drops back.
+  # Keeps the phrase `clock lags the store` that the rig's scripts grep for.
+  defp note_protected_skew(renewed, _state, _skew, false), do: %{renewed | skew_alarmed: false}
+  defp note_protected_skew(%{skew_alarmed: true} = renewed, _state, _skew, true), do: renewed
+
+  defp note_protected_skew(renewed, state, skew, true) do
+    Logger.error(
+      "heartbeat owner clock lags the store for #{state.owner} by ~#{skew}ms " <>
+        "(> ttl - renew - steal_margin); the steal watch is on at >= ttl + steal_margin so a " <>
+        "renewing owner cannot be stolen from, writes continue (audit 2026-11-22 #3). Fix the clock."
+    )
+
+    :telemetry.execute(
+      [:fathom, :shard, :heartbeat, :skew_alarm],
+      %{count: 1, skew_ms: skew},
+      %{owner: state.owner}
+    )
+
+    %{renewed | skew_alarmed: true}
   end
 
   defp suspend_forces_lapse?(%{renewed_mono_ms: m, renewed_wall_ms: w} = state, now, wall)

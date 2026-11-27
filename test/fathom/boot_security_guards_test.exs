@@ -652,6 +652,40 @@ defmodule Fathom.BootSecurityGuardsTest do
     assert quiet_log(fn -> Fathom.BootChecks.check_replication_flush_interval!() end) == ""
   end
 
+  # Audit 2026-11-22 #3. SKEW_DEFER_TO_STEAL_WATCH lets a lagging-clock owner keep writing, which is
+  # safe only behind a steal watch of at least `ttl + steal_margin`. A node that opts in with a
+  # narrower (or off) watch would silently keep self-lapsing, so the config is refused at boot.
+  test "SKEW_DEFER_TO_STEAL_WATCH is refused when this node's own steal watch is too short" do
+    alias Fathom.Shard.Storage
+
+    Env.put!(:env, :prod)
+    wide = Storage.lease_ttl_ms() + Storage.steal_margin_ms()
+
+    # Off (the default): nothing to say, whatever the watch is.
+    Env.put!(:steal_watch_ms, 0)
+    assert Fathom.BootChecks.check_skew_defer_to_steal_watch!() == nil
+
+    # On with the watch off or narrower: refused, and the message names both numbers.
+    Env.put!(:skew_defer_to_steal_watch, true)
+
+    for short <- [0, wide - 1] do
+      Env.put!(:steal_watch_ms, short)
+
+      assert_raise RuntimeError, ~r/SKEW_DEFER_TO_STEAL_WATCH.*#{wide} ms/s, fn ->
+        Fathom.BootChecks.check_skew_defer_to_steal_watch!()
+      end
+    end
+
+    # On with the watch wide enough: boots.
+    Env.put!(:steal_watch_ms, wide)
+    assert Fathom.BootChecks.check_skew_defer_to_steal_watch!() == nil
+
+    # And prod-only, like every sibling guard.
+    Env.put!(:steal_watch_ms, 0)
+    Env.put!(:env, :dev)
+    assert Fathom.BootChecks.check_skew_defer_to_steal_watch!() == nil
+  end
+
   # Expert review 2026-08-20 #23. The replica store holds a full copy of every shard this node
   # FOLLOWS, grows from other nodes' write traffic, and has no retention — and both it and the live
   # shard data dir default under System.tmp_dir!(), so the unsafe arrangement is the DEFAULT one.

@@ -798,6 +798,16 @@ case env_bool.("BLOCK_TENANT_DDL") do
   on? -> config :fathom, :block_tenant_ddl, on?
 end
 
+# SKEW_DEFER_TO_STEAL_WATCH=true|1: a node whose clock lags the store past the self-lapse bound keeps
+# writing (alarm only) instead of fencing itself, because a stealer must first see the heartbeat
+# unchanged for a whole steal-watch window and a renewing owner changes it every cycle (audit
+# 2026-11-22 #3). Off by default: it is safe only if EVERY node runs the watch at >= ttl + steal_margin,
+# which one node cannot verify about the others. Boot refuses it when this node's own watch is too short.
+case env_bool.("SKEW_DEFER_TO_STEAL_WATCH") do
+  nil -> :ok
+  on? -> config :fathom, :skew_defer_to_steal_watch, on?
+end
+
 # Host-level tail attribution (expert review 2026-10-29 #17; docs/deploy-cluster.md "Host writeback").
 # SYSTEM_MONITOR: the `:erlang.system_monitor` long_schedule (20 ms) / long_gc (50 ms) counters. On in
 # prod, off elsewhere (the monitor is VM-global, so dev/test must not own it). `false` leaves the

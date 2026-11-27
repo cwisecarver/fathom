@@ -80,9 +80,20 @@ defmodule Fathom.Shard.Snapshot do
   # An unknown reading (poller not running, or stale) skips the check: a flush must never be refused
   # on a guess.
   @flush_space_margin_bytes 32 * 1024 * 1024
-  def flush_space_preflight(id, path) do
+  #
+  # TWO CHARGES, because the route is not known up front (audit 2026-11-22 #17, Fable). `:upload` is
+  # what EVERY route writes: the codec's encoded temp (about the shard's size when the backend
+  # compresses, nothing for `:none`) plus the margin; it runs before the route is chosen. `:snapshot`
+  # adds the VACUUM INTO / page-copy temp (db + wal), and runs only where that temp is written: the
+  # `:fallback` branch of `scan_and_upload/4`. The pinned-live route uploads the live `.db` and writes
+  # no such temp, so a volume with between one and two shard sizes free used to refuse a flush that
+  # would have fit, exactly while it was under pressure. (The page-copy route DOES write a shard-sized
+  # temp, so it is in the `:snapshot` charge; the audit's "page-copy needs far less" was wrong.)
+  @spec flush_space_preflight(String.t(), Path.t(), :upload | :snapshot) ::
+          :ok | {:error, {:flush_no_space, integer(), integer()}}
+  def flush_space_preflight(id, path, charge \\ :snapshot) when charge in [:upload, :snapshot] do
     with {:ok, free} <- Fathom.Admin.Measurements.data_free_bytes(),
-         need = flush_space_need(path),
+         need = flush_space_need(path, charge),
          true <- free < need do
       :telemetry.execute(
         [:fathom, :shard, :flush, :no_space],
@@ -105,10 +116,11 @@ defmodule Fathom.Shard.Snapshot do
   # The VACUUM INTO temp (db + wal content) plus the margin. A compressing backend writes a SECOND
   # temp, the encoded body, next to it (`S3.with_body/2`, `Codec.compress_to_temp/2`); at worst it is
   # about the size of the shard, so add the shard's size again (expert review 2026-10-13 #30).
-  defp flush_space_need(path) do
+  defp flush_space_need(path, charge) do
     snapshot = local_db_bytes(path)
     encoded = if Fathom.Shard.Storage.Codec.encoding() == :none, do: 0, else: snapshot
-    snapshot + encoded + flush_space_margin()
+    temp = if charge == :snapshot, do: snapshot, else: 0
+    temp + encoded + flush_space_margin()
   end
 
   defp flush_space_margin,

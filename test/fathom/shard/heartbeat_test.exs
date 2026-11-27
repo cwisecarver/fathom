@@ -189,6 +189,75 @@ defmodule Fathom.Shard.HeartbeatTest do
     end
   end
 
+  # Audit 2026-11-22 #3 (Fable decision). The self-lapse above arms the fence "before a peer treats the
+  # lease as stealable" under the store-clock rule. Since Jepsen 2026-10-24 finding 3 a peer ALSO has
+  # to have seen the owner's heartbeat unchanged for a whole steal-watch window, and a renewing owner
+  # rewrites it every cycle, so with the watch on at (at least) `ttl + steal_margin` the owner cannot be
+  # stolen from however far its clock lags. The self-lapse then protected nothing and cost the node
+  # every write (and a failover that never comes): a clock step on the rig wedged it for as long as the
+  # lag lasted. With the watch OFF (or shorter) the self-lapse above is unchanged.
+  #
+  # OPT-IN (`:skew_defer_to_steal_watch`, default off): the safety rests on EVERY stealer running the
+  # watch at that width, which this node cannot see. So the deferral needs the setting AND a wide
+  # enough watch on THIS node; either missing keeps the self-lapse.
+  describe "owner clock lags the store, with the steal watch on" do
+    test "setting on and a watch of at least ttl + steal_margin keeps the owner writable (and says so)",
+         %{pid: pid} do
+      gen = Heartbeat.generation()
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:skew_defer_to_steal_watch, true)
+      Env.put!(:steal_watch_ms, @ttl + Storage.steal_margin_ms())
+      Env.put!(:heartbeat_skew_ms, 60_000)
+
+      log =
+        capture_log(fn ->
+          send(pid, :renew)
+          _ = :sys.get_state(pid)
+        end)
+
+      assert Heartbeat.valid_for_write?(gen) == :ok,
+             "an owner the steal watch protects was fenced for a clock lag no peer can act on"
+
+      assert log =~ "clock lags the store",
+             "the lag must still be loud: the rig's run.sh/chaos.sh grep this phrase"
+
+      # The skew stays published (the write breaker subtracts it) and a second renew does not re-log.
+      assert Heartbeat.measured_skew_ms() > 0
+
+      assert capture_log(fn ->
+               send(pid, :renew)
+               _ = :sys.get_state(pid)
+             end) =~ "clock lags the store" == false,
+             "the alarm repeats every renew instead of once per episode"
+    end
+
+    test "a wide watch WITHOUT the setting (the default) still self-lapses", %{pid: pid} do
+      gen = Heartbeat.generation()
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:steal_watch_ms, @ttl + Storage.steal_margin_ms())
+      Env.put!(:heartbeat_skew_ms, 60_000)
+
+      send(pid, :renew)
+      _ = :sys.get_state(pid)
+
+      assert Heartbeat.valid_for_write?(gen) == :not_valid,
+             "the deferral is opt-in: a node that did not ask for it must keep the self-lapse"
+    end
+
+    test "the setting with a watch SHORTER than ttl + steal_margin still self-lapses", %{pid: pid} do
+      gen = Heartbeat.generation()
+      Env.put!(:shard_storage, Fathom.Test.FaultyStorage)
+      Env.put!(:skew_defer_to_steal_watch, true)
+      Env.put!(:steal_watch_ms, @ttl + Storage.steal_margin_ms() - 1)
+      Env.put!(:heartbeat_skew_ms, 60_000)
+
+      send(pid, :renew)
+      _ = :sys.get_state(pid)
+
+      assert Heartbeat.valid_for_write?(gen) == :not_valid
+    end
+  end
+
   # Expert review #21: the local validity/lapse decisions used the wall clock, so a
   # backward clock step (NTP correction, VM live-migration) after a renewal inflated
   # perceived remaining validity — a genuine lapse (during which a peer with a correct

@@ -158,6 +158,25 @@ defmodule Fathom.RuntimeConfigTest do
     refute Keyword.has_key?(prod_config(%{}), :block_tenant_ddl)
   end
 
+  test "SKEW_DEFER_TO_STEAL_WATCH is opt-in: unset leaves it unwritten, true|1 turns it on" do
+    refute Keyword.has_key?(prod_config(%{}), :skew_defer_to_steal_watch)
+
+    assert Keyword.fetch!(
+             prod_config(%{"SKEW_DEFER_TO_STEAL_WATCH" => "true"}),
+             :skew_defer_to_steal_watch
+           )
+
+    assert Keyword.fetch!(
+             fathom_config(%{"SKEW_DEFER_TO_STEAL_WATCH" => "1"}),
+             :skew_defer_to_steal_watch
+           )
+
+    refute Keyword.fetch!(
+             fathom_config(%{"SKEW_DEFER_TO_STEAL_WATCH" => "false"}),
+             :skew_defer_to_steal_watch
+           )
+  end
+
   test "SHARD_LOAD unset outside prod leaves :shard_load off (module default)" do
     # Unset: the key isn't written, so Application falls back to the false default.
     refute Keyword.has_key?(fathom_config(%{}), :shard_load)
