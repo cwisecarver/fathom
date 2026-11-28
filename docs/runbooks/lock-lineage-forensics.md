@@ -64,6 +64,12 @@ demonstrably survived. A logged timeout, exit or 5xx is NOT proof the delete mis
 - **The chaos rig cannot exercise the plain-release half of the stale-release fix.** MinIO ignores
   `If-Match` on DELETE (the rig runs with `allow_weak_conditional_delete`), so a stale plain release
   deletes the lock regardless. Real S3 answers 412. See `docs/jepsen-run-plan.md` item 13.
+  Since audit 2026-11-22 #7 the release READS the lock first under that flag, so a superseded
+  coordinator's clean idle drop no longer deletes the live owner's lock on the rig.
+  `PAUSE_FENCE_CLEAN=1 ./chaos.sh pause-fence <shard>` is the arm that exercises it (no dirty write, so
+  the unpause-time idle stop takes the CLEAN drop); its verdict is zero bare `release_delete` lines from
+  the zombie after the steal. Measured 2026-11-27: the pre-fix build issued one (a stale-etag DELETE 0.4 s
+  after the survivor stole, which MinIO honours), the fixed build none.
 - With replication off there are no claims, so owner and epoch cannot tell a same-owner reclaim from its
   predecessor.
 - The tools read `logs/ds/…` paths by default for run outputs; `logs/` is not committed.

@@ -783,8 +783,17 @@ cmd_pause_fence() {
   # a dirty, unflushed write right before the freeze — the zombie's flush payload.
   # seq=300 is NOT in S3 (frozen before the next flush); losing it is within RPO.
   # The invariant is that the zombie must not RESURRECT it over the survivor's write.
-  sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 300)" >/dev/null
-  echo "owner=$owner survivor=$survivor — pausing owner with a dirty (unflushed) write"
+  # PAUSE_FENCE_CLEAN=1 (audit 2026-11-22 #7): no dirty write, so the zombie's unpause-time idle stop takes
+  # the CLEAN drop (`release_clean`, no fence) instead of the dirty one (`keeping_claim`). The schema is
+  # already durable (the wait above), the pause is longer than SHARD_IDLE_MS, and the rig runs with
+  # :allow_weak_conditional_delete (MinIO ignores If-Match on DELETE), so this is the arm in which a
+  # superseded coordinator's release could delete the SURVIVOR's lock. The verdict is at the end.
+  if [ -z "${PAUSE_FENCE_CLEAN:-}" ]; then
+    sql "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', 300)" >/dev/null
+    echo "owner=$owner survivor=$survivor — pausing owner with a dirty (unflushed) write"
+  else
+    echo "owner=$owner survivor=$survivor — pausing owner CLEAN (no unflushed write)"
+  fi
   "$DOCKER" pause "$(cname "$owner")" >/dev/null
   local wait_s=$(( (TTL_MS + STEAL_MARGIN_MS) / 1000 + 6 ))  # + cushion past the steal threshold
   echo "frozen; waiting ${wait_s}s (past TTL ${TTL_MS}ms + steal margin ${STEAL_MARGIN_MS}ms)..."
@@ -823,6 +832,27 @@ cmd_pause_fence() {
   # worse than no check at all. So in promote mode the question becomes WHERE it came from: a
   # promotion on the survivor (correct), or the zombie's flush (split-brain). The self-fence log
   # line settles it, and is required rather than assumed.
+  if [ -n "${PAUSE_FENCE_CLEAN:-}" ]; then
+    # The zombie's release path, from its own lock-trace lines after the steal, and what the survivor
+    # saw next: a deleted lock shows up as the survivor's next open being a fresh_create/recreated.
+    local zl; zl=$(compose logs --since 3m "$owner" 2>/dev/null | grep "shard $shard: lock-trace" | sed 's/^[^|]*| *//')
+    local by_read bare surv_after
+    by_read=$(printf '%s\n' "$zl" | grep -c "release_delete_by_read" || true)
+    bare=$(printf '%s\n' "$zl" | grep -c "lock-trace release_delete " || true)
+    surv_after=$(compose logs --since 3m "$survivor" 2>/dev/null | grep "shard $shard: lock-trace" | grep -cE "fresh_create|recreated" || true)
+    echo "RESULT pause-fence (CLEAN zombie):"
+    echo "  survivor's post-steal write (seq=400) present = $live   (MUST be 1)"
+    echo "  zombie release_delete_by_read lines           = $by_read"
+    echo "  zombie bare release_delete (fast path) lines  = $bare   (MUST be 0 on the weak-delete rig)"
+    echo "  survivor fresh_create/recreated lines         = $surv_after   (MUST be 0: its lock was not deleted)"
+    printf '%s\n' "$zl" | tail -6 | cut -c1-200 | sed 's/^/  trace: /'
+    if [ "$live" = "1" ] && [ "$bare" = "0" ] && [ "$surv_after" = "0" ]; then
+      echo "  PASS: the superseded coordinator's clean release did not touch the live owner's lock"
+      return 0
+    fi
+    echo "  *** the zombie's release reached the survivor's lock"
+    return 1
+  fi
   echo "RESULT pause-fence:"
   echo "  survivor's post-steal write (seq=400) present = $live   (MUST be 1)"
 
