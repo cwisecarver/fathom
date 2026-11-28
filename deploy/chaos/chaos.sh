@@ -926,6 +926,83 @@ cmd_partition() {
   echo "restored; node should resume renewing (watch: ./chaos.sh logs -f $node)"
 }
 
+# partition-fence <shard> [secs] (audit 2026-11-22 #6): cut the OWNER off S3 while a write loop hits the shard
+# DIRECTLY on that node, then read the three instants the write breaker is judged by:
+#   lapse   `heartbeat lapsed` (the heartbeat deadline: last good renew + TTL)
+#   fence   `fencing writes` for THIS shard (the breaker armed)
+#   refused the first loop write that failed after the cut
+# Expected: fence ~= lapse + steal_margin (the instant a peer may steal), and the first refused write at or
+# after it. Before #6 the fence landed a full `margin` (ttl/3) later. lapse and fence are both on the node's
+# clock, so their gap is exact; the loop runs on the host clock, mapped onto the node's by one `date` read
+# (+-1 s). Also counts `clock lags the store` on every node: a colima clock step invalidates the run.
+cmd_partition_fence() {
+  local shard=${1:?usage: partition-fence <shard> [secs]} secs=${2:-45}
+  seed "$shard"
+  echo "waiting one flush interval so $shard is durable..."; sleep 6
+  local owner; owner=$(cmd_owner "$shard") || { echo "no owner"; return 1; }
+  local loop=/tmp/pf-loop.$$; : > "$loop"
+  local off_s; off_s=$(( $("$DOCKER" exec "$(cname "$owner")" date -u +%s) - $(date -u +%s) ))
+  (
+    local i=0 now rc
+    while [ ! -f "$loop.stop" ]; do
+      i=$((i+1)); now=$(python3 -c 'import time;print(int(time.time()*1000))')
+      if sql_direct "$owner" "$shard" "INSERT INTO kv (tenant, seq) VALUES ('$shard', $i)" >/dev/null 2>&1; then rc=ok; else rc=FAIL; fi
+      echo "$now $rc" >> "$loop"; sleep 0.4
+    done
+  ) &
+  local looppid=$!
+  sleep 4
+  local t0; t0=$(python3 -c 'import time;print(int(time.time()*1000))')
+  echo "owner=$owner: cutting S3 for ${secs}s with a write loop running"
+  curl -sS -X POST "$TOXI/proxies/s3-${owner}" -d '{"enabled": false}' >/dev/null
+  sleep "$secs"
+  curl -sS -X POST "$TOXI/proxies/s3-${owner}" -d '{"enabled": true}' >/dev/null
+  touch "$loop.stop"; wait "$looppid" 2>/dev/null
+  local logs; logs=$(compose logs --no-log-prefix --since $((secs + 15))s "$owner" 2>/dev/null)
+  local clock=0 n
+  for n in "${NODES[@]}"; do
+    clock=$(( clock + $(compose logs --since $((secs + 40))s "$n" 2>/dev/null | grep -c "clock lags the store" || true) ))
+  done
+  T0=$t0 OFF=$off_s LOOP=$loop SHARD=$shard CLOCK=$clock STEAL=$STEAL_MARGIN_MS TTL=$TTL_MS python3 - "$logs" <<'PY'
+import os,re,sys
+logs=sys.argv[1].splitlines()
+def tod(line):
+    m=re.match(r'(\d\d):(\d\d):(\d\d)\.(\d{3})',line.strip())
+    return None if not m else ((int(m[1])*60+int(m[2]))*60+int(m[3]))*1000+int(m[4])
+lapse=next((tod(l) for l in logs if 'heartbeat lapsed' in l),None)
+fence=next((tod(l) for l in logs if 'fencing writes' in l and 'shard '+os.environ['SHARD']+':' in l),None)
+off=int(os.environ['OFF'])*1000; t0=int(os.environ['T0'])
+def vm_tod(host_ms): return ((host_ms+off)%86400000)
+rows=[l.split() for l in open(os.environ['LOOP']) if l.strip()]
+after=[(int(t),r) for t,r in rows if int(t)>=t0]
+refused=next((vm_tod(t) for t,r in after if r=='FAIL'),None)
+okafter=[vm_tod(t) for t,r in after if r=='ok']
+print('RESULT partition-fence:')
+print('  heartbeat lapsed (deadline)  = %s'%lapse)
+print('  fencing writes (breaker)     = %s'%fence)
+steal=int(os.environ['STEAL'])
+good=True
+if lapse is None or fence is None:
+    print('  *** no lapse/fence line for the shard: the coordinator did not stay up through the cut'); good=False
+else:
+    gap=fence-lapse
+    print('  fence - lapse                = %d ms   (expect ~%d: steal_margin; pre-#6 ~%d more)'%(gap,steal,int(os.environ['TTL'])//3))
+    if abs(gap-steal)>1500: good=False
+if refused is not None and fence is not None:
+    print('  first refused write - fence  = %d ms   (expect >= ~0, within ~1 s of the +-1 s clock map)'%(refused-fence))
+    last_ok_after_fence=[t for t in okafter if t>fence+1500]
+    print('  writes ACCEPTED >1.5 s after the fence = %d   (MUST be 0)'%len(last_ok_after_fence))
+    if last_ok_after_fence: good=False
+else:
+    print('  no refused write observed'); good=False
+print('  "clock lags the store" lines across all nodes = %s   (MUST be 0: a clock step invalidates the run)'%os.environ['CLOCK'])
+if os.environ['CLOCK']!='0': good=False
+print('  PASS' if good else '  *** FAIL')
+sys.exit(0 if good else 1)
+PY
+  local rc=$?; rm -f "$loop" "$loop.stop"; return $rc
+}
+
 cmd_soak() {
   local secs=${1:-120} tenants=(t1 t2 t3 t4 t5 t6) t
   require_fast_flush soak || return 1
@@ -4283,6 +4360,7 @@ case "${1:-}" in
   msacc-poll)  shift; cmd_msacc_poll "$@" ;;
   failover)    shift; cmd_failover "$@" ;;
   pause-fence) shift; cmd_pause_fence "$@" ;;
+  partition-fence) shift; cmd_partition_fence "$@" ;;
   partition)   shift; cmd_partition "$@" ;;
   soak)        shift; cmd_soak "$@" ;;
   *) awk 'NR==1{next} /^#/{print;next} {exit}' "$(basename "$0")"; exit 64 ;;

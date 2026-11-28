@@ -40,6 +40,7 @@ cd deploy/chaos
 
 ./chaos.sh failover acme      # silent-kill acme's owner; time to first acked write on a survivor
 ./chaos.sh pause-fence acme   # freeze the owner past TTL, steal on a survivor, prove the zombie self-fences
+./chaos.sh partition-fence acme [secs]   # cut the owner off S3 under a write loop; the breaker must arm at lapse + steal_margin
 PAUSE_FENCE_CLEAN=1 ./chaos.sh pause-fence acme   # same with a CLEAN zombie: its idle-drop release must not touch the survivor's lock
 ./chaos.sh partition fathom2  # cut fathom2 off S3; observe heartbeat lapse + recovery
 ./chaos.sh soak 180           # sustained load + node churn; acked-vs-stored + isolation audit
